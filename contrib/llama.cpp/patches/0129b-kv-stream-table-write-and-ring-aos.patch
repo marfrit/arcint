@@ -1,76 +1,8 @@
-diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 6319c6e..e427bee 100644
---- a/ggml/include/ggml.h
-+++ b/ggml/include/ggml.h
-@@ -221,7 +221,14 @@
- 
- #define GGML_MAX_DIMS           4
- #define GGML_MAX_PARAMS         2048
--#define GGML_MAX_SRC            10
-+// 0126: 12, so the paged FLASH_ATTN_EXT sources fit. The KV stream puts
-+// GGML_FA_SRC_HOST_K/V and GGML_FA_SRC_PLAN at 9/10/11 (ggml-impl.h); at 10 the
-+// set_host call wrote past src[] into the tensor's following fields, and every
-+// FA node then read garbage as its plan (measured on the B60, window 266: the
-+// first FLASH_ATTN_EXT case asserted host_k && host_v && ring_k && ring_v). A
-+// source index beyond the array is undefined behaviour; the static_assert in
-+// ggml-impl.h keeps the two constants in step.
-+#define GGML_MAX_SRC            12
- #define GGML_MAX_N_THREADS      512
- #define GGML_MAX_OP_PARAMS      64
- 
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 1aef1e8..cf768de 100644
---- a/ggml/src/ggml-cpu/ops.cpp
-+++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -9774,11 +9774,12 @@ static void ggml_compute_forward_flash_attn_ext_paged(
-                     const size_t kb = (size_t) host_k->nb[2];   // a page of K: page_size rows
-                     const size_t vb = (size_t) host_v->nb[2];
-                     const size_t rb = (size_t) ring_k->nb[1];   // the slot's row (all heads of a cell)
-+                    const size_t rvb = (size_t) ring_v->nb[1];  // 0129b: V has its own row stride
-                     for (int64_t p = 0; p < plan->ne[0]; ++p) {
-                         const int32_t row = pl[p];
-                         if (row < 0) continue;   // a resident page: the pool holds it
-                         memcpy((char *) rk + (size_t) row*page_size*rb, hk + (size_t) p*kb, kb);
--                        memcpy((char *) rv + (size_t) row*page_size*rb, hv + (size_t) p*vb, vb);
-+                        memcpy((char *) rv + (size_t) row*page_size*rvb, hv + (size_t) p*vb, vb);
-                     }
-                 }
-                 ggml_barrier(params->threadpool);
-diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
-index 34bc169..9bcc075 100644
---- a/ggml/src/ggml-impl.h
-+++ b/ggml/src/ggml-impl.h
-@@ -197,6 +197,12 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
- #define GGML_FA_SRC_HOST_K      9   // the host store of this attention layer: [n_embd, page_size, n_pages]
- #define GGML_FA_SRC_HOST_V      10
- #define GGML_FA_SRC_PLAN        11  // I32 [n_pages]: the ring row of each streamed page, -1 for a resident one
-+// the sources live in ggml_tensor::src[GGML_MAX_SRC]; an index past it is UB (window 266)
-+#ifdef __cplusplus
-+static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
-+#else
-+_Static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
-+#endif
- 
- static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
-     const uint32_t * p;
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 6c8eb09..d904b3d 100644
+index 7c07d1c..d904b3d 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -16918,6 +16918,12 @@ static void ggml_backend_opencl_buffer_clear(ggml_backend_buffer_t buffer, uint8
- 
-     ggml_backend_opencl_buffer_context * ctx = (ggml_backend_opencl_buffer_context *) buffer->context;
-     ctx->drop_f16_copies();   // 0110: they would hold the old values
-+    if (ctx->usm != nullptr) {
-+        // 0127: a USM host buffer's bytes are host memory (the placeholder cl_mem is 64
-+        // bytes); fillBuffer(buffer->size) on it faulted the device (window 269, ENOENT)
-+        memset(ctx->usm, value, buffer->size);
-+        return;
-+    }
-     for (cl_mem buf : ctx->buffer) {
-         CL_CHECK(clEnqueueFillBuffer(queue, buf, &value, sizeof(value), 0, buffer->size, 0, NULL, NULL));
-     }
-@@ -23565,7 +23571,9 @@ static ggml_cl_fa_table ggml_cl_fa_table_row(ggml_backend_opencl_context * backe
+@@ -23571,7 +23571,9 @@ static ggml_cl_fa_table ggml_cl_fa_table_row(ggml_backend_opencl_context * backe
  // read them. Layer i's copies therefore run while layer i's own attention runs, and the slot layer
  // i+2 reuses is only overwritten after layer i's kernels were enqueued, so no two layers share a
  // slot's content at the time of their attention. The host store is read once per attention call.
@@ -81,48 +13,7 @@ index 6c8eb09..d904b3d 100644
      const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
      if (!plan) {
          return;
-@@ -23579,35 +23587,104 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
-     const char * hk = (const char *) ggml_backend_opencl_usm_ptr(host_k);
-     const char * hv = (const char *) ggml_backend_opencl_usm_ptr(host_v);
-     const int32_t * pl = (const int32_t *) ggml_backend_opencl_usm_ptr(plan);
--    if (hk == nullptr || hv == nullptr || pl == nullptr) {
--        GGML_ABORT("ggml_opencl: a paged attention with a host store that is not USM host memory");
-+    // 0127: the op test allocates its host store in the backend's ordinary buffer (the
-+    // serving stream uses USM host memory). A regular host store is copied on the device
-+    // instead; its layout is AOS (regions() returns one region for it), so the bytes are
-+    // a byte copy. The plan is tiny and read on the host, so it is copied to host memory.
-+    // 0129a: the op test uploads its host store whole, which the backend splits into
-+    // SoA planes (set_tensor of a contiguous q8_0/q4_0 tensor not a weight); the
-+    // restore kernel rebuilds the AOS bytes into a temporary buffer, as the ring's
-+    // reconstruct does. A plain (non-SoA) store is copied from its one region.
-+    ggml_cl_flash_attn_temp_buffer temp_hk, temp_hv;
-+    cl_mem       hk_buf = NULL, hv_buf = NULL;
-+    cl_ulong     hk_off = 0, hv_off = 0;
-+    cl_ulong     hk_nb1 = 0, hv_nb1 = 0, hk_nb2 = 0, hv_nb2 = 0, hk_nb3 = 0, hv_nb3 = 0;
-+    bool hk_aos = false, hv_aos = false;
-+    ggml_cl_region hk_r[2], hv_r[2];
-+    if (hk == nullptr || hv == nullptr) {
-+        hk_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, host_k, temp_hk, hk_buf, hk_off, hk_nb1, hk_nb2, hk_nb3);
-+        hv_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, host_v, temp_hv, hv_buf, hv_off, hv_nb1, hv_nb2, hv_nb3);
-+        if (!hk_aos && !hv_aos) {
-+            if (ggml_cl_regions(host_k, hk_r) != 1 || ggml_cl_regions(host_v, hv_r) != 1 || (hk == nullptr) != (hv == nullptr)) {
-+                GGML_ABORT("ggml_opencl: a paged attention with a host store that is neither USM nor one AOS region");
-+            }
-+        } else if (!(hk_aos == hv_aos)) {
-+            GGML_ABORT("ggml_opencl: a paged attention whose K and V host stores differ in layout");
-+        }
-+    }
-+    const int64_t n_pages = plan->ne[0];
-+    cl_command_queue queue = backend_ctx->queue;
-+    int32_t plan_rows[1024];
-+    if (pl == nullptr) {
-+        GGML_ASSERT(n_pages <= 1024);
-+        CL_CHECK(clEnqueueReadBuffer(queue, ((ggml_tensor_extra_cl *) plan->extra)->data_device, CL_TRUE,
-+                                      ((ggml_tensor_extra_cl *) plan->extra)->offset, (size_t) n_pages * sizeof(int32_t),
-+                                      plan_rows, 0, NULL, NULL));
-+        pl = plan_rows;
-     }
- 
+@@ -23624,36 +23626,62 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
      ggml_cl_region rk[2], rv[2];
      const int nrk = ggml_cl_regions(ring_k, rk);
      const int nrv = ggml_cl_regions(ring_v, rv);
@@ -153,9 +44,6 @@ index 6c8eb09..d904b3d 100644
      const size_t vb = (size_t) host_v->nb[2];
 -    const size_t rb = (size_t) ring_k->nb[1];   // the K slot's row (all its heads of a cell)
 -    const size_t rvb = (size_t) ring_v->nb[1];
--    const int64_t n_pages = plan->ne[0];
--
--    cl_command_queue queue = backend_ctx->queue;
 +    const size_t rb = rk_aos_buf ? (size_t) rk_aos_nb1 : (size_t) ring_k->nb[1];   // the slot's row (all its heads of a cell)
 +    const size_t rvb = rv_aos_buf ? (size_t) rv_aos_nb1 : (size_t) ring_v->nb[1];
      for (int64_t p = 0; p < n_pages; ++p) {
@@ -165,27 +53,27 @@ index 6c8eb09..d904b3d 100644
          }
 -        const cl_ulong off_k = rk[0].off + (cl_ulong) ring_k->view_offs;
 -        const cl_ulong off_v = rv[0].off + (cl_ulong) ring_v->view_offs;
--        CL_CHECK(clEnqueueWriteBuffer(queue, rk[0].mem, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
--                                      hk + (size_t) p*kb, 0, NULL, NULL));
--        CL_CHECK(clEnqueueWriteBuffer(queue, rv[0].mem, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
--                                      hv + (size_t) p*vb, 0, NULL, NULL));
 +        const cl_ulong off_k = k_off;
 +        const cl_ulong off_v = v_off;
-+        if (hk == nullptr) {
-+            // a regular host store: device-to-device, AOS both sides (SoA rebuilt by
-+            // the restore kernel above into hk_buf/hv_buf, a plain store from its region)
-+            cl_mem sk = hk_aos ? hk_buf : hk_r[0].mem, sv = hv_aos ? hv_buf : hv_r[0].mem;
-+            const cl_ulong so = hk_aos ? hk_off : hk_r[0].off, sv_off = hv_aos ? hv_off : hv_r[0].off;
+         if (hk == nullptr) {
+             // a regular host store: device-to-device, AOS both sides (SoA rebuilt by
+             // the restore kernel above into hk_buf/hv_buf, a plain store from its region)
+             cl_mem sk = hk_aos ? hk_buf : hk_r[0].mem, sv = hv_aos ? hv_buf : hv_r[0].mem;
+             const cl_ulong so = hk_aos ? hk_off : hk_r[0].off, sv_off = hv_aos ? hv_off : hv_r[0].off;
+-            CL_CHECK(clEnqueueCopyBuffer(queue, sk, rk[0].mem, so + (cl_ulong) p*kb,
 +            CL_CHECK(clEnqueueCopyBuffer(queue, sk, k_buf, so + (cl_ulong) p*kb,
-+                                         off_k + (cl_ulong) row*ps*rb, (size_t) kb, 0, NULL, NULL));
+                                          off_k + (cl_ulong) row*ps*rb, (size_t) kb, 0, NULL, NULL));
+-            CL_CHECK(clEnqueueCopyBuffer(queue, sv, rv[0].mem, sv_off + (cl_ulong) p*vb,
 +            CL_CHECK(clEnqueueCopyBuffer(queue, sv, v_buf, sv_off + (cl_ulong) p*vb,
-+                                         off_v + (cl_ulong) row*ps*rvb, (size_t) vb, 0, NULL, NULL));
-+        } else {
+                                          off_v + (cl_ulong) row*ps*rvb, (size_t) vb, 0, NULL, NULL));
+         } else {
+-            CL_CHECK(clEnqueueWriteBuffer(queue, rk[0].mem, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
 +            CL_CHECK(clEnqueueWriteBuffer(queue, k_buf, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
-+                                          hk + (size_t) p*kb, 0, NULL, NULL));
+                                           hk + (size_t) p*kb, 0, NULL, NULL));
+-            CL_CHECK(clEnqueueWriteBuffer(queue, rv[0].mem, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
 +            CL_CHECK(clEnqueueWriteBuffer(queue, v_buf, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
-+                                          hv + (size_t) p*vb, 0, NULL, NULL));
-+        }
+                                           hv + (size_t) p*vb, 0, NULL, NULL));
+         }
      }
 +    // 0129b: GGML_OPENCL_FA_PAGED_SYNC=1 drains after this layer's page copies. The moves
 +    // and the kernels share the in-order compute queue, so the queue order alone is the
@@ -194,13 +82,10 @@ index 6c8eb09..d904b3d 100644
 +    if (!sync_env || atoi(sync_env) != 0) {
 +        CL_CHECK(clFinish(queue));
 +    }
-+    // the restore buffers live until their queued copies run (OpenCL's retain)
-+    if (hk_aos) clReleaseMemObject(hk_buf);
-+    if (hv_aos) clReleaseMemObject(hv_buf);
- }
- 
- static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
-@@ -23630,7 +23707,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // the restore buffers live until their queued copies run (OpenCL's retain)
+     if (hk_aos) clReleaseMemObject(hk_buf);
+     if (hv_aos) clReleaseMemObject(hv_buf);
+@@ -23679,7 +23707,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
      // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
@@ -208,7 +93,7 @@ index 6c8eb09..d904b3d 100644
  
      const int n_q = q->ne[1];
      // paged K/V (0119): the attended length is the page table's pages * page_size,
-@@ -24008,6 +24084,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -24057,6 +24084,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      const bool rv_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, dst->src[GGML_FA_SRC_RING_V], temp_rv_aos,
                                                             rv_aos_buf, rv_aos_off, rv_aos_nb1, rv_aos_nb2, rv_aos_nb3);
  
@@ -223,7 +108,7 @@ index 6c8eb09..d904b3d 100644
      // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
      // after the reconstruction above a SoA tensor is a block copy too), so
      // the dequantization below is skipped when one of them takes the call.
-@@ -25119,6 +25203,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -25168,6 +25203,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                          (long long) v->ne[1], (unsigned long long) v_nb1, (unsigned long long) v_nb2,
                          (long long) (rv ? rv->ne[1] : 0), (unsigned long long) rv_nb1, (unsigned long long) rv_nb2);
                  GGML_LOG_INFO("ggml_opencl: paged FA dump: table [%s]\n", list.c_str());
@@ -242,35 +127,19 @@ index 6c8eb09..d904b3d 100644
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &rk_buffer));
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_rk));
 diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
-index 7f459ef..7ff7754 100644
+index 79bd30c..7ff7754 100644
 --- a/src/llama-kv-stream.cpp
 +++ b/src/llama-kv-stream.cpp
-@@ -4,6 +4,7 @@
- // backend probe).
- 
- #include "llama-kv-stream.h"
-+#include "llama-impl.h"   // LLAMA_LOG_INFO: the per-request stream line (0129b)
- 
- #include <algorithm>
- #include <cstring>
-@@ -228,6 +229,16 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
- 
-     GGML_ASSERT((int64_t) n_streamed*page_size <= slots[0].k->ne[1]);
- 
-+    // 0129b: once per request, not per step -- the depth where pages move is the
-+    // depth a window has to be able to tell from the logs. Printed when what streams
-+    // changes (a request's first ubatch, and a grow past the pool), not every ubatch
-+    if ((int32_t) n_streamed != last_log_streamed) {
-+        last_log_streamed = (int32_t) n_streamed;
-+        const uint32_t moved = n_streamed*layers.size()*2;
+@@ -235,7 +235,7 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
+     if ((int32_t) n_streamed != last_log_streamed) {
+         last_log_streamed = (int32_t) n_streamed;
+         const uint32_t moved = n_streamed*layers.size()*2;
+-        LLAMA_LOG_INFO("%s: KV streaming: %u of %u pages resident, %u streamed, %u page moves this request (%u ring rows)\n",
 +        LLAMA_LOG_WARN("%s: KV streaming: %u of %u pages resident, %u streamed, %u page moves this request (%u ring rows)\n",
-+                __func__, n_pages - n_streamed, n_pages, n_streamed, moved, n_streamed);
-+    }
-+
-     // the plan: the ring row of each streamed page, -1 for a resident one. The
-     // slots are filled per layer just before that layer's attention (copy_layer,
-     // or the OpenCL FA dispatch), so no two layers share a slot's content at the
-@@ -246,16 +257,23 @@ int64_t llama_kv_stream::row(uint32_t cell) const {
+                 __func__, n_pages - n_streamed, n_pages, n_streamed, moved, n_streamed);
+     }
+ 
+@@ -257,16 +257,23 @@ int64_t llama_kv_stream::row(uint32_t cell) const {
  }
  
  void llama_kv_stream::set_input_pages(ggml_tensor * dst) const {
@@ -299,20 +168,8 @@ index 7f459ef..7ff7754 100644
      }
  }
  
-diff --git a/src/llama-kv-stream.h b/src/llama-kv-stream.h
-index bba09f3..d2d7f3b 100644
---- a/src/llama-kv-stream.h
-+++ b/src/llama-kv-stream.h
-@@ -156,6 +156,7 @@ private:
- 
-     uint64_t layout_id  = 0;
-     uint32_t n_streamed = 0;
-+    int32_t  last_log_streamed = -1;   // 0129b: the last logged streamed count (once a request)
-     uint32_t rotation   = 0;
-     bool     debug_rotate = false;
- };
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index edd53a2..ccf4657 100644
+index 431985b..ccf4657 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -9395,7 +9395,10 @@ struct test_flash_attn_ext_paged_layers : public test_case {
@@ -327,13 +184,12 @@ index edd53a2..ccf4657 100644
      }
      double max_nmse_err() override {
          return 5e-4;
-@@ -13148,6 +13151,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
-     // joined by an ADD (decode and a 6-row verify); the per-layer copy is what the CPU reference does too
-     test_cases.emplace_back(new test_flash_attn_ext_paged_layers(256, 4, 6, 8192, 1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 16));
-     test_cases.emplace_back(new test_flash_attn_ext_paged_layers(256, 4, 6, 8192, 6, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 2, 16));
-+    // 0129a: the same pair with f16 K/V -- a stride difference is visible only with
-+    // K and V of different row sizes (q8_0:q4_0), so both arms are needed
-+    test_cases.emplace_back(new test_flash_attn_ext_paged_layers(256, 4, 6, 8192, 6, GGML_TYPE_F16, GGML_TYPE_F16, 2, 16));
-     test_cases.emplace_back(new test_flash_attn_ext_paged(256, 4, 6, 8192, 512, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2, 16));
-     // Mistral Small 24B's geometry (head size 128, 32 query heads on 8):
-     // decode, verify rows, prompts; f16 and quantized K/V
+@@ -13541,8 +13544,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_gdn_replay_chain(4, 1, 5, chain_a, exact));
+         test_cases.emplace_back(new test_gdn_replay_chain(2, 3, 5, chain_b, exact));
+         test_cases.emplace_back(new test_gdn_replay_chain(16, 3, 5, chain_a, exact));
+-        // 0127: the coder's geometry (16 key heads, 2 v repeats = 32 value heads, MTP 4 -> K 5)
+-        test_cases.emplace_back(new test_gdn_replay_chain(16, 2, 5, chain_a, exact));
+         test_cases.emplace_back(new test_gdn_replay_chain(2, 2, 3, { {7, 1}, {3, 2}, {3, 0}, {1, 0} }, exact));
+     }
+     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2));
