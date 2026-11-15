@@ -1,0 +1,113 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 390610e..39bfd54 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23668,6 +23668,35 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+                 "k_buf %zu off %llu, v_buf %zu off %llu, hk %zu, hv %zu\n", __func__, (int) n_pages, ps,
+                 (int) (ring_k->ne[1]/ps), kb, vb, rb, rvb, k_size, (unsigned long long) k_off,
+                 v_size, (unsigned long long) v_off, hk_size, hv_size);
++        // 0129h: what the KERNEL will read, not just what the copies wrote (window 283's -5
++        // came after this function returned clean): this layer's table row's largest ring
++        // index and largest slot, against the ring pages in the layer's view and the pool's
++        // pages. A table that points past its ring sends the kernel outside it -- the reads
++        // are not covered by the copy bounds.
++        const ggml_tensor * kv_pages = dst->src[GGML_FA_SRC_PAGES];
++        const ggml_tensor * kpool = dst->src[1];
++        if (kv_pages && kpool) {
++            const int32_t tr = ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGES_ROW);
++            std::vector<int32_t> entries((size_t) kv_pages->ne[0]);
++            ggml_cl_fa_table tb = ggml_cl_fa_table_row(backend_ctx, kv_pages, tr);
++            CL_CHECK(clEnqueueReadBuffer(backend_ctx->queue, tb.mem, CL_TRUE, tb.off,
++                    entries.size()*sizeof(int32_t), entries.data(), 0, NULL, NULL));
++            if (tb.uploaded) CL_CHECK(clReleaseMemObject(tb.mem));
++            int32_t max_ring = -1, max_slot = -1;
++            for (int32_t e : entries) {
++                if (e >= 0) max_slot = std::max(max_slot, e);
++                else        max_ring = std::max(max_ring, -1 - e);
++            }
++            const int64_t ring_pages = ring_k->ne[1]/ps, pool_pages = kpool->ne[1]/ps;
++            GGML_LOG_WARN("%s: paged FA reads: layer row %d entries %d max ring %d of ring pages %lld, "
++                    "max slot %d of pool pages %lld\n", __func__, tr, (int) entries.size(),
++                    (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);
++            if (max_ring >= ring_pages || max_slot >= pool_pages) {
++                GGML_ABORT("ggml_opencl: a paged FA kernel would read past its ring or pool "
++                           "(layer row %d: max ring %d of %lld, max slot %d of %lld)", tr,
++                           (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);
++            }
++        }
+     }
+     for (int64_t p = 0; p < n_pages; ++p) {
+         const int32_t row = pl[p];
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+index 2b9841a..a39cbde 100644
+--- a/src/llama-kv-stream.cpp
++++ b/src/llama-kv-stream.cpp
+@@ -240,6 +240,8 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
+         // pool arithmetic is checkable (window 281 read "1023 of 1024 resident" over the
+         // whole context, which counts pages nobody attends), plus the context totals
+         const uint32_t res_att = n_att - n_streamed;
++        att_last = n_att;
++        streamed_last = n_streamed;
+         LLAMA_LOG_WARN("%s: KV streaming: attended %u pages, %u resident, %u streamed, %u page moves this request"
+                 " (%u ring rows; context: %u of %u pages resident)\n",
+                 __func__, n_att, res_att, n_streamed, moved, n_streamed, n_pages - n_streamed, n_pages);
+@@ -303,6 +305,16 @@ void llama_kv_stream::clear() {
+     page_ring.assign(n_pages, -1);
+     dirty.assign(n_pages, 0);
+     saved.assign(n_pages, 0);
++    // 0129i: one line per request for its LAST ubatch too -- the cache clears pages at a
++    // new request's start, so the previous request's final counts are still here: the
++    // 261k request never printed before (window 283 held two lines over seven requests)
++    if (logged_first) {
++        const uint32_t moved = streamed_last*layers.size()*2;
++        LLAMA_LOG_WARN("%s: KV streaming (request end): attended %u pages, %u resident, %u streamed, "
++                "%u page moves this request (%u ring rows; context: %u of %u pages resident)\n",
++                __func__, att_last, att_last - streamed_last, streamed_last, moved, streamed_last,
++                n_pages - n_streamed, n_pages);
++    }
+     n_streamed = 0;
+     logged_first = logged_stream = false;
+     layout_id++;
+diff --git a/src/llama-kv-stream.h b/src/llama-kv-stream.h
+index baffcc6..9d26d0e 100644
+--- a/src/llama-kv-stream.h
++++ b/src/llama-kv-stream.h
+@@ -160,6 +160,7 @@ private:
+     // first ubatch, and the first ubatch whose pages actually stream
+     bool     logged_first = false;
+     bool     logged_stream = false;
++    uint32_t att_last = 0, streamed_last = 0;   // 0129i: the last prepared ubatch, for the request-end line
+     uint32_t rotation   = 0;
+     bool     debug_rotate = false;
+ };
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c67d4b3..c5a4e93 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9476,14 +9476,19 @@ struct test_flash_attn_ext_paged_layers : public test_case {
+                 std::vector<int32_t> slots(n_slots);
+                 std::iota(slots.begin(), slots.end(), 0);
+                 std::shuffle(slots.begin(), slots.end(), std::mt19937(1234));
++                // 0129j: every layer's row, not only row 1 (window 284: row 0 held the
++                // INT32_MAX fill, so layer 0's kernel read slot INT32_MAX / no ring entry
++                // and the queue failed at the next synchronize)
+                 std::vector<int32_t> table(2*n_pages(), INT32_MAX);
+-                int32_t res = 0, ring = 0;
+-                for (int64_t i = 0; i < n_pages(); ++i) {
+-                    // 0129f: the table's ring entry must be the row the plan names
+-                    // (ascending), else the kernel reads another pair's rows (window 281)
+-                    const int32_t e = ring_every && i % ring_every == 0
+-                        ? -1 - (int32_t) ring++ : slots[(size_t) res++];
+-                    table[n_pages() + i] = e;
++                for (int64_t l = 0; l < 2; ++l) {
++                    int32_t res = 0, ring = 0;
++                    for (int64_t i = 0; i < n_pages(); ++i) {
++                        // 0129f: the table's ring entry must be the row the plan names
++                        // (ascending), else the kernel reads another pair's rows (window 281)
++                        const int32_t e = ring_every && i % ring_every == 0
++                            ? -1 - (int32_t) ring++ : slots[(size_t) res++];
++                        table[(size_t) l*n_pages() + i] = e;
++                    }
+                 }
+                 ggml_backend_tensor_set(t, table.data(), 0, ggml_nbytes(t));
+             } else if (strcmp(t->name, "plan") == 0) {
