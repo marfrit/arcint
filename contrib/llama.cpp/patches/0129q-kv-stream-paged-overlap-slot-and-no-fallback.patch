@@ -10,7 +10,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
 +        // layer (or the MTP head's graph) would otherwise guard the wrong slot
 +        cl_mem   slot_mem[2] = { nullptr, nullptr };
 +        cl_ulong slot_off[2] = { 0, 0 };
-+        int issued_n = 0, fell_back = 0, logged = 0;
++        int issued_n = 0, fell_back = 0;
 +        bool fell_back_logged = false, summary_logged = false;
      } fa_paged;
      int             kq_mm_sg = 16;
