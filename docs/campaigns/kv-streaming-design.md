@@ -659,6 +659,16 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   parity's `consumed` marker is recorded for the next copy. `synchronize` drains
   the copy queue. Unset: every copy stays on the compute queue exactly as
   0123zzzzz3 had it, so the served bytes are the same.
+- **Window 286 (`code` + `measured-here`): 0129l is serial by construction.** Its copies sit
+  in their own layer's FA dispatch and wait a marker of the compute queue taken there, so a
+  copy begins only when the compute queue reaches that layer and the FA waits it: the old
+  order plus a marker, a barrier and two flushes a layer. Measured: 0 gain, +8 ms/step at
+  261k (511.4 unset, 519.5 overlap), the 65k slope unchanged (0.587 ms per page). Not a
+  verdict on overlap (a materially different build, CLAUDE.md). 0129n gives the copies real
+  lead: one layer ahead, enqueued at the previous layer's dispatch end, the graph's first
+  two nodes at its first paged FA after a compute-queue marker (0042's placement), and only
+  the parity's `consumed` event waited otherwise; C7 coalesces consecutive pages+rows into
+  one command, counted under DEBUG.
 - **Red (0129l, development only):** `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1`
   keeps the copies on the copy queue but drops the FA's ready wait. Expected:
   at 261k the kernel reads a slot mid-copy -- wrong answers (needle or Paris) or

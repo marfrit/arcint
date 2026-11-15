@@ -7802,3 +7802,36 @@ line. The served path ends a request by removing its sequence from the cache
 now called there when the removal covers the whole sequence (`p0 < 0 &&
 p1 < 0`); `clear()` calls it too, so a cleared cache logs its last counts
 once and not twice.
+
+## 0129n-kv-stream-paged-overlap-one-layer-lead.patch
+
+Window 286 (`code` + `measured-here`) shows 0129l's form is serial by
+construction: its copies sit inside their own layer's FA dispatch and wait a
+marker of the compute queue taken there, so a copy starts only when the
+compute queue reaches that layer, and the FA waits for it -- plus a marker, a
+barrier and two flushes a layer, +8 ms/step at 261k. `0129n` gives the copies
+real lead: `graph_compute` walks the graph's paged FA nodes once (dispatch
+order, `op == FLASH_ATTN_EXT` with `src[PLAN]`); at the first paged FA, node 0's
+copies wait a marker of the compute queue (after the input uploads, per 0042's
+measured placement) and node 1's follow immediately; every other node's pages
+are enqueued at the END of the previous node's dispatch, right after its
+kernels. A copy waits only its parity's `consumed` event -- the FA two
+attention layers back. Nothing waits the compute queue besides node 0's
+marker: the streamed pages' source (the USM host store) and the plan are
+written by the host before the graph and nothing on the device writes them
+during it (this ubatch's new K/V land in the pool through `set_rows`; the ring
+receives bytes only from these copies). The same switch, default off; NOWAIT
+still drops only the FA's ready wait, so a slot is read mid-copy.
+`0129n` also coalesces: consecutive plan pages with consecutive ring rows go
+as ONE command a run (C7); under DEBUG the dispatch prints commands before and
+after coalescing and the bytes. The plan-text byte count is `2 x pages` before.
+
+## 0129p-kv-stream-request-end-api.patch
+
+Window 286 (`measured-here`): zero request-end lines in four served arms. A
+served request is not ended by `seq_rm` -- the cache keeps the prefix for reuse
+and the removal comes at the NEXT request on the divergent tail. The line now
+sits where a completion ends: `llama_memory_request_end(mem)` (llama.h;
+`llama_kv_cache::request_end` calls the stream's), called from arcint's
+`generate` and `generate_spec_lane` before their return, so one line per
+completion with the stream's counts since its last line.
