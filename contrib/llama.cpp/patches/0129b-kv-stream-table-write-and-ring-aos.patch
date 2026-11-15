@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 7c07d1c..6f90e2f 100644
+index 7c07d1c..43e137f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -23571,7 +23571,9 @@ static ggml_cl_fa_table ggml_cl_fa_table_row(ggml_backend_opencl_context * backe
@@ -106,21 +106,22 @@ index 7c07d1c..6f90e2f 100644
      // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
      // after the reconstruction above a SoA tensor is a block copy too), so
      // the dequantization below is skipped when one of them takes the call.
-@@ -25168,6 +25201,17 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -25168,6 +25201,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
                          (long long) v->ne[1], (unsigned long long) v_nb1, (unsigned long long) v_nb2,
                          (long long) (rv ? rv->ne[1] : 0), (unsigned long long) rv_nb1, (unsigned long long) rv_nb2);
                  GGML_LOG_INFO("ggml_opencl: paged FA dump: table [%s]\n", list.c_str());
 +                // 0129c: window 275b read all-zero entries -- name where the table lives and
 +                // what the host-side bytes are, so the next window says which write is lost
 +                const ggml_tensor_extra_cl * ex = kv_pages->extra ? (const ggml_tensor_extra_cl *) kv_pages->extra : NULL;
++                const bool hfirst = kv_pages->data && ggml_backend_buffer_is_host(kv_pages->buffer);
 +                GGML_LOG_WARN("ggml_opencl: paged FA dump: table source host %d data %d extra %d off %llu nb1 %llu view_offs %llu host_first [%d %d %d %d]\n",
 +                        (int) ggml_backend_buffer_is_host(kv_pages->buffer), (int) (kv_pages->data != NULL),
 +                        (int) (ex != NULL), (unsigned long long) (ex ? ex->offset : 0),
 +                        (unsigned long long) kv_pages->nb[1], (unsigned long long) kv_pages->view_offs,
-+                        kv_pages->data ? ((const int32_t *) kv_pages->data)[0] : -999,
-+                        kv_pages->data ? ((const int32_t *) kv_pages->data)[1] : -999,
-+                        kv_pages->data ? ((const int32_t *) kv_pages->data)[2] : -999,
-+                        kv_pages->data ? ((const int32_t *) kv_pages->data)[3] : -999);
++                        hfirst ? ((const int32_t *) kv_pages->data)[0] : -999,
++                        hfirst ? ((const int32_t *) kv_pages->data)[1] : -999,
++                        hfirst ? ((const int32_t *) kv_pages->data)[2] : -999,
++                        hfirst ? ((const int32_t *) kv_pages->data)[3] : -999);
              }
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &rk_buffer));
              CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_rk));

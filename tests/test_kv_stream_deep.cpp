@@ -165,6 +165,20 @@ void arm(ggml_type tk, ggml_type tv) {
     ggml_backend_buffer_ptr tbuf2(ggml_backend_alloc_ctx_tensors_from_buft(tc.get(), ggml_backend_cpu_buffer_type()));
     s1.set_input_pages(pages1);
     s2.set_input_pages(pages2);
+    {
+        // 0129c: the stream's line says pages sit in slots; the TABLE the kernel reads
+        // must carry them (window 275b read an all-zero table). Both are filled from
+        // the same state, so a table entry is -1-ring for a streamed page, a slot
+        // otherwise -- a table that disagrees with the plan sends the kernel elsewhere.
+        const int32_t * pl = (const int32_t *) s1.plan()->data;
+        const int32_t * tb = (const int32_t *) pages1->data;
+        bool agree = true;
+        for (int64_t p = 0; p < n_kv/llama_kv_stream::page_size; ++p) {
+            if (pl[p] >= 0) agree = agree && tb[p] == -1 - pl[p];
+            else            agree = agree && tb[p] >= 0;
+        }
+        CHECK(agree, "deep table", "the page table disagrees with the stream's plan");
+    }
 
     std::vector<ggml_tensor *> o1, o2;
     build(gc.get(), f1, s1, o1, q, mask, pages1, scale);
@@ -250,6 +264,7 @@ void after_clear(ggml_type tk, ggml_type tv) {
         }
     }
 
+
     std::vector<ggml_tensor *> o1, o2;
     {
         ggml_init_params ip = { (size_t) 128*1024*1024, nullptr, false };
@@ -275,13 +290,13 @@ void after_clear(ggml_type tk, ggml_type tv) {
         for (ggml_tensor * t : o1) ggml_build_forward_expand(gf, t);
         for (ggml_tensor * t : o2) ggml_build_forward_expand(gf, t);
         ggml_graph_compute_with_ctx(gc.get(), gf, 4);
-    }
-
-    for (int64_t l = 0; l < n_layers; ++l) {
-        char name[96];
-        snprintf(name, sizeof(name), "after-clear attention %lld (%zu/%zu)", (long long) l, (size_t) row_k, (size_t) row_v);
-        CHECK(memcmp(o1[(size_t) l]->data, o2[(size_t) l]->data, ggml_nbytes(o2[(size_t) l])) == 0,
-              name, "a request after a streamed one differs from a fresh all-resident run");
+        // the compare stays inside the context's lifetime: the outputs live in gc
+        for (int64_t l = 0; l < n_layers; ++l) {
+            char name[96];
+            snprintf(name, sizeof(name), "after-clear attention %lld (%zu/%zu)", (long long) l, (size_t) row_k, (size_t) row_v);
+            CHECK(memcmp(o1[(size_t) l]->data, o2[(size_t) l]->data, ggml_nbytes(o2[(size_t) l])) == 0,
+                  name, "a request after a streamed one differs from a fresh all-resident run");
+        }
     }
 }
 
