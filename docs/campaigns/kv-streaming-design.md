@@ -669,6 +669,19 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   two nodes at its first paged FA after a compute-queue marker (0042's placement), and only
   the parity's `consumed` event waited otherwise; C7 coalesces consecutive pages+rows into
   one command, counted under DEBUG.
+- **0129q (`code`), 0129n read back:** the parity is keyed by the RING SLOT (the node's K ring
+  buffer + `view_offs`, two remembered keys), not by the node's place in the chain: the
+  stream's slots are `slots[ikv % 2]` and the MTP head's graph or a layer-skipping graph need
+  not preserve that order (a third distinct slot aborts under DEBUG). No silent fallback: a
+  node whose store is not USM or whose ring is not one region WARNs once a process, and the
+  last node of the first graph with streamed pages prints "issued ahead / fell back" counts.
+  `issue`'s out-of-range read on a one-node chain fixed.
+- **Node 0's lead (`inferred` price):** its copies still wait a compute-queue marker taken at
+  the first paged FA, so they wait the first GDN layers' kernels as well as the input uploads.
+  Kept rather than moved to `graph_compute`: moving is the same marker one earlier, and the
+  uploads are the only write on the compute queue that the copies must follow (0042); the
+  first GDN layers write nothing the copies read. Price ~1/16 of the copy time (one of 16
+  attention layers) per step, about 17 ms at 261k by window 284's 274 ms -- `inferred`.
 - **Red (0129l, development only):** `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1`
   keeps the copies on the copy queue but drops the FA's ready wait. Expected:
   at 261k the kernel reads a slot mid-copy -- wrong answers (needle or Paris) or
