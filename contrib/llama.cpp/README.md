@@ -7853,3 +7853,11 @@ Five corrections to `0129n`, all from reading it (`code`):
   the node's index in the chain happens to match today, but the MTP head's graph or a graph
   that skips an attention layer need not keep that order. A third distinct slot aborts under
   DEBUG with both keys; without DEBUG that node falls back.
+- Node 0's copies still wait a compute-queue marker taken at the first paged FA, so they wait
+  the first GDN layers as well as the input uploads. Kept: the uploads are the only compute-
+  queue write the copies must follow (0042), and moving the marker to `graph_compute` would
+  not shorten it. Price ~1/16 of the copy time (`inferred`, about 17 ms a step at 261k).
+- The op suite does not reach this path: its host store is a plain buffer (not USM) and its
+  2-layer ring is SoA (`nrk = 2`), so coalescing and the lead both take the fallback. An op
+  case that reaches `ggml_cl_fa_paged_enqueue_pages` needs USM allocations and a single-region
+  q8_0/q4_0 ring; not built yet, so the served NOWAIT arm is the only red evidence.

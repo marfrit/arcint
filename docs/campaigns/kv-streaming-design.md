@@ -682,6 +682,11 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   uploads are the only write on the compute queue that the copies must follow (0042); the
   first GDN layers write nothing the copies read. Price ~1/16 of the copy time (one of 16
   attention layers) per step, about 17 ms at 261k by window 284's 274 ms -- `inferred`.
+- **No op-level evidence yet (`code` of the suite):** `test-backend-ops`' host store is a plain
+  buffer and its 2-layer ring is SoA (window 283's DEBUG line: `nrk 2`), so 0129n's coalescing
+  and lead both take the fallback there; the FA filter's pass count says nothing about them.
+  A case that reaches the path needs USM host allocations and a one-region ring -- the next
+  step; until then the served NOWAIT arm is the only red evidence for "the FA waits its copy".
 - **Red (0129l, development only):** `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1`
   keeps the copies on the copy queue but drops the FA's ready wait. Expected:
   at 261k the kernel reads a slot mid-copy -- wrong answers (needle or Paris) or
