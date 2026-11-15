@@ -1874,6 +1874,9 @@ public:
         report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         report_loop_guard(seq, sampler, stats);
         log_expert_cache(seq);
+        // 0129p: the request's end (a served request is not ended by seq_rm: the cache keeps
+        // the prefix for reuse, so the stream's counts need this call). One line per request.
+        llama_memory_request_end(llama_get_memory(ctx_));
         return reason;
     }
 
@@ -2597,6 +2600,9 @@ private:
         report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         report_loop_guard(seq, sampler, stats);
         log_expert_cache(seq);
+        // 0129p: the request's end (a served request is not ended by seq_rm: the cache keeps
+        // the prefix for reuse, so the stream's counts need this call). One line per request.
+        llama_memory_request_end(llama_get_memory(ctx_));
         return reason;
     }
 
