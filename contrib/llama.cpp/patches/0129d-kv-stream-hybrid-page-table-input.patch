@@ -1,0 +1,17 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1225,6 +1225,13 @@
+         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+     }
+ 
++    // 0129d: KV streaming on a hybrid model -- the attention input of the hybrid memory is
++    // filled here, not by llm_graph_input_attn_kv::set_input, so the page table was never
++    // written (windows 275b/279: every dumped table row all zero on Qwen3.8-27B)
++    if (inp_attn->self_kv_pages && inp_attn->self_kv_pages->buffer) {
++        mctx->get_attn()->set_input_kv_pages(inp_attn->self_kv_pages);
++    }
++
+     const int64_t n_rs = mctx->get_recr()->get_n_rs();
+ 
+     if (inp_rs->s_copy) {
