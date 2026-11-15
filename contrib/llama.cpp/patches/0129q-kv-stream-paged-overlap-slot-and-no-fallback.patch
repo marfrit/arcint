@@ -90,7 +90,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          return;   // cannot issue here (a host store this path does not copy): the dispatch's loop
      }
 -    const int parity = ni % 2;
-+    const int parity = ggml_cl_fa_paged_overlap_slot(ctx, backend_ctx->fa_paged.chain[ni]);
++    const int parity = ggml_cl_fa_paged_overlap_slot(ctx, ctx->fa_paged.chain[ni]);
 +    if (parity < 0) return;
      if (!ggml_cl_fa_paged_overlap_nowait()) {
          CL_CHECK(clEnqueueBarrierWithWaitList(ctx->queue, 1, &o.ready[parity], nullptr));
