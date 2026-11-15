@@ -547,6 +547,24 @@ at 261000, the only streaming depth; 0129a fixes the CPU arm's V row stride (K's
 stride was used for V, unlike the card's dispatch) and adds the per-request
 stream line, and the new `test_kv_stream_deep` compares streamed attention with
 the all-resident run at four streamed pages, two layers, q8_0:q4_0 and f16. The host store
+Window 275 (`measured-here`) moved the defect onto the card's path: the full
+suite aborted on the first 2-layer op case (`FLASH_ATTN_EXT(hs=256,...,nb=1)`),
+whose ring is a whole-uploaded q8_0 tensor and therefore SoA -- `nrk == 1` failed
+because the ring check saw two planes. 0129b moves the per-layer page copy AFTER
+the ring's AOS reconstruction and writes into the reconstructed AOS buffer the
+kernels read (no SoA plane is written), names nrk/nrv and the ring's buffer kind
+before that check, makes the 2-layer cases reachable from `-o FLASH_ATTN_EXT`
+(their last op is the joining ADD, so the op name must be the plain one), and
+prints the per-request stream line at WARN so a window sees it without `-v` (a
+route drops INFO). The same window's `-v` rerun read every dumped page table as
+all zero while the stream's line named pages in slots (`measured-here`), and
+a fresh short request after a streamed one answered wrong with nothing streamed:
+0129b makes the table write use `ggml_backend_tensor_set` whenever the node does
+not sit in host memory (a write through `dst->data` lands only there; the graph
+input may be placed in the backend's device buffer), and 0129c prints the table's
+buffer kind, `data`, extra and host-side bytes in the dump so the next window
+says which write was lost.
+
 is a USM tensor and its page access goes through the slices entry points, never
 `->data` arithmetic on an OpenCL buffer; the cache sets `stream_buft = buft`
 only when the caller gave none, and the stream's construction throws when that

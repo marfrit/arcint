@@ -185,11 +185,112 @@ void arm(ggml_type tk, ggml_type tv) {
     }
 }
 
+// 0129c: window 275b -- a request AFTER a streamed one answers wrong although its
+// own stream line says "0 streamed, 0 page moves". The CPU arm: stream a six-page
+// context, clear, serve a one-page request, and compare with a fresh stream that
+// never streamed anything. A residency bookkeeping left stale by the streamed
+// request (pool slots, the plan, the page table) shows here.
+void after_clear(ggml_type tk, ggml_type tv) {
+    const size_t row_k = ggml_row_size(tk, hs*nh), row_v = ggml_row_size(tv, hs*nh);
+
+    const int64_t n_short = llama_kv_stream::page_size;   // one page, all resident
+    std::vector<uint32_t> cells_short;
+    for (int64_t c = 0; c < n_short; ++c) cells_short.push_back((uint32_t) c);
+    std::vector<uint32_t> cells_long;
+    for (int64_t c = 0; c < n_written; ++c) cells_long.push_back((uint32_t) c);
+
+    std::vector<std::vector<char>> kb(n_layers), vb(n_layers);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        kb[(size_t) l] = layer_bytes(l, false, tk);
+        vb[(size_t) l] = layer_bytes(l, true, tv);
+    }
+
+    fixture f1(tk, tv, 2*llama_kv_stream::page_size), f2(tk, tv, 6*llama_kv_stream::page_size);
+    llama_kv_stream s1(f1.layers(), /*n_slots =*/ 2, /*n_ring =*/ 4, n_kv, ggml_backend_cpu_buffer_type());
+    llama_kv_stream s2(f2.layers(), /*n_slots =*/ 6, /*n_ring =*/ 1, n_kv, ggml_backend_cpu_buffer_type());
+
+    // the streamed request on s1 (four of six pages move), then a clear
+    s1.prepare(cells_long, n_kv);
+    for (int64_t l = 0; l < n_layers; ++l) {
+        s1.set_rows((int32_t) l, false, 0, n_written, kb[(size_t) l].data());
+        s1.set_rows((int32_t) l, true,  0, n_written, vb[(size_t) l].data());
+    }
+    CHECK(s1.n_streamed_pages() == 4, "after-clear", "the streamed arm does not stream four pages");
+    {
+        ggml_init_params ip = { (size_t) 128*1024*1024, nullptr, false };
+        ggml_context_ptr gc(ggml_init(ip));
+        ggml_tensor * q = ggml_new_tensor_4d(gc.get(), GGML_TYPE_F32, hs, n_q, nh*n_q, 1);
+        for (int64_t i = 0; i < ggml_nelements(q); ++i) ((float *) q->data)[(size_t) i] = pseudo(i*7);
+        ggml_tensor * mask = ggml_new_tensor_4d(gc.get(), GGML_TYPE_F16, n_kv, n_q, 1, 1);
+        for (int64_t i = 0; i < n_q; ++i)
+            for (int64_t j = 0; j < n_kv; ++j)
+                ((ggml_fp16_t *) mask->data)[(size_t) (i*n_kv + j)] =
+                    j <= n_kv - n_q + i ? ggml_fp32_to_fp16(0.0f) : ggml_fp32_to_fp16(-INFINITY);
+        ggml_init_params tp = { (size_t) 4*ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr tc(ggml_init(tp));
+        ggml_tensor * pages = ggml_new_tensor_2d(tc.get(), GGML_TYPE_I32, n_kv/llama_kv_stream::page_size, n_layers);
+        ggml_backend_buffer_ptr tbuf(ggml_backend_alloc_ctx_tensors_from_buft(tc.get(), ggml_backend_cpu_buffer_type()));
+        s1.set_input_pages(pages);
+        std::vector<ggml_tensor *> o;
+        build(gc.get(), f1, s1, o, q, mask, pages, 1.0f/std::sqrt((float) hs));
+        ggml_cgraph * gf = ggml_new_graph(gc.get());
+        for (ggml_tensor * t : o) ggml_build_forward_expand(gf, t);
+        ggml_graph_compute_with_ctx(gc.get(), gf, 4);
+    }
+    s1.clear();
+
+    // the short request: the same streamed stream (s1) and a fresh all-resident one (s2)
+    s1.prepare(cells_short, n_short);
+    s2.prepare(cells_short, n_short);
+    CHECK(s1.n_streamed_pages() == 0, "after-clear", "the short request streams pages");
+    for (llama_kv_stream * s : { &s1, &s2 }) {
+        for (int64_t l = 0; l < n_layers; ++l) {
+            s->set_rows((int32_t) l, false, 0, n_short, kb[(size_t) l].data());
+            s->set_rows((int32_t) l, true,  0, n_short, vb[(size_t) l].data());
+        }
+    }
+
+    std::vector<ggml_tensor *> o1, o2;
+    {
+        ggml_init_params ip = { (size_t) 128*1024*1024, nullptr, false };
+        ggml_context_ptr gc(ggml_init(ip));
+        ggml_tensor * q = ggml_new_tensor_4d(gc.get(), GGML_TYPE_F32, hs, n_q, nh*n_q, 1);
+        for (int64_t i = 0; i < ggml_nelements(q); ++i) ((float *) q->data)[(size_t) i] = pseudo(i*7);
+        ggml_tensor * mask = ggml_new_tensor_4d(gc.get(), GGML_TYPE_F16, n_short, n_q, 1, 1);
+        for (int64_t i = 0; i < n_q; ++i)
+            for (int64_t j = 0; j < n_short; ++j)
+                ((ggml_fp16_t *) mask->data)[(size_t) (i*n_short + j)] =
+                    j <= n_short - n_q + i ? ggml_fp32_to_fp16(0.0f) : ggml_fp32_to_fp16(-INFINITY);
+        ggml_init_params tp = { (size_t) 8*ggml_tensor_overhead(), nullptr, true };
+        ggml_context_ptr tc(ggml_init(tp));
+        const int64_t n_p = n_short/llama_kv_stream::page_size;
+        ggml_tensor * pages1 = ggml_new_tensor_2d(tc.get(), GGML_TYPE_I32, n_p, n_layers);
+        ggml_tensor * pages2 = ggml_new_tensor_2d(tc.get(), GGML_TYPE_I32, n_p, n_layers);
+        ggml_backend_buffer_ptr tbuf(ggml_backend_alloc_ctx_tensors_from_buft(tc.get(), ggml_backend_cpu_buffer_type()));
+        s1.set_input_pages(pages1);
+        s2.set_input_pages(pages2);
+        build(gc.get(), f1, s1, o1, q, mask, pages1, 1.0f/std::sqrt((float) hs));
+        build(gc.get(), f2, s2, o2, q, mask, pages2, 1.0f/std::sqrt((float) hs));
+        ggml_cgraph * gf = ggml_new_graph(gc.get());
+        for (ggml_tensor * t : o1) ggml_build_forward_expand(gf, t);
+        for (ggml_tensor * t : o2) ggml_build_forward_expand(gf, t);
+        ggml_graph_compute_with_ctx(gc.get(), gf, 4);
+    }
+
+    for (int64_t l = 0; l < n_layers; ++l) {
+        char name[96];
+        snprintf(name, sizeof(name), "after-clear attention %lld (%zu/%zu)", (long long) l, (size_t) row_k, (size_t) row_v);
+        CHECK(memcmp(o1[(size_t) l]->data, o2[(size_t) l]->data, ggml_nbytes(o2[(size_t) l])) == 0,
+              name, "a request after a streamed one differs from a fresh all-resident run");
+    }
+}
+
 } // namespace
 
 int main() {
     arm(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);   // the agent's cache pair
     arm(GGML_TYPE_F16, GGML_TYPE_F16);
+    after_clear(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0);
 
     if (g_failures != 0) {
         printf("FAILED: %d\n", g_failures);
