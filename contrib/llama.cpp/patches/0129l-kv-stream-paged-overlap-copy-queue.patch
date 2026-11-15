@@ -1,4 +1,6 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1298,6 +1298,17 @@
          std::vector<cl_event> marks;                          // per ticket: the queue's marker, null once released
                                                                // (emptied whenever none is outstanding)
@@ -134,28 +136,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      ggml_cl_region rk[2], rv[2];
      const int nrk = ggml_cl_regions(ring_k, rk);
      const int nrv = ggml_cl_regions(ring_v, rv);
-@@ -23683,15 +23781,19 @@
-                     entries.size()*sizeof(int32_t), entries.data(), 0, NULL, NULL));
-             if (tb.uploaded) CL_CHECK(clReleaseMemObject(tb.mem));
-             int32_t max_ring = -1, max_slot = -1;
-+            bool sentinel = false;
-             for (int32_t e : entries) {
-                 if (e >= 0) max_slot = std::max(max_slot, e);
-                 else        max_ring = std::max(max_ring, -1 - e);
-+                // 0129k: INT32_MAX is the table's "unwritten row" fill; window 284 printed
-+                // it and the check did not fire, so it is named here and aborts too
-+                if (e == INT32_MAX) sentinel = true;
-             }
-             const int64_t ring_pages = ring_k->ne[1]/ps, pool_pages = kpool->ne[1]/ps;
-             GGML_LOG_WARN("%s: paged FA reads: layer row %d entries %d max ring %d of ring pages %lld, "
-                     "max slot %d of pool pages %lld\n", __func__, tr, (int) entries.size(),
-                     (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);
--            if (max_ring >= ring_pages || max_slot >= pool_pages) {
-+            if (sentinel || max_ring >= ring_pages || max_slot >= pool_pages) {
-                 GGML_ABORT("ggml_opencl: a paged FA kernel would read past its ring or pool "
-                            "(layer row %d: max ring %d of %lld, max slot %d of %lld)", tr,
-                            (int) max_ring, (long long) ring_pages, (int) max_slot, (long long) pool_pages);
-@@ -23722,17 +23824,22 @@
+@@ -23726,17 +23824,22 @@
                             (unsigned long long) (so + (cl_ulong) p*kb), kb, hk_size,
                             (unsigned long long) (sv_off + (cl_ulong) p*vb), vb, hv_size);
              }
@@ -186,7 +167,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // 0129b/0129g: the moves and the kernels share the in-order compute queue, so the
      // queue order alone is the barrier; GGML_OPENCL_FA_PAGED_SYNC=1 adds a clFinish after
      // each layer's copies for a race-vs-layout arm. OFF by default (window 279's A/B arms
-@@ -23740,6 +23847,7 @@
+@@ -23744,6 +23847,7 @@
      static const char * sync_env = getenv("GGML_OPENCL_FA_PAGED_SYNC");
      if (sync_env && atoi(sync_env) != 0) {
          CL_CHECK(clFinish(queue));
@@ -194,7 +175,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      }
      // the restore buffers are temp_hk/temp_hv's: their destructors release them, and the
      // queued copies keep them alive (OpenCL's retain). 0129e: a second release here was
-@@ -24147,9 +24255,12 @@
+@@ -24151,9 +24255,12 @@
      // above, because a SoA ring's reconstructed AOS buffer is what both the copies and
      // the kernel have to use (window 275: the op suite's 2-layer ring is SoA; the copy
      // ran before the reconstruction and wrote the split planes)
@@ -208,7 +189,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
      // after the reconstruction above a SoA tensor is a block copy too), so
-@@ -25455,6 +25566,10 @@
+@@ -25459,6 +25566,10 @@
          size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
          backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
      }
