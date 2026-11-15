@@ -1,0 +1,128 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1313,8 +1313,13 @@
+         std::vector<const ggml_tensor *> chain;
+         std::vector<char>   issued;
+         int cur = 0;
++        // 0129q: the parity is keyed by the RING SLOT (its buffer and view offset), not by the
++        // node's place: slots[ikv%2] is the stream's, and a graph that skips an attention
++        // layer (or the MTP head's graph) would otherwise guard the wrong slot
++        cl_mem   slot_mem[2] = { nullptr, nullptr };
++        cl_ulong slot_off[2] = { 0, 0 };
+         int issued_n = 0, fell_back = 0, logged = 0;
+-        bool fell_back_logged = false;
++        bool fell_back_logged = false, summary_logged = false;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -23706,12 +23711,37 @@
+     }
+ }
+ 
++// 0129q: the parity is the RING SLOT this node's FA reads (its K ring's buffer and view
++// offset), not the node's place in the chain: the stream's slots are slots[ikv % 2]
++// (llama-kv-stream.h slot_k/slot_v, 0120), and the MTP head's graph or a graph that skips an
++// attention layer would otherwise index a parity that guards another slot. -1 when the ring
++// is not one region (the fallback's own path); a third distinct slot aborts under DEBUG.
++static int ggml_cl_fa_paged_overlap_slot(ggml_backend_opencl_context * ctx, const ggml_tensor * dst) {
++    const ggml_tensor * ring_k = dst->src[GGML_FA_SRC_RING_K];
++    if (!ring_k) return -1;
++    ggml_cl_region rk[2];
++    if (ggml_cl_regions(ring_k, rk) != 1 || rk[0].mem == nullptr) return -1;
++    const cl_mem   m = rk[0].mem;
++    const cl_ulong off = rk[0].off + (cl_ulong) ring_k->view_offs;
++    auto & o = ctx->fa_paged;
++    for (int i = 0; i < 2; ++i) if (o.slot_mem[i] == m && o.slot_off[i] == off) return i;
++    for (int i = 0; i < 2; ++i) if (o.slot_mem[i] == nullptr) { o.slot_mem[i] = m; o.slot_off[i] = off; return i; }
++    if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
++        GGML_ABORT("ggml_opencl: paged FA overlap: a third ring slot (%p + %llu beside %p + %llu, %p + %llu)",
++                (void *) m, (unsigned long long) off, (void *) o.slot_mem[0], (unsigned long long) o.slot_off[0],
++                (void *) o.slot_mem[1], (unsigned long long) o.slot_off[1]);
++    }
++    return -1;
++}
++
+ // enqueue node `ni`'s pages on the copy queue; `after_inputs` (node 0) waits the compute
+ // queue's uploads, per 0042's measured placement: a graph-start prefetch ordered after them
+ static bool ggml_cl_fa_paged_overlap_issue(ggml_backend_opencl_context * ctx, int ni, bool after_inputs) {
+     auto & o = ctx->fa_paged;
+-    if (ni < 0 || ni >= (int) o.chain.size() || o.issued[ni]) return o.issued[ni] != 0;
+-    const int parity = ni % 2;
++    if (ni < 0 || ni >= (int) o.chain.size()) return false;   // 0129q: a one-node chain's next node
++    if (o.issued[ni]) return true;
++    const int parity = ggml_cl_fa_paged_overlap_slot(ctx, o.chain[ni]);
++    if (parity < 0) return false;   // a ring this path does not copy: the fallback below
+     if (o.ready[parity]) { CL_CHECK(clReleaseEvent(o.ready[parity])); o.ready[parity] = nullptr; }
+     cl_event wl[2] = { nullptr, nullptr };
+     cl_uint  nw = 0;
+@@ -23724,7 +23754,29 @@
+     }
+     const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, o.chain[ni], o.q, nw, nw ? wl : NULL);
+     if (mark) CL_CHECK(clReleaseEvent(mark));
+-    if (runs < 0) return false;    if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
++    if (runs < 0) {
++        // 0129q, no silent fallback: a node whose store is not USM or whose ring is not one
++        // region copies itself on the compute queue, and says so once a process
++        o.fell_back++;
++        if (!o.fell_back_logged) {
++            o.fell_back_logged = true;
++            GGML_LOG_WARN("ggml_opencl: paged FA overlap: node %d of %d fell back to the compute "
++                          "queue (a host store that is not USM, or a ring that is not one region)\n",
++                          ni, (int) o.chain.size());
++        }
++        return false;
++    }
++    if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
++        const ggml_tensor * dst = o.chain[ni];
++        size_t bytes = 0;
++        const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
++        const int32_t * pl = plan ? (const int32_t *) ggml_backend_opencl_usm_ptr(plan) : nullptr;
++        if (pl) for (int64_t p = 0; p < plan->ne[0]; ++p) if (pl[p] >= 0) bytes += (size_t) dst->src[GGML_FA_SRC_HOST_K]->nb[2] + (size_t) dst->src[GGML_FA_SRC_HOST_V]->nb[2];
++        GGML_LOG_WARN("%s: paged FA commands (lead): node %d slot %d, %d after coalescing, %zu bytes\n",
++                __func__, ni, parity, runs, bytes);
++    }
++    o.issued_n++;
++    if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
+     CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.ready[parity]));
+     CL_CHECK(clFlush(o.q));
+     o.issued[ni] = 1;
+@@ -23740,7 +23792,8 @@
+     if (!o.issued[ni] && !ggml_cl_fa_paged_overlap_issue(ctx, ni, false)) {
+         return;   // cannot issue here (a host store this path does not copy): the dispatch's loop
+     }
+-    const int parity = ni % 2;
++    const int parity = ggml_cl_fa_paged_overlap_slot(ctx, backend_ctx->fa_paged.chain[ni]);
++    if (parity < 0) return;
+     if (!ggml_cl_fa_paged_overlap_nowait()) {
+         CL_CHECK(clEnqueueBarrierWithWaitList(ctx->queue, 1, &o.ready[parity], nullptr));
+     }
+@@ -23748,10 +23801,17 @@
+ // after node `ni`'s kernels: the slot may be refilled, and the next layer's pages go now
+ static void ggml_cl_fa_paged_overlap_after(ggml_backend_opencl_context * ctx, int ni) {
+     auto & o = ctx->fa_paged;
+-    const int parity = ni % 2;
++    const int parity = ggml_cl_fa_paged_overlap_slot(ctx, o.chain[ni]);
++    if (parity < 0) return;   // that node's copies fell back to the compute queue
+     if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
+     CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &o.consumed[parity]));
+     if (ni + 1 < (int) o.chain.size()) ggml_cl_fa_paged_overlap_issue(ctx, ni + 1, false);
++    // 0129q: once per process, at the last node of the first graph with streamed pages,
++    // how many nodes the lead issued and how many fell back (no silent fallback)
++    if (!o.summary_logged && ni + 1 >= (int) o.chain.size()) {
++        o.summary_logged = true;
++        GGML_LOG_WARN("ggml_opencl: paged FA overlap: %d of %d nodes issued ahead, %d fell back\n",
++                o.issued_n, (int) o.chain.size(), o.fell_back);
+     }
+ }
+ 
+@@ -23969,8 +24029,10 @@
+         *overlap_copied = true;
+     }
+     if (getenv("GGML_OPENCL_FA_PAGED_DEBUG") && cmd_before >= 0) {
++        size_t cmd_bytes = 0;
++        for (int64_t p = 0; p < n_pages; ++p) if (pl[p] >= 0) cmd_bytes += kb + vb;
+         GGML_LOG_WARN("%s: paged FA commands: %d before coalescing, %d after, %zu bytes (%s)\n",
+-                __func__, cmd_before, cmd_after, (size_t) cmd_after, ov ? "overlap lead" : "compute queue");
++                __func__, cmd_before, cmd_after, cmd_bytes, ov ? "overlap lead" : "compute queue");
+     }
+     // 0129b/0129g: the moves and the kernels share the in-order compute queue, so the
+     // queue order alone is the barrier; GGML_OPENCL_FA_PAGED_SYNC=1 adds a clFinish after

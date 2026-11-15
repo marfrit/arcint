@@ -7835,3 +7835,21 @@ sits where a completion ends: `llama_memory_request_end(mem)` (llama.h;
 `llama_kv_cache::request_end` calls the stream's), called from arcint's
 `generate` and `generate_spec_lane` before their return, so one line per
 completion with the stream's counts since its last line.
+
+## 0129q-kv-stream-paged-overlap-slot-and-no-fallback.patch
+
+Five corrections to `0129n`, all from reading it (`code`):
+- No silent fallback (CLAUDE.md). `ggml_cl_fa_paged_overlap_issue` returns -1 when the ring is
+  not one region or the host store is not USM; each such node now WARNs once a process
+  ("node %d of %d fell back to the compute queue"), and `overlap_after` prints once a process,
+  at the last node of the first graph with streamed pages, "%d of %d nodes issued ahead,
+  %d fell back". `issue` prints its own DEBUG line tagged "(lead)". The dispatch's DEBUG
+  "bytes" field prints bytes now, not the command count.
+- `issue`'s guard read `o.issued[ni]` out of range: `before()` asks for node 1 on a one-node
+  chain. It now returns false for `ni >= size` before touching the vector.
+- The parity is keyed by the RING SLOT, not by the node's place: `overlap_slot` reads the
+  node's K ring's buffer and `view_offs` (`ggml_cl_regions == 1`) and matches it against two
+  remembered slot keys. The stream's slots are `slots[ikv % 2]` (llama-kv-stream.h, 0120);
+  the node's index in the chain happens to match today, but the MTP head's graph or a graph
+  that skips an attention layer need not keep that order. A third distinct slot aborts under
+  DEBUG with both keys; without DEBUG that node falls back.
