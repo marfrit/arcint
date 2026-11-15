@@ -567,7 +567,26 @@ says which write was lost. The stream line now prints at most twice per request
 (the first ubatch, and the first that streams) instead of once per ubatch (54 in
 one window), and the device-free `test_kv_stream_deep` gained an after-clear arm
 (stream a six-page context, clear, serve a one-page request, compare with a fresh
-all-resident run) and a table-vs-plan arm; both are green on the CPU path.
+all-resident run) and a table-vs-plan arm; both are green on the CPU path -- but the arm missed the
+hybrid graph path (`llm_graph_input_mem_hybrid::set_input`), which is where the
+served model's table was never filled; 0129d fills it there, measured on window
+281 (258 distinct table values, 7,968 ring entries, needle found at 261k).
+Round 8 (`measured-here`, windows 278-281): 0129b's ring check accepts a SoA ring
+that carries its AOS buffer (`(nrk == 1 || rk_aos_buf)`), and 0129e releases the
+host store's restore buffers once (window 280's `clReleaseMemObject -38`). The
+2-layer op case then failed at the barrier (`-5`): 0129f checks every page copy's
+offset+size against the buffers' `CL_MEM_SIZE` before enqueuing (aborting with
+page, row, offsets and sizes), prints the copy geometry with
+`GGML_OPENCL_FA_PAGED_DEBUG=1`, and fixes the case's own table (its ring entries
+descended while the plan ascended, so the kernel read another pair's rows).
+0129g logs attended/resident-attended/streamed for the request's prefix beside the
+context totals, and makes `GGML_OPENCL_FA_PAGED_SYNC` OFF by default (window 279's
+A/B arms were identical because the old default drained every layer).
+- The ring's capacity is `n_ring` pages = the configured context's non-resident
+  pages (llama-kv-cache.cpp's construction from the pool), not two slots: the plan
+  names one row per streamed page of the whole context, so the worst case is that
+  complement and a static bound has to hold it; the price is its VRAM (473 pages,
+  ~3 GiB at pool 3584), kept until a dynamic resize exists.
 
 is a USM tensor and its page access goes through the slices entry points, never
 `->data` arithmetic on an OpenCL buffer; the cache sets `stream_buft = buft`
