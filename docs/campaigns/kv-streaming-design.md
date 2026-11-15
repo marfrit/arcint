@@ -563,7 +563,11 @@ a fresh short request after a streamed one answered wrong with nothing streamed:
 not sit in host memory (a write through `dst->data` lands only there; the graph
 input may be placed in the backend's device buffer), and 0129c prints the table's
 buffer kind, `data`, extra and host-side bytes in the dump so the next window
-says which write was lost.
+says which write was lost. The stream line now prints at most twice per request
+(the first ubatch, and the first that streams) instead of once per ubatch (54 in
+one window), and the device-free `test_kv_stream_deep` gained an after-clear arm
+(stream a six-page context, clear, serve a one-page request, compare with a fresh
+all-resident run) and a table-vs-plan arm; both are green on the CPU path.
 
 is a USM tensor and its page access goes through the slices entry points, never
 `->data` arithmetic on an OpenCL buffer; the cache sets `stream_buft = buft`
