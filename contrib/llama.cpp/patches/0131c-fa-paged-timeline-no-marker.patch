@@ -24,12 +24,11 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  };
  
  struct ggml_backend_opencl_context {
-@@ -1360,9 +1362,14 @@
+@@ -1360,9 +1362,13 @@
          std::vector<fa_paged_post> post_pending;
          int  post_cur = -1;
          int64_t v_post_changes = 0;
 +        int64_t v_read_changes = 0, v_late_changes = 0;   // 0131d: VERIFY=4's two comparisons
-+        int     v_rehash_missing = 0;                     // 0131d
          int  v_post_warned = 0;
          int  v_post_nopost_warned = 0;
 +        int  v_read_warned = 0;          // 0131d: the post-read WARN, once a process
@@ -39,7 +38,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          // 0130h: the forced race's busy-wait kernel and its sink, built once a process
          cl_program delay_prog = nullptr;
          cl_kernel  delay_kernel = nullptr;
-@@ -1379,7 +1386,7 @@
+@@ -1379,7 +1385,7 @@
          std::vector<fa_paged_tl_ev> tl;
          long long tl_host_base = 0, tl_dev_base = 0;   // 0130x: clGetDeviceAndHostTimer at the base
          // 0130r: what each development switch did this request, counted not asserted
@@ -48,7 +47,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      } fa_paged;
      int             kq_mm_sg = 16;
      ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
-@@ -1662,7 +1669,9 @@
+@@ -1662,7 +1668,9 @@
          return workgroup_size;
      }
  
@@ -59,7 +58,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          // From the spec on clEnqueueNDRangeKernel:
          // If the device associated with command_queue is an OpenCL 2.1 or newer device,
          // and global_work_size is NULL or the value in any passed dimension is zero,
-@@ -1682,6 +1691,7 @@
+@@ -1682,6 +1690,7 @@
  #ifdef GGML_OPENCL_PROFILING
          cl_event evt;
          CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
@@ -67,7 +66,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
          profiling_info.emplace_back();
          populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
-@@ -1690,7 +1700,9 @@
+@@ -1690,7 +1699,9 @@
          }
  #else
          GGML_UNUSED(tensor);
@@ -78,7 +77,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  #endif
      }
  
-@@ -11912,6 +11924,8 @@
+@@ -11912,6 +11923,8 @@
  // 0130d: VERIFY=3's collect is defined below; the request's end flushes the last graph's
  // pairs before the summary prints, and the global names the one context that recorded them
  static void ggml_cl_fa_paged_verify3_collect(ggml_backend_opencl_context * ctx);
@@ -87,7 +86,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_fa_paged_tl_finish(ggml_backend_opencl_context * ctx);   // 0130p
  static ggml_backend_opencl_context * g_fa_paged_verify3_ctx = nullptr;
  static ggml_backend_opencl_context * g_fa_paged_ctx = nullptr;   // 0130p: the timeline's finish
-@@ -11923,19 +11937,23 @@
+@@ -11923,19 +11936,23 @@
      int issued = 0, fell_back = 0, reused = 0, recopied = 0, pre_issued = 0;
      long long v_nodes = 0, v_bytes = 0, v_mismatch = 0;
      long long v_post_changes = 0;   // 0130d: VERIFY=3, a copy landed while the FA read the slot
@@ -113,7 +112,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          !g_fa_paged_totals.nofix_drops && !g_fa_paged_totals.delay_kernels &&
          !g_fa_paged_totals.self3_writes) return;
      GGML_LOG_WARN("ggml_opencl: paged FA overlap (request end): %d nodes issued ahead, %d fell back; "
-@@ -11945,6 +11963,14 @@
+@@ -11945,6 +11962,14 @@
              g_fa_paged_totals.v_bytes, g_fa_paged_totals.v_mismatch,
              g_fa_paged_totals.pre_issued, g_fa_paged_totals.reused, g_fa_paged_totals.recopied,
              g_fa_paged_totals.v_post_changes);
@@ -128,7 +127,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      // 0130r: one line per development switch arm, so the log says what ran (green and red)
      GGML_LOG_WARN("ggml_opencl: paged FA dev switches (request end): NOCONSUME consumed waits dropped %lld; "
              "NOFIX cross-step waits dropped %lld; delay kernels %lld; self-test writes %lld\n",
-@@ -11999,7 +12025,13 @@
+@@ -11999,7 +12024,13 @@
          g_fa_paged_totals.nofix_drops += o.nofix_drops;
          g_fa_paged_totals.delay_kernels += o.delay_kernels;
          g_fa_paged_totals.self3_writes += o.self3_writes;
@@ -142,7 +141,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          o.issued_n = o.fell_back = 0;
          o.v_nodes = o.v_bytes = o.v_mismatch = 0;
          o.v_post_changes = 0;
-@@ -24063,8 +24095,10 @@
+@@ -24063,8 +24094,10 @@
  // that assigns ring rows in host-store order is one command a layer instead of n_pages.
  // Returns the commands issued, 0 when the plan names no streamed page, -1 for a host store
  // this function cannot copy (not USM): the dispatch's own path below covers those.
@@ -154,7 +153,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      const ggml_tensor * plan   = dst->src[GGML_FA_SRC_PLAN];
      const ggml_tensor * host_k = dst->src[GGML_FA_SRC_HOST_K];
      const ggml_tensor * host_v = dst->src[GGML_FA_SRC_HOST_V];
-@@ -24111,10 +24145,24 @@
+@@ -24111,10 +24144,24 @@
                         (long long) n, (unsigned long long) dk, (size_t) n*kb, k_size,
                         (unsigned long long) dv, (size_t) n*vb, v_size);
          }
@@ -181,7 +180,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          runs += 2;   // K and V: each a command
          p += n;
      }
-@@ -24143,20 +24191,12 @@
+@@ -24143,20 +24190,12 @@
      if (!ggml_cl_fa_paged_timeline() || o.tl_graph != ctx->graph_gen) return;
      o.tl.push_back({ role, node, slot, nullptr, ggml_cl_fa_paged_tl_host_ns() });
  }
@@ -208,7 +207,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  static void ggml_cl_fa_paged_tl_finish(ggml_backend_opencl_context * ctx) {
      auto & o = ctx->fa_paged;
      if (o.tl.empty()) return;
-@@ -24188,15 +24228,20 @@
+@@ -24188,15 +24227,20 @@
          }
          return;
      }
@@ -234,7 +233,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      for (int slot = 0; slot < 2; ++slot) {
          struct one { int node; long long st, en, host; };
          std::vector<one> cs, ce, fs, fe, me, cons, post, hin, hout;
-@@ -24207,8 +24252,11 @@
+@@ -24207,8 +24251,11 @@
              // the host when the recording began; tl_dev_base is the device clock AT the host
              // base. Without the timer the column is the host-relative time and says so.
              const long long shift = o.tl_dev_base > 0 ? o.tl_dev_base - (long long) base_en : 0;
@@ -248,7 +247,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              if (x.role == 0) cs.push_back(e);
              else if (x.role == 1) ce.push_back(e);
              else if (x.role == 2) fs.push_back(e);
-@@ -24244,7 +24292,7 @@
+@@ -24244,7 +24291,7 @@
          std::vector<int> cn, fn;
          for (auto & x : ev) {
              if (x.slot != slot) continue;
@@ -257,7 +256,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              else if (x.role == 3) { fe.push_back((long long) x.en - (long long) base_en); fn.push_back(x.node); }
          }
          long long mn = 0;
-@@ -24262,7 +24310,7 @@
+@@ -24262,7 +24309,7 @@
                  cs.size() > 1 ? cn[1] : -1, fe.empty() ? -1 : fn[0]);
      }
      for (auto & x : ev) {
@@ -266,7 +265,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          if (x.role == 3) last_fa = (long long) x.en - (long long) base_en;
      }
      GGML_LOG_WARN("ggml_opencl: paged FA timeline margin: min %lld ns over %d pairs, negative %d; "
-@@ -24307,7 +24355,7 @@
+@@ -24307,7 +24354,7 @@
          CL_CHECK(err);
      }
      if (ggml_cl_fa_paged_timeline() && o.tl_graph < 0 && o.tl_graphs_seen <= 4 && o.tl.empty()) {
@@ -275,7 +274,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          o.tl_graph = ctx->graph_gen;
          // 0130x: the host and device clocks together at the base, so a submit time and a
          // device start are in one frame. An ICD without the timer falls back to the host
-@@ -24324,10 +24372,8 @@
+@@ -24324,10 +24371,8 @@
              if (!o.tl_warned) { o.tl_warned = true;
                  GGML_LOG_WARN("ggml_opencl: paged FA timeline: no clGetDeviceAndHostTimer; the submit times are host-clocked only\n"); }
          }
@@ -288,7 +287,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      }
  }
  
-@@ -24393,8 +24439,13 @@
+@@ -24393,8 +24438,13 @@
      cl_uint  nw = (o.consumed[p] != nullptr && !nofix) ? 1 : 0;
      cl_event wl[1] = { o.consumed[p] };
      if (o.consumed[p] != nullptr && nofix) ++o.nofix_drops;   // 0130r: the drop, counted
@@ -304,7 +303,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (runs < 0) {
          if (warn) { o.pre_head_dead_warned = true; GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: the host store or the ring is not what the copies read (enqueue_pages -1); nothing prefetched\n"); }
          return;
-@@ -24402,9 +24453,11 @@
+@@ -24402,9 +24452,11 @@
      if (runs == 0 && warn) {   // a plan with no streamed page: correct, but say it once
          GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: node 0's plan names no streamed page; %d issued so far\n", o.pre_issued);
      }
@@ -318,7 +317,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      o.pre_parity = p;
      o.pre_rows   = rows;
      o.pre_pages  = pages;
-@@ -24455,8 +24508,13 @@
+@@ -24455,8 +24507,13 @@
          CL_CHECK(clFlush(ctx->queue));
          wl[nw++] = mark;
      }
@@ -334,7 +333,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (mark) CL_CHECK(clReleaseEvent(mark));
      if (runs < 0) {
          // 0129q, no silent fallback: a node whose store is not USM or whose ring is not one
-@@ -24481,9 +24539,10 @@
+@@ -24481,9 +24538,10 @@
      }
      o.issued_n++;
      if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
@@ -347,7 +346,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      o.issued[ni] = 1;
      return true;
  }
-@@ -24575,6 +24634,8 @@
+@@ -24575,6 +24633,8 @@
          v = e ? atoi(e) : 0;
          if (v != 0) {   // 0130r: the mode, once, so a window's log says which check ran
              GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_VERIFY=%d: %s\n", v,
@@ -356,7 +355,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                      v == 3 ? "pre and post hashes of every streamed node, compared at the request's end" :
                      v == 2 ? "the self-test: one host byte flipped, the check must see 1 chunk" :
                               "the pre-FA hash of every streamed node, blocking readback");
-@@ -24626,6 +24687,7 @@
+@@ -24626,6 +24686,7 @@
          size_t kb, size_t vb, const void * hk, const void * hv,
          const int32_t * pl, int64_t n_pages, int node) {
      if (!ggml_cl_fa_paged_verify_on() || ggml_cl_fa_paged_verify_mode() == 3 ||
@@ -364,7 +363,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          hk == nullptr || hv == nullptr || pl == nullptr) return;   // 0130d: =3 runs the pair below
      // 0129t: the plan index travels with the ring row. The copy loop takes ring row pl[p]
      // from hk + p*kb, p the PLAN index (0129n's enqueue_pages); compacting the rows alone
-@@ -24718,7 +24780,9 @@
+@@ -24718,7 +24779,9 @@
  // enqueue the hash of one slot region into `out`, then read it back non-blocking into `host`
  static void ggml_cl_fa_paged_verify3_hash_read(ggml_backend_opencl_context * ctx,
          cl_mem buf, cl_mem rowsbuf, cl_ulong base_off, cl_ulong stride_bytes, cl_ulong nbytes,
@@ -375,7 +374,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      auto & o = ctx->fa_paged;
      const uint32_t chunk = 4096;
      CL_CHECK(clSetKernelArg(o.verify_kernel, 0, sizeof(cl_mem), &buf));
-@@ -24729,8 +24793,10 @@
+@@ -24729,8 +24792,10 @@
      CL_CHECK(clSetKernelArg(o.verify_kernel, 5, sizeof(uint32_t), &chunk));
      CL_CHECK(clSetKernelArg(o.verify_kernel, 6, sizeof(cl_mem), &out));
      size_t gws[2] = { (size_t) nc, gy };
@@ -387,7 +386,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      host.resize((size_t) nc*gy);
      // CL_FALSE: the graph does not wait for it; the event is waited at the next graph's start
      CL_CHECK(clEnqueueReadBuffer(ctx->queue, out, CL_FALSE, 0, host.size()*sizeof(uint32_t),
-@@ -24739,8 +24805,8 @@
+@@ -24739,8 +24804,8 @@
  
  static void ggml_cl_fa_paged_verify3_begin(ggml_backend_opencl_context * ctx,
          cl_mem k_buf, cl_mem v_buf, cl_ulong k_off, cl_ulong v_off, int ps, int rb, int rvb,
@@ -398,7 +397,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      auto & o = ctx->fa_paged;
      o.post_cur = -1;   // this dispatch's pair; `post` below finds it even when node is -1
      if (pl == nullptr) return;
-@@ -24752,6 +24818,7 @@
+@@ -24752,6 +24817,7 @@
      const uint32_t chunk = 4096;
      fa_paged_post e;
      e.node = node;
@@ -406,7 +405,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      e.rows = rows;
      e.pages = pages;
      e.nk = (int64_t) ((kb + chunk - 1) / chunk);
-@@ -24770,7 +24837,7 @@
+@@ -24770,7 +24836,7 @@
      CL_CHECK((e.rowsbuf = clCreateBuffer(ctx->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
              gy*sizeof(int32_t), rows.data(), &err), err));
      for (int kv = 0; kv < 2; ++kv) {
@@ -415,7 +414,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
              CL_CHECK((e.out[kv][pp] = clCreateBuffer(ctx->context, CL_MEM_WRITE_ONLY, out_bytes,
                      nullptr, &err), err));
          }
-@@ -24807,7 +24874,7 @@
+@@ -24807,7 +24873,7 @@
  
  // after this FA's kernels and before `ggml_cl_fa_paged_overlap_after`'s consumed marker
  static void ggml_cl_fa_paged_verify3_post(ggml_backend_opencl_context * ctx, bool decode) {
@@ -424,7 +423,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      auto & o = ctx->fa_paged;
      if (o.post_cur < 0 || o.post_cur >= (int) o.post_pending.size()) return;
      fa_paged_post & e = o.post_pending[o.post_cur];
-@@ -24823,13 +24890,71 @@
+@@ -24823,13 +24889,71 @@
                  e.node, e.pages[0]);
      }
      const size_t gy = e.rows.size();
@@ -497,7 +496,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  // wait the pairs of the previous graph(s) and compare pre against post
  static void ggml_cl_fa_paged_verify3_collect(ggml_backend_opencl_context * ctx) {
      auto & o = ctx->fa_paged;
-@@ -24864,9 +24989,36 @@
+@@ -24864,9 +24988,36 @@
                  GGML_LOG_WARN("ggml_opencl: paged FA post-FA changed: node %d page %d chunk %d\n",
                          e.node, first_page, first_chunk);
              }
@@ -535,7 +534,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
                  if (e.out[kv][pp])  { CL_CHECK(clReleaseMemObject(e.out[kv][pp]));  e.out[kv][pp] = nullptr; }
                  if (e.ev[kv][pp])   { CL_CHECK(clReleaseEvent(e.ev[kv][pp]));       e.ev[kv][pp] = nullptr; }
              }
-@@ -25089,8 +25241,10 @@
+@@ -25089,8 +25240,10 @@
      // and bytes the FA reads, at the moment it runs.
      ggml_cl_fa_paged_verify(backend_ctx, dst, k_buf, v_buf, k_off, v_off, ps, (int) rb, (int) rvb,
              kb, vb, hk, hv, pl, n_pages, ov_node_out);
@@ -547,7 +546,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      if (ov) {
          *overlap_parity = ov_node_out;
          *overlap_copied = true;
-@@ -26687,10 +26841,20 @@
+@@ -26687,10 +26840,20 @@
                  paged_overlap_parity < (int) backend_ctx->fa_paged.chain.size())
                  ? ggml_cl_fa_paged_overlap_slot(backend_ctx, backend_ctx->fa_paged.chain[paged_overlap_parity]) : -1;
          ggml_cl_fa_paged_tl_host(backend_ctx, 8, paged_overlap_parity, fa_slot);   // 0130x FA dispatch entry
@@ -571,7 +570,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          if (kv_tmp_table != NULL) {
              // a temporary upload buffer: a queued kernel keeps it alive until it runs
              clReleaseMemObject(kv_tmp_table);
-@@ -26716,9 +26880,13 @@
+@@ -26716,9 +26879,13 @@
          const size_t merge_wg  = (size_t) (d_head_v / 4); // one lane per float4
          size_t merge_lws[3] = { merge_wg, 1, 1 };
          size_t merge_gws[3] = { merge_wg, (size_t)(n_head * n_batch), (size_t) n_q };
