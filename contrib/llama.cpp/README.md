@@ -8139,3 +8139,48 @@ and each warns; the tail prints `ggml_opencl: flash_attn_gqa_dpas.cl not built;
 flash_attn_f32_f16.cl takes decode` with the downgrade record `path=fallback
 reason=not-built what=fa_gqa_dpas`, and decode takes `flash_attn_f32_f16.cl`. This entry
 records that route so 0130k's build failure cannot be mistaken for a silent fallback.
+
+## 0130o-fa-gqa-nopriv-macro-continuations.patch
+
+`measured-here` (ocl 26.27, `-device bmg`, q8_0 K / q4_0 V, head 256, 2 sides): 0130l's
+component-store lines in the NOPRIV stage/store bodies carried no trailing backslash, so
+each macro ended after its four loads and the stores landed at file scope. `cpp` accepts
+that; ocloc did not (rc 245, `use of undeclared identifier 'dst'`) for every NOPRIV form,
+while the base form was unaffected. 0130o adds the continuations, and the cpp gate now
+fails when a macro parameter (`dst`, `k0i`) survives preprocessing: red on 0130l in 6 of 18
+sets, green with 0130o. ISA (`measured-here`, same window): base 5,888 B private, 101
+private loads / 54 stores, instCount 6,448; NOPRIV 0 B, 0 private messages, 3,840 B spill
+(6,921 inst); NOPRIV+PRE 6,144 B private (10,176 B spill). Lesson: a cpp-clean file is not a
+compiling file; check that the body ends where intended.
+
+## 0130p-fa-paged-timeline.patch
+
+`code`: `GGML_OPENCL_FA_PAGED_TIMELINE=1`, development only. Markers on both queues carry
+the waits of the command after them, so their END is that command's start: per slot copy
+start/end, FA split start/end, merge end, the consumed marker and the post hash start of the
+request's first split-decode graph (a prompt graph is dropped and the next one recorded),
+each in device ns relative to the graph's first paged command; then the derived margin
+`copy(k+2).start - FA(k).split end` with its minimum and negative count per slot, and the
+cross-step prefetch's copy start against that slot's first FA split end and against the last
+FA's split end. The copy queue is created with `CL_QUEUE_PROFILING_ENABLE` only when the
+switch is on; the compute queue's stamps need `GGML_OPENCL_PROFILING` in the build, and a
+build without it warns once instead of printing zeros. No host wait is added.
+
+## 0130q-fa-paged-nofix-dev-switch-lines.patch
+
+`code`: `GGML_OPENCL_FA_PAGED_NOFIX=1`, development only, drops exactly the cross-step
+prefetch's consumed wait -- 0130c's own site -- and `NOCONSUME` keeps its meaning (the
+intra-graph wait in `issue` only). Every development switch prints one line with its value
+when first read (NOCONSUME, NOFIX, DELAY n, VERIFY mode, VERIFY_SELFTEST, TIMELINE), and
+the request-end summary gains `NOCONSUME consumed waits dropped N; NOFIX cross-step waits
+dropped N; delay kernels N; self-test writes N`, so window 296's defect -- no line saying
+the red arm had run red -- cannot recur.
+
+## 0130r-fa-paged-timeline-nofix-gate.patch
+
+`code`: `tests/python/test_fa_paged_lead.py`'s `FaPagedTimelineAndNoFix`, source-text
+cells for the timeline's marks, the margin arithmetic and the negative count, the two
+profiling sources, NOFIX called exactly once in the prefetch and NOCONSUME once in `issue`,
+every switch's startup line and the request-end counts. Mutations run and seen failing,
+then restored: the split start stamp moved after the merge, NOFIX added to `issue`'s wait,
+the summary's dev-switch line renamed.
