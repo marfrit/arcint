@@ -8096,3 +8096,15 @@ inside FA j (nonzero `post-FA changes`); with the consumed wait on, the same del
 not part of NOCONSUME (0130d's exactly-one-wait arm): it stays unconditional, which is why
 window 294's red arm could not land. Gate: `FaPagedForcedRace`, three mutations run and seen
 failing.
+
+## 0130k-fa-gqa-no-private-memory.patch
+
+`code` for the mechanism; the ISA is the card host's (ocl 26.27, `-device bmg`, `-DDK=256
+-DGQA_SIDES=2 -DKT=1 -DVT=2`): base/V2/PRE all reported `//.private memory size 5888`, 61
+private loads and 8 private stores inside the dpas span. `GGML_OPENCL_FA_GQA_NOPRIV=1`, default
+off, compiles the same source with `FA_UNROLL` (`_Pragma("unroll")`) on every loop that indexes
+a private array (8, NDH, KC, NKB, PRE's 2: all compile-time) and the V stage's `vv[64]`
+replaced by 64 component stores straight to local memory, in both stage macros; the reduction
+order is base's, no reassociation. BROKEN is a separate build that writes value 15 of every
+staged V row as zero, the red op cases. Expected: `//.private memory size 0`. Gate:
+`tests/python/test_fa_decode_v2.py`'s `FaDecodeNoPriv`, three mutations run and seen failing.

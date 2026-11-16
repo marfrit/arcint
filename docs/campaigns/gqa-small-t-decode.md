@@ -365,3 +365,52 @@ arithmetic): the V stage's stall moves off the tile's critical path; if the 400 
 at 48 GB/s bound by that stall, the floor is the 1.2x that V2 promised, but now with no
 additional local memory to pay for it. Gate: `tests/python/test_fa_decode_v2.py`'s
 `FaDecodePre`, placements and the broken store, three mutations run and seen failing.
+
+### Round 18 -- the private memory, and 0130k (`code`; ISA measured on the card host)
+
+**The ISA (`measured-here`, ocloc 26.27.39122.11, `-device bmg`, source df1c3163, options
+`-cl-intel-256-GRF-per-thread -DDK=256 -DGQA_SIDES=2 -DKT=1 -DVT=2`):** base, V2, PRE and
+PRE_BROKEN all report `//.private memory size 5888`, 48 dpas, no spill, no retry dump;
+instCount 6,448 / 7,418 / 8,395. Inside base's dpas span: 61 private loads, 8 private stores
+(`ugm`, address space private) against 27 global loads, 46 SLM loads, 66 SLM stores, 4
+barriers; whole kernel 101 private loads, 54 private stores. PRE's ~1,950 extra instructions
+leave that private traffic unchanged.
+
+**Every private array in `flash_attn_gqa_dpas` (line numbers at 0130h's tree), declared bytes,
+and why IGC keeps it addressable.** Acquired private memory is per work-item; a work-group of
+96-192 work-items therefore multiplies these.
+| array | line | bytes | why it is materialized |
+|---|---|---|---|
+| `float8 o[NDH]` | :270 | 256 (NDH 8 = DV/2/16 at head 256) | indexed by `i` in the init, rescale, PV update and record loops; all four are loops with a register index |
+| `short8 qa[KC]` | :518 | 256 (KC 16) | written in a `c < KC` loop, read in the DPAS `c < KC` loop, same |
+| `float8 s[NKB]` | :599 | 64 | written per `g`, read in the S-split exchange, the mask add, the max reduction, the P build |
+| `short8 pa[NKB]` | :699 | 32 | written per `g`, read in the PV `g` loop |
+| `float m[8]`, `mnew[8]`, `corr[8]`, `mk[8]`, `mv[8]`, `larr[8]`, `ov[8]` | :266, :662, :689, :669, :685, :746, :756 | 32 each, 224 | every one is indexed by `r` in a `for r < 8` loop; `mk` also by the key group |
+| `rh[8]`, `rt[8]` | :256 | 64 | index `r` loops, and `rt` feeds address arithmetic |
+| `rv[8]` | :257 | 8 | `rv[r]` in the row loops |
+| `mrow[8]` | :538 | 64 | `mrow[r]` in the mask add |
+| `const half vv[64]` | stage macro | 128 an instance; base has two call sites | a 64-element store loop `for j < 64` the unroller never takes, so the components round-trip through private |
+| `float x[32]`, `int q[32]` | :495, :506 | 256, I8 only, not this build | quantizer staging |
+| `half16 pre[2][4]` | :557, PRE only | 256 | PRE's register prefetch, indexed by `it` |
+Sum of the base build's declared arrays: ~1,096 B. The dump's 5,888 B is IGC's count after its
+own materialization (per-unrolled-instance copies, addressable temporaries, per-work-item
+stack); the per-array split above is arithmetic from the source (`inferred`), only an ocloc
+A/B attributes exactly.
+
+**Q1 split kernel (1-3 rows, `flash_attn_f32_f16.cl`'s `fdi_split_body`, GDMLOD 1/2 K/V codes
+KT/VT):** `o[FDI_E]`, `q[FDI_E]`, `s[FDI_KB]`, `kr[FDI_E]`, `vr[FDI_E]` (`FDI_E` = DK/16 = 16,
+`FDI_KB` = 4) -- declared 64 floats of `o`, `q` and 4-key `s`, 16-float `kr`/`vr` -- and every
+loop over them already carries `#pragma unroll`, so that body is not expected to acquire
+private memory beyond the dump's own count; it is not what the production 4-7 row decode
+runs. `code`; no separate ISA dump for it in this round.
+
+**0130k (`code`).** `GGML_OPENCL_FA_GQA_NOPRIV=1`, default off, own programme: `FA_UNROLL`
+(`_Pragma("unroll")`) on every loop that indexes one of the arrays above (all trip counts are
+compile-time: 8, NDH, KC, NKB, 2 for PRE's `it`), and the V stage's `vv[64]` replaced by 64
+component stores straight to local memory in both stage macros. The reduction order is
+unchanged: every loop keeps its ascending order, `mx8` still starts at `s[0]`, `acc = DPAS(pa[g], b, acc)`
+still runs g ascending, and no `mad`/`fma` reassociation is introduced. `GGML_OPENCL_FA_GQA_NOPRIV_BROKEN=1`
+is a separate build whose NOPRIV path writes value 15 of every staged V row as zero: the red
+op cases fail while the register shape stays. Expected ISA (`inferred`, the second red the
+card host checks): `//.private memory size 0`, no `address space: private` messages in the
+dpas span, instCount above base's 6,448 for the stores.

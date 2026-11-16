@@ -183,3 +183,61 @@ class FaDecodePre(unittest.TestCase):
         self.assertIn("for (int64_t nb : {4, 5, 6, 7})", perf, "the 4-7 row form")
         self.assertIn("new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb", perf)
         self.assertIn("{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}", perf)
+
+
+class FaDecodeNoPriv(unittest.TestCase):
+    """Patch 0130k's device-free gate: GGML_OPENCL_FA_GQA_NOPRIV compiles the same source
+    with every private array's indexing loop unrolled and the V stage's vv[64] replaced by
+    component stores, behind its own programme; the reduction order stays base's.
+
+    Red mutations, each run and seen failing before it was restored:
+      (a) FA_UNROLL defined unconditionally (outside the #ifdef GQA_NOPRIV): the
+          default-off cell fails -- the base build would change too;
+      (b) the vv[64] stage unguarded (the direct-store path outside #ifdef GQA_NOPRIV): the
+          stage cell fails -- the base source would lose its array;
+      (c) the broken variant's zero store removed: the broken-gate cell fails.
+    """
+
+    def setUp(self):
+        self.root = _llama_root()
+        self.t = {f: (self.root / f).read_text() for f in (OPENCL, KERNEL)}
+
+    def test_switch_is_default_off_and_a_separate_programme(self):
+        t = self.t[OPENCL]
+        i = t.find('const char * fnp_env  = getenv("GGML_OPENCL_FA_GQA_NOPRIV");')
+        self.assertTrue(i >= 0, "the NOPRIV switch is absent")
+        block = t[i:t.find("\n", t.find("const bool   fnp_on", i))]
+        self.assertIn("atoi(fnp_env) != 0", block,
+                      "NOPRIV must be off unless GGML_OPENCL_FA_GQA_NOPRIV is a nonzero number")
+        self.assertIn("if (fnp_on) {", t, "the NOPRIV build is not gated on the switch")
+        self.assertIn('" -DGQA_NOPRIV=1"', t)
+        self.assertIn('(fnp_broken ? " -DGQA_NOPRIV_BROKEN=1" : "")', t,
+                      "the broken variant is a separate build, not a runtime flag")
+        self.assertIn("did not build; the base kernel stays", t)
+
+    def test_the_unroll_is_conditional_and_the_v_stage_has_no_array(self):
+        k = self.t[KERNEL]
+        self.assertIn('#ifdef GQA_NOPRIV\n#define FA_UNROLL _Pragma("unroll")\n#else\n#define FA_UNROLL\n#endif', k,
+                      "FA_UNROLL must be empty outside GQA_NOPRIV")
+        self.assertIn("for (int it = 0; it < 2; ++it) {", k)
+        # the array path is the non-NOPRIV one; the NOPRIV path stores components
+        i = k.find("#ifndef GQA_NOPRIV\n        // 0130k")
+        self.assertIn("#ifdef GQA_NOPRIV", k)
+        self.assertIn("const half vv[64] = { v0.s0", k,
+                      "the base stage must keep its vv array")
+        self.assertIn("(dst)[(64 * c64 + 0) * BK + key] = v0.s0;", k,
+                      "NOPRIV must store the components straight to local memory")
+        self.assertIn("(dst)[(64 * c64 + 63) * BK + key] = v3.sf;", k)
+
+    def test_the_broken_variant_zeroes_one_component(self):
+        k = self.t[KERNEL]
+        self.assertIn("#ifdef GQA_NOPRIV_BROKEN", k, "the broken variant is absent")
+        self.assertIn("(dst)[(64 * c64 + 15) * BK + key] = 0.0h;", k,
+                      "the red op cases need a wrong V value")
+
+    def test_the_reduction_order_is_the_bases(self):
+        k = self.t[KERNEL]
+        # no reassociation: the softmax and PV loops keep their single-message order
+        self.assertIn("for (int i = 0; i < NDH; ++i) o[i] *= cv;", k)
+        self.assertIn("for (int g = 1; g < NKB; ++g) mx8 = fmax(mx8, s[g]);", k)
+        self.assertIn("acc = DPAS(pa[g], b, acc);", k)
