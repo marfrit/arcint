@@ -286,6 +286,18 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.root = _llama_root()
         self.t = (self.root / OPENCL).read_text()
 
+    def test_timeline_marker_wait_list_null_when_empty_0130v(self):
+        # 0130v: tl_mark's callers hand over their wait array with nw 0 (no consumed event yet,
+        # or NOFIX); a non-NULL list with a count of 0 is CL_INVALID_EVENT_WAIT_LIST (-57,
+        # window 298). Red: the marker passing `wl` unguarded.
+        t = self.t
+        i = t.find("static void ggml_cl_fa_paged_tl_mark(")
+        self.assertGreater(i, 0, "0130v: no timeline marker helper")
+        j = t.find("static void ggml_cl_fa_paged_tl_finish(", i)
+        self.assertGreater(j, i)
+        self.assertIn("clEnqueueMarkerWithWaitList(q, nw, nw ? wl : nullptr, &ev)", t[i:j],
+                      "0130v: the timeline marker must pass NULL when its wait list is empty")
+
     def test_compute_queue_profiling_at_runtime_0130u(self):
         # 0130u: the compute queue takes CL_QUEUE_PROFILING_ENABLE when the timeline switch is
         # set at runtime, so a timeline build need not define GGML_OPENCL_PROFILING (whose

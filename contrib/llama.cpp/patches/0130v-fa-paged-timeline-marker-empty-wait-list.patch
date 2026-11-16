@@ -1,0 +1,16 @@
+0130v: the paged FA timeline's marker passes NULL for an empty wait list (CL_INVALID_EVENT_WAIT_LIST, -57, on the first decode graph).
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -24112,7 +24112,10 @@
+ static void ggml_cl_fa_paged_tl_mark(ggml_backend_opencl_context * ctx, cl_command_queue q, int role,
+         int slot, cl_uint nw, cl_event * wl) {
+     cl_event ev = nullptr;
+-    CL_CHECK(clEnqueueMarkerWithWaitList(q, nw, wl, &ev));
++    // 0130v: the callers pass their wait array even when it holds no event (nw 0, the first
++    // graph's consumed[] or every NOFIX prefetch); a non-NULL list with a count of 0 is
++    // CL_INVALID_EVENT_WAIT_LIST (-57), which window 298 hit on the first decode graph.
++    CL_CHECK(clEnqueueMarkerWithWaitList(q, nw, nw ? wl : nullptr, &ev));
+     ggml_cl_fa_paged_tl_keep(ctx, role, slot, ev);
+     if (ev) CL_CHECK(clReleaseEvent(ev));
+ }
