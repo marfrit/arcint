@@ -775,8 +775,9 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   re-measured on `71429597`; window 288 and 292 both showed the alternate opening
   ("...exec/flash_nex" against "...exec/backend_o") at 261k in the OVERLAP arms, two windows
   running. The post-FA check (VERIFY=3: a second hash enqueued right after FA j's kernels,
-  compared with the pre-FA one, non-blocking readback at the graph's end) is specified but not
-  built yet; `GGML_OPENCL_FA_PAGED_NOCONSUME=1` is its red arm.
+  compared with the pre-FA one, non-blocking readback collected at the next graph's start and
+  at the request's end) is built in 0130d: its device-free gate is green, the card number is
+  owed; `GGML_OPENCL_FA_PAGED_NOCONSUME=1` drops exactly the consumed wait, its red arm (`code`).
 - **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
   kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
   `{fa_gqa_sides*n_tiles*16, n_head_kv*n_batch, n_splits}`, and w289b's grid {160,4,256} is

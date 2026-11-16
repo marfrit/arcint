@@ -8019,3 +8019,28 @@ Window 292 (`measured-here`) + `code`. This patch carries 0129x, 0129y and 0129z
   window 292's A-uverify arm (VERIFY=1, OVERLAP unset) printed no totals and could not show it
   had checked anything. The roll-up and the zeroing now run when either switch is on; the
   chain (0129n's lead) stays overlap-only. 0129s/0129t's verification itself is unchanged.
+
+## 0130d-kv-stream-paged-verify-post-fa.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session). The gate is
+device-free: `tests/python/test_fa_paged_lead.py`'s `FaPagedPostFA`, three mutations run and
+seen failing.
+- **VERIFY=3, the post-FA hash.** 0129s/0129t's `fa_paged_verify` hashes the streamed rows
+  the FA reads, but at the FA's start and with a blocking read: it proves what FA j reads
+  when it starts, not what the slot holds while j runs. `=3` enqueues the same hash at that
+  start (pre), then the SAME rows again right after FA j's kernels (post), both on the
+  compute queue, both read back `CL_FALSE` with an event. On the split-decode branch the
+  post sits after `k_merge` and before `ggml_cl_fa_paged_overlap_after`'s consumed marker;
+  on the prompt tail after the tail kernels and before the same call. The pairs are awaited
+  at the next graph's start and at the request's end; a chunk whose two hashes differ means
+  a copy landed while the FA read the slot. WARN once a process:
+  `paged FA post-FA changed: node %d page %d chunk %d`, and the request summary gains
+  `post-FA changes N` (`code`).
+- **The red arm.** `GGML_OPENCL_FA_PAGED_NOCONSUME=1`, development only, drops exactly the
+  consumed wait in `ggml_cl_fa_paged_overlap_issue` -- the 0129n-0129w decode, where
+  `consumed[]` stayed nullptr, so a copy into a slot could start while the FA two layers
+  back read it. The prefetch's own consumed wait is untouched (`code`).
+- **Why the post is before the marker.** The consumed marker waits the queue's prior work,
+  the post hash included; a copy that waits the marker cannot land inside the FA it guards.
+  With the wait dropped the only ordering left is the copy queue's own, which is the race
+  `=3` is built to see (`code`).
