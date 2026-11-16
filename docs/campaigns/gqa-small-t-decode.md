@@ -173,3 +173,77 @@ code-level GA (`kernel-autotune-ga.md`).
 - `kernels/flash_attn_gqa_dpas.cl`;
 - the decode route in `ggml-opencl.cpp`;
 - the verify-row cases and the depth perf cases in test-backend-ops.
+
+## Round 14 -- the non-paged number at 240k (`measured-here`, window 291, 2026-11-16)
+
+The production agent's 240k cached 32-token decode, unitrace on the B60: device span 2,713 ms
+over ~13 graphs, attention 1,841 ms (68 %). `flash_attn_gqa_dpas` (4-7 rows) 116 calls x
+8.34 ms; `flash_attn_q8q4_q1_split_intel` (1-3 rows) 100 calls x 8.74 ms; merge 0.22 ms.
+~938 keys x 416 B a call = ~400 MB, ~48 GB/s. Window 289b's paged call at 261k: 9.15 ms,
+~47 GB/s. Paging costs ~1 %: the kernel is the bound, non-paged and paged alike, and the
+1-row path costs what the 6-row path does because both read the KV once per call.
+
+### A. Analysis (`code`, read 2026-11-16)
+
+Per work-group, per call, q8_0 K / q4_0 V, head 256: a K row is 256/32 blocks x 34 B = 272 B,
+a V row 8 blocks x 18 B = 144 B, so 416 B a key. 0097's split (128-256 keys, cap 256) gives
+each work-group ~938 keys = ~390 KB. Work-groups a call = 4 KV heads x splits x row tiles;
+at 240k and cap 256 that is 4 x 256 x (rows/8-per-side) = ~1024-2048, against 160 Xe cores
+with 0045's one work-group a core and 20 a wave -- ~6-13 waves a call, i.e. the grid is
+full, occupancy is not the problem.
+- Both kernels: `#define BK 32` (`flash_attn_gqa_dpas.cl:66`), staged path
+  (GQA_K_STAGED, :85) copies BK keys to local memory, then TWO `barrier(CLK_LOCAL_MEM_FENCE)`
+  per tile (:305 before the stage, :318 after it, :336 for the q8 staging) plus the V and S
+  exchange barriers (:23 says one covers V and S). So staging and the products are strictly
+  serialised: while the tile loads, the DPAS units idle; while they compute, the memory
+  system idles. Ablations 2026-10-04 measured exactly that (2.0 + 1.3 ms at 131k, 1 row).
+- Loads in flight per sub-group: with BK 32 and staged K, one sub-group's stage is
+  BK x DK/64 x 4 vector loads = 32 x 4 x 4 = 128 `load16` calls issued by the whole
+  work-group's threads (nthr threads stride them, :307), so ~1-4 16-byte loads in flight per
+  lane; the barrier drains them all before any product. Little's law, latency assumed
+  ~700 ns (B60 HBM; the 14.3 GB/s copy measurement of 0032/0044 is per-slot streaming, not a
+  latency figure -- `measured-here` has no latency probe, so this is an assumption): at
+  700 ns and 16 B a load, 300 GB/s needs 300e9 x 700e-9 / 16 = 13,125 loads in flight device-
+  wide, ~82 a core. One work-group a core with ~4 loads a lane x 16 lanes is ~64 issued but
+  drained at a barrier, so the average in-flight count is far below 82 -- consistent with the
+  measured 48 GB/s. This is the bound: not the arithmetic (DPAS is idle during staging), not
+  the split, not the merge.
+- BK 64 costs local memory and lowers the work-groups a core (the record's ablation: BK 32
+  vs 16/64), so growing the tile is not the way out. Making K direct from VRAM (0016's f16
+  form, :86: staged only when KT != 0) removes the barrier pair but leaves one sub-group's
+  8-row x 16-lane loads as the in-flight count.
+
+### References for long-context decode on this class of GPU (`code`, read 2026-11-16)
+
+- llama.cpp CUDA: `flash-decoding` splits the KV and merges with the log-sum-exp rescale --
+  `launch_fattn` (`ggml/src/ggml-cuda/fattn-common.cuh:981`), `parallel_blocks` (:928, the
+  wave-fill split that 0045 ports), `flash_attn_combine_results` (:924, the merge). arcint
+  already has that shape (0097 + the merge); the reference's advantage is not the split.
+- Strata: its decode attention is split-K with an explicit merge too --
+  `decode_attn_i8_split_kernel` and the merge block (`src/kernels/cuda/qsa_prompt_attn.cu:805`,
+  :1018-1030, one block per (query, head), a thread per dimension). No Intel/SYCL attention
+  port exists in the checkout: `grep -rli sycl|xpu src` matches only CPU kernels
+  (`src/kernels/cpu/*`), so the SYCL claim in the round's premise is not in this source
+  (`code`, negative by grep -- I did not find a second checkout).
+- FreeToken: paged decode goes to `sgl_kernel.flash_attn_with_kvcache` with `num_splits`
+  and `pack_gqa` (`python/freetoken/attention/fa.py:169,194`), i.e. it delegates to
+  FlashAttention's split + GQA packing; its own Triton path is FA-shape, not a novel
+  mainloop.
+- Bandwidth fraction reached by any of them: none of the three states a fraction in code or
+  comments (`paper`/`code` gap): their splits are about wave fill and occupancy, which this
+  kernel already satisfies. So the mechanism to build is the one none of them ship on a
+  memory-latency-bound IG: double-buffered staging with the products, i.e. more loads in
+  flight per sub-group without more local memory.
+
+### B. The build (next: patch 0130a)
+
+Switch `GGML_OPENCL_FA_DECODE_V2=1`, default off, 4-7 row path first:
+- double-buffer BK tiles in local memory (two BK-32 K stages), issue tile t+1's stage at
+  `lid` before the S products of tile t, one barrier pair a tile instead of two, and K as
+  `int8`/`half` vectors read by the DPAS a operand from the buffer being consumed -- so the
+  stage of t+1 is in flight while t's DPAS runs;
+- the same for the q8_0 1-3 row form (`ks8` doubled) if the first carries over.
+Red first: op cases in `tests/test-backend-ops.cpp` at 4-7 rows, q8_0/q4_0, head 256, GQA 6,
+4k/64k/240k keys (0016's depth cases exist; extend them to quantized KV), plus a
+broken variant (single buffer, barrier before the product) that must fail.
+Bar: CLAUDE.md's answer-level bar (KL within 0.03 nats of the baseline arm), op cases green.
