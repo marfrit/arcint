@@ -7898,3 +7898,20 @@ that print gate. Now `prepare()` keeps `att_last`/`streamed_last` every ubatch, 
   dispatch satisfied both, while the DEBUG lead lines prove the 16 issues. It is printed at
   the next graph's start now -- `ggml_backend_opencl_graph_compute` always runs -- with the
   previous graph's "issued ahead / fell back" and the VERIFY totals.
+
+## 0129t-kv-stream-paged-verify-plan-index-and-selftest.patch
+
+Read-back of 0129s (`code`): `ggml_cl_fa_kv_stream_pages`' copy loop takes ring row `pl[p]`
+from `hk + p*kb`, `p` the PLAN index; the verify compacted the streamed rows alone and then
+read `host + i*nb` with `i` the compacted index, so the host side compared page i of the
+store against the i-th streamed row -- a false red whenever the streamed pages are not the
+front of the plan. From the code, the served layout does put them at the front while the
+pool is short of the attended pages: `prepare()` assigns the newest attended pages first
+("free slots take the newest attended pages", llama-kv-stream.cpp:224-228) and the streamed
+pages are that oldest prefix, so 0129s would have passed on a fresh 261k decode -- and
+failed as soon as evictions (the victim is the oldest non-written page) break the prefix.
+The plan index now travels with the ring row (`pages` beside `rows`), the host hash reads
+`host + pages[i]*nb`, and the first-mismatch WARN prints that plan index as "host page".
+`GGML_OPENCL_FA_PAGED_VERIFY=2` is a green self-test: on the first checked node one byte of
+the host-side expected value (the comparison's copy, never the store) is flipped, so exactly
+one chunk must mismatch -- proof the comparison can fail without a race. `=1` unchanged.
