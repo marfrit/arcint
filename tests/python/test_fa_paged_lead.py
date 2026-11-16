@@ -286,6 +286,18 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.root = _llama_root()
         self.t = (self.root / OPENCL).read_text()
 
+    def test_compute_queue_profiling_at_runtime_0130u(self):
+        # 0130u: the compute queue takes CL_QUEUE_PROFILING_ENABLE when the timeline switch is
+        # set at runtime, so a timeline build need not define GGML_OPENCL_PROFILING (whose
+        # per-kernel recording drains the host every 2048 kernels). Red: the |= line removed.
+        t = self.t
+        i = t.find('getenv("GGML_OPENCL_FA_PAGED_TIMELINE");\n        if (tl != nullptr && atoi(tl) != 0) {')
+        self.assertGreater(i, 0, "0130u: no runtime timeline check at the compute queue's creation")
+        j = t.find("backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props", i)
+        self.assertGreater(j, i, "0130u: the check must precede the compute queue's creation")
+        self.assertIn("command_queue_props |= CL_QUEUE_PROFILING_ENABLE;\n            GGML_LOG_INFO", t[i:j],
+                      "0130u: the switch must set the compute queue's profiling property and say so")
+
     def test_the_switch_and_the_two_profiling_sources(self):
         t = self.t
         self.assertIn('getenv("GGML_OPENCL_FA_PAGED_TIMELINE")', t, "the timeline switch is absent")

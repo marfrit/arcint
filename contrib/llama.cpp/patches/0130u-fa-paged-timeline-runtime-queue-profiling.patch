@@ -1,0 +1,24 @@
+0130u: compute-queue profiling at runtime for the paged FA timeline (GGML_OPENCL_FA_PAGED_TIMELINE=1),
+so a timeline build need not define GGML_OPENCL_PROFILING and its per-2048-kernel host drains.
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -9460,6 +9460,18 @@
+ #ifdef GGML_OPENCL_PROFILING
+     command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
+ #endif
++    // 0130u: the paged FA timeline (0130p) needs device stamps on the compute queue. Asked for
++    // at runtime, so a timeline build need not define GGML_OPENCL_PROFILING, whose per-kernel
++    // recording waits on every event once per 2048 kernels: a host drain that, like VERIFY=3's
++    // collect, can order the very copies the timeline is meant to observe. Off: properties
++    // unchanged.
++    {
++        const char * tl = getenv("GGML_OPENCL_FA_PAGED_TIMELINE");
++        if (tl != nullptr && atoi(tl) != 0) {
++            command_queue_props |= CL_QUEUE_PROFILING_ENABLE;
++            GGML_LOG_INFO("ggml_opencl: compute queue profiling on for GGML_OPENCL_FA_PAGED_TIMELINE (0130u)\n");
++        }
++    }
+     CL_CHECK((backend_ctx->queue = clCreateCommandQueue(context, device, command_queue_props, &err), err));
+ 
+     // USM entry points of this device's platform (an expert cache's host bank);
