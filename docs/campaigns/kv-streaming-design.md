@@ -1166,3 +1166,24 @@ per patch; DESIGN §7 and §3.9 gain a line when the state of play moves;
 3. **The phase switch's graph rebuild** at a first decode after a prefill:
    whether arcint's scheduler can reuse the graphs for the decode pool (a
    different pool size changes the views) or must re-reserve each switch.
+- **0130p-0130r (`code`), window 296's two holes closed:** (1) every development switch
+  prints its value once when first read (NOCONSUME, NOFIX, DELAY n, VERIFY mode,
+  VERIFY_SELFTEST, TIMELINE) and the request-end summary counts what ran -- consumed waits
+  dropped, cross-step waits dropped, delay kernels, self-test writes -- so a window's log
+  says whether the red arm was red. (2) `GGML_OPENCL_FA_PAGED_TIMELINE=1` stamps the
+  request's first split-decode graph on both queues with markers that carry the next
+  command's waits: copy start/end, FA split start/end, merge end, the consumed marker and
+  the post hash start per slot, plus the derived margin `copy(k+2).start - FA(k).split end`
+  with its minimum and negative count, and the cross-step prefetch's copy start against the
+  last FA's split end. The copy queue gets `CL_QUEUE_PROFILING_ENABLE` only with the switch
+  on; the compute queue's profiling is the build's `GGML_OPENCL_PROFILING`, and its absence
+  warns once instead of printing zeros. (3) `GGML_OPENCL_FA_PAGED_NOFIX=1` drops exactly
+  the cross-step prefetch's consumed wait, 0130c's own site, and NOCONSUME keeps its
+  meaning. Why window 296's red arms could not land (`code`): VERIFY=3's collect at the next
+  graph's start calls `clWaitForEvents` on every pending pair's readback events, which were
+  enqueued after that FA's kernels -- the host therefore waits the previous graph's last FA
+  before dispatching the next graph, and the prefetch, issued inside that last FA's `after`,
+  is ordered behind it by the host. The post-FA check cannot see this race by construction;
+  the timeline margin is the non-blocking detector, and a post hash on the second queue is
+  the other. The delay n follows from the timeline: FA split duration and copy duration per
+  slot, n ~ (copy duration - FA hold) * 1.5 GHz / 2 iterations (`inferred`).
