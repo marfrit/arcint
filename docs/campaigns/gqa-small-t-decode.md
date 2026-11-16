@@ -397,7 +397,7 @@ own materialization (per-unrolled-instance copies, addressable temporaries, per-
 stack); the per-array split above is arithmetic from the source (`inferred`), only an ocloc
 A/B attributes exactly.
 
-**Q1 split kernel (1-3 rows, `flash_attn_f32_f16.cl`'s `fdi_split_body`, GDMLOD 1/2 K/V codes
+**Q1 split kernel (1-3 rows, `flash_attn_f32_f16.cl`'s `fdi_split_body`, the quantized K/V codes
 KT/VT):** `o[FDI_E]`, `q[FDI_E]`, `s[FDI_KB]`, `kr[FDI_E]`, `vr[FDI_E]` (`FDI_E` = DK/16 = 16,
 `FDI_KB` = 4) -- declared 64 floats of `o`, `q` and 4-key `s`, 16-float `kr`/`vr` -- and every
 loop over them already carries `#pragma unroll`, so that body is not expected to acquire
