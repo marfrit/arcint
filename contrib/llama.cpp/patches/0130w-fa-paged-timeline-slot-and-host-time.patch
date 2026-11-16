@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index c7ee73a..179f597 100644
+index c7ee73a..402261e 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1373,8 +1373,11 @@ struct ggml_backend_opencl_context {
@@ -237,7 +237,7 @@ index c7ee73a..179f597 100644
  }
  
  // this graph's state: chain (graph order), issued per node, parity events; reset on a new graph
-@@ -24247,6 +24296,18 @@ static void ggml_cl_fa_paged_overlap_graph(ggml_backend_opencl_context * ctx) {
+@@ -24247,9 +24296,21 @@ static void ggml_cl_fa_paged_overlap_graph(ggml_backend_opencl_context * ctx) {
      if (ggml_cl_fa_paged_timeline() && o.tl_graph < 0 && o.tl_graphs_seen <= 4 && o.tl.empty()) {
          // start a recording: the base is the graph's first paged command
          o.tl_graph = ctx->graph_gen;
@@ -255,7 +255,11 @@ index c7ee73a..179f597 100644
 +        }
          cl_event ev = nullptr;
          CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &ev));
-         o.tl.push_back({ -1, -1, ev });
+-        o.tl.push_back({ -1, -1, ev });
++        o.tl.push_back({ -1, -1, -1, ev, ggml_cl_fa_paged_tl_host_ns() });   // 0130x the base submit time
+         o.tl_base = ev;   // released by tl_finish through the list
+     }
+ }
 @@ -24316,7 +24377,7 @@ static void ggml_cl_fa_paged_prefetch_head(ggml_backend_opencl_context * ctx) {
      cl_uint  nw = (o.consumed[p] != nullptr && !nofix) ? 1 : 0;
      cl_event wl[1] = { o.consumed[p] };
