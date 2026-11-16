@@ -71,8 +71,8 @@ class FaPagedLead(unittest.TestCase):
         self.assertIn("next-graph lead: %d issued, %d reused, %d re-copied", t)
         self.assertIn("int issued = 0, fell_back = 0, reused = 0, recopied = 0, pre_issued = 0;", t)
         self.assertIn("g_fa_paged_totals.pre_issued += o.pre_issued;", t)
-        i = t.find("if (ggml_cl_fa_paged_overlap_on() || ggml_cl_fa_paged_verify_on()) {")
-        self.assertTrue(i >= 0, "0129z's roll-up gate is absent")
+        i = t.find("if (ggml_cl_fa_paged_overlap_on() || ggml_cl_fa_paged_verify_on() || ggml_cl_fa_paged_timeline()) {")
+        self.assertTrue(i >= 0, "0129z's roll-up gate is absent (0130p adds the timeline's counters)")
         block = t[i:t.find("backend_ctx->pair_perm_t = nullptr;", i)]
         self.assertIn("g_fa_paged_totals.v_nodes    += o.v_nodes;", block,
                       "the verify totals roll up without OVERLAP")
@@ -156,7 +156,7 @@ class FaPagedPostFA(unittest.TestCase):
         self.assertIn("long long v_post_changes = 0;", t)
         self.assertIn("post-FA changes %lld", t)
         self.assertIn("g_fa_paged_totals.v_post_changes += o.v_post_changes;", t)
-        i = t.find("if (ggml_cl_fa_paged_overlap_on() || ggml_cl_fa_paged_verify_on()) {")
+        i = t.find("if (ggml_cl_fa_paged_overlap_on() || ggml_cl_fa_paged_verify_on() || ggml_cl_fa_paged_timeline()) {")
         self.assertTrue(i >= 0)
         block = t[i:t.find("backend_ctx->pair_perm_t = nullptr;", i)]
         self.assertIn("o.v_post_changes = 0;", block)
@@ -165,10 +165,12 @@ class FaPagedPostFA(unittest.TestCase):
         t = self.t
         self.assertEqual(t.count("ggml_cl_fa_paged_noconsume()"), 2,
                          "the switch must be defined once and called exactly once")
-        self.assertIn("if (o.consumed[parity] && !ggml_cl_fa_paged_noconsume()) wl[nw++] = o.consumed[parity];", t)
+        self.assertIn("const bool nocons = ggml_cl_fa_paged_noconsume();", t,
+                      "the drop switch is read once and the drop is the only effect")
+        self.assertIn("if (o.consumed[parity] && !nocons) wl[nw++] = o.consumed[parity];", t)
         # the cross-step prefetch's wait is not the drop
-        self.assertIn("cl_uint  nw = o.consumed[p] != nullptr ? 1 : 0;", t,
-                      "NOCONSUME must not touch the prefetch's consumed wait")
+        self.assertIn("cl_uint  nw = (o.consumed[p] != nullptr && !nofix) ? 1 : 0;", t,
+                      "NOCONSUME must not touch the prefetch's consumed wait (NOFIX does)")
 
 
 class FaPagedPostSelftest(unittest.TestCase):
@@ -263,5 +265,84 @@ class FaPagedForcedRace(unittest.TestCase):
         t = self.t
         self.assertEqual(t.count("ggml_cl_fa_paged_noconsume()"), 2,
                          "NOCONSUME is defined once and called exactly once, in issue")
-        self.assertIn("cl_uint  nw = o.consumed[p] != nullptr ? 1 : 0;", t,
-                      "the cross-step prefetch's consumed wait must stay unconditional")
+        self.assertIn("cl_uint  nw = (o.consumed[p] != nullptr && !nofix) ? 1 : 0;", t,
+                      "the cross-step prefetch's consumed wait is kept unset; NOFIX drops it")
+
+class FaPagedTimelineAndNoFix(unittest.TestCase):
+    """Patches 0130p/0130q/0130r's device-free gate: the timeline's marks and margin, the
+    NOFIX drop at 0130c's site, and every development switch's startup line and per-request
+    count.
+
+    Red mutations, each run and seen failing before it was restored:
+      (a) the FA split start stamp moved after k_merge: the ordering cell fails -- the margin
+          would be taken against the merge, not against the FA's read;
+      (b) NOFIX applied to `issue`'s consumed wait instead of the prefetch's: the site cell
+          fails -- the red must be at 0130c, not the intra-graph wait;
+      (c) the request-end dev-switch line removed: the counted cell fails -- window 296's
+          defect was a log that could not say the red arm had run red.
+    """
+
+    def setUp(self):
+        self.root = _llama_root()
+        self.t = (self.root / OPENCL).read_text()
+
+    def test_the_switch_and_the_two_profiling_sources(self):
+        t = self.t
+        self.assertIn('getenv("GGML_OPENCL_FA_PAGED_TIMELINE")', t, "the timeline switch is absent")
+        self.assertIn("const cl_command_queue_properties cqp = ggml_cl_fa_paged_timeline() ? CL_QUEUE_PROFILING_ENABLE : 0;", t,
+                      "the copy queue is profiling-enabled only when the switch is on")
+        self.assertIn("clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_START", t)
+        self.assertIn("build with GGML_OPENCL_PROFILING", t,
+                      "a build without compute-queue profiling must say so, not print zeros")
+        self.assertIn("ggml_cl_fa_paged_tl_finish(g_fa_paged_ctx)", t,
+                      "the request's end must print and release the stamps")
+
+    def test_the_marks_and_the_margin(self):
+        t = self.t
+        split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
+        start = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 2, paged_overlap_parity, 0, nullptr);")
+        end   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 3, paged_overlap_parity, 0, nullptr);")
+        merge = t.find("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);")
+        mend  = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 4, paged_overlap_parity, 0, nullptr);")
+        post  = t.find("ggml_cl_fa_paged_verify3_post(backend_ctx, true);")
+        pst   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 6, paged_overlap_parity, 0, nullptr);")
+        self.assertTrue(min(split, start, end, merge, mend, post, pst) >= 0, "a stamp is absent")
+        self.assertLess(start, split, "the FA split start stamp must precede the split kernel")
+        self.assertGreater(end, split, "the FA split end stamp must follow it")
+        self.assertLess(end, merge, "the split end must precede the merge")
+        self.assertGreater(mend, merge, "the merge stamp must follow it")
+        self.assertLess(pst, post, "the post start stamp must precede the post hash")
+        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 5, parity, o.consumed[parity]);", t,
+                      "the consumed marker is stamped")
+        # the copy start marker carries the copy's waits
+        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 0, parity, nw, wl);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 7, p, nw, wl);", t)
+        # the margin: copy k+2 against FA k's split end, minimum and negative count
+        self.assertIn("const long long m = (long long) cs[k + 1] - (long long) fe[k];", t)
+        self.assertIn("negative %d", t, "the margin line must say whether any pair landed negative")
+
+    def test_nofix_is_the_prefetch_wait_only(self):
+        t = self.t
+        self.assertIn('getenv("GGML_OPENCL_FA_PAGED_NOFIX")', t, "the NOFIX switch is absent")
+        self.assertIn("const bool nofix = ggml_cl_fa_paged_nofix();", t)
+        self.assertIn("cl_uint  nw = (o.consumed[p] != nullptr && !nofix) ? 1 : 0;", t,
+                      "NOFIX must drop the cross-step prefetch's consumed wait (0130c's site)")
+        self.assertEqual(t.count("ggml_cl_fa_paged_nofix()"), 2,
+                         "NOFIX is defined once and called exactly once, in the prefetch")
+        # and not issue's wait: NOCONSUME keeps that meaning, defined once and called once
+        self.assertEqual(t.count("ggml_cl_fa_paged_noconsume()"), 2,
+                         "NOCONSUME stays defined once and called once, in issue")
+
+    def test_every_switch_says_its_value_and_the_summary_counts(self):
+        t = self.t
+        for s in ("GGML_OPENCL_FA_PAGED_NOCONSUME=1", "GGML_OPENCL_FA_PAGED_NOFIX=1",
+                  "GGML_OPENCL_FA_PAGED_DELAY=%ld", "GGML_OPENCL_FA_PAGED_VERIFY=%d",
+                  "GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=3", "GGML_OPENCL_FA_PAGED_TIMELINE=1"):
+            self.assertIn("paged FA switch " + s, t, "the startup line for %s is absent" % s)
+        self.assertIn("paged FA dev switches (request end): NOCONSUME consumed waits dropped %lld; ",
+                      t, "the request end must count the switch arms")
+        self.assertIn("NOFIX cross-step waits dropped %lld; delay kernels %lld; self-test writes %lld", t)
+        self.assertIn("++o.delay_kernels;", t, "delay kernels are counted")
+        self.assertIn("++o.self3_writes;", t, "the injected write is counted")
+        self.assertIn("++o.nc_drops;", t)
+        self.assertIn("++o.nofix_drops;", t)
