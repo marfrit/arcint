@@ -86,6 +86,20 @@ for p in "$work/$SRC"/contrib/llama.cpp/patches/*.patch; do
     [ -e "$p" ] || { echo "no contrib/llama.cpp/patches in the source tarball" >&2; exit 1; }
     git apply --whitespace=nowarn "$p" || { echo "patch does not apply to the pin: $p" >&2; exit 1; }
 done
+# 0130l: a kernel source the host builds must survive the C preprocessor in every
+# define set it hands to the compiler. 0130k put directives inside backslash-continued
+# macro bodies, which fails the whole file and the production decode kernel with it.
+# The same matrix as tests/python/test_kernel_preproc.py; glue steps do not run it.
+KCL="ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl"
+for kv in "-DKT=1 -DVT=2" "-DKT=0 -DVT=0"; do
+  for d in "" "-DGQA_I8=1" "-DGQA_I8=1 -DGQA_ST=1" "-DGQA_V2=1" "-DGQA_PRE=1" \
+           "-DGQA_PRE=1 -DGQA_PRE_BROKEN=1" "-DGQA_NOPRIV=1" \
+           "-DGQA_NOPRIV=1 -DGQA_NOPRIV_BROKEN=1" "-DGQA_NOPRIV=1 -DGQA_PRE=1"; do
+    if ! err=$(cpp -x c -P -DDK=256 -DGQA_SIDES=2 $kv $d "$KCL" -o /dev/null 2>&1); then
+      echo "kernel does not preprocess ($kv $d): $err" >&2; exit 1
+    fi
+  done
+done
 cd "$work"
 
 # The build must be able to say which commit it is. The tarball has no .git, so

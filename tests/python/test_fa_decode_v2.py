@@ -231,8 +231,9 @@ class FaDecodeNoPriv(unittest.TestCase):
 
     def test_the_broken_variant_zeroes_one_component(self):
         k = self.t[KERNEL]
-        self.assertIn("#ifdef GQA_NOPRIV_BROKEN", k, "the broken variant is absent")
-        self.assertIn("(dst)[(64 * c64 + 15) * BK + key] = 0.0h;", k,
+        self.assertIn("#ifdef GQA_NOPRIV_BROKEN\n#define FA_GQA_V15(x) 0.0h", k,
+                      "the broken variant is a file-level value macro (no directive in a macro body)")
+        self.assertIn("(dst)[(64 * c64 + 15) * BK + key] = FA_GQA_V15(v0.sf);", k,
                       "the red op cases need a wrong V value")
 
     def test_the_reduction_order_is_the_bases(self):

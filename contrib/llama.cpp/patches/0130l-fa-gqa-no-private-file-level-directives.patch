@@ -1,0 +1,352 @@
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+index 387d91f..7fb1fcd 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -88,13 +88,12 @@
+ 
+ #define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
+ 
+-// 0130k: GGML_OPENCL_FA_GQA_NOPRIV -- the 5,888 B of private memory the ISA dump shows
+-// at df1c3163, 61 private loads and 8 private stores inside the DPAS span, come from the
+-// kernel's arrays being addressable: every loop that indexes one runs with its index in a
+-// register. This switch unrolls exactly those loops (constant indices then, so IGC keeps
+-// each element in a GRF) and drops the V stage's `vv[64]` array, whose 64-element store
+-// loop no unroller takes. The reduction order is untouched: every loop keeps its
+-// ascending order, so the greedy answer is the base's.
++// 0130k: GGML_OPENCL_FA_GQA_NOPRIV -- the ISA's 5,888 B of private memory and its 61
++// private loads / 8 stores inside the DPAS span come from the kernel's arrays being
++// addressable. This switch unrolls every loop that indexes one (constant indices then, so
++// IGC keeps each element in a GRF) and drops the V stage's vv[64] array. Every directive
++// sits at file level: a '#' inside a backslash-continued macro body is the stringize
++// operator and fails the whole file (0130l's gate).
+ #ifdef GQA_NOPRIV
+ #define FA_UNROLL _Pragma("unroll")
+ #else
+@@ -255,7 +254,9 @@ kernel void flash_attn_gqa_dpas(
+     // this sub-group's rows: (query head, token), valid when m < n_rows
+     int  rh[8], rt[8];
+     bool rv[8];
++#if defined(GQA_NOPRIV)
+     FA_UNROLL
++#endif
+     for (int r = 0; r < 8; ++r) {
+         const int m = tile * 8 + r;
+         rv[r] = m < n_rows;
+@@ -265,14 +266,25 @@ kernel void flash_attn_gqa_dpas(
+ 
+     float m[8];
+     float8 lv = (float8)(0.f);
++#if defined(GQA_NOPRIV)
+     FA_UNROLL
++#endif
+     for (int r = 0; r < 8; ++r) m[r] = M_INIT;
+     float8 o[NDH];
++#if defined(GQA_NOPRIV)
+     FA_UNROLL
++#endif
+     for (int i = 0; i < NDH; ++i) o[i] = (float8)(0.f);
+ 
+     // the V tile of BK keys into a local stage: key fastest, neighbouring lanes
+     // store neighbouring halves
++#ifdef GQA_NOPRIV_BROKEN
++#define FA_GQA_V15(x) 0.0h
++#else
++#define FA_GQA_V15(x) (x)
++#endif
++#if defined(GQA_NOPRIV) && !defined(GQA_PRE)
++    // 0130k: the components straight to local memory, no 64-entry array
+ #define FA_GQA_STAGE_V(k0i, dst)                                                              \
+     for (int u = lid; u < BK * DV / 64; u += nthr) {                                          \
+         const int key = u % BK, c64 = u / BK, kk = min(k0i + key, kv_end - 1);                \
+@@ -281,11 +293,7 @@ kernel void flash_attn_gqa_dpas(
+         const half16 v1 = load16(VT, vrow, 4 * c64 + 1);                                      \
+         const half16 v2 = load16(VT, vrow, 4 * c64 + 2);                                      \
+         const half16 v3 = load16(VT, vrow, 4 * c64 + 3);                                      \
+-#ifdef GQA_NOPRIV
+-        // 0130k: the components straight to local memory, no 64-entry array. The broken
+-        // variant writes one component as zero, so the op cases fail while the registers
+-        // stay: the red arm's shape.
+-                (dst)[(64 * c64 + 0) * BK + key] = v0.s0;
++        (dst)[(64 * c64 + 0) * BK + key] = v0.s0;
+         (dst)[(64 * c64 + 1) * BK + key] = v0.s1;
+         (dst)[(64 * c64 + 2) * BK + key] = v0.s2;
+         (dst)[(64 * c64 + 3) * BK + key] = v0.s3;
+@@ -300,7 +308,7 @@ kernel void flash_attn_gqa_dpas(
+         (dst)[(64 * c64 + 12) * BK + key] = v0.sc;
+         (dst)[(64 * c64 + 13) * BK + key] = v0.sd;
+         (dst)[(64 * c64 + 14) * BK + key] = v0.se;
+-        (dst)[(64 * c64 + 15) * BK + key] = v0.sf;
++        (dst)[(64 * c64 + 15) * BK + key] = FA_GQA_V15(v0.sf);
+         (dst)[(64 * c64 + 16) * BK + key] = v1.s0;
+         (dst)[(64 * c64 + 17) * BK + key] = v1.s1;
+         (dst)[(64 * c64 + 18) * BK + key] = v1.s2;
+@@ -348,11 +356,17 @@ kernel void flash_attn_gqa_dpas(
+         (dst)[(64 * c64 + 60) * BK + key] = v3.sc;
+         (dst)[(64 * c64 + 61) * BK + key] = v3.sd;
+         (dst)[(64 * c64 + 62) * BK + key] = v3.se;
+-        (dst)[(64 * c64 + 63) * BK + key] = v3.sf;
+-#ifdef GQA_NOPRIV_BROKEN
+-        (dst)[(64 * c64 + 15) * BK + key] = 0.0h;   // the red op cases: one V value of every row
+-#endif
++        (dst)[(64 * c64 + 63) * BK + key] = v3.sf;\
++    }
+ #else
++#define FA_GQA_STAGE_V(k0i, dst)                                                              \
++    for (int u = lid; u < BK * DV / 64; u += nthr) {                                          \
++        const int key = u % BK, c64 = u / BK, kk = min(k0i + key, kv_end - 1);                \
++        const global char * vrow = fa_gqa_page_row(ptable, page_size, kk, vb, v_nb1, rvb, rv_nb1); \
++        const half16 v0 = load16(VT, vrow, 4 * c64);                                          \
++        const half16 v1 = load16(VT, vrow, 4 * c64 + 1);                                      \
++        const half16 v2 = load16(VT, vrow, 4 * c64 + 2);                                      \
++        const half16 v3 = load16(VT, vrow, 4 * c64 + 3);                                      \
+         const half vv[64] = { v0.s0, v0.s1, v0.s2, v0.s3, v0.s4, v0.s5, v0.s6, v0.s7,        \
+                               v0.s8, v0.s9, v0.sa, v0.sb, v0.sc, v0.sd, v0.se, v0.sf,        \
+                               v1.s0, v1.s1, v1.s2, v1.s3, v1.s4, v1.s5, v1.s6, v1.s7,        \
+@@ -361,10 +375,9 @@ kernel void flash_attn_gqa_dpas(
+                               v2.s8, v2.s9, v2.sa, v2.sb, v2.sc, v2.sd, v2.se, v2.sf,        \
+                               v3.s0, v3.s1, v3.s2, v3.s3, v3.s4, v3.s5, v3.s6, v3.s7,        \
+                               v3.s8, v3.s9, v3.sa, v3.sb, v3.sc, v3.sd, v3.se, v3.sf };      \
+-        FA_UNROLL \
+         for (int j = 0; j < 64; ++j) (dst)[(64 * c64 + j) * BK + key] = vv[j];                   \
+-#endif
+     }
++#endif
+ 
+ #ifdef GQA_PRE
+     // 0130f: tile t+1's V rows into THIS thread's private registers at the loop's
+@@ -373,7 +386,6 @@ kernel void flash_attn_gqa_dpas(
+     // A global load into registers does not block the thread; its value is
+     // consumed at the store, so the products run while the loads are in flight.
+ #define FA_GQA_PRE_V(k0i, R)                                                                  \
+-    FA_UNROLL \
+     for (int it = 0; it < 2; ++it) {                                                          \
+         const int u = lid + it * nthr;                                                        \
+         if (u >= BK * DV / 64) continue;                                                      \
+@@ -384,15 +396,14 @@ kernel void flash_attn_gqa_dpas(
+         (R)[it][2] = load16(VT, vrow, 4 * c64 + 2);                                           \
+         (R)[it][3] = load16(VT, vrow, 4 * c64 + 3);                                           \
+     }
++#if defined(GQA_NOPRIV) && defined(GQA_PRE)
++    // 0130k: the loaded halves straight to local memory, no 64-entry array
+ #define FA_GQA_STORE_V(R, dst)                                                                \
+-    FA_UNROLL \
+     for (int it = 0; it < 2; ++it) {                                                          \
+         const int u = lid + it * nthr;                                                        \
+         if (u >= BK * DV / 64) continue;                                                      \
+         const int key = u % BK, c64 = u / BK;                                                 \
+-#ifdef GQA_NOPRIV
+-        // 0130k: the loaded halves straight to local memory, no 64-entry array
+-                (dst)[(64 * c64 + 0) * BK + key] = (R)[it][0].s0;
++        (dst)[(64 * c64 + 0) * BK + key] = (R)[it][0].s0;
+         (dst)[(64 * c64 + 1) * BK + key] = (R)[it][0].s1;
+         (dst)[(64 * c64 + 2) * BK + key] = (R)[it][0].s2;
+         (dst)[(64 * c64 + 3) * BK + key] = (R)[it][0].s3;
+@@ -407,7 +418,7 @@ kernel void flash_attn_gqa_dpas(
+         (dst)[(64 * c64 + 12) * BK + key] = (R)[it][0].sc;
+         (dst)[(64 * c64 + 13) * BK + key] = (R)[it][0].sd;
+         (dst)[(64 * c64 + 14) * BK + key] = (R)[it][0].se;
+-        (dst)[(64 * c64 + 15) * BK + key] = (R)[it][0].sf;
++        (dst)[(64 * c64 + 15) * BK + key] = FA_GQA_V15((R)[it][0].sf);
+         (dst)[(64 * c64 + 16) * BK + key] = (R)[it][1].s0;
+         (dst)[(64 * c64 + 17) * BK + key] = (R)[it][1].s1;
+         (dst)[(64 * c64 + 18) * BK + key] = (R)[it][1].s2;
+@@ -455,11 +466,14 @@ kernel void flash_attn_gqa_dpas(
+         (dst)[(64 * c64 + 60) * BK + key] = (R)[it][3].sc;
+         (dst)[(64 * c64 + 61) * BK + key] = (R)[it][3].sd;
+         (dst)[(64 * c64 + 62) * BK + key] = (R)[it][3].se;
+-        (dst)[(64 * c64 + 63) * BK + key] = (R)[it][3].sf;
+-#ifdef GQA_NOPRIV_BROKEN
+-        (dst)[(64 * c64 + 15) * BK + key] = 0.0h;
+-#endif
++        (dst)[(64 * c64 + 63) * BK + key] = (R)[it][3].sf;\
++    }
+ #else
++#define FA_GQA_STORE_V(R, dst)                                                                \
++    for (int it = 0; it < 2; ++it) {                                                          \
++        const int u = lid + it * nthr;                                                        \
++        if (u >= BK * DV / 64) continue;                                                      \
++        const int key = u % BK, c64 = u / BK;                                                 \
+         const half vv[64] = { (R)[it][0].s0, (R)[it][0].s1, (R)[it][0].s2, (R)[it][0].s3,     \
+                               (R)[it][0].s4, (R)[it][0].s5, (R)[it][0].s6, (R)[it][0].s7,     \
+                               (R)[it][0].s8, (R)[it][0].s9, (R)[it][0].sa, (R)[it][0].sb,     \
+@@ -476,10 +490,9 @@ kernel void flash_attn_gqa_dpas(
+                               (R)[it][3].s4, (R)[it][3].s5, (R)[it][3].s6, (R)[it][3].s7,     \
+                               (R)[it][3].s8, (R)[it][3].s9, (R)[it][3].sa, (R)[it][3].sb,     \
+                               (R)[it][3].sc, (R)[it][3].sd, (R)[it][3].se, (R)[it][3].sf };  \
+-        FA_UNROLL \
+         for (int j = 0; j < 64; ++j) (dst)[(64 * c64 + j) * BK + key] = vv[j];                 \
+-#endif
+     }
++#endif
+ #endif
+ 
+     // Q (scaled, half) as the a operand: component r = row r, lane = column
+@@ -497,10 +510,14 @@ kernel void flash_attn_gqa_dpas(
+                 const int rhq = hk * G + (r % G), rtq = r / G;
+                 const global float * qrow = (const global float *)((const global char *) q_void + q_offset +
+                     batch * q_nb3 + rhq * q_nb2 + rtq * q_nb1) + b * 32;
++#if defined(GQA_NOPRIV)
+                 FA_UNROLL
++#endif
+                 for (int i = 0; i < 32; ++i) x[i] = qrow[i] * scale;
+             } else {
++#if defined(GQA_NOPRIV)
+                 FA_UNROLL
++#endif
+                 for (int i = 0; i < 32; ++i) x[i] = 0.f;
+             }
+             float dq; int q[32];
+@@ -516,10 +533,14 @@ kernel void flash_attn_gqa_dpas(
+     }
+ #else
+     short8 qa[KC];
++#if defined(GQA_NOPRIV)
+     FA_UNROLL
++#endif
+     for (int c = 0; c < KC; ++c) {
+         half qv[8];
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int r = 0; r < 8; ++r) {
+             const global float * qrow = (const global float *)((const global char *) q_void + q_offset +
+                 batch * q_nb3 + rh[r] * q_nb2 + rt[r] * q_nb1);
+@@ -536,7 +557,9 @@ kernel void flash_attn_gqa_dpas(
+     // the device) or an uploaded host row, the byte offset given by the backend
+     const global int * ptable = table_void ? (const global int *)((const global char *) table_void + table_off) : 0;
+     const global half * mrow[8];
++#if defined(GQA_NOPRIV)
+     FA_UNROLL
++#endif
+     for (int r = 0; r < 8; ++r) {
+         mrow[r] = mask_void != 0
+             ? (const global half *)((const global char *) mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 +
+@@ -597,7 +620,9 @@ kernel void flash_attn_gqa_dpas(
+ #endif
+         // QK^T
+         float8 s[NKB];
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int g = 0; g < NKB; ++g) {
+ #ifdef GQA_S_SPLIT
+             if (g % GQA_SIDES != side) continue;
+@@ -624,7 +649,9 @@ kernel void flash_attn_gqa_dpas(
+                        (float8)(dk, dk, dk, dk, dk, dk, dk, dk);
+             }
+ #else
++#if defined(GQA_NOPRIV)
+             FA_UNROLL
++#endif
+             for (int c = 0; c < KC; ++c) {
+ #ifndef GQA_K_STAGED
+                 const int8 b = kb16(KT, fa_gqa_page_row(ptable, page_size, min(k0 + g * 16 + lane, kv_end - 1),
+@@ -653,21 +680,29 @@ kernel void flash_attn_gqa_dpas(
+ #endif
+         barrier(CLK_LOCAL_MEM_FENCE);
+ #ifdef GQA_S_SPLIT
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int g = 0; g < NKB; ++g) {
+             if (g % GQA_SIDES == side) continue;
+             s[g] = vload8(0, sx + ((tile * NKB + g) * 16 + lane) * 8);
+         }
+ #endif
+         float mnew[8];
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int r = 0; r < 8; ++r) mnew[r] = m[r];
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int g = 0; g < NKB; ++g) {
+             const int key = k0 + g * 16 + lane;
+             const bool kvis = key < kv_end;
+             float mk[8];
++#if defined(GQA_NOPRIV)
+             FA_UNROLL
++#endif
+             for (int r = 0; r < 8; ++r) {
+                 if (kvis && rv[r]) mk[r] = mrow[r] != 0 ? (float) mrow[r][key] : 0.f;
+                 else mk[r] = M_INIT;
+@@ -679,21 +714,29 @@ kernel void flash_attn_gqa_dpas(
+         }
+         // one reduction per row over all groups instead of one per (row, group)
+         float8 mx8 = s[0];
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int g = 1; g < NKB; ++g) mx8 = fmax(mx8, s[g]);
+         {
+             const float mv[8] = { mx8.s0, mx8.s1, mx8.s2, mx8.s3, mx8.s4, mx8.s5, mx8.s6, mx8.s7 };
++#if defined(GQA_NOPRIV)
+             FA_UNROLL
++#endif
+             for (int r = 0; r < 8; ++r) mnew[r] = fmax(mnew[r], sub_group_reduce_max(mv[r]));
+         }
+         float corr[8];
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int r = 0; r < 8; ++r) {
+             corr[r] = m[r] > 0.5f * M_INIT ? exp(m[r] - mnew[r]) : 0.f;
+             m[r]  = mnew[r];
+         }
+         const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int i = 0; i < NDH; ++i) o[i] *= cv;
+         lv *= cv;
+         short8 pa[NKB];
+@@ -701,7 +744,9 @@ kernel void flash_attn_gqa_dpas(
+             // P for both key groups at once, as float8 vectors
+             const float8 m8 = (float8)(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+             const float8 mcut = (float8)(0.5f * M_INIT);
++#if defined(GQA_NOPRIV)
+             FA_UNROLL
++#endif
+             for (int g = 0; g < NKB; ++g) {
+                 float8 e = native_exp(s[g] - m8);
+                 e = select((float8)(0.f), e, s[g] > mcut);   // M_INIT entries -> 0
+@@ -710,11 +755,15 @@ kernel void flash_attn_gqa_dpas(
+                 pa[g] = as_short8(ph);
+             }
+         }
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int i = 0; i < NDH; ++i) {
+             const int col = side * (DV / GQA_SIDES) + i * 16 + lane;
+             float8 acc = o[i];
++#if defined(GQA_NOPRIV)
+             FA_UNROLL
++#endif
+             for (int g = 0; g < NKB; ++g) {
+ #if defined(GQA_V2) || defined(GQA_PRE)
+                 const int8 b = as_int8(vload8(0, (local const uint *)(vt + vcur * (DV * BK) + col * BK + g * 16)));
+@@ -741,17 +790,22 @@ kernel void flash_attn_gqa_dpas(
+ #undef FA_GQA_PRE_V
+ #undef FA_GQA_STORE_V
+ #endif
++#undef FA_GQA_V15
+ 
+     // the partial records: m and l by the left half's lane 0, O by column
+     const float larr[8] = { lv.s0, lv.s1, lv.s2, lv.s3, lv.s4, lv.s5, lv.s6, lv.s7 };
++#if defined(GQA_NOPRIV)
+     FA_UNROLL
++#endif
+     for (int r = 0; r < 8; ++r) {
+         const float lr = sub_group_reduce_add(larr[r]);
+         if (!rv[r]) continue;
+         const ulong rec_idx = (((ulong) batch * n_head + rh[r]) * n_q + rt[r]) * n_splits + split;
+         global float * rec = partial_void + rec_idx * (ulong) PARTIAL;
+         if (side == 0 && lane == 0) { rec[0] = m[r]; rec[1] = lr; }
++#if defined(GQA_NOPRIV)
+         FA_UNROLL
++#endif
+         for (int i = 0; i < NDH; ++i) {
+             const float ov[8] = { o[i].s0, o[i].s1, o[i].s2, o[i].s3, o[i].s4, o[i].s5, o[i].s6, o[i].s7 };
+             rec[2 + side * (DV / GQA_SIDES) + i * 16 + lane] = ov[r];
