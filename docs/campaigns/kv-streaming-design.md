@@ -739,6 +739,17 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   only through zero_host/host_set_page for pages it saves, llama-kv-stream.cpp:172-259) and
   new K/V go to resident cells (llama-kv-cache.cpp:1730,1765). No invariant conflict; the
   pool partition and slots are untouched, nothing is evicted for it. Estimated 239 -> ~211 ms.
+- **0129v/0129w (`code` + window 290 `measured-here`):** the cross-step lead is keyed by
+  (plan page, ring row) pairs and the issuing chain, not by the row sequence -- two plans of
+  the same size share `[0..n-1]` while holding different pages, and the MTP head's graph is its
+  own chain. Window 290: VERIFY=2's self-test fired (1 of 312 chunks, the flipped byte), and
+  three lines were silent: the self-test tested its counter after the increment; the summary
+  printed at the first graph with zero counters; and the request-end line never reached the
+  stream because the served hybrid model's memory is `llama_memory_hybrid`
+  (src/llama-model.cpp:3317-3324), whose `request_end()` was `llama_memory_i`'s no-op. It now
+  forwards to the attention cache (hybrid, hybrid_iswa, kv_cache_iswa), and the request's
+  totals -- issued ahead, fell back, verify nodes/bytes/mismatches, reused/re-copied -- print
+  at the request's end through a weak symbol, so a build without the OpenCL backend links.
 - **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
   kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
   `{fa_gqa_sides*n_tiles*16, n_head_kv*n_batch, n_splits}`, and w289b's grid {160,4,256} is
