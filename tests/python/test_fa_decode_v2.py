@@ -72,7 +72,7 @@ class FaDecodeV2(unittest.TestCase):
         k = self.t[KERNEL]
         self.assertIn("local half vt[2 * DV * BK];", k,
                       "two V stages: 16 KB each at head 256, BK 32")
-        i = k.find("#ifdef GQA_V2\n    // the first tile staged before the loop")
+        i = k.find("#if defined(GQA_V2) || defined(GQA_PRE)\n    // the first tile staged before the loop")
         self.assertTrue(i >= 0, "the prologue stage is absent")
         loop = k.find("for (int k0 = kv_start; k0 < kv_end; k0 += BK) {", i)
         self.assertTrue(loop >= 0)
@@ -93,7 +93,7 @@ class FaDecodeV2(unittest.TestCase):
                       "P V must read this tile's buffer")
         self.assertIn("vcur = 1 - vcur;", k, "the consumed buffer toggles at the tile's end")
         # the base form is untouched: the non-V2 path stages k0 into vt at the old place
-        self.assertIn("#ifndef GQA_V2\n        FA_GQA_STAGE_V(k0, vt)\n#endif", k)
+        self.assertIn("#if !defined(GQA_V2) && !defined(GQA_PRE)\n        FA_GQA_STAGE_V(k0, vt)\n#endif", k)
         self.assertIn("local half vt[DV * BK];     // [column][key]", k)
 
     def test_depth_op_cases_exist_for_the_quantized_decode(self):
@@ -110,3 +110,76 @@ class FaDecodeV2(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FaDecodePre(unittest.TestCase):
+    """Patch 0130f's device-free gate: the register prefetch of the V stage, its
+    broken variant, and 0130e's perf cases.
+
+    0130b's V2 stage writes the loaded halves straight to local memory, so the
+    thread stalls at the store before tile t's products; 0130f loads tile t+1's
+    halves into private registers at the loop's top and stores them to the other
+    buffer only after P V, so the value is consumed after the products.
+
+    Red mutations, each run and seen failing before it was restored:
+      (a) the register store moved before the tile's P V (into the other buffer):
+          the placement cell fails -- the loads are consumed before the products;
+      (b) the register loads moved after QK^T: the placement cell fails -- no
+          load is in flight during the products;
+      (c) the broken store removed: the broken-gate cell fails -- the red op
+          cases would have nothing to fail against.
+    """
+
+    def setUp(self):
+        self.root = _llama_root()
+        self.t = {f: (self.root / f).read_text() for f in (OPENCL, KERNEL, BACKEND)}
+
+    def test_switch_is_default_off_and_a_separate_build(self):
+        t = self.t[OPENCL]
+        i = t.find('const char * fdp_env    = getenv("GGML_OPENCL_FA_DECODE_PRE");')
+        self.assertTrue(i >= 0, "the PRE switch is absent")
+        block = t[i:t.find("\n", t.find("const bool   fdp_on", i))]
+        self.assertIn("atoi(fdp_env) != 0", block,
+                      "PRE must be off unless GGML_OPENCL_FA_DECODE_PRE is a nonzero number")
+        self.assertIn("if (fdp_on) {", t, "the PRE build is not gated on the switch")
+        self.assertIn('" -DGQA_PRE=1"', t)
+        self.assertIn('(fdp_broken ? " -DGQA_PRE_BROKEN=1" : "")', t,
+                      "the broken variant is a separate build, not a runtime flag")
+        self.assertIn("did not build; the base kernel stays", t)
+
+    def test_loads_are_at_the_top_and_the_store_after_pv(self):
+        k = self.t[KERNEL]
+        loop = k.find("for (int k0 = kv_start; k0 < kv_end; k0 += BK) {")
+        self.assertTrue(loop >= 0)
+        load = k.find("FA_GQA_PRE_V(k0 + BK, pre)", loop)
+        qkt = k.find("// QK^T", loop)
+        pv = k.find("for (int i = 0; i < NDH; ++i) {\n            const int col", loop)
+        store = k.find("FA_GQA_STORE_V(pre, vt + (1 - vcur) * (DV * BK))", loop)
+        self.assertTrue(load >= 0 and qkt >= 0 and pv >= 0 and store >= 0,
+                        "PRE's load, QK^T, P V and store must all be present")
+        self.assertLess(load, qkt, "the loads must be issued before the products")
+        self.assertLess(qkt, pv)
+        self.assertGreater(store, pv, "the store must follow the tile's P V")
+        self.assertIn("half16 pre[2][4];", k, "private registers, not a local buffer")
+        self.assertIn("local half vt[2 * DV * BK];", k, "V2's two stages are reused")
+
+    def test_the_broken_variant_overwrites_the_consumed_stage(self):
+        k = self.t[KERNEL]
+        i = k.find("#ifdef GQA_PRE_BROKEN")
+        self.assertTrue(i >= 0, "the broken variant is absent")
+        block = k[i:k.find("#endif", i)]
+        self.assertIn("FA_GQA_STORE_V(pre, vt + vcur * (DV * BK))", block,
+                      "the broken store must target the buffer P V reads")
+        j = k.find("barrier(CLK_LOCAL_MEM_FENCE);", i)
+        self.assertGreater(j, i, "the broken store precedes the P V barrier")
+
+    def test_the_perf_list_carries_the_depth_cases(self):
+        t = self.t[BACKEND]
+        i = t.find("static std::vector<std::unique_ptr<test_case>> make_test_cases_perf()")
+        self.assertTrue(i >= 0)
+        perf = t[i:t.find("// SWIGLU at a 27B-class FFN width", i)]
+        self.assertIn("// 0130e: 0130a's depth cases in the PERF list too.", perf)
+        self.assertIn("for (int64_t kv : {4096, 65536, 245760})", perf, "the served depth")
+        self.assertIn("for (int64_t nb : {4, 5, 6, 7})", perf, "the 4-7 row form")
+        self.assertIn("new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb", perf)
+        self.assertIn("{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}", perf)

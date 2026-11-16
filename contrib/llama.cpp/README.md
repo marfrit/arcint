@@ -8044,3 +8044,27 @@ seen failing.
   the post hash included; a copy that waits the marker cannot land inside the FA it guards.
   With the wait dropped the only ordering left is the copy queue's own, which is the race
   `=3` is built to see (`code`).
+
+## 0130e-fa-decode-perf-depth-cases.patch
+
+`code` for the mechanism; the timed number is owed (no GPU in this session). 0130a added the
+4-7 row decode kernel's depth cases to the TEST list only; `make_test_cases_perf()` builds
+its own list, so window 293b's perf arms matched nothing (`test-backend-ops perf -o
+FLASH_ATTN_EXT -p '<depth regex>'` ran 0 cases). This patch puts the same 3 K/V pairs x
+{4,5,6,7} rows x {4,096, 65,536, 245,760} keys into the perf list, so a red-first run of the
+filter prints `us/run` for the kernel's own served shapes.
+
+## 0130f-fa-decode-v-register-prefetch.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session). 0130b's V2
+double buffer stores the loaded halves to local memory immediately after the loads, so the
+thread stalls at the store before tile t's products run; the second buffer hides nothing
+within a sub-group. 0130f loads tile t+1's V halves into the thread's private registers at
+the loop's top, runs tile t's QK^T, softmax and P V, and stores the registers to the other
+stage only after P V, so the load's value is consumed after the products. Two stages and
+the same local footprint as V2 (58,224 B at head 256 q8_0 K/q4_0 V); the build option set is
+identical, one switch apart: `GGML_OPENCL_FA_DECODE_PRE=1`, default off, replacing a pair's
+kernel only after it built and fits local memory, with a WARN and the base kernel when it
+does not. `GGML_OPENCL_FA_DECODE_PRE_BROKEN=1` is a separate build whose store goes to the
+buffer P V reads, before the products: the red op cases. The gate is device-free,
+`tests/python/test_fa_decode_v2.py`'s `FaDecodePre`, three mutations run and seen failing.
