@@ -12,6 +12,7 @@ Red first: on 8236e31d's file the base set prints
   "flash_attn_gqa_dpas.cl:276:32: error: '#' is not followed by a macro parameter"
 and rc 1. Green: rc 0 for every set.
 """
+import re
 import shutil
 import subprocess
 import unittest
@@ -60,6 +61,11 @@ class KernelPreproc(unittest.TestCase):
                     r = subprocess.run(["cpp", *base, *kv, *d, str(p)], capture_output=True, text=True)
                     if r.returncode != 0 or r.stderr.strip():
                         bad.append((k, kvname, name, r.returncode, r.stderr.strip()[:160]))
+                    # 0130o: a macro parameter left in the output = a body that ended early
+                    # (dafb1a4b: the NOPRIV stores outside FA_GQA_STAGE_V/STORE_V, which cpp
+                    # accepts and ocloc rejects: "use of undeclared identifier 'dst'")
+                    elif re.search(r"\b(dst|k0i)\b", r.stdout):
+                        bad.append((k, kvname, name, "residue", "macro parameter dst/k0i after cpp"))
         self.assertEqual(bad, [], "a kernel failed the preprocessor: %r" % (bad,))
 
 

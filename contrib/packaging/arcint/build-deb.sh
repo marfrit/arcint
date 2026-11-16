@@ -98,6 +98,11 @@ for kv in "-DKT=1 -DVT=2" "-DKT=0 -DVT=0"; do
     if ! err=$(cpp -x c -P -DDK=256 -DGQA_SIDES=2 $kv $d "$KCL" -o /dev/null 2>&1); then
       echo "kernel does not preprocess ($kv $d): $err" >&2; exit 1
     fi
+    # 0130o: a stage/store macro parameter left in the output means a body ended early
+    # (a line without its continuation), which cpp accepts and the device compiler does not.
+    if cpp -x c -P -DDK=256 -DGQA_SIDES=2 $kv $d "$KCL" | grep -q -w -E "dst|k0i"; then
+      echo "kernel macro body ends early ($kv $d): parameter dst/k0i left after preprocessing" >&2; exit 1
+    fi
   done
 done
 cd "$work"
