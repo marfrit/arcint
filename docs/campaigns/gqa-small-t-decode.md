@@ -188,9 +188,10 @@ over ~13 graphs, attention 1,841 ms (68 %). `flash_attn_gqa_dpas` (4-7 rows) 116
 Per work-group, per call, q8_0 K / q4_0 V, head 256: a K row is 256/32 blocks x 34 B = 272 B,
 a V row 8 blocks x 18 B = 144 B, so 416 B a key. 0097's split (128-256 keys, cap 256) gives
 each work-group ~938 keys = ~390 KB. Work-groups a call = 4 KV heads x splits x row tiles;
-at 240k and cap 256 that is 4 x 256 x (rows/8-per-side) = ~1024-2048, against 160 Xe cores
-with 0045's one work-group a core and 20 a wave -- ~6-13 waves a call, i.e. the grid is
-full, occupancy is not the problem.
+at 240k and cap 256 that is 4 x 256 x (rows/8-per-side) = ~1024-2048 work-groups. The B60
+has **20 Xe cores** (160 vector engines), so with 0045's one work-group a core and 20 a wave
+that is **~51-102 waves** a call (corrected 2026-11-16; the first draft said 6-13): the grid
+is full many times over, so occupancy is not the problem.
 - Both kernels: `#define BK 32` (`flash_attn_gqa_dpas.cl:66`), staged path
   (GQA_K_STAGED, :85) copies BK keys to local memory, then TWO `barrier(CLK_LOCAL_MEM_FENCE)`
   per tile (:305 before the stage, :318 after it, :336 for the q8 staging) plus the V and S
@@ -201,8 +202,8 @@ full, occupancy is not the problem.
   BK x DK/64 x 4 vector loads = 32 x 4 x 4 = 128 `load16` calls issued by the whole
   work-group's threads (nthr threads stride them, :307), so ~1-4 16-byte loads in flight per
   lane; the barrier drains them all before any product. Little's law, latency assumed
-  ~700 ns (B60 HBM; the 14.3 GB/s copy measurement of 0032/0044 is per-slot streaming, not a
-  latency figure -- `measured-here` has no latency probe, so this is an assumption): at
+  ~700 ns (**assumed, no latency probe here**: the B60's memory is GDDR6, and the 14.3 GB/s
+  copy measurement of 0032/0044 is per-slot streaming, not a latency figure): at
   700 ns and 16 B a load, 300 GB/s needs 300e9 x 700e-9 / 16 = 13,125 loads in flight device-
   wide, ~82 a core. One work-group a core with ~4 loads a lane x 16 lanes is ~64 issued but
   drained at a barrier, so the average in-flight count is far below 82 -- consistent with the
@@ -221,10 +222,19 @@ full, occupancy is not the problem.
   already has that shape (0097 + the merge); the reference's advantage is not the split.
 - Strata: its decode attention is split-K with an explicit merge too --
   `decode_attn_i8_split_kernel` and the merge block (`src/kernels/cuda/qsa_prompt_attn.cu:805`,
-  :1018-1030, one block per (query, head), a thread per dimension). No Intel/SYCL attention
-  port exists in the checkout: `grep -rli sycl|xpu src` matches only CPU kernels
-  (`src/kernels/cpu/*`), so the SYCL claim in the round's premise is not in this source
-  (`code`, negative by grep -- I did not find a second checkout).
+  :1018-1030, one block per (query, head), a thread per dimension). **Correction
+  (2026-11-16): the Intel port is in the checkout under `sycl/`** -- my first grep covered
+  `src/` only. `docs/INTEL.md`, `docs/INTEL_ARC.md`;
+  `sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp` (the decode attention: scores in local
+  memory, three `barrier()` a chunk at :186, :305, :326, cells read straight from global --
+  no staged tile, no double buffer); `qsa_prompt_attn_esimd.dp.cpp` (:1-16: the FP32 prompt
+  kernel is compute bound at ~60 % of the card's FP32 peak; the ESIMD form runs both products
+  on the s8 DPAS, scores to local memory, one barrier later every thread has all 128 cells,
+  load-block reads); `qsa_prompt_attn_xmx.dp.cpp`; `native_flash_attn.dp.cpp` (:253, :260,
+  :297, group barriers a tile, loads by block). Strata's decode attention is **sparse (QSA,
+  over selected cells)** -- a different mechanism from our dense GQA decode; read only for
+  how its Intel mainloop issues loads: block loads straight into the DPAS a operand, one
+  barrier a tile, nothing double-buffered. None of that reaches past our form.
 - FreeToken: paged decode goes to `sgl_kernel.flash_attn_with_kvcache` with `num_splits`
   and `pack_gqa` (`python/freetoken/attention/fa.py:169,194`), i.e. it delegates to
   FlashAttention's split + GQA packing; its own Triton path is FA-shape, not a novel
@@ -247,3 +257,21 @@ Red first: op cases in `tests/test-backend-ops.cpp` at 4-7 rows, q8_0/q4_0, head
 4k/64k/240k keys (0016's depth cases exist; extend them to quantized KV), plus a
 broken variant (single buffer, barrier before the product) that must fail.
 Bar: CLAUDE.md's answer-level bar (KL within 0.03 nats of the baseline arm), op cases green.
+
+### Round 15 -- built 2026-11-16 (patch 0130b, head ac04a969)
+
+The mechanism the analysis picked, behind `GGML_OPENCL_FA_DECODE_V2=1` (default off), 4-8 row
+form: **two local V stages** (16 KB each at head 256, BK 32), tile t+1's stage at the loop's
+top before tile t's Q K^T so its global loads run during the products, P V reading this tile's
+buffer, the consumed buffer toggling at the tile's end. `local` a work-group goes 42 KB ->
+58 KB (q8s 16 + q8d 2 + vt 32 + sx 8), below the 64 KB device limit and still one work-group a
+core per 0045 -- so 0016's BK-64 local-memory loss does not apply. Barrier count unchanged:
+one WAR fence at the tile's top, one before P V (the second previously also covered the V
+tile, which now comes from the earlier stage). Red: `GGML_OPENCL_FA_DECODE_V2_BROKEN=1` makes
+the stage overwrite the buffer the products read, and 0130a adds the quantized depths (4-7
+rows, head 256, G 6, q8_0 K / q4_0 V at 4,096 / 65,536 / 245,760 keys).
+Expectation at 240k (`inferred`, arithmetic): a call reads 4 KV heads x 240k x 416 B = ~400 MB;
+today 8.34 ms = 48 GB/s with the V stage on the critical path. If the overlap lifts the
+achieved rate to 75-90 GB/s (the scatter limit of 32-44 B rows on this class of GPU, not a
+measured figure here), the same call is 400 MB / 80 GB/s = **~5 ms, 1.7x**; a 1.2x gain is the
+conservative floor if only the latency, not the throughput, was hidden.
