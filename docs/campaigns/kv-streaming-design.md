@@ -717,6 +717,49 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   and lead both take the fallback there; the FA filter's pass count says nothing about them.
   A case that reaches the path needs USM host allocations and a one-region ring -- the next
   step; until then the served NOWAIT arm is the only red evidence for "the FA waits its copy".
+- **Window 289b (`measured-here`, unitrace device timeline, 261k pool 3584, one cached 32-token decode):**
+  unset one queue: span 6317.6 ms over ~16 graphs, kernels 3181.6 ms, page copies 2919.7 ms
+  (41.8 GB at 14.32 GB/s), idle 209 ms -- ~199 compute + ~182 copies serial a step.
+  OVERLAP: span 3586.6 ms, kernels 2972.8 ms, copy queue 2678.2 ms (38.36 GB at 14.32 GB/s),
+  both busy 2208.9 ms, compute only 788.2 ms, copy only 469.3 ms, idle 110 ms -- ~198 compute
+  + ~31 copy-only + ~7 idle = ~239 ms a step. Compute does not slow under concurrent DMA
+  (flash_attn_gqa_dpas 9356 us vs 9148 us a call). Copy-only sits before the FIRST paged FA
+  of every graph (28.0 ms, copy queue busy), i.e. node 0 (C8), and before each other paged FA
+  0.4-1.3 ms (each ~160 MB copy ~11.2 ms is just longer than the compute between two
+  attention layers): ~28 + 13 ms a step. FA dominates compute: 9.15 ms x 16 ~ 146 of ~198.
+- **C8 (`code` + 0129u):** node 0's copies wait a compute-queue marker taken at the first
+  paged FA, so they start after the graph's stems and first GDN layers; node 1's copies
+  follow node 0's on one in-order copy queue, but FA 0 waits only `ready[slot 0]` -- the
+  28 ms is that start delay plus node 0's ~11 ms, not node 1's wait. 0129u copies the next
+  graph's node 0 pages at the last paged FA, waiting the slot's last reader's `consumed`
+  event (two attention layers back), so they run under this graph's last FA, last layer,
+  the head and the host's sampling; `before(0)` reuses them when this graph's node 0 plan
+  rows equal the rows they filled and re-copies on a difference (counted). Valid by
+  immutability: streamed pages never change in the host store (prepare() writes the store
+  only through zero_host/host_set_page for pages it saves, llama-kv-stream.cpp:172-259) and
+  new K/V go to resident cells (llama-kv-cache.cpp:1730,1765). No invariant conflict; the
+  pool partition and slots are untouched, nothing is evicted for it. Estimated 239 -> ~211 ms.
+- **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
+  kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
+  `{fa_gqa_sides*n_tiles*16, n_head_kv*n_batch, n_splits}`, and w289b's grid {160,4,256} is
+  2 sides x 5 tiles x 16 lanes = 10 sub-groups a work-group (5 tiles because GQA 6 x 6
+  tokens = 36 rows), 4 KV heads, 256 splits (the cap, ~1020 keys a split). Bounds, from the
+  kernel: every work-group walks its split's keys; each key costs one `fa_gqa_page_row`
+  lookup (an int load of the 1024-entry table, `key/ps` a shift for ps 256,
+  `flash_attn_gqa_dpas.cl:166-172`) and a K row (1088 B q8_0) and a V
+  row (576 B) -- 261k keys a layer is ~434 MB, the number w289b measured at 47 GB/s against
+  a 456 GB/s peak, so the call is bandwidth/occupancy bound, not arithmetic bound; 1024
+  work-groups at one a Xe core (0045's measured 20 a wave) is 51 waves, so the split count
+  sets the wave count while kv_per_split sets the per-wave work. The merge
+  (`:25875-25890`, one lane per float4) reads the partials: 12 heads x 6 tokens x 256 splits
+  x 256 floats = 18.9 MB a layer, ~302 MB a step -- a tenth of the FA's own read. Compare
+  the non-paged path when w291's 240k number lands; before it, 0097's split rule (quantized
+  K/V wants 128-256 a split at 4k+, 256 cap) and 0045's wave quantization are the two
+  measured anchors. No build until then; the change would follow llama.cpp CUDA's
+  flash-decoding split (`ggml-cuda/fattn-common.cuh` `launch_fattn` /
+  `flash_attn_combine_results`, `code`, cited in 0045) -- fewer, longer splits when the wave
+  count is under the core count -- and Strata's paged decode attention would be read first
+  (no proposal without that read).
 - **Next lever, analysis (`code` from the references, `measured-here` from windows 284/288):**
   at 261k the step is copy-bound: 473 pages x 425,984 B x 16 layers = 3.22 GB a step; at
   14.3 GB/s USM that is 225 ms against 274.3 measured, with compute 237 ms. What lowers it:
