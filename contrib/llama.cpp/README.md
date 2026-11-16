@@ -8184,3 +8184,30 @@ profiling sources, NOFIX called exactly once in the prefetch and NOCONSUME once 
 every switch's startup line and the request-end counts. Mutations run and seen failing,
 then restored: the split start stamp moved after the merge, NOFIX added to `issue`'s wait,
 the summary's dev-switch line renamed.
+
+## 0130w-fa-paged-timeline-slot-and-host-time.patch
+
+`code`: window 298b's timeline paired once per ring slot and could not say why a copy did
+not land inside an FA, so this patch carries the three mechanisms as one file -- they are
+one timeline build's measurements, and none changes a runtime default.
+
+- **The event carries node and slot separately** (0130w's slot fix): the FA stamps passed
+  the dispatch's *node index* in the slot field, so only nodes 0/1 matched a ring slot and
+  the margin compared one pair per slot. `struct fa_paged_tl_ev` gains `node` beside
+  `slot`; the FA's slot is `ggml_cl_fa_paged_overlap_slot` of the chain node (the copy
+  stamps already used the issue's slot), the lines print "slot %d node %d", and the margin
+  pairs copy k+2 against FA k per slot.
+- **The host submit time** (0130x): each stamp keeps the host time it was submitted at
+  (`CLOCK_MONOTONIC`), the base takes `clGetDeviceAndHostTimer` so both clocks are in one
+  frame (an ICD without it warns once and keeps the device stamps relative to the base
+  event), the FA's dispatch entry and exit are stamped host-only, and each copy prints
+  `start-submit` -- 'the host submitted late' and 'the device held the copy' separate.
+- **`GGML_OPENCL_FA_PAGED_DELAY_AT=splits`** (0130y): moves 0130h's spin before the split
+  kernels, the only placement that widens the ring's read window; the default `merge`
+  keeps its meaning. For the cross-step prefetch to land inside a reader, the FA to
+  lengthen is the slot's last reader two attention layers before the graph's last FA --
+  the FA whose `overlap_after` armed `consumed[p]` (`code`).
+
+Gate: `FaPagedTimelineSlotHostDelay` in `tests/python/test_fa_paged_lead.py`; three
+mutations run and seen failing, restored: an FA stamp back to the node in the slot field,
+the AT=splits spin removed, the submit time dropped from the kept stamps.

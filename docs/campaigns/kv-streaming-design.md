@@ -1187,3 +1187,10 @@ per patch; DESIGN §7 and §3.9 gain a line when the state of play moves;
   the timeline margin is the non-blocking detector, and a post hash on the second queue is
   the other. The delay n follows from the timeline: FA split duration and copy duration per
   slot, n ~ (copy duration - FA hold) * 1.5 GHz / 2 iterations (`inferred`).
+
+- **0130w-0130z (`code`), round 7's timeline defects:** the stamps' slot field held the
+  node index (one margin pair per slot), the events carried no host time, and 0130h's spin
+  sat after the readers so it lengthened no read. The events now carry node and slot, the
+  submit time (clGetDeviceAndHostTimer at the base), and `DELAY_AT=splits` puts the spin
+  before the split kernels; to widen the read the prefetch must wait, the FA to lengthen
+  is the slot's last reader two layers before the graph's last FA.
