@@ -759,6 +759,24 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   the next layer one ahead sits after a `return` in the split-decode branch the served decode
   takes (`ggml-opencl.cpp:25979` before :26102), so every node's copies went out in its own
   dispatch; 0130c calls it in that branch too and names every early return of the prefetch.
+- **0129n-0129w decode: no consumed wait (`code`), OVERLAP decode timings before
+  `71429597` void.** `consumed[p]` -- the event a copy into slot p waits before overwriting
+  bytes the FA two layers back read -- is armed only in
+  `ggml_cl_fa_paged_overlap_after` (`ggml-opencl.cpp:23960-23972`), and
+  `overlap_graph` clears it at every new graph (`:23890-23905`). In the split-decode branch,
+  which every decode takes, the tail call was unreachable until 0130c (`return` at :25979,
+  call at :26102), so on a decode `consumed[]` stayed nullptr, `issue()` passed `nw = 0`
+  (`:23940`), and a copy into slot p could start while the FA two layers back was still
+  reading it: a write-after-read race. Prompt graphs were not affected -- a prompt FA ends at
+  the function's tail, so `after` ran and armed the consumed marker. The read side was
+  correct: each FA waited its own ready event, which is why VERIFY (a hash at the FA's start,
+  blocking readback) read 0 mismatches -- it cannot see a write that lands *during* the FA.
+  Window 288 (261k, 12.07 t/s), 289b and 292 are therefore **void as OVERLAP timings** until
+  re-measured on `71429597`; window 288 and 292 both showed the alternate opening
+  ("...exec/flash_nex" against "...exec/backend_o") at 261k in the OVERLAP arms, two windows
+  running. The post-FA check (VERIFY=3: a second hash enqueued right after FA j's kernels,
+  compared with the pre-FA one, non-blocking readback at the graph's end) is specified but not
+  built yet; `GGML_OPENCL_FA_PAGED_NOCONSUME=1` is its red arm.
 - **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
   kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
   `{fa_gqa_sides*n_tiles*16, n_head_kv*n_batch, n_splits}`, and w289b's grid {160,4,256} is
