@@ -254,12 +254,16 @@ class FaPagedForcedRace(unittest.TestCase):
     def test_the_delay_sits_between_the_split_kernels_and_the_merge(self):
         t = self.t
         split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
-        call  = t.find("ggml_cl_fa_paged_delay(backend_ctx);")
+        call  = t.find("if (!ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);")
         merge = t.find("cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);")
         self.assertTrue(split >= 0 and call >= 0 and merge >= 0)
         self.assertGreater(call, split, "the delay must follow the FA's split kernels")
         self.assertLess(call, merge, "the delay must precede the merge")
-        self.assertIn("// 0130h: the forced race's busy-wait, after the split kernels and before the merge", t)
+        self.assertIn("// 0130h: the forced race's busy-wait, after the split kernels and before the merge;", t)
+        # 0130y: with DELAY_AT=splits the same spin goes out BEFORE the split kernels instead
+        early = t.find("if (ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);   // 0130y: before the readers")
+        self.assertGreater(early, 0)
+        self.assertLess(early, split, "0130y: the AT=splits spin must precede the split kernels")
 
     def test_noconsume_stays_in_issue_and_the_prefetch_keeps_its_wait(self):
         t = self.t
@@ -316,7 +320,7 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.assertIn("const cl_command_queue_properties cqp = ggml_cl_fa_paged_timeline() ? CL_QUEUE_PROFILING_ENABLE : 0;", t,
                       "the copy queue is profiling-enabled only when the switch is on")
         self.assertIn("clGetEventProfilingInfo(e.ev, CL_PROFILING_COMMAND_START", t)
-        self.assertIn("build with GGML_OPENCL_PROFILING", t,
+        self.assertIn("carry no profiling (the compute queue needs", t,
                       "a build without compute-queue profiling must say so, not print zeros")
         self.assertIn("ggml_cl_fa_paged_tl_finish(g_fa_paged_ctx)", t,
                       "the request's end must print and release the stamps")
@@ -324,25 +328,25 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
     def test_the_marks_and_the_margin(self):
         t = self.t
         split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
-        start = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 2, paged_overlap_parity, 0, nullptr);")
-        end   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 3, paged_overlap_parity, 0, nullptr);")
+        start = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 2, paged_overlap_parity, fa_slot, 0, nullptr);")
+        end   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 3, paged_overlap_parity, fa_slot, 0, nullptr);")
         merge = t.find("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);")
-        mend  = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 4, paged_overlap_parity, 0, nullptr);")
+        mend  = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 4, paged_overlap_parity, fa_slot, 0, nullptr);")
         post  = t.find("ggml_cl_fa_paged_verify3_post(backend_ctx, true);")
-        pst   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 6, paged_overlap_parity, 0, nullptr);")
+        pst   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 6, paged_overlap_parity, fa_slot, 0, nullptr);")
         self.assertTrue(min(split, start, end, merge, mend, post, pst) >= 0, "a stamp is absent")
         self.assertLess(start, split, "the FA split start stamp must precede the split kernel")
         self.assertGreater(end, split, "the FA split end stamp must follow it")
         self.assertLess(end, merge, "the split end must precede the merge")
         self.assertGreater(mend, merge, "the merge stamp must follow it")
         self.assertLess(pst, post, "the post start stamp must precede the post hash")
-        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 5, parity, o.consumed[parity]);", t,
+        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 5, ni, parity, o.consumed[parity]);", t,
                       "the consumed marker is stamped")
         # the copy start marker carries the copy's waits
-        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 0, parity, nw, wl);", t)
-        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 7, p, nw, wl);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 0, ni, parity, nw, wl);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 7, 0, p, nw, wl);", t)
         # the margin: copy k+2 against FA k's split end, minimum and negative count
-        self.assertIn("const long long m = (long long) cs[k + 1] - (long long) fe[k];", t)
+        self.assertIn("const long long m = cs[k + 1] - fe[k];", t)
         self.assertIn("negative %d", t, "the margin line must say whether any pair landed negative")
 
     def test_nofix_is_the_prefetch_wait_only(self):
@@ -370,3 +374,53 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.assertIn("++o.self3_writes;", t, "the injected write is counted")
         self.assertIn("++o.nc_drops;", t)
         self.assertIn("++o.nofix_drops;", t)
+
+
+class FaPagedTimelineSlotHostDelay(unittest.TestCase):
+    """Patches 0130w/0130x/0130y's gate: the events carry node and ring slot separately,
+    the host submit time comes with the stamps, and DELAY_AT=splits places the spin before
+    the split kernels -- the only placement that widens the ring's read window.
+
+    Red mutations, each run and seen failing before it was restored:
+      (a) an FA stamp back to the node index in the slot field: the slot cell fails;
+      (b) the split-branch delay back to after the split kernels with AT=splits set: the
+          placement cell fails;
+      (c) the submit time dropped from the kept stamps: the host-time cell fails.
+    """
+
+    def setUp(self):
+        self.root = _llama_root()
+        self.t = (self.root / OPENCL).read_text()
+
+    def test_the_fa_stamps_carry_the_ring_slot(self):
+        t = self.t
+        self.assertIn("struct fa_paged_tl_ev { int role; int node; int slot; cl_event ev; long long host; };", t)
+        self.assertIn("const int fa_slot = (paged_overlap_parity >= 0 &&", t,
+                      "the FA stamps must look the slot up from the chain node")
+        self.assertIn("ggml_cl_fa_paged_overlap_slot(backend_ctx, backend_ctx->fa_paged.chain[paged_overlap_parity]) : -1;", t)
+        for role in ("2", "3", "4", "6"):
+            self.assertIn("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, %s, paged_overlap_parity, fa_slot, 0, nullptr);" % role,
+                          t, "the FA stamp %s must carry node and slot" % role)
+        self.assertIn("slot %d node %d copy start %lld end %lld submit %lld", t)
+
+    def test_the_host_submit_time(self):
+        t = self.t
+        self.assertIn("clock_gettime(CLOCK_MONOTONIC, &ts);", t, "the host stamps need the monotonic clock")
+        self.assertIn("clGetDeviceAndHostTimer(ctx->device, &devb, &hostb)", t,
+                      "the base must take the device and host clocks together")
+        self.assertIn("o.tl.push_back({ role, node, slot, ev, ggml_cl_fa_paged_tl_host_ns() });", t)
+        self.assertIn("ggml_cl_fa_paged_tl_host(backend_ctx, 8, paged_overlap_parity, fa_slot);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_host(backend_ctx, 9, paged_overlap_parity, fa_slot);", t)
+        self.assertIn("start-submit %lld", t, "a copy's device start is printed against its submit time")
+
+    def test_delay_at_splits_stays_before_the_readers(self):
+        t = self.t
+        self.assertIn('getenv("GGML_OPENCL_FA_PAGED_DELAY_AT")', t)
+        self.assertIn('strcmp(e, "splits") == 0', t, "only `splits` moves the spin")
+        self.assertIn("if (ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);   // 0130y: before the readers", t)
+        i = t.find("// 0130y: before the readers")
+        j = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
+        self.assertGreater(j, i, "the AT=splits spin must precede the split kernels")
+        k = t.find("if (!ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);")
+        self.assertGreater(k, j, "the default placement stays after the split kernels")
+        self.assertIn("paged FA switch GGML_OPENCL_FA_PAGED_DELAY_AT=splits", t)
