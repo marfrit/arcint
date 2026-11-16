@@ -7938,3 +7938,36 @@ old path. After a `seq_rm` or a pool change: the next `prepare()` reassigns ring
 comparison re-copies. No invariant conflicts: the pool partition and slots are unchanged,
 nothing is evicted for the prefetch. DEBUG prints per graph "node 0 reused N pages" or
 "rows differ, re-copied", with the running issued/reused/re-copied counts.
+
+## 0129v-kv-stream-paged-prefetch-pairs-and-chain-key.patch
+
+Read-back of 0129u (`code`): `prefetch_same` compared the sequence of ring rows only.
+`prepare()` numbers ring rows in plan order (`src/llama-kv-stream.cpp:225-230`: streamed pages
+get `n_streamed++` as the plan walks), so two plans with the same number of streamed pages but
+a different set both give `[0..n-1]`, and node 0 would reuse rows holding the previous plan's
+pages. The prefetch now records `(plan page, ring row)` pairs and the issuing graph's chain
+length and first-node slot; reuse needs all three identical. From the code, a same-count set
+change is reachable in a decode: an eviction swaps the oldest non-written page for a slot
+(`llama-kv-stream.cpp:207-216`), a request's prefix reuse moves which pages are resident, and
+the MTP head's graph is its own chain whose tail can leave its own node 0 in the slot. The
+DEBUG line now carries both chain lengths ("chain %d, prefetched by chain %d").
+
+## 0129w-kv-stream-request-summary-and-hybrid-request-end.patch
+
+Window 290 (`measured-here` + `code`): the VERIFY=2 self-test fired correctly (1 of 312 chunk
+hashes differed, the flipped byte), but three lines stayed silent.
+- The self-test line tested `o.v_nodes == 0` after `o.v_nodes++`, so it could never print;
+  the flag is taken before the increment.
+- The once-per-process summary printed at the first graph with the counters still zero ("0 of
+  16 nodes issued ahead"). The graph's counters now roll into a process total, and
+  `ggml_backend_opencl_fa_paged_summary` (weak-called from `llama_kv_stream::request_end`)
+  prints the REQUEST's totals at the request's end -- issued ahead, fell back, verify nodes /
+  bytes / mismatches, next-graph reused / re-copied -- and resets them. The fallback WARN
+  stays once per process.
+- The request-end line never reached the stream: 0129p overrides `request_end()` only on
+  `llama_kv_cache`, and the served hybrid model's memory is `llama_memory_hybrid`
+  (`src/llama-model.cpp:3317-3324`, the QWEN3NEXT/QWEN35/QWEN35MOE branch without SWA or an
+  indexer), which kept the `llama_memory_i` no-op. `llama_memory_hybrid` now forwards to
+  `mem_attn`; `llama_memory_hybrid_iswa` does the same, and `llama_kv_cache_iswa` (which had
+  no override) forwards to its base and SWA caches. `llama_memory_hybrid_idx` inherits the
+  hybrid override.
