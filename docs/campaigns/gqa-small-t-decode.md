@@ -275,3 +275,93 @@ today 8.34 ms = 48 GB/s with the V stage on the critical path. If the overlap li
 achieved rate to 75-90 GB/s (the scatter limit of 32-44 B rows on this class of GPU, not a
 measured figure here), the same call is 400 MB / 80 GB/s = **~5 ms, 1.7x**; a 1.2x gain is the
 conservative floor if only the latency, not the throughput, was hidden.
+
+### Round 16 -- measured negative, window 293b (B60, build 881f4361)
+
+**V2 does not pay.** Evidence: `measured-here` for the numbers, `code` for the mechanism.
+- Op red gate: V2 BROKEN fails 0/18 on both I8 and f16 arms (8 of 8 kernels replaced; local
+  59,392 B I8, 57,344 B f16), V2 green 18/18, base 18/18. So the stage is wired and the
+  broken variant is red.
+- Served, production Q4_K_M agent, 240k, no paging, 256-token decode: base 222.7 ms/step
+  (17.89 t/s) against V2 255.9 ms/step (15.57 t/s) -- **V2 +14.9 % slower**. Needle found
+  in both, so this is not a correctness regression, it is a throughput one.
+- Served Q5 (UD-Q5_K_M), KV stream pool 1024, 261k, OVERLAP on: 262.2 ms/step, V2 283.3
+  ms/step (+8.0 %).
+- The perf arms measured nothing: `make_test_cases_perf()` builds its own list and 0130a
+  added the depth cases to the test list only. 0130e fixes that (`code`).
+
+**Why the double buffer hides nothing, from the source.** In OpenCL C a stage is a global
+load into private registers followed by a store to local memory; there is no asynchronous
+copy and no memory fence that lets the store be deferred past a shared-memory barrier.
+`FA_GQA_STAGE_V` (`flash_attn_gqa_dpas.cl:258-275`) is exactly `load16` x4 per half16 into
+registers, then 64 stores into `local`. The call for tile t+1 sits at `:355`, tile t's
+QK^T at `:381` and P V at `:480-507` (line numbers of the 0130b tree, patch 0130a-c+d
+applied). Every `load16` result is consumed by a store in the same
+thread before any product instruction of tile t is issued: the hardware must have the data
+before it can retire the store, the store precedes the barrier before P V, and the thread
+stalls on the load's return at the first store. Only IGC could sink the stores below the
+DPAS (an ISA question -- `ocloc` below); in the source the sequence is load, store, then
+products. The second local buffer therefore buys no latency hiding inside a sub-group: it
+adds 16 KB of local memory and one set of stores per tile, which is what the measured
+numbers show.
+
+**Occupancy, per Xe core (`code` for the kernel's own attributes, `paper`/`web` for the
+hardware figures, marked below).**
+- Work-group: `GQA_SIDES x n_tiles x 16` = 2 x 3..6 x 16 = **96-192 work-items** for 4-7 rows
+  (G 6, head 256): 6-12 sub-groups per work-group, `intel_reqd_sub_group_size(16)`.
+- GRF mode: the backend passes `-cl-intel-256-GRF-per-thread` for every FA GQA build, base
+  and V2 alike (`ggml-opencl.cpp` ~5479, ~5548); a 16-lane sub-group at 256 GRF per thread
+  needs the 256-register mode (the register file is 64 KB per thread at that mode).
+- Local memory: base 42,224 B, V2 58,224 B per work-group (q8s 16,384 + q8d 2,048 + vt
+  32,768 + sx 8,192). Both above half of a 64 KB local memory: **one work-group a core
+  either arm**; V2's +16 KB does not cost a work-group.
+- Hardware threads: B60 is Xe2, 20 Xe cores, 8 vector engines a core (`web`: the datasheet
+  table, `docs/imggen.md:326`); 8 threads per engine at 128 GRF, 4 at 256 GRF (`inferred`,
+  from `research-inferzero.md:67-68`, a patch 0013 record, not a vendor table). At 256 GRF
+  that is 32 thread slots a core; a work-group of 6-12 sub-groups occupies 6-12 of the 32
+  slots, and local memory caps it at one work-group, so **6-12 of 32 slots resident, 19-38
+  %, identical for base and V2**. The grid's 51-102 waves say nothing about this: waves are
+  dispatch rounds, resident threads are the latency-hiding resource, and both arms sit at
+  one work-group a core. Reaching more would need a smaller local footprint (<= 32 KB a
+  work-group, unreachable at head 256 with the q8s and sx stages) or a second work-group a
+  core by shrinking the stages -- not by a second V buffer, which only raises them.
+
+**Offline ISA comparison (`code`, commands for the card host, no GPU here).** `ocloc
+compile -device bmg` with the backend's own option set:
+```
+ocloc compile -device bmg -file flash_attn_gqa_dpas.cl \
+  -options "-cl-intel-256-GRF-per-thread -DDK=256 -DGQA_SIDES=2 -DKT=8 -DVT=4 -DGQA_I8=1" \
+  -output base.isa
+ocloc compile -device bmg -file flash_attn_gqa_dpas.cl \
+  -options "-cl-intel-256-GRF-per-thread -DDK=256 -DGQA_SIDES=2 -DKT=8 -DVT=4 -DGQA_I8=1 -DGQA_V2=1" \
+  -output v2.isa
+ocloc compile -device bmg -file flash_attn_gqa_dpas.cl \
+  -options "-cl-intel-256-GRF-per-thread -DDK=256 -DGQA_SIDES=2 -DKT=8 -DVT=4 -DGQA_I8=1 -DGQA_PRE=1" \
+  -output pre.isa
+ocloc compile -device bmg -file flash_attn_gqa_dpas.cl \
+  -options "-cl-intel-256-GRF-per-thread -DDK=256 -DGQA_SIDES=2 -DKT=8 -DVT=4 -DGQA_I8=1 -DGQA_PRE=1 -DGQA_PRE_BROKEN=1" \
+  -output prebroken.isa
+```
+KT/DT are the `gkv` codes (KT 8 = q8_0, VT 4 = q4_0); add `-DGQA_ST=1` for the 1-3 row
+form. Compare: **spill bytes** (the "Spill Count" line, or grep `spill` in the `-stats` /
+`IGC_ShaderDumpEnable` output), GRF mode line, the **`simd32`/`simd16` send count in the
+loop body** (`send` instructions per tile near the DPAS block), and the IGC retry dump with
+rolled loops (`IGC_EnableDPASLowering` / `EnableRetry` mentions). A store-count drop in PRE
+with the loads hoisted above the first DPAS in the loop confirms or refutes the source
+reading above.
+
+### Round 17 -- 0130f, the register prefetch (`code`)
+
+The mechanism 0130b should have been: tile t+1's V halves go into the thread's private
+registers (`half16 pre[2][4]`, up to two units a thread at 96-192 threads) at the loop's
+top, tile t's QK^T, softmax and P V run, and the registers are stored to the other stage
+only after P V (`FA_GQA_PRE_V` / `FA_GQA_STORE_V`) -- the load's value is consumed after
+the products, not before. No extra local memory over V2 (same two 16 KB stages), one extra
+barrier avoided compared with a single-buffer form by writing the buffer this tile does not
+read. Switch `GGML_OPENCL_FA_DECODE_PRE=1`, default off; the build is a separate programme
+that replaces a pair's kernel only after it built and fits; `..._PRE_BROKEN=1` stores into
+the buffer P V reads before the products, the red op cases. Expected at 240k (`inferred`
+arithmetic): the V stage's stall moves off the tile's critical path; if the 400 MB call was
+at 48 GB/s bound by that stall, the floor is the 1.2x that V2 promised, but now with no
+additional local memory to pay for it. Gate: `tests/python/test_fa_decode_v2.py`'s
+`FaDecodePre`, placements and the broken store, three mutations run and seen failing.

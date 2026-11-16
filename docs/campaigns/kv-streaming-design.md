@@ -778,6 +778,17 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   compared with the pre-FA one, non-blocking readback collected at the next graph's start and
   at the request's end) is built in 0130d: its device-free gate is green, the card number is
   owed; `GGML_OPENCL_FA_PAGED_NOCONSUME=1` drops exactly the consumed wait, its red arm (`code`).
+- **Window 293b (`measured-here`, build `881f4361`):** the race fix pays where the copies are
+  the critical path -- Q5 at 65k, OVERLAP against unset, 116.3 against 161.0 ms/step (-28 %),
+  next-graph lead 105 issued / 105 reused, VERIFY=1 at 261k 4,032 nodes / 425.9 GB / 0
+  mismatches. At 261k the OVERLAP arms open with "...exec/flash_nex" where window 288 and
+  292's unset arms opened with "...exec/backend_o"; this window has no unset arm at 261k, so
+  the 261k OVERLAP numbers are not comparable across windows yet. 0130a-c's 4-7 row V2
+  kernel is a **measured negative**: +14.9 % at 240k no-paging (222.7 -> 255.9 ms/step) and
+  +8.0 % at 261k OVERLAP (262.2 -> 283.3); the switch stays in, default off. 0130e puts
+  0130a's depth cases into the perf list (window 293b's perf arms matched 0 cases), and
+  0130f is the 0130b mechanism done right -- the V halves to private registers, stored after
+  P V: `GGML_OPENCL_FA_DECODE_PRE=1`, default off, the card number owed (`code`).
 - **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
   kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
   `{fa_gqa_sides*n_tiles*16, n_head_kv*n_batch, n_splits}`, and w289b's grid {160,4,256} is
