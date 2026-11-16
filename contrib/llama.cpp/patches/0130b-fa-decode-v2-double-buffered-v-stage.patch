@@ -1,0 +1,199 @@
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -210,7 +210,13 @@
+     local uint ks8[BK * KSTR];         // [key][dword]: the raw q8_0 rows
+ #endif
+ #endif
++#ifdef GQA_V2
++    // 0130b: two V stages, so the next tile's global loads run while this tile's
++    // products do ([DV * BK] each: 16 KB for head 256, BK 32)
++    local half vt[2 * DV * BK]; // [buffer][column][key]
++#else
+     local half vt[DV * BK];     // [column][key]
++#endif
+ #ifdef GQA_S_SPLIT
+     // the sides of a tile split Q K^T by 16-key group and exchange S here,
+     // up to 8 tiles: [tile][group][lane][row], rows contiguous per lane, so
+@@ -247,6 +253,27 @@
+     float8 o[NDH];
+     for (int i = 0; i < NDH; ++i) o[i] = (float8)(0.f);
+ 
++    // the V tile of BK keys into a local stage: key fastest, neighbouring lanes
++    // store neighbouring halves
++#define FA_GQA_STAGE_V(k0i, dst)                                                              \
++    for (int u = lid; u < BK * DV / 64; u += nthr) {                                          \
++        const int key = u % BK, c64 = u / BK, kk = min(k0i + key, kv_end - 1);                \
++        const global char * vrow = fa_gqa_page_row(ptable, page_size, kk, vb, v_nb1, rvb, rv_nb1); \
++        const half16 v0 = load16(VT, vrow, 4 * c64);                                          \
++        const half16 v1 = load16(VT, vrow, 4 * c64 + 1);                                      \
++        const half16 v2 = load16(VT, vrow, 4 * c64 + 2);                                      \
++        const half16 v3 = load16(VT, vrow, 4 * c64 + 3);                                      \
++        const half vv[64] = { v0.s0, v0.s1, v0.s2, v0.s3, v0.s4, v0.s5, v0.s6, v0.s7,        \
++                              v0.s8, v0.s9, v0.sa, v0.sb, v0.sc, v0.sd, v0.se, v0.sf,        \
++                              v1.s0, v1.s1, v1.s2, v1.s3, v1.s4, v1.s5, v1.s6, v1.s7,        \
++                              v1.s8, v1.s9, v1.sa, v1.sb, v1.sc, v1.sd, v1.se, v1.sf,        \
++                              v2.s0, v2.s1, v2.s2, v2.s3, v2.s4, v2.s5, v2.s6, v2.s7,        \
++                              v2.s8, v2.s9, v2.sa, v2.sb, v2.sc, v2.sd, v2.se, v2.sf,        \
++                              v3.s0, v3.s1, v3.s2, v3.s3, v3.s4, v3.s5, v3.s6, v3.s7,        \
++                              v3.s8, v3.s9, v3.sa, v3.sb, v3.sc, v3.sd, v3.se, v3.sf };      \
++        for (int j = 0; j < 64; ++j) dst[(64 * c64 + j) * BK + key] = vv[j];                   \
++    }
++
+     // Q (scaled, half) as the a operand: component r = row r, lane = column
+ #if GQA_I8 && KT == 1
+     // Q -> int8 once a call, one RNE scale per row per 32-dim block; the
+@@ -304,8 +331,30 @@
+             : 0;
+     }
+ 
++#ifdef GQA_V2
++    // the first tile staged before the loop; the loop stages tile t+1 into the
++    // other buffer at its top, so the loads of t+1 are in flight during t's
++    // QK^T, softmax and P V (0130b)
++    if (kv_start < kv_end) FA_GQA_STAGE_V(kv_start, vt)
++    int vcur = 0;
++#endif
+     for (int k0 = kv_start; k0 < kv_end; k0 += BK) {
+         barrier(CLK_LOCAL_MEM_FENCE);
++#ifdef GQA_V2
++        // 0130b: tile t+1's V into the buffer this tile does not read, issued
++        // here so its loads overlap the products below. The broken variant for
++        // the red op cases targets the buffer the products read instead.
++        {
++#if GQA_V2_BROKEN
++            // GGML_OPENCL_FA_DECODE_V2_BROKEN=1 (the red op cases): the stage
++            // overwrites the buffer the products of this tile read
++            const int vn = vcur;
++#else
++            const int vn = 1 - vcur;
++#endif
++            if (k0 + BK < kv_end) FA_GQA_STAGE_V(k0 + BK, vt + vn * (DV * BK))
++        }
++#endif
+ #if defined(GQA_K_STAGED) && !(GQA_I8 && KT == 1)
+         for (int u = lid; u < BK * DK / 64; u += nthr) {
+             const int key = u / (DK / 64), c64 = u % (DK / 64), kk = min(k0 + key, kv_end - 1);
+@@ -373,26 +422,11 @@
+ #endif
+         }
+         // QK^T ran before the V staging, so the one barrier below covers both
+-        // the V tile and the S exchange
+-        // V transposed with the key fastest: neighbouring lanes store
+-        // neighbouring halves
+-        for (int u = lid; u < BK * DV / 64; u += nthr) {
+-            const int key = u % BK, c64 = u / BK, kk = min(k0 + key, kv_end - 1);
+-            const global char * vrow = fa_gqa_page_row(ptable, page_size, kk, vb, v_nb1, rvb, rv_nb1);
+-            const half16 v0 = load16(VT, vrow, 4 * c64);
+-            const half16 v1 = load16(VT, vrow, 4 * c64 + 1);
+-            const half16 v2 = load16(VT, vrow, 4 * c64 + 2);
+-            const half16 v3 = load16(VT, vrow, 4 * c64 + 3);
+-            const half vv[64] = { v0.s0, v0.s1, v0.s2, v0.s3, v0.s4, v0.s5, v0.s6, v0.s7,
+-                                  v0.s8, v0.s9, v0.sa, v0.sb, v0.sc, v0.sd, v0.se, v0.sf,
+-                                  v1.s0, v1.s1, v1.s2, v1.s3, v1.s4, v1.s5, v1.s6, v1.s7,
+-                                  v1.s8, v1.s9, v1.sa, v1.sb, v1.sc, v1.sd, v1.se, v1.sf,
+-                                  v2.s0, v2.s1, v2.s2, v2.s3, v2.s4, v2.s5, v2.s6, v2.s7,
+-                                  v2.s8, v2.s9, v2.sa, v2.sb, v2.sc, v2.sd, v2.se, v2.sf,
+-                                  v3.s0, v3.s1, v3.s2, v3.s3, v3.s4, v3.s5, v3.s6, v3.s7,
+-                                  v3.s8, v3.s9, v3.sa, v3.sb, v3.sc, v3.sd, v3.se, v3.sf };
+-            for (int j = 0; j < 64; ++j) vt[(64 * c64 + j) * BK + key] = vv[j];
+-        }
++        // the V tile and the S exchange. Under GQA_V2 the tile was staged at the
++        // loop's top, and this barrier covers it (stored in the previous turn).
++#ifndef GQA_V2
++        FA_GQA_STAGE_V(k0, vt)
++#endif
+         barrier(CLK_LOCAL_MEM_FENCE);
+ #ifdef GQA_S_SPLIT
+         for (int g = 0; g < NKB; ++g) {
+@@ -447,12 +481,20 @@
+             const int col = side * (DV / GQA_SIDES) + i * 16 + lane;
+             float8 acc = o[i];
+             for (int g = 0; g < NKB; ++g) {
++#ifdef GQA_V2
++                const int8 b = as_int8(vload8(0, (local const uint *)(vt + vcur * (DV * BK) + col * BK + g * 16)));
++#else
+                 const int8 b = as_int8(vload8(0, (local const uint *)(vt + col * BK + g * 16)));
++#endif
+                 acc = DPAS(pa[g], b, acc);
+             }
+             o[i] = acc;
+         }
++#ifdef GQA_V2
++        vcur = 1 - vcur;
++#endif
+     }
++#undef FA_GQA_STAGE_V
+ 
+     // the partial records: m and l by the left half's lane 0, O by column
+     const float larr[8] = { lv.s0, lv.s1, lv.s2, lv.s3, lv.s4, lv.s5, lv.s6, lv.s7 };
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -5480,6 +5480,66 @@
+                         CL_CHECK(clReleaseProgram(pg));
+                     }
+                 }
++                // 0130b: GGML_OPENCL_FA_DECODE_V2 -- the double-buffered V
++                // stage for the 4-8 row form: tile t+1's V loads are issued at
++                // the loop's top, before t's QK^T, so they are in flight during
++                // the products; two local stages (16 KB each at head 256).
++                // The base kernels above stay built and are replaced only when
++                // the V2 programme builds and fits local memory, so a refused
++                // V2 leaves the base kernel in the slot.
++                const char * fdv_env    = getenv("GGML_OPENCL_FA_DECODE_V2");
++                const bool   fdv_on     = fdv_env != nullptr && atoi(fdv_env) != 0;
++                const char * fdb_env    = getenv("GGML_OPENCL_FA_DECODE_V2_BROKEN");
++                const bool   fdv_broken = fdb_env != nullptr && atoi(fdb_env) != 0;
++                if (fdv_on) {
++                    int n_v2 = 0;
++                    cl_ulong v2_lm = 0;
++                    for (int di = 0; di < 2; ++di) {
++                        const int dk = di == 0 ? 256 : 128;
++                        for (int i = 0; i < 4; ++i) {
++                            if (backend_ctx->kernel_fa_gqa_dk[di][i] == nullptr) continue;
++                            const bool i8_arm = fi8_on && gkv[i][0] == 1;
++                            std::string v2_prog_src = gqa_src;
++                            if (i8_arm) {
++                                v2_prog_src = gqa_i8_inc + gqa_src;
++                            }
++                            std::string v2_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DDK=" + std::to_string(dk) + " -DGQA_SIDES=" + std::to_string(fg_sides) +
++                                " -DKT=" + std::to_string(gkv[i][0]) +
++                                " -DVT=" + std::to_string(gkv[i][1]) +
++                                " -DGQA_V2=1" +
++                                (i8_arm ? " -DGQA_I8=1" : "") +
++                                (fdv_broken ? " -DGQA_V2_BROKEN=1" : "") +
++                                (getenv("GGML_OPENCL_FA_GQA_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_GQA_OPTS") : std::string());
++                            cl_program pg = build_program_from_source_optional(backend_ctx, v2_prog_src.c_str(), v2_opts);
++                            if (pg == nullptr) {
++                                GGML_LOG_WARN("ggml_opencl: FA decode V2 (dk %d, K %d V %d) did not build; the base kernel stays\n", dk, gkv[i][0], gkv[i][1]);
++                                continue;
++                            }
++                            cl_kernel kg = clCreateKernel(pg, "flash_attn_gqa_dpas", &err);
++                            if (err == CL_SUCCESS) {
++                                size_t   wg = 0;
++                                cl_ulong lm = 0, lm_dev = 0;
++                                CL_CHECK(clGetKernelWorkGroupInfo(kg, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                                CL_CHECK(clGetKernelWorkGroupInfo(kg, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                                CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
++                                if (wg >= (size_t) fg_sides * 8 * 16 && lm <= lm_dev) {
++                                    CL_CHECK(clReleaseKernel(backend_ctx->kernel_fa_gqa_dk[di][i]));
++                                    backend_ctx->kernel_fa_gqa_dk[di][i] = kg;
++                                    n_v2++;
++                                    if (di == 0 && i == 2) v2_lm = lm;
++                                } else {
++                                    GGML_LOG_WARN("ggml_opencl: FA decode V2 (dk %d, K %d V %d) refused: work-group %zu, local %llu of %llu; the base kernel stays\n",
++                                                  dk, gkv[i][0], gkv[i][1], wg, (unsigned long long) lm, (unsigned long long) lm_dev);
++                                    CL_CHECK(clReleaseKernel(kg));
++                                }
++                            }
++                            CL_CHECK(clReleaseProgram(pg));
++                        }
++                    }
++                    GGML_LOG_INFO("ggml_opencl: FA decode V2 (GGML_OPENCL_FA_DECODE_V2=1%s): %d of 8 pair/head kernels, "
++                                  "double-buffered V stage, local %llu B a work-group at head 256 q8_0 K/q4_0 V\n",
++                                  fdv_broken ? " BROKEN (the red op cases)" : "", n_v2, (unsigned long long) v2_lm);
++                }
+                 // 0089: the 1-3 row form, the same source with GQA_ST (raw q8_0
+                 // key rows staged once a work-group), only when the int8 switch
+                 // is on and only for the q8_0 K pairs (KT 1). It is a second

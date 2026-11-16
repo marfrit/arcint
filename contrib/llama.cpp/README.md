@@ -7971,3 +7971,27 @@ hashes differed, the flipped byte), but three lines stayed silent.
   `mem_attn`; `llama_memory_hybrid_iswa` does the same, and `llama_kv_cache_iswa` (which had
   no override) forwards to its base and SWA caches. `llama_memory_hybrid_idx` inherits the
   hybrid override.
+
+## 0130a-fa-decode-depth-op-cases.patch
+
+The red half of 0130b (`code`): the 4-7 row decode kernel's depths with quantized K/V had no
+op case. 0016's depth arms stop at 131,072 and are f16, and the 0088 arms reach 131,072 at 1-3
+rows only, so the served decode (q8_0 K / q4_0 V, head 256, 24 query heads on 4, 4-7 rows) was
+tested at 4,096 and 1,013 but never at 65k or 240k. Added: those types at 4, 5, 6 and 7 rows,
+4,096 / 65,536 / 245,760 keys, eval and perf. Window 291's unitrace says a call at 240k reads
+~938 keys a split and takes 8.34 ms in this form, so this is the case the switch is red against.
+
+## 0130b-fa-decode-v2-double-buffered-v-stage.patch
+
+`GGML_OPENCL_FA_DECODE_V2=1` (default off), 4-8 row form of `flash_attn_gqa_dpas.cl`
+(`code`): the kernel staged each tile's V between its Q K^T and its P V, so the global loads
+sat on the critical path and the DPAS units were idle while they ran -- window 291 measures
+~48 GB/s at 240k, and the 2026-10-04 ablations showed staging and products adding up rather
+than overlapping. Now two V stages (16 KB each at head 256, BK 32 -> `local` 42 KB becomes
+58 KB a work-group, still one work-group a core per 0045, 64 KB device limit), the tile t+1
+stage runs at the loop's top before t's Q K^T, P V reads the buffer of this tile, and the
+consumed buffer toggles at the tile's end. Barrier count is unchanged (one WAR fence a tile
+at its top, one before P V). `GGML_OPENCL_FA_DECODE_V2_BROKEN=1` is the red variant: the stage
+targets the buffer the products read, so every arm must fail. The base kernels stay built and
+are replaced only when a V2 programme builds and fits local memory; the log line carries the
+built count and the local bytes. The 1-3 row q8q4 split kernel is untouched.
