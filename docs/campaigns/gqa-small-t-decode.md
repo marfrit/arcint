@@ -414,3 +414,19 @@ is a separate build whose NOPRIV path writes value 15 of every staged V row as z
 op cases fail while the register shape stays. Expected ISA (`inferred`, the second red the
 card host checks): `//.private memory size 0`, no `address space: private` messages in the
 dpas span, instCount above base's 6,448 for the stores.
+
+0130l (`code`): 0130k's directives sat inside the continued macro bodies and failed `cpp`
+(`'#' is not followed by a macro parameter`, rc 1) and ocloc (rc 245, no ISA) for the base
+kernel too -- the production decode. The alternatives are whole macro definitions under
+file-level `#ifdef` and the broken zero is a value macro; `cpp -P` of the NOPRIV-off base is
+identical to 347e312b (diff 0 lines). `tests/python/test_kernel_preproc.py` runs the
+preprocessor over the kernel under every host define set (base, I8, ST, V2, PRE, PRE+BROKEN,
+NOPRIV, NOPRIV+BROKEN, NOPRIV+PRE; K/V q8q4 and f16), red on 8236e31d and green on the fix,
+and `build-deb.sh` runs the same matrix, so the recipe fails a kernel that does not
+preprocess. PRE stays a `measured-here` negative (window 295, build df1c3163: 240k no-paging
+223.3 against 279.8 ms/step, +25.3 %; 261k pool 3584 OVERLAP 262.1 against 308.4, +17.7 %;
+unset 261k 453.2, so OVERLAP -42 %; op perf 245760 base 94.0-97.6, PRE 97.3-99.1, V2
+95.7-97.4 ms/run); NOPRIV+PRE stays one optional arm, dropped if the ISA shows PRE's ~1,950
+extra instructions remain with private 0. If the base programme fails to build, the decode
+is not silent: `flash_attn_gqa_dpas.cl not built; flash_attn_f32_f16.cl takes decode` with
+the downgrade record (`code`, 0130n).

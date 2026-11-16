@@ -8108,3 +8108,34 @@ replaced by 64 component stores straight to local memory, in both stage macros; 
 order is base's, no reassociation. BROKEN is a separate build that writes value 15 of every
 staged V row as zero, the red op cases. Expected: `//.private memory size 0`. Gate:
 `tests/python/test_fa_decode_v2.py`'s `FaDecodeNoPriv`, three mutations run and seen failing.
+
+## 0130l-fa-gqa-no-private-file-level-directives.patch
+
+`code` and `measured-here` (recipe host, cpp 14.2.0): 0130k broke compilation of the
+production GQA decode kernel, NOPRIV off. It put `#ifdef GQA_NOPRIV` / `#else` / `#endif`
+inside the backslash-continued bodies of `FA_GQA_STAGE_V` and `FA_GQA_STORE_V`; a `#` inside
+a macro body is the stringize operator, so `cpp -x c -P -DDK=256 -DGQA_SIDES=2 -DKT=1
+-DVT=2 flash_attn_gqa_dpas.cl` on 8236e31d's file prints `276:32: error: '#' is not followed
+by a macro parameter`, rc 1, and ocloc 26.27.39122.11 `-device bmg` gave rc 245 with no ISA
+for every form (base, NOPRIV, NOPRIV_BROKEN, NOPRIV+PRE, PRE). The alternatives are now
+whole macro definitions under file-level `#ifdef`, the broken zero is a value macro
+(`#define FA_GQA_V15(x) 0.0h` vs `(x)`), and `FA_UNROLL` is wrapped in
+`#if defined(GQA_NOPRIV)` so its empty branch leaves no blank line: `cpp -P` of the fixed
+base is identical to the pre-0130k file (347e312b), diff 0 lines. Everything else in 0130k is
+unchanged: the unrolled private-array loops, the 64 component stores, base's reduction order.
+Gate: `tests/python/test_kernel_preproc.py` runs `cpp -x c -P` over the kernel under every
+define set the host builds (base, I8, ST, V2, PRE, PRE+BROKEN, NOPRIV, NOPRIV+BROKEN,
+NOPRIV+PRE) at DK=256, GQA_SIDES=2, K/V q8_0/q4_0 (KT=1, VT=2) and f16 (KT=0, VT=0); red on
+8236e31d, green here, and one mutation (a directive inside the continued body) run and seen
+failing. `build-deb.sh` runs the same matrix after the patch loop, so the recipe fails on a
+kernel that does not preprocess.
+
+## 0130n-fa-gqa-no-private-host-route.patch
+
+`code`, no host change: the host builds the GQA kernel through
+`build_program_from_source_optional`, so a refused programme is never silent. Base failing
+(`pg == nullptr`) leaves `kernel_fa_gqa_dk[di][i]` null; the V2/PRE/NOPRIV arms skip that pair
+and each warns; the tail prints `ggml_opencl: flash_attn_gqa_dpas.cl not built;
+flash_attn_f32_f16.cl takes decode` with the downgrade record `path=fallback
+reason=not-built what=fa_gqa_dpas`, and decode takes `flash_attn_f32_f16.cl`. This entry
+records that route so 0130k's build failure cannot be mistaken for a silent fallback.
