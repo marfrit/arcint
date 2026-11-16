@@ -1,0 +1,125 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1325,6 +1325,13 @@
+         int     v_first_bad = 0;
+         cl_program verify_prog = nullptr;        // 0129s: GGML_OPENCL_FA_PAGED_VERIFY
+         cl_kernel  verify_kernel = nullptr;
++        // 0129u (C8): the next graph's node 0 pages, copied at this graph's last paged FA
++        // (its slot's last reader's consumed event), so they run under this graph's last
++        // layers, the head and the host's sampling instead of before FA 0
++        cl_event pre_ready = nullptr;
++        int pre_parity = -1;
++        std::vector<int32_t> pre_rows;   // the plan rows those copies filled, in page order
++        int pre_issued = 0, pre_reused = 0, pre_recopied = 0;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -23753,6 +23760,52 @@
+     return -1;
+ }
+ 
++// 0129u (C8): the next graph's node 0 pages, enqueued at this graph's LAST paged FA, waiting
++// the consumed event of the FA that last read slot 0 (two attention layers back). Their
++// bytes come from the USM host store, immutable for streamed pages: prepare() writes the
++// store only when a page is saved and zeroed, and this ubatch's new K/V go to resident
++// pages (llama-kv-cache.cpp:1730,1765 write the cache cells, which are never streamed).
++static void ggml_cl_fa_paged_prefetch_head(ggml_backend_opencl_context * ctx) {
++    auto & o = ctx->fa_paged;
++    if (o.chain.empty()) return;
++    const int p = ggml_cl_fa_paged_overlap_slot(ctx, o.chain[0]);
++    if (p < 0) return;
++    const ggml_tensor * dst = o.chain[0];
++    const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
++    const int32_t * pl = plan ? (const int32_t *) ggml_backend_opencl_usm_ptr(plan) : nullptr;
++    if (pl == nullptr) return;   // a plan that is not USM: this lead cannot compare it later
++    std::vector<int32_t> rows;
++    for (int64_t i = 0; i < plan->ne[0]; ++i) if (pl[i] >= 0) rows.push_back(pl[i]);
++    // the wait: the slot's last reader. It was set by the FA two layers back; the graph's
++    // last FA is on the other slot, so this copy runs beside it and the layers after it.
++    if (o.pre_ready) { CL_CHECK(clReleaseEvent(o.pre_ready)); o.pre_ready = nullptr; }
++    cl_uint  nw = o.consumed[p] != nullptr ? 1 : 0;
++    cl_event wl[1] = { o.consumed[p] };
++    const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, dst, o.q, nw, nw ? wl : NULL);
++    if (runs < 0) return;
++    CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.pre_ready));
++    CL_CHECK(clFlush(o.q));
++    o.pre_parity = p;
++    o.pre_rows   = rows;
++    o.pre_issued++;
++}
++
++// 0129u: does the graph's node 0 plan name the rows the cross-step copies filled?
++static bool ggml_cl_fa_paged_prefetch_same(ggml_backend_opencl_context * ctx) {
++    auto & o = ctx->fa_paged;
++    if (o.chain.empty() || o.pre_rows.empty()) return false;
++    const ggml_tensor * plan = o.chain[0]->src[GGML_FA_SRC_PLAN];
++    const int32_t * pl = plan ? (const int32_t *) ggml_backend_opencl_usm_ptr(plan) : nullptr;
++    if (pl == nullptr) return false;
++    int64_t k = 0;
++    for (int64_t i = 0; i < plan->ne[0]; ++i) {
++        if (pl[i] < 0) continue;
++        if (k >= (int64_t) o.pre_rows.size() || o.pre_rows[k] != pl[i]) return false;
++        ++k;
++    }
++    return k == (int64_t) o.pre_rows.size();
++}
++
+ // enqueue node `ni`'s pages on the copy queue; `after_inputs` (node 0) waits the compute
+ // queue's uploads, per 0042's measured placement: a graph-start prefetch ordered after them
+ static bool ggml_cl_fa_paged_overlap_issue(ggml_backend_opencl_context * ctx, int ni, bool after_inputs) {
+@@ -23805,8 +23858,42 @@
+ static void ggml_cl_fa_paged_overlap_before(ggml_backend_opencl_context * ctx, int ni) {
+     auto & o = ctx->fa_paged;
+     if (ni == 0) {
+-        // the graph's first paged FA: issue this layer and the next, after the input uploads
+-        if (ggml_cl_fa_paged_overlap_issue(ctx, 0, true)) ggml_cl_fa_paged_overlap_issue(ctx, 1, false);
++        // 0129u: the last graph's tail copied node 0's pages into its slot. If this graph's
++        // node 0 plan names the same rows (it is the same request stepping one ubatch, or the
++        // same prefix), those bytes are already in the slot: FA 0 waits that copy's ready
++        // event and none of its ~11 ms is exposed. Otherwise re-copy them (counted), which is
++        // the first graph and the case after a seq_rm changed the plan.
++        if (o.pre_ready != nullptr) {
++            if (ggml_cl_fa_paged_prefetch_same(ctx)) {
++                const int p = ggml_cl_fa_paged_overlap_slot(ctx, o.chain[0]);
++                if (p >= 0) {
++                    if (o.ready[p]) { CL_CHECK(clReleaseEvent(o.ready[p])); o.ready[p] = nullptr; }
++                    o.ready[p] = o.pre_ready;
++                    o.pre_ready = nullptr;
++                    o.issued[0] = 1;
++                    o.pre_reused++;
++                    if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
++                        GGML_LOG_WARN("%s: paged FA next-graph lead: node 0 reused %zu pages, "
++                                "issued %d, reused %d, re-copied %d\n", __func__, o.pre_rows.size(),
++                                o.pre_issued, o.pre_reused, o.pre_recopied);
++                    }
++                    ggml_cl_fa_paged_overlap_issue(ctx, 1, false);   // node 1's lead unchanged
++                }
++            } else {
++                CL_CHECK(clReleaseEvent(o.pre_ready));   // stale rows: the copy below overwrites them
++                o.pre_ready = nullptr;
++                o.pre_recopied++;
++                if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
++                    GGML_LOG_WARN("%s: paged FA next-graph lead: node 0 rows differ, re-copied "
++                            "(issued %d, reused %d, re-copied %d)\n", __func__, o.pre_issued,
++                            o.pre_reused, o.pre_recopied);
++                }
++                if (ggml_cl_fa_paged_overlap_issue(ctx, 0, true)) ggml_cl_fa_paged_overlap_issue(ctx, 1, false);
++            }
++        } else {
++            // the graph's first paged FA: issue this layer and the next, after the input uploads
++            if (ggml_cl_fa_paged_overlap_issue(ctx, 0, true)) ggml_cl_fa_paged_overlap_issue(ctx, 1, false);
++        }
+     }
+     if (!o.issued[ni] && !ggml_cl_fa_paged_overlap_issue(ctx, ni, false)) {
+         return;   // cannot issue here (a host store this path does not copy): the dispatch's loop
+@@ -23825,6 +23912,9 @@
+     if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
+     CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &o.consumed[parity]));
+     if (ni + 1 < (int) o.chain.size()) ggml_cl_fa_paged_overlap_issue(ctx, ni + 1, false);
++    // 0129u: last paged FA of this graph: the other slot's last reader was two layers back,
++    // so its consumed event is armed; copy the next graph's node 0 pages there now
++    if (ni + 1 >= (int) o.chain.size()) ggml_cl_fa_paged_prefetch_head(ctx);
+ }
+ 
+ // 0123zzzzz3: the streamed pages of this attention layer, from the host store (USM host memory)

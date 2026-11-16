@@ -7915,3 +7915,26 @@ The plan index now travels with the ring row (`pages` beside `rows`), the host h
 `GGML_OPENCL_FA_PAGED_VERIFY=2` is a green self-test: on the first checked node one byte of
 the host-side expected value (the comparison's copy, never the store) is flipped, so exactly
 one chunk must mismatch -- proof the comparison can fail without a race. `=1` unchanged.
+
+## 0129u-kv-stream-paged-next-graph-head-lead.patch
+
+Window 289b (`measured-here`) + `0129n`'s code: node 0's copies are the exposed 28.0 ms gap
+before the first paged FA of every graph. From the code, node 0's copy waits a compute-queue
+marker taken at that dispatch, so it starts only after every kernel before FA 0 (the graph's
+stems and the first GDN layers), and node 1's copies follow it on one in-order copy queue;
+FA 0 waits only `ready[slot 0]`, but 28 ms > one layer's ~11 ms is the marker's start delay
+plus the copy, not node 1's wait. `0129u` removes it from the graph: at the LAST paged FA of
+a graph, `ggml_cl_fa_paged_prefetch_head` copies the NEXT graph's node 0 pages into their
+slot, waiting the `consumed` event of the FA that last read that slot (two attention layers
+back), so they run beside this graph's last FA, its last layer, the output head and the
+host's sampling. At the next graph's `before(0)`, `ggml_cl_fa_paged_prefetch_same` compares
+this graph's node 0 plan rows with the rows those copies filled; equal rows reuse the copy
+(FA 0 waits its ready event and copies nothing), a difference re-copies (counted). Valid
+because streamed pages are immutable in the host store: `prepare()`
+(`src/llama-kv-stream.cpp:172-259`) writes the store only through `zero_host`/`host_set_page`
+for pages it saves, and this ubatch's new K/V go to resident cache cells
+(`src/llama-kv-cache.cpp:1730,1765`), never to streamed pages. First graph: no pre-copy, the
+old path. After a `seq_rm` or a pool change: the next `prepare()` reassigns ring rows and the
+comparison re-copies. No invariant conflicts: the pool partition and slots are unchanged,
+nothing is evicted for the prefetch. DEBUG prints per graph "node 0 reused N pages" or
+"rows differ, re-copied", with the running issued/reused/re-copied counts.
