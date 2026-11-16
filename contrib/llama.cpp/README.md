@@ -8068,3 +8068,31 @@ kernel only after it built and fits local memory, with a WARN and the base kerne
 does not. `GGML_OPENCL_FA_DECODE_PRE_BROKEN=1` is a separate build whose store goes to the
 buffer P V reads, before the products: the red op cases. The gate is device-free,
 `tests/python/test_fa_decode_v2.py`'s `FaDecodePre`, three mutations run and seen failing.
+
+## 0130g-fa-paged-post-selftest.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session). Window 294's
+NOCONSUME arms printed `post-FA changes 0` on every request-end line at both depths, so
+VERIFY=3's collect and compare path had never been seen to fire. `GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=3`
+writes ONE byte (pattern 1 byte, offset = the first streamed row's chunk 0) into the K slot on
+the compute queue inside `verify3_post`, after the FA's kernels and before the post hash, on
+one node a request (the first streamed node of the first decode graph); the post hash must
+differ from the pre hash in exactly one chunk, so exactly one
+`paged FA post-FA changed: node %d page %d chunk %d` WARN and `post-FA changes 1` in the
+summary. One K byte of one streamed key is corrupted in the ring slot until the next copy
+refills it: the answer on that node's decode chain may change, so this arm is not for serving.
+Gate: `tests/python/test_fa_paged_lead.py`'s `FaPagedPostSelftest`, three mutations run and
+seen failing.
+
+## 0130h-fa-paged-forced-race-delay.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session).
+`GGML_OPENCL_FA_PAGED_DELAY=<n>`, development only: a busy-wait of n iterations in its own
+one-work-item kernel on the compute queue, enqueued BETWEEN this FA's split kernels and its
+`k_merge`, so it lengthens FA j's hold of its slot and adds nothing before FA j starts. With
+`NOCONSUME=1` the copy into that slot two layers later no longer waits the marker and lands
+inside FA j (nonzero `post-FA changes`); with the consumed wait on, the same delay reads
+`post-FA changes 0` -- the measured proof of 0130c. The cross-step prefetch's consumed wait is
+not part of NOCONSUME (0130d's exactly-one-wait arm): it stays unconditional, which is why
+window 294's red arm could not land. Gate: `FaPagedForcedRace`, three mutations run and seen
+failing.

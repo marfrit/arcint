@@ -105,7 +105,7 @@ class FaPagedPostFA(unittest.TestCase):
 
     def test_the_post_hash_follows_the_fa_and_precedes_the_marker(self):
         t = self.t
-        post = "ggml_cl_fa_paged_verify3_post(backend_ctx);"
+        post = "ggml_cl_fa_paged_verify3_post(backend_ctx, true);"   # 0130g adds the branch flag
         # the split-decode branch: after k_merge, before the consumed marker
         i = t.find("this branch returns here, before the tail call below")
         self.assertTrue(i >= 0)
@@ -123,7 +123,7 @@ class FaPagedPostFA(unittest.TestCase):
         self.assertTrue(i >= 0, "the tail's post site is absent")
         j = t.find("if (paged_overlap_copied && paged_overlap_parity >= 0) {", i)
         tailblock = t[i:j]
-        self.assertIn(post, tailblock)
+        self.assertIn("ggml_cl_fa_paged_verify3_post(backend_ctx, false);", tailblock)
         self.assertLess(t.find(post, i), j, "the tail's post hash must precede its marker")
         self.assertGreater(t.find("// 0129n: this layer's kernels are enqueued", 0), i,
                            "the 0129n marker comment precedes the tail's after call")
@@ -142,7 +142,7 @@ class FaPagedPostFA(unittest.TestCase):
                       "the comparison must be pre against post per (page, chunk)")
         # collected at the next graph's start and flushed at the request's end
         self.assertIn("if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)", t)
-        self.assertIn("if (g_fa_paged_verify3_ctx) ggml_cl_fa_paged_verify3_collect(g_fa_paged_verify3_ctx);", t)
+        self.assertIn("ggml_cl_fa_paged_verify3_collect(g_fa_paged_verify3_ctx);", t)
 
     def test_a_change_warns_once(self):
         t = self.t
@@ -169,3 +169,99 @@ class FaPagedPostFA(unittest.TestCase):
         # the cross-step prefetch's wait is not the drop
         self.assertIn("cl_uint  nw = o.consumed[p] != nullptr ? 1 : 0;", t,
                       "NOCONSUME must not touch the prefetch's consumed wait")
+
+
+class FaPagedPostSelftest(unittest.TestCase):
+    """Patch 0130g's device-free gate: GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=3 writes one byte
+    into the K slot's first streamed row after the FA and before the post hash, so the collect
+    and compare path must fire ("post-FA changes 1").
+
+    Red mutations, each run and seen failing before it was restored:
+      (a) the switch accepting any nonzero value (`atoi(e) != 0`): the exactly-three cell
+          fails -- VERIFY_SELFTEST also names other modes;
+      (b) the fill moved into the pre hash's site (`verify3_begin`): the placement cell fails
+          -- the pre hash then hashes the written byte too and nothing differs;
+      (c) the once-a-request reset removed: the one-write cell fails.
+    """
+
+    def setUp(self):
+        self.root = _llama_root()
+        self.t = (self.root / OPENCL).read_text()
+
+    def test_the_switch_is_mode_3_only(self):
+        t = self.t
+        i = t.find('getenv("GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST")')
+        self.assertTrue(i >= 0, "the self-test switch is absent")
+        block = t[i:t.find("\n", t.find("return on;", i))]
+        self.assertIn("atoi(e) == 3", block,
+                      "the self-test must run only for VERIFY_SELFTEST=3")
+
+    def test_one_byte_after_the_fa_before_the_post_hash(self):
+        t = self.t
+        i = t.find("static void ggml_cl_fa_paged_verify3_post(")
+        j = t.find("static void ggml_cl_fa_paged_verify3_collect(", i)
+        block = t[i:j]
+        fill = block.find("clEnqueueFillBuffer(ctx->queue, e.buf[0], &pat, 1, off, 1, 0, nullptr, nullptr)")
+        hash = block.find("ggml_cl_fa_paged_verify3_hash_read(ctx, e.buf[kv]")
+        self.assertGreater(fill, 0, "the fill is absent from the post site")
+        self.assertGreater(hash, fill, "the fill must precede the post hash")
+        self.assertIn("const cl_ulong off = e.base[0] + (cl_ulong) e.rows[0] * e.stride[0];", block,
+                      "the write must land in the first streamed row's chunk 0")
+        self.assertIn("decode && ggml_cl_fa_paged_selftest3()", block,
+                      "the write must be the decode branch's, not the prompt tail's")
+
+    def test_one_node_a_request_and_its_warn(self):
+        t = self.t
+        self.assertIn("!o.v_self3_done && e.node == 0", t,
+                      "one streamed node a request: the first decode node only")
+        self.assertIn("o.v_self3_done = 1;", t)
+        self.assertIn("g_fa_paged_verify3_ctx->fa_paged.v_self3_done = 0;", t,
+                      "the one-a-request flag resets at the request's end")
+        self.assertIn('"ggml_opencl: paged FA post-FA self-test: node %d page %d chunk 0 one byte written after the FA\\n"', t)
+
+
+class FaPagedForcedRace(unittest.TestCase):
+    """Patch 0130h's device-free gate: the busy-wait between the FA's split kernels and the
+    merge, on the compute queue, so it lengthens FA j's hold of its slot and adds nothing
+    before FA j starts; the NOCONSUME drop is in `issue` only, and the cross-step prefetch's
+    consumed wait stays -- that is why window 294's red arm did not land.
+
+    Red mutations, each run and seen failing before it was restored:
+      (a) the delay enqueued before the split kernel's dispatch: the ordering cell fails --
+          it would add time before FA j starts, not during its hold;
+      (b) the call removed from the split branch: the ordering cell fails;
+      (c) the prefetch's consumed wait made conditional on !noconsume: the kept-wait cell
+          fails -- that would make NOCONSUME land in the wrong place.
+    """
+
+    def setUp(self):
+        self.root = _llama_root()
+        self.t = (self.root / OPENCL).read_text()
+
+    def test_the_switch_and_the_spin(self):
+        t = self.t
+        self.assertIn('getenv("GGML_OPENCL_FA_PAGED_DELAY")', t, "the delay switch is absent")
+        self.assertIn("static const long   n = e != nullptr ? atol(e) : 0;", t,
+                      "the delay is an iteration count")
+        body = t[t.find("static void ggml_cl_fa_paged_delay("):]
+        self.assertIn("if (n <= 0) return;", body, "unset or 0 must not delay")
+        self.assertIn("fa_paged_delay(__global uint * sink, uint n)", t, "the spin kernel is absent")
+        self.assertIn("clEnqueueNDRangeKernel(ctx->queue, o.delay_kernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr));", t,
+                      "the spin runs on the compute queue, one work-item")
+
+    def test_the_delay_sits_between_the_split_kernels_and_the_merge(self):
+        t = self.t
+        split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
+        call  = t.find("ggml_cl_fa_paged_delay(backend_ctx);")
+        merge = t.find("cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);")
+        self.assertTrue(split >= 0 and call >= 0 and merge >= 0)
+        self.assertGreater(call, split, "the delay must follow the FA's split kernels")
+        self.assertLess(call, merge, "the delay must precede the merge")
+        self.assertIn("// 0130h: the forced race's busy-wait, after the split kernels and before the merge", t)
+
+    def test_noconsume_stays_in_issue_and_the_prefetch_keeps_its_wait(self):
+        t = self.t
+        self.assertEqual(t.count("ggml_cl_fa_paged_noconsume()"), 2,
+                         "NOCONSUME is defined once and called exactly once, in issue")
+        self.assertIn("cl_uint  nw = o.consumed[p] != nullptr ? 1 : 0;", t,
+                      "the cross-step prefetch's consumed wait must stay unconditional")

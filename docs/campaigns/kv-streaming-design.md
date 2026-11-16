@@ -789,6 +789,55 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   0130a's depth cases into the perf list (window 293b's perf arms matched 0 cases), and
   0130f is the 0130b mechanism done right -- the V halves to private registers, stored after
   P V: `GGML_OPENCL_FA_DECODE_PRE=1`, default off, the card number owed (`code`).
+- **Window 294 (`measured-here`, build 9856f644 = 0130d):** four Q5 arms, OVERLAP=1,
+  VERIFY=3, greedy 32-token: B-red 261k pool 3584 and A-red 65k pool 1024 with
+  `GGML_OPENCL_FA_PAGED_NOCONSUME=1`, B/A-green without it. **Every arm printed
+  `post-FA changes 0` and no `post-FA changed` WARN**, red and green the same time (827.7 vs
+  828.0 s at 261k, 113.4 vs 113.3 s at 65k), pre-FA verify clean (4,032 nodes / 425.9 GB at
+  261k, 1,040 / 26.9 GB at 65k). So the red arm is green: either the race cannot land at
+  these depths or the check cannot see it, and the race's absence is not proven yet.
+  Also: window 293b's 261k B arms used pool 3584, not 1024; the kernel's K/V codes are
+  KT 1 (q8_0) and VT 2 (q4_0), not KT 8 / VT 4 (`code`).
+- **Why NOCONSUME=1 did not land, from the code (`code`):** every ordering that keeps a copy
+  out of the slot an FA is reading, in the order that matters.
+  - The copy queue is one in-order queue (`clCreateCommandQueue(ctx->context, ctx->device,
+    0, &err)`, `ggml-opencl.cpp:23927`), and a node's copies are issued at `issue` time
+    (`:24043-24086`). Copy k+2 is enqueued at `after(k+1)` (`:24148`), so it starts no earlier
+    than copy k+1's marker; copy k+1 starts at copy k's marker, which is exactly FA k's start,
+    because the FA waits `ready[parity] = copy k`'s marker (`before`, barrier at `:24138`).
+  - The two slots alternate: copy k+1 fills the slot FA k+1 reads, copy k+2 fills FA k's
+    slot. Copy k+2 reaching FA k's slot therefore needs copy k+1 shorter than FA k. Window
+    289b's `measured-here` figures say the opposite: at 261k a layer's copy ~11.4 ms against
+    the FA call's 9.15 ms, so copy k+1 ends after FA k does and copy k+2 launches into an
+    idle slot. At 65k the step is 116 ms against ~48 ms of copies a step, the copies are
+    not the critical path, and copy k+1 is still the longer side of the pair at the same
+    K/V ratio (`inferred` from 289b's per-layer ratio). The hazard needs FA k to hold its
+    slot LONGER than copy k+1 -- that is what 0130h's delay buys.
+  - `wl[1]`: `issue`'s wait list is at most two events, `consumed[parity]` first and the
+    `after_inputs` marker second (`:24050-24056`); NOCONSUME drops only the first, and the
+    second (compute queue marker, so after the graph's stems) still bounds the first nodes'
+    copies.
+  - The cross-step prefetch, the one copy whose start coincides with a reader's start, keeps
+    its wait unconditionally: `cl_uint nw = o.consumed[p] != nullptr ? 1 : 0;` and
+    `cl_event wl[1] = { o.consumed[p] };` (`:24005-24010`), not gated on
+    `ggml_cl_fa_paged_noconsume()`. 0129n-0129w's race was there: before 0130c that event was
+    never armed, so the pre-0130c copy into the graph's node-0 slot could start exactly when
+    the graph's last FA started reading the same slot.
+  - VERIFY=3's own enqueues lockstep the host at the next graph's start:
+    `ggml_cl_fa_paged_verify3_collect` calls `clWaitForEvents` on both readback events of
+    every pending pair (`:24404-24406`), and the post hash's readback was enqueued after that
+    FA's kernels; so before the host dispatches the next graph it waits for the previous
+    graph's last post hash -- i.e. its last FA -- to finish. That removes host lead across
+    the graph boundary, which is where the prefetch copy would otherwise be enqueued while
+    the last FA runs. (VERIFY=1's blocking readback at the FA's start does the same a node.)
+  - `GGML_OPENCL_FA_PAGED_DELAY=<n>` in 0130h is the arm that then makes the intra-graph
+    hazard reachable: an n-iteration spin on the compute queue between the split kernels and
+    `k_merge`, so FA j's hold grows by the spin; the red needs n large enough that FA k's hold
+    exceeds copy k+1's duration -- at 261k ~2.3 ms, at 65k ~0.5 ms (`inferred` arithmetic from
+    289b) -- so `DELAY=1000000` (~1-2 ms if the loop is ~4 cycles at 1.5 GHz) is a first
+    value and `5000000` a safe one; raise until the red runs. With the consumed wait on the
+    same delay must read 0: `after` arms the marker on the compute queue (`:24146-24147`), so
+    copy k+2 waits FA k's kernels, delay included.
 - **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
   kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
   `{fa_gqa_sides*n_tiles*16, n_head_kv*n_batch, n_splits}`, and w289b's grid {160,4,256} is

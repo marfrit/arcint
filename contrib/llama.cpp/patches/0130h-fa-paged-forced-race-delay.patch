@@ -1,0 +1,74 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 89722da..944df54 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1363,6 +1363,10 @@ struct ggml_backend_opencl_context {
+         int  v_post_warned = 0;
+         int  v_post_nopost_warned = 0;
+         int  v_self3_done = 0;   // 0130g: the device-side write went out once this request
++        // 0130h: the forced race's busy-wait kernel and its sink, built once a process
++        cl_program delay_prog = nullptr;
++        cl_kernel  delay_kernel = nullptr;
++        cl_mem     delay_buf = nullptr;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -23861,6 +23865,49 @@ static bool ggml_cl_fa_paged_noconsume() {
+     return on;
+ }
+ 
++// 0130h: GGML_OPENCL_FA_PAGED_DELAY=<n>, development only -- the forced race VERIFY=3 cannot
++// otherwise be seen. Window 294's NOCONSUME arm printed "post-FA changes 0" at both depths
++// (see the design note's ordering list): copy k+1 starts no earlier than FA k's start and is
++// LONGER than FA k, and copy k+2 starts no earlier than copy k+1's end, so without the delay
++// copy k+2 never launches while FA k reads the slot. This busy-waits n iterations in its own
++// kernel on the compute queue BETWEEN this FA's split kernels and its k_merge, so it runs
++// after the FA's reads and before the consumed marker: it lengthens FA j's HOLD of slot p,
++// it adds nothing before FA j starts. With NOCONSUME=1 the copy into p (two layers later) no
++// longer waits the marker and lands inside FA j; with the consumed wait on it does not.
++static long ggml_cl_fa_paged_delay_n() {
++    static const char * e = getenv("GGML_OPENCL_FA_PAGED_DELAY");
++    static const long   n = e != nullptr ? atol(e) : 0;
++    return n;
++}
++static const char * GGML_CL_FA_PAGED_DELAY_SRC =
++    "// 0130h: GGML_OPENCL_FA_PAGED_DELAY's spin, one work-item on the compute queue\n"
++    "__kernel void fa_paged_delay(__global uint * sink, uint n) {\n"
++    "    uint x = 0u;\n"
++    "    for (uint i = 0; i < n; ++i) { x = x * 1664525u + 1013904223u; }\n"
++    "    sink[0] = x;\n"
++    "}\n";
++
++static void ggml_cl_fa_paged_delay(ggml_backend_opencl_context * ctx) {
++    const long n = ggml_cl_fa_paged_delay_n();
++    if (n <= 0) return;
++    auto & o = ctx->fa_paged;
++    if (o.delay_kernel == nullptr) {
++        o.delay_prog = build_program_from_source_optional(ctx, GGML_CL_FA_PAGED_DELAY_SRC, "");
++        if (o.delay_prog == nullptr) {
++            GGML_LOG_WARN("ggml_opencl: paged FA delay: the spin kernel did not build; no delay\n");
++            return;
++        }
++        cl_int err;
++        CL_CHECK((o.delay_kernel = clCreateKernel(o.delay_prog, "fa_paged_delay", &err), err));
++        CL_CHECK((o.delay_buf = clCreateBuffer(ctx->context, CL_MEM_WRITE_ONLY, sizeof(cl_uint), nullptr, &err), err));
++    }
++    const cl_uint nn = (cl_uint) (n > 0xffffffffL ? 0xffffffffL : n);
++    CL_CHECK(clSetKernelArg(o.delay_kernel, 0, sizeof(cl_mem), &o.delay_buf));
++    CL_CHECK(clSetKernelArg(o.delay_kernel, 1, sizeof(cl_uint), &nn));
++    const size_t gws[1] = { 1 };
++    CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, o.delay_kernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr));
++}
++
+ // 0129n (C7): the streamed pages of `dst` from its USM host store into its ring on `cq`.
+ // Consecutive plan rows whose ring rows are consecutive coalesce into ONE command, so a plan
+ // that assigns ring rows in host-store order is one command a layer instead of n_pages.
+@@ -26273,6 +26320,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             clReleaseMemObject(kv_tmp_table);
+         }
+ 
++        // 0130h: the forced race's busy-wait, after the split kernels and before the merge
++        ggml_cl_fa_paged_delay(backend_ctx);
+         cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);
+         argi = 0;
+         CL_CHECK(clSetKernelArg(k_merge, argi++, sizeof(cl_mem),   &partial_buffer));

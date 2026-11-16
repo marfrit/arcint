@@ -1,0 +1,81 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index bba21a1..89722da 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1362,6 +1362,7 @@ struct ggml_backend_opencl_context {
+         int64_t v_post_changes = 0;
+         int  v_post_warned = 0;
+         int  v_post_nopost_warned = 0;
++        int  v_self3_done = 0;   // 0130g: the device-side write went out once this request
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -11850,7 +11851,10 @@ struct ggml_cl_fa_paged_totals {
+ };
+ static ggml_cl_fa_paged_totals g_fa_paged_totals;
+ extern "C" void ggml_backend_opencl_fa_paged_summary(void) {
+-    if (g_fa_paged_verify3_ctx) ggml_cl_fa_paged_verify3_collect(g_fa_paged_verify3_ctx);
++    if (g_fa_paged_verify3_ctx) {
++        ggml_cl_fa_paged_verify3_collect(g_fa_paged_verify3_ctx);
++        g_fa_paged_verify3_ctx->fa_paged.v_self3_done = 0;   // 0130g: one injected byte a request
++    }
+     if (!g_fa_paged_totals.issued && !g_fa_paged_totals.v_nodes && !g_fa_paged_totals.reused &&
+         !g_fa_paged_totals.pre_issued && !g_fa_paged_totals.fell_back &&
+         !g_fa_paged_totals.v_post_changes) return;
+@@ -24374,13 +24378,37 @@ static void ggml_cl_fa_paged_verify3_begin(ggml_backend_opencl_context * ctx,
+     o.post_cur = (int) o.post_pending.size() - 1;
+ }
+ 
++// 0130g: GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=3 -- the post-FA check's own red arm. Window
++// 294's NOCONSUME arm printed "post-FA changes 0" on every request-end line, so the collect
++// and compare path had never been seen to fire. This writes ONE byte into the K slot's first
++// streamed row, on the compute queue after this FA's kernels and before the post hash, on one
++// node a request (the first streamed node of the first decode graph): the post hash must
++// differ from the pre hash in exactly one chunk, the WARN must name that node/page/chunk, and
++// the summary must read "post-FA changes 1". It corrupts one K byte of one streamed key in
++// the ring slot until the next copy refills it: the answer may change on that node's decode
++// chain (the self-test is not for serving).
++static bool ggml_cl_fa_paged_selftest3() {
++    static const char * e = getenv("GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST");
++    static const bool   on = e != nullptr && atoi(e) == 3;
++    return on;
++}
++
+ // after this FA's kernels and before `ggml_cl_fa_paged_overlap_after`'s consumed marker
+-static void ggml_cl_fa_paged_verify3_post(ggml_backend_opencl_context * ctx) {
++static void ggml_cl_fa_paged_verify3_post(ggml_backend_opencl_context * ctx, bool decode) {
+     if (ggml_cl_fa_paged_verify_mode() != 3) return;
+     auto & o = ctx->fa_paged;
+     if (o.post_cur < 0 || o.post_cur >= (int) o.post_pending.size()) return;
+     fa_paged_post & e = o.post_pending[o.post_cur];
+     if (e.post) return;
++    if (decode && ggml_cl_fa_paged_selftest3() && !o.v_self3_done && e.node == 0) {
++        // the first streamed row's chunk 0: 1 byte, so exactly one chunk's hash changes
++        const unsigned char pat = 0xA5;
++        const cl_ulong off = e.base[0] + (cl_ulong) e.rows[0] * e.stride[0];
++        CL_CHECK(clEnqueueFillBuffer(ctx->queue, e.buf[0], &pat, 1, off, 1, 0, nullptr, nullptr));
++        o.v_self3_done = 1;
++        GGML_LOG_WARN("ggml_opencl: paged FA post-FA self-test: node %d page %d chunk 0 one byte written after the FA\n",
++                e.node, e.pages[0]);
++    }
+     const size_t gy = e.rows.size();
+     for (int kv = 0; kv < 2; ++kv) {
+         ggml_cl_fa_paged_verify3_hash_read(ctx, e.buf[kv], e.rowsbuf, e.base[kv], e.stride[kv],
+@@ -26265,7 +26293,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
+         // 0130d: VERIFY=3's post hash of the same rows, after the FA's kernels and before
+         // the consumed marker below (a landed copy changes these bytes; pre never sees it)
+-        ggml_cl_fa_paged_verify3_post(backend_ctx);
++        ggml_cl_fa_paged_verify3_post(backend_ctx, true);   // 0130g: the self-test only here
+         // 0129x: window 292's DEBUG arm printed 2,240 "commands (lead)" lines and not one
+         // "next-graph lead" line, and every request-end summary read "0 reused, 0 re-copied":
+         // this branch returns here, before the tail call below, and the served decode takes it
+@@ -26399,7 +26427,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+     }
+     // 0130d: VERIFY=3's post hash, after the tail kernels and before the consumed marker
+-    ggml_cl_fa_paged_verify3_post(backend_ctx);
++    ggml_cl_fa_paged_verify3_post(backend_ctx, false);
+     // 0129n: this layer's kernels are enqueued: the slot may be refilled, and the next
+     // attention layer's pages go on the copy queue now (one layer of lead)
+     if (paged_overlap_copied && paged_overlap_parity >= 0) {
