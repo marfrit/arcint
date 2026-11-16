@@ -7861,3 +7861,40 @@ Five corrections to `0129n`, all from reading it (`code`):
   2-layer ring is SoA (`nrk = 2`), so coalescing and the lead both take the fallback. An op
   case that reaches `ggml_cl_fa_paged_enqueue_pages` needs USM allocations and a single-region
   q8_0/q4_0 ring; not built yet, so the served NOWAIT arm is the only red evidence.
+
+## 0129r-kv-stream-request-end-counts.patch
+
+Window 288 (`code` + `measured-here`): zero request-end lines with 0129p in every served
+arm, though `generate_spec_lane` calls it (backend_llama.cpp:2605, the MTP-5 path). From the
+code: `llama_kv_stream::request_end()` returned when `logged_first` was false, but
+`logged_first` stays true after the first line a stream ever printed, and `prepare()` prints
+only when `!logged_first || (n_streamed > 0 && !logged_stream)` -- a later request that
+streams after one already logged prints nothing and never clears the flag. Warmup and a
+short probe log; the 65k/261k requests do not. The counts were also only assigned inside
+that print gate. Now `prepare()` keeps `att_last`/`streamed_last` every ubatch, and
+`request_end()` prints unconditionally (one line per completion) and resets both flags.
+
+## 0129s-kv-stream-paged-verify-and-overlap-summary.patch
+
+- `GGML_OPENCL_FA_PAGED_VERIFY=1`: exact integrity of what each paged FA reads, on the card.
+  `ggml_cl_fa_paged_verify` builds a small FNV kernel (`fa_paged_verify`) and enqueues it on
+  the compute queue at the FA's position: after the lead's ready barrier (so after its
+  copies) and, in the unset/sync arms, after the copies just enqueued on that same queue;
+  the FA's own kernels are enqueued after this function returns. It hashes EXACTLY the ring
+  rows the plan names as streamed for this node, at the slot's own base offset and row
+  stride, in 4096-byte chunks, K then V. The host hashes the same bytes of the plan's pages
+  in the USM host store, which `prepare()` wrote before the graph. The ring row stride
+  equals the host page stride (K 1088*256 = 278528 = `kb`, V 576*256 = 147456 = `vb`), so
+  the compared bytes are the attended bytes; the check reads the slot after the copies in
+  the same queue position, so it observes the state FA j sees. What it does not prove is the
+  kernel's own addressing (it validates the copies, not the paged kernel's row math).
+  Per process the first mismatch WARNs with node, host page, ring row and chunk; totals are
+  in the summary line. A mismatch is a WARN, not an abort, and `NOWAIT` is the red arm: a
+  slot read mid-copy must show chunk hashes differ. If it stays clean, the copies are far
+  enough ahead (or the sync drain covers them) and the check is not reaching the race --
+  say so rather than claim it; the arm's log then does.
+- The overlap summary line: 0129q printed it from the LAST chain node's dispatch tail, which
+  needs that dispatch to take the tail and its `ov` to hold; window 288's zero count says no
+  dispatch satisfied both, while the DEBUG lead lines prove the 16 issues. It is printed at
+  the next graph's start now -- `ggml_backend_opencl_graph_compute` always runs -- with the
+  previous graph's "issued ahead / fell back" and the VERIFY totals.

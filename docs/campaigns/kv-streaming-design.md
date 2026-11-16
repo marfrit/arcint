@@ -682,11 +682,69 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   uploads are the only write on the compute queue that the copies must follow (0042); the
   first GDN layers write nothing the copies read. Price ~1/16 of the copy time (one of 16
   attention layers) per step, about 17 ms at 261k by window 284's 274 ms -- `inferred`.
+- **Window 288 (`measured-here`, head 48e19f15):** the lead works. Q5 UD-Q5_K_M, B60, one
+  process an arm.
+
+  | arm | pool | 4k ms | 65k ms (t/s) | 261k ms (t/s) |
+  |---|---|---|---|---|
+  | old `bd68d80d` | 1024 | 74.0 | 173.1 (21.99) | - |
+  | new, unset | 1024 | 73.6 | 160.8 (23.67) | - |
+  | new, OVERLAP | 1024 | 74.1 | 119.9 (32.22) | - |
+  | OVERLAP+NOWAIT | 1024 | 74.0 | 120.0 (31.72) | - |
+  | new, unset | 3584 | - | - | 453.2 (6.78) |
+  | new, OVERLAP | 3584 | - | - | 274.3 (12.07) |
+
+  C7 coalescing alone: -12.3 ms at 65k, -58.2 ms at 261k (against 286's 511.4). C6 lead:
+  -40.9 ms at 65k, -178.9 ms at 261k; 65k is 4.2 ms above all-resident 115.7, 261k lands at
+  280 as estimated. DEBUG at 65k: 16 of 16 nodes take the lead, each 2 commands after
+  coalescing for 43,024,384 bytes (101 pages x 425,984, one command for K and one for V),
+  slots alternating. Answers: 65k identical opening in all arms, needle absent in the text,
+  Paris after; 261k needle found and Paris after in both new arms. **Open item:** the 261k
+  opening differs between unset ("...exec/backend_o") and OVERLAP ("...exec/flash_nex"),
+  acceptance 173 vs 179. A different opening alone is within the card's per-forward
+  nondeterminism (0.136 nats floor), so it is neither proof of a race nor proof against one;
+  it stays open until `GGML_OPENCL_FA_PAGED_VERIFY=1` is clean in both arms. The NOWAIT arm's
+  absent-needle wording differs (424 vs 411 tokens) -- also not a visible failure.
+- **VERIFY replaces the op-level case for now (`code` + `measured-here` on the card):** the
+  op suite cannot reach the lead path (plain host store, SoA 2-layer ring, window 288:
+  "node 0 of 1 fell back"), so the exact integrity check runs on the served path instead:
+  FNV over exactly the plan's streamed ring rows at FA j's queue position, against the host
+  store pages (0129s). The design note counts it as the red evidence until a USM + one-region
+  op case exists; the design note says the NOWAIT arm is red only if VERIFY reports
+  mismatches.
 - **No op-level evidence yet (`code` of the suite):** `test-backend-ops`' host store is a plain
   buffer and its 2-layer ring is SoA (window 283's DEBUG line: `nrk 2`), so 0129n's coalescing
   and lead both take the fallback there; the FA filter's pass count says nothing about them.
   A case that reaches the path needs USM host allocations and a one-region ring -- the next
   step; until then the served NOWAIT arm is the only red evidence for "the FA waits its copy".
+- **Next lever, analysis (`code` from the references, `measured-here` from windows 284/288):**
+  at 261k the step is copy-bound: 473 pages x 425,984 B x 16 layers = 3.22 GB a step; at
+  14.3 GB/s USM that is 225 ms against 274.3 measured, with compute 237 ms. What lowers it:
+  - **Page selection / sparse attention over streamed pages** -- Strata's resolve
+    (`src/kernels/cuda/kv_stream.cu:100-165`) looks up only the blocks the call's ids touch
+    and copies just the misses (`copy_kernel`, :167-180), with a clock-sweep slot choice;
+    FreeToken keeps a paged KV pool in VRAM and attends selected tiles
+    (`python/freetoken/attention/dsv41_sparse.py`, `kernel/triton/dsv41/sparse_attn.py`).
+    For dense attention at 261k every page is touched, so selection saves nothing today; it
+    becomes the lever if the served attention is sparse.
+  - **Lower precision for streamed pages only** -- Strata streams K8V4/Q4/int8 pools
+    (`kv_stream.cu:34-59`); our pages are already q8_0 K / q4_0 V. K at q4_0 would take a
+    page from 425,984 to ~294,912 B: 2.23 GB, ~156 ms at 14.3 GB/s. That is the largest
+    single cut and it is a precision decision, judged at the answer (CLAUDE.md), not here.
+  - **Keeping pages resident across steps** -- the pool partition already does this for the
+    resident pages; for dense attention the streamed set is read every step, so residency
+    growth is the only cut, i.e. a bigger pool or fewer bytes a page (above).
+  - **USM gather kernel** (round 11's option): the paged kernel reads the host store through
+    the table, no copies, one enqueue a layer; the bytes over the link equal the copies' but
+    the VRAM write of the staging copy is saved. llama.cpp itself does this for KV:
+    `--no-kv-offload` keeps the KV cache in host memory and the kernels read it there
+    (`code`, the pinned tree; our path adds the paged table on top).
+  - **The 37 ms** between max(237, ~216 inferred copies) and 274.3: candidates are node 0's
+    marker (one of 16 layers, ~17 ms `inferred`), the tail layer's copies starting only after
+    its preceding `consumed` (one layer not fully hidden), 16 event waits + 16 barriers a
+    graph, and the copy engine sharing with the input uploads (0042). A unitrace pass that
+    sums `clEnqueueWriteBuffer` busy bytes/time and the gaps between kernel batches splits
+    copy time from wait time per node; that is the measurement to run.
 - **Red (0129l, development only):** `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1`
   keeps the copies on the copy queue but drops the FA's ready wait. Expected:
   at 261k the kernel reads a slot mid-copy -- wrong answers (needle or Paris) or
