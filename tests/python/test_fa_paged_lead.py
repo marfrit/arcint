@@ -50,7 +50,7 @@ class FaPagedLead(unittest.TestCase):
                       "the split branch must call the tail before it returns")
         self.assertIn("ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);", block)
         # the served decode takes this branch; the tail call below it is unreachable there
-        self.assertIn("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);", block,
+        self.assertIn("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst, tl_now ? &ev_merge : nullptr);", block,
                       "the call must follow both kernels")
 
     def test_every_early_return_names_itself(self):
@@ -112,7 +112,7 @@ class FaPagedPostFA(unittest.TestCase):
         j = t.rfind("const size_t merge_wg", 0, i)
         self.assertTrue(j >= 0)
         block = t[j:t.find("        return;\n", i)]
-        k = block.find("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);")
+        k = block.find("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst, tl_now ? &ev_merge : nullptr);")
         p = block.find(post)
         a = block.find("ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);")
         self.assertTrue(k >= 0 and p >= 0 and a >= 0, "the split branch lacks kernel, post or marker")
@@ -253,7 +253,7 @@ class FaPagedForcedRace(unittest.TestCase):
 
     def test_the_delay_sits_between_the_split_kernels_and_the_merge(self):
         t = self.t
-        split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
+        split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst, tl_now ? &ev_split : nullptr);")
         call  = t.find("if (!ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);")
         merge = t.find("cl_kernel k_merge = backend_ctx->fa.f32_merge.at(dk_dv);")
         self.assertTrue(split >= 0 and call >= 0 and merge >= 0)
@@ -302,44 +302,20 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
                       "0131i: the flag must reach the context parameters")
 
     def test_timeline_markers_absent_with_the_switch_off_0131b(self):
-        # 0131b: tl_mark enqueues nothing unless GGML_OPENCL_FA_PAGED_TIMELINE is on; the
-        # markers 0130p added ran on every FA and copy with the switch unset (window 299:
-        # OVERLAP 451.9 ms/step vs 261-262 before). Red: the early return removed.
+        # 0131b removed 0130p's always-enqueued markers; 0131c removed the timeline's markers
+        # altogether (they serialized the queues and, with the switch off, cost the overlap its
+        # gain). The cell now asserts the absence, which subsumes 0131b's guard.
         t = self.t
-        i = t.find("static void ggml_cl_fa_paged_tl_mark(")
-        self.assertGreater(i, 0)
-        j = t.find("clEnqueueMarkerWithWaitList", i)
-        self.assertGreater(j, i)
-        self.assertIn("if (!ggml_cl_fa_paged_timeline()) return;", t[i:j],
-                      "0131b: the timeline marker must return before enqueueing when the switch is off")
-
-    def test_timeline_submit_times_share_the_device_axis_0131a(self):
-        # 0131a: start-submit compares a device stamp (relative to the base marker's END) with a
-        # host stamp; the host base is our own CLOCK_MONOTONIC beside clGetDeviceAndHostTimer and
-        # the submit time is shifted by tl_dev_base - base_en, the device's lag at the base.
-        # Red: the shift dropped, or the timer's own host clock used as the base. Roles 8/9 print.
-        t = self.t
-        self.assertIn("const long long shift = o.tl_dev_base > 0 ? o.tl_dev_base - (long long) base_en : 0;", t)
-        self.assertIn("x.host - hb + shift };", t, "0131a: the submit time must be shifted onto the device axis")
-        i = t.find("clGetDeviceAndHostTimer(ctx->device, &devb, &hostb) == CL_SUCCESS")
-        self.assertGreater(i, 0)
-        self.assertIn("o.tl_host_base = ggml_cl_fa_paged_tl_host_ns();", t[i:i + 600],
-                      "0131a: the host base must be the same clock as the host stamps")
-        self.assertNotIn("o.tl_host_base = (long long) hostb;", t)
-        self.assertIn("k < hin.size() ? hin[k].host : -1, k < hout.size() ? hout[k].host : -1", t,
-                      "0131a: the FA host line prints roles 8 and 9")
+        self.assertNotIn("ggml_cl_fa_paged_tl_mark", t)
 
     def test_timeline_marker_wait_list_null_when_empty_0130v(self):
-        # 0130v: tl_mark's callers hand over their wait array with nw 0 (no consumed event yet,
-        # or NOFIX); a non-NULL list with a count of 0 is CL_INVALID_EVENT_WAIT_LIST (-57,
-        # window 298). Red: the marker passing `wl` unguarded.
+        # 0130v (window 298's -57 abort) guarded a marker's wait list. 0131c removed the
+        # timeline's markers; the hash kernel's wait list is the only new one and it is
+        # guarded the same way, so the rule survives in its new place.
         t = self.t
-        i = t.find("static void ggml_cl_fa_paged_tl_mark(")
-        self.assertGreater(i, 0, "0130v: no timeline marker helper")
-        j = t.find("static void ggml_cl_fa_paged_tl_finish(", i)
-        self.assertGreater(j, i)
-        self.assertIn("clEnqueueMarkerWithWaitList(q, nw, nw ? wl : nullptr, &ev)", t[i:j],
-                      "0130v: the timeline marker must pass NULL when its wait list is empty")
+        self.assertIn("const cl_uint nw = ws != nullptr ? 1 : 0;   // 0131d: never a host wait, only the copy's event", t)
+        self.assertIn("cl_event wl[1] = { ws != nullptr ? *ws : nullptr };", t)
+        self.assertNotIn("CL_CHECK(clEnqueueMarkerWithWaitList(q, nw, nw ? wl : nullptr, &ev))", t)
 
     def test_compute_queue_profiling_at_runtime_0130u(self):
         # 0130u: the compute queue takes CL_QUEUE_PROFILING_ENABLE when the timeline switch is
@@ -364,27 +340,29 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.assertIn("ggml_cl_fa_paged_tl_finish(g_fa_paged_ctx)", t,
                       "the request's end must print and release the stamps")
 
-    def test_the_marks_and_the_margin(self):
+    def test_the_stamps_and_the_margin(self):
+        # 0131c: the stamps are the commands' own events, so their order is the enqueue order:
+        # k_split's event is stamped after it is enqueued, k_merge's after k_merge, the post
+        # hash's inside verify3_post. The margin takes the split's END (role 3) against the
+        # copy's first write START (role 0).
         t = self.t
-        split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
-        start = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 2, paged_overlap_parity, fa_slot, 0, nullptr);")
-        end   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 3, paged_overlap_parity, fa_slot, 0, nullptr);")
-        merge = t.find("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);")
-        mend  = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 4, paged_overlap_parity, fa_slot, 0, nullptr);")
+        split = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst, tl_now ? &ev_split : nullptr);")
+        start = t.find("ggml_cl_fa_paged_tl_keep(backend_ctx, 2, paged_overlap_parity, fa_slot, ev_split);")
+        end   = t.find("ggml_cl_fa_paged_tl_keep(backend_ctx, 3, paged_overlap_parity, fa_slot, ev_split);")
+        merge = t.find("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst, tl_now ? &ev_merge : nullptr);")
+        mend  = t.find("ggml_cl_fa_paged_tl_keep(backend_ctx, 4, paged_overlap_parity, fa_slot, ev_merge);")
         post  = t.find("ggml_cl_fa_paged_verify3_post(backend_ctx, true);")
-        pst   = t.find("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 6, paged_overlap_parity, fa_slot, 0, nullptr);")
+        pst   = t.find("ggml_cl_fa_paged_tl_keep(ctx, 6, e.node, e.slot, kev);")
         self.assertTrue(min(split, start, end, merge, mend, post, pst) >= 0, "a stamp is absent")
-        self.assertLess(start, split, "the FA split start stamp must precede the split kernel")
-        self.assertGreater(end, split, "the FA split end stamp must follow it")
-        self.assertLess(end, merge, "the split end must precede the merge")
-        self.assertGreater(mend, merge, "the merge stamp must follow it")
-        self.assertLess(pst, post, "the post start stamp must precede the post hash")
+        self.assertGreater(start, split, "0131c: the split start stamp follows its enqueue")
+        self.assertGreater(end, start, "0131c: the split end stamp is the same event, after the start")
+        self.assertLess(end, merge, "the split's stamps must precede the merge's")
+        self.assertGreater(mend, merge, "0131c: the merge stamp follows its enqueue")
+        self.assertLess(pst, post, "0131c: the post start stamp is inside verify3_post")
         self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 5, ni, parity, o.consumed[parity]);", t,
-                      "the consumed marker is stamped")
-        # the copy start marker carries the copy's waits
-        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 0, ni, parity, nw, wl);", t)
-        self.assertIn("ggml_cl_fa_paged_tl_mark(ctx, o.q, 7, 0, p, nw, wl);", t)
-        # the margin: copy k+2 against FA k's split end, minimum and negative count
+                      "the consumed marker is stamped (role 5, the marker the copy waits anyway)")
+        self.assertIn("const long long st = x.role == 2 || x.role == 6 ? (long long) x.st : (long long) x.en;", t)
+        self.assertIn("if (x.role == 0) { cs.push_back((long long) x.st - (long long) base_en);", t)
         self.assertIn("const long long m = cs[k + 1] - fe[k];", t)
         self.assertIn("negative %d", t, "the margin line must say whether any pair landed negative")
 
@@ -437,9 +415,12 @@ class FaPagedTimelineSlotHostDelay(unittest.TestCase):
         self.assertIn("const int fa_slot = (paged_overlap_parity >= 0 &&", t,
                       "the FA stamps must look the slot up from the chain node")
         self.assertIn("ggml_cl_fa_paged_overlap_slot(backend_ctx, backend_ctx->fa_paged.chain[paged_overlap_parity]) : -1;", t)
-        for role in ("2", "3", "4", "6"):
-            self.assertIn("ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, %s, paged_overlap_parity, fa_slot, 0, nullptr);" % role,
-                          t, "the FA stamp %s must carry node and slot" % role)
+        # 0131c: the stamps come from k_split's and k_merge's events and the post hash kernel's
+        for role in ("2", "3", "4"):
+            self.assertIn("ggml_cl_fa_paged_tl_keep(backend_ctx, %s, paged_overlap_parity, fa_slot," % role, t,
+                          "the FA stamp %s must carry node and slot" % role)
+        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 6, e.node, e.slot, kev);", t,
+                      "the post-start stamp must carry node and slot")
         self.assertIn("slot %d node %d copy start %lld end %lld submit %lld", t)
 
     def test_the_host_submit_time(self):
@@ -458,8 +439,91 @@ class FaPagedTimelineSlotHostDelay(unittest.TestCase):
         self.assertIn('strcmp(e, "splits") == 0', t, "only `splits` moves the spin")
         self.assertIn("if (ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);   // 0130y: before the readers", t)
         i = t.find("// 0130y: before the readers")
-        j = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);")
+        j = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst, tl_now ? &ev_split : nullptr);")
         self.assertGreater(j, i, "the AT=splits spin must precede the split kernels")
         k = t.find("if (!ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);")
         self.assertGreater(k, j, "the default placement stays after the split kernels")
         self.assertIn("paged FA switch GGML_OPENCL_FA_PAGED_DELAY_AT=splits", t)
+
+
+class FaPagedTimelineNoMarkerAndPostRead(unittest.TestCase):
+    """Patches 0131c/0131d: the timeline stamps with the commands' own events (no marker of
+    its own), and VERIFY=4 hashes the slot's rows without a host wait, comparing pre-read
+    against the reader's hash and the reader's hash against a re-hash that waits the slot's
+    next copy by event.
+
+    Red mutations, each run and seen failing before it was restored:
+      (a) a marker back in the recording start: the no-marker cell fails;
+      (b) the copy's stamps taken from a marker instead of the write commands' events: the
+          copy-event cell fails;
+      (c) the re-hash enqueued without the copy's ready event: the ready-wait cell fails;
+      (d) VERIFY=4's pairs collected at the graph start again: the collect-site cell fails.
+    """
+
+    def setUp(self):
+        self.root = _llama_root()
+        self.t = (self.root / OPENCL).read_text()
+
+    def test_no_timeline_marker_of_its_own(self):
+        t = self.t
+        self.assertNotIn("ggml_cl_fa_paged_tl_mark", t,
+                         "0131c: the timeline must stamp with command events, not markers of its own")
+        self.assertNotIn("tl_mark(", t)
+        # the markers left in the overlap are the copy's readiness, the after-inputs order and
+        # the consumed marker that the next copy waits anyway -- none of them the timeline's
+        self.assertIn("CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.ready[parity]));"
+                      "   // the slot's readiness; the FA waits it", t)
+        self.assertIn("CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &o.consumed[parity]));", t)
+        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 5, ni, parity, o.consumed[parity]);", t)
+        # the recording start enqueues nothing at all; the base is derived from the stamps
+        i = t.find("static void ggml_cl_fa_paged_overlap_graph(")
+        self.assertGreater(i, 0)
+        j = t.find("// start a recording", i)
+        k = t.find("\nstatic void ", j + 10)   # the next definition ends the recording-start block
+        self.assertGreater(j, i)
+        seg = t[j:k]
+        self.assertNotIn("clEnqueueMarker", seg,
+                         "0131c: the recording start must enqueue no command")
+        self.assertIn("base the earliest device start among the stamps", t)
+
+    def test_the_stamps_are_the_commands_events(self):
+        t = self.t
+        self.assertIn("cl_event * ev_out = nullptr", t, "enqueue_ndrange_kernel must hand out its event")
+        self.assertIn("cl_event * ev_first = nullptr, cl_event * ev_last = nullptr", t,
+                      "enqueue_pages must hand out its first and last write's event")
+        # the split's one event is both stamps; the merge's END is its stamp
+        self.assertIn("ggml_cl_fa_paged_tl_keep(backend_ctx, 2, paged_overlap_parity, fa_slot, ev_split);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_keep(backend_ctx, 3, paged_overlap_parity, fa_slot, ev_split);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_keep(backend_ctx, 4, paged_overlap_parity, fa_slot, ev_merge);", t)
+        self.assertEqual(t.count("tl ? &ev_first : nullptr, tl ? &ev_last : nullptr);"), 2,
+                         "0131c: both copy sites ask enqueue_pages for the writes' events")
+        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 0, ni, parity, ev_first);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 1, ni, parity, ev_last);", t)
+        self.assertIn("ggml_cl_fa_paged_tl_keep(ctx, 7, 0, p, ev_first);", t)
+        # role 2 prints the event's START, role 3 its END (both from one event)
+        self.assertIn("const long long st = x.role == 2 || x.role == 6 ? (long long) x.st : (long long) x.en;", t)
+
+    def test_verify4_does_not_block(self):
+        t = self.t
+        self.assertIn("ggml_cl_fa_paged_verify4_rehash(ctx, parity, o.ready[parity]);", t)
+        self.assertIn("ggml_cl_fa_paged_verify4_rehash(ctx, p, o.pre_ready);", t)
+        self.assertIn("const cl_uint nw = ws != nullptr ? 1 : 0;   // 0131d: never a host wait, only the copy's event", t)
+        # stage 1: the reader's hash against the state it started from; stage 2: that hash
+        # against the re-hash behind the slot's next copy
+        self.assertIn("ggml_opencl: paged FA post-read changed: node %d page %d chunk %d", t)
+        self.assertIn("pre-read vs read %lld mismatches, \"", t)
+        self.assertIn("\"read vs re-hash %lld, re-hash missing on %d pairs, stage-1 self-test writes %lld", t)
+        self.assertIn('getenv("GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST")', t)
+        self.assertIn("== 4;", t, "SELFTEST=4 is the stage-1 red arm")
+        self.assertIn("ggml_cl_fa_paged_verify4_selftest(backend_ctx, paged_overlap_parity);", t)
+        # the stage-1 write sits between the pre hash and the reader: after the AT=splits spin
+        # and before k_split
+        i = t.find("ggml_cl_fa_paged_verify4_selftest(backend_ctx, paged_overlap_parity);")
+        j = t.find("backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst, tl_now ? &ev_split : nullptr);")
+        self.assertGreater(j, i, "0131d: the self-test write must precede the split kernel")
+
+    def test_verify4_collects_only_at_the_request_end(self):
+        t = self.t
+        self.assertIn("if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)", t,
+                      "0131d: a VERIFY=4 pair must not be waited at a graph's start")
+        self.assertNotIn("verify_mode() == 3 || ggml_cl_fa_paged_verify_mode() == 4 && g_fa_paged_verify3_ctx", t)

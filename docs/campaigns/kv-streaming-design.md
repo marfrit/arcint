@@ -1194,3 +1194,16 @@ per patch; DESIGN §7 and §3.9 gain a line when the state of play moves;
   submit time (clGetDeviceAndHostTimer at the base), and `DELAY_AT=splits` puts the spin
   before the split kernels; to widen the read the prefetch must wait, the FA to lengthen
   is the slot's last reader two layers before the graph's last FA.
+
+- **0131c-0131h (`code`), round 8's two defects:** 0130p's markers were commands on both
+  queues (window 299: 451.9 ms/step with the switch unset against 261.3/262.1 before
+  0130p), so the timeline serialized what it measured; its stamps are now the commands'
+  own events (k_split both split stamps, k_merge, the writes' first/last events, the
+  consumed marker, the post hash), the base is the earliest device start among them, and
+  the recording start enqueues nothing. VERIFY=4 is the non-blocking race detector: a
+  reader's hash after its kernels and a re-hash behind the slot's next copy's ready event,
+  both in a USM-indexed pair, compared only at the request's end -- VERIFY=3's collect at a
+  graph's start was the host wait that ordered the prefetch behind the last FA. The
+  TIMELINE on/off text difference (`code` for the unchanged dependencies, `inferred` for
+  the cause) is either a copy landing inside a reader or the B60's per-forward floor;
+  VERIFY=4 with SELFTEST=4 decides it on the card.

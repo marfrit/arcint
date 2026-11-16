@@ -8211,3 +8211,59 @@ one timeline build's measurements, and none changes a runtime default.
 Gate: `FaPagedTimelineSlotHostDelay` in `tests/python/test_fa_paged_lead.py`; three
 mutations run and seen failing, restored: an FA stamp back to the node in the slot field,
 the AT=splits spin removed, the submit time dropped from the kept stamps.
+
+## 0131c-fa-paged-timeline-no-marker.patch
+
+`code`: the timeline's stamps are the commands' own events; it enqueues no command of its
+own and waits no host in a graph. This file also carries 0131d (one file, one build; a
+review that wants them apart splits the hunks).
+
+- **0131c, no marker.** 0130p stamped with `clEnqueueMarkerWithWaitList`, four with output
+  events on the compute queue per split-decode FA, a copy-start marker carrying the copy's
+  same wait list and an unflushed copy-end marker on the copy queue. Window 299 measured
+  the overlap's whole gain gone with the switch unset (451.9 ms/step against 261.3/262.1
+  before 0130p) and 0131b's early return only hid it while the switch was off. Now:
+  `enqueue_ndrange_kernel` hands out its command's event on request, `k_split`'s event is
+  both the split start (its start) and the split end (its end), `k_merge`'s end is the merge
+  end, `enqueue_pages` hands out its first and last write command's events (the copy's
+  start and end), the consumed marker is stamped as it is (role 5, the marker the next copy
+  waits anyway), the post hash kernel's start is the post-start stamp when VERIFY=3/4 runs.
+  The base is no longer a command: `tl_finish` takes the earliest device start among the
+  stamps. The overlap's remaining markers are the ones the schedule needs (`o.ready`,
+  `o.pre_ready`, the after-inputs order, `o.consumed`) -- none of them the timeline's.
+- **Which call serialized, from the code (`code`; the cost mechanism `inferred`):** the
+  copy-start marker was enqueued whenever `nw` was non-zero, i.e. also with the switch off
+  (`if (nw || ggml_cl_fa_paged_timeline())`), so every issue put an extra command with a
+  cross-queue wait list and an output event nobody consumed on the queue that carries the
+  copies. The compute-side markers ran only under the switch. A marker is a command: ICC
+  schedules it as its own node, and its event exists only to be released. Whether that
+  costs 190 ms/step as a submission boundary or as an event-scheduling stall cannot be
+  decided on this host; window 299's numbers are the measurement that matters.
+- **0131d, VERIFY=4: a post-read pair that waits nothing in the graph.** The same pre-read
+  hash 0130s/0130d use, plus a hash of the slot's rows enqueued after the reader's split
+  kernels and merge (`verify3_post`'s second hash), plus a re-hash when the slot's next
+  copy has been issued: a kernel on the compute queue whose only wait list is that copy's
+  `o.ready` event, no readback in the graph and no host wait. The pair is collected only at
+  the request's end: pre-read against the reader's hash is `read` (a copy landing inside
+  the read), the reader's hash against the re-hash is `late` (a copy landing after it), and
+  a missing re-hash is counted, not silently skipped. `VERIFY=3`'s collect at a graph's
+  start ordered the next graph's dispatch behind the previous graph's last FA (the host
+  waited the readback events); VERIFY=4 does not collect there at all. Line:
+  `paged FA post-read (request end): pre-read vs read N mismatches, read vs re-hash M,
+  re-hash missing on K pairs, stage-1 self-test writes S`; a difference WARNs
+  `ggml_opencl: paged FA post-read changed: node %d page %d chunk %d`, once a process.
+  `GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=4` is its stage-1 red arm: one byte written into
+  the slot between the pre-read hash and the reader's split kernel, on one node a request.
+- **Why TIMELINE on and off gave different greedy texts (`code` for the dependencies,
+  `inferred` for the cause):** the markers added no wait to the compute queue and the copy
+  queue's copy-start marker carried exactly the wait list its writes carried, so no
+  buffer's reader/producer order changed -- the math kernels see the same dependencies.
+  What changed is when the copies run relative to the readers: 190 ms/step of extra
+  schedule. A copy landing inside a reader's window changes bytes that reader sees, and
+  that is a data race, not rounding; the alternative is the B60's per-forward
+  nondeterminism (CLAUDE.md's 0.136-nat floor). VERIFY=4, with its self-test proving the
+  detector fires, decides which -- on the card.
+- **Gate:** `FaPagedTimelineNoMarkerAndPostRead` in `tests/python/test_fa_paged_lead.py`.
+  Four mutations run and seen failing, then restored: a marker back in the recording start,
+  the copy stamps taken from no command event, the re-hash enqueued without the copy's
+  ready event, VERIFY=4's pairs collected at a graph's start.
