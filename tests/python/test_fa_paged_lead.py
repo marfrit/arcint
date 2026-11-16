@@ -290,6 +290,22 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.root = _llama_root()
         self.t = (self.root / OPENCL).read_text()
 
+    def test_timeline_submit_times_share_the_device_axis_0131a(self):
+        # 0131a: start-submit compares a device stamp (relative to the base marker's END) with a
+        # host stamp; the host base is our own CLOCK_MONOTONIC beside clGetDeviceAndHostTimer and
+        # the submit time is shifted by tl_dev_base - base_en, the device's lag at the base.
+        # Red: the shift dropped, or the timer's own host clock used as the base. Roles 8/9 print.
+        t = self.t
+        self.assertIn("const long long shift = o.tl_dev_base > 0 ? o.tl_dev_base - (long long) base_en : 0;", t)
+        self.assertIn("x.host - hb + shift };", t, "0131a: the submit time must be shifted onto the device axis")
+        i = t.find("clGetDeviceAndHostTimer(ctx->device, &devb, &hostb) == CL_SUCCESS")
+        self.assertGreater(i, 0)
+        self.assertIn("o.tl_host_base = ggml_cl_fa_paged_tl_host_ns();", t[i:i + 600],
+                      "0131a: the host base must be the same clock as the host stamps")
+        self.assertNotIn("o.tl_host_base = (long long) hostb;", t)
+        self.assertIn("k < hin.size() ? hin[k].host : -1, k < hout.size() ? hout[k].host : -1", t,
+                      "0131a: the FA host line prints roles 8 and 9")
+
     def test_timeline_marker_wait_list_null_when_empty_0130v(self):
         # 0130v: tl_mark's callers hand over their wait array with nw 0 (no consumed event yet,
         # or NOFIX); a non-NULL list with a count of 0 is CL_INVALID_EVENT_WAIT_LIST (-57,

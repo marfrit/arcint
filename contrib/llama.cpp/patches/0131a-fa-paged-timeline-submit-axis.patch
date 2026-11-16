@@ -1,0 +1,56 @@
+0131a: the timeline's submit times on the device stamps' axis (host base = CLOCK_MONOTONIC beside the timer, shifted by the device lag at the base); roles 8/9 printed.
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -24194,11 +24194,16 @@
+             ev.size());
+     for (int slot = 0; slot < 2; ++slot) {
+         struct one { int node; long long st, en, host; };
+-        std::vector<one> cs, ce, fs, fe, me, cons, post;
++        std::vector<one> cs, ce, fs, fe, me, cons, post, hin, hout;
+         for (auto & x : ev) {
+             if (x.slot != slot) continue;
++            // 0131a: a submit time on the device stamps' axis. The device stamps are relative
++            // to the base marker's END, which runs late by however far the device was behind
++            // the host when the recording began; tl_dev_base is the device clock AT the host
++            // base. Without the timer the column is the host-relative time and says so.
++            const long long shift = o.tl_dev_base > 0 ? o.tl_dev_base - (long long) base_en : 0;
+             const one e{ x.node, (long long) x.en - (long long) base_en,
+-                         (long long) x.en - (long long) base_en, x.host - hb };
++                         (long long) x.en - (long long) base_en, x.host - hb + shift };
+             if (x.role == 0) cs.push_back(e);
+             else if (x.role == 1) ce.push_back(e);
+             else if (x.role == 2) fs.push_back(e);
+@@ -24206,6 +24211,8 @@
+             else if (x.role == 4) me.push_back(e);
+             else if (x.role == 5) cons.push_back(e);
+             else if (x.role == 6) post.push_back(e);
++            else if (x.role == 8) hin.push_back(e);    // 0131a
++            else if (x.role == 9) hout.push_back(e);   // 0131a
+         }
+         for (size_t k = 0; k < cs.size(); ++k) {
+             GGML_LOG_WARN("ggml_opencl: paged FA timeline: slot %d node %d copy start %lld end %lld submit %lld "
+@@ -24219,7 +24226,8 @@
+         if (!fs.empty()) {   // the FA dispatch's host side, one line a slot per FA
+             for (size_t k = 0; k < fs.size(); ++k) {
+                 GGML_LOG_WARN("ggml_opencl: paged FA timeline host: slot %d node %d FA entry %lld exit %lld ns; "
+-                        "split start %lld ns, submit margin %lld ns\n", slot, fs[k].node, fs[k].host, fs[k].host,
++                        "split start %lld ns, submit margin %lld ns\n", slot, fs[k].node,
++                        k < hin.size() ? hin[k].host : -1, k < hout.size() ? hout[k].host : -1,   // 0131a: roles 8/9
+                         fs[k].st, fs[k].st - fs[k].host);
+             }
+         }
+@@ -24301,9 +24309,12 @@
+         // clock alone (device stamps stay relative to the base event).
+         cl_ulong devb = 0, hostb = 0;
+         if (clGetDeviceAndHostTimer(ctx->device, &devb, &hostb) == CL_SUCCESS) {
++            // 0131a: the host stamps are CLOCK_MONOTONIC; the timer's host clock is the ICD's
++            // choice. Take our own clock beside the call: one frame, off by the call's latency.
++            o.tl_host_base = ggml_cl_fa_paged_tl_host_ns();
+             o.tl_dev_base  = (long long) devb;
+-            o.tl_host_base = (long long) hostb;
+         } else {
++            o.tl_dev_base  = 0;
+             o.tl_host_base = ggml_cl_fa_paged_tl_host_ns();
+             if (!o.tl_warned) { o.tl_warned = true;
+                 GGML_LOG_WARN("ggml_opencl: paged FA timeline: no clGetDeviceAndHostTimer; the submit times are host-clocked only\n"); }
