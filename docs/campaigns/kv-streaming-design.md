@@ -736,9 +736,12 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
     growth is the only cut, i.e. a bigger pool or fewer bytes a page (above).
   - **USM gather kernel** (round 11's option): the paged kernel reads the host store through
     the table, no copies, one enqueue a layer; the bytes over the link equal the copies' but
-    the VRAM write of the staging copy is saved. llama.cpp itself does this for KV:
-    `--no-kv-offload` keeps the KV cache in host memory and the kernels read it there
-    (`code`, the pinned tree; our path adds the paged table on top).
+    the VRAM write of the staging copy is saved. **No reference does this** -- an arcint
+    option. llama.cpp is not a precedent for it: with `--no-kv-offload` the KV buffers come
+    from `ggml_backend_cpu_buffer_type()` (`src/llama-kv-cache.cpp:251-255`, `offload` false)
+    and the graph then pins every node between the KV store and the attention output to the
+    CPU backend (`src/llama-graph.cpp:3186-3190`: `ggml_backend_sched_set_tensor_backend(sched,
+    cur, backend_cpu)`), so no device kernel reads KV over the link there.
   - **The 37 ms** between max(237, ~216 inferred copies) and 274.3: candidates are node 0's
     marker (one of 16 layers, ~17 ms `inferred`), the tail layer's copies starting only after
     its preceding `consumed` (one layer not fully hidden), 16 event waits + 16 barriers a
