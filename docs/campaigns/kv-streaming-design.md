@@ -750,6 +750,15 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   forwards to the attention cache (hybrid, hybrid_iswa, kv_cache_iswa), and the request's
   totals -- issued ahead, fell back, verify nodes/bytes/mismatches, reused/re-copied -- print
   at the request's end through a weak symbol, so a build without the OpenCL backend links.
+- **Window 292 (`measured-here`, 65k, c152135c + 0129w):** the verify is alive and green --
+  A-self (VERIFY=2) printed "expect exactly 1 mismatching chunk, got 1" 64 times and the
+  request totals read **1,040 nodes, 26,894,925,824 bytes, 64 mismatches**, one flip per graph
+  seen exactly once; A-verify (VERIFY=1) read the same nodes and bytes with **0 mismatches**,
+  Paris answered. That is 0129n's lead's integrity evidence at 65k (the 261k arms were still
+  running). C8 (0129u/v) was dead: the tail that prefetches the next graph's node 0 and issues
+  the next layer one ahead sits after a `return` in the split-decode branch the served decode
+  takes (`ggml-opencl.cpp:25979` before :26102), so every node's copies went out in its own
+  dispatch; 0130c calls it in that branch too and names every early return of the prefetch.
 - **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
   kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
   `{fa_gqa_sides*n_tiles*16, n_head_kv*n_batch, n_splits}`, and w289b's grid {160,4,256} is

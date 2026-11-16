@@ -1,0 +1,135 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1337,6 +1337,7 @@
+         std::vector<int32_t> pre_pages;
+         int pre_chain_n = 0;
+         int pre_issued = 0, pre_reused = 0, pre_recopied = 0;
++        bool pre_head_dead_warned = false;   // 0129y: one line a process for the lead's early returns
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -11755,23 +11756,25 @@
+ // printed at the request's end by llama_kv_stream::request_end through this weak-called
+ // function (no opencl backend in the build: the symbol is null there).
+ struct ggml_cl_fa_paged_totals {
+-    int issued = 0, fell_back = 0, reused = 0, recopied = 0;
++    int issued = 0, fell_back = 0, reused = 0, recopied = 0, pre_issued = 0;
+     long long v_nodes = 0, v_bytes = 0, v_mismatch = 0;
+ };
+ static ggml_cl_fa_paged_totals g_fa_paged_totals;
+ extern "C" void ggml_backend_opencl_fa_paged_summary(void) {
+-    if (!g_fa_paged_totals.issued && !g_fa_paged_totals.v_nodes && !g_fa_paged_totals.reused) return;
++    if (!g_fa_paged_totals.issued && !g_fa_paged_totals.v_nodes && !g_fa_paged_totals.reused &&
++        !g_fa_paged_totals.pre_issued && !g_fa_paged_totals.fell_back) return;
+     GGML_LOG_WARN("ggml_opencl: paged FA overlap (request end): %d nodes issued ahead, %d fell back; "
+-            "verify %lld nodes, %lld bytes, %lld mismatches; next-graph lead: %d reused, %d re-copied\n",
++            "verify %lld nodes, %lld bytes, %lld mismatches; next-graph lead: %d issued, %d reused, %d re-copied\n",
+             g_fa_paged_totals.issued, g_fa_paged_totals.fell_back, g_fa_paged_totals.v_nodes,
+             g_fa_paged_totals.v_bytes, g_fa_paged_totals.v_mismatch,
+-            g_fa_paged_totals.reused, g_fa_paged_totals.recopied);
++            g_fa_paged_totals.pre_issued, g_fa_paged_totals.reused, g_fa_paged_totals.recopied);
+     g_fa_paged_totals = {};
+ }
+ 
+ static void ggml_cl_fewq_prepass(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph);   // 0115
+ // 0129n: defined below, used by graph_compute's chain walk
+ static bool ggml_cl_fa_paged_overlap_on();
++static bool ggml_cl_fa_paged_verify_on();   // 0129z: the verify-only arm's totals
+ 
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+@@ -11786,9 +11789,16 @@
+         }
+         o.issued.assign(o.chain.size(), 0);
+         o.cur = 0;
+-        // 0129w: window 290 printed the summary once at the first graph as 0 of 16 (nothing
+-        // had happened yet). The graph's counters now roll into the request's totals, which
+-        // llama_kv_stream::request_end prints and resets at the request's end.
++    }
++    // 0129w: window 290 printed the summary once at the first graph as 0 of 16 (nothing
++    // had happened yet). The graph's counters now roll into the request's totals, which
++    // llama_kv_stream::request_end prints and resets at the request's end.
++    // 0129z: window 292's A-uverify arm (VERIFY=1, OVERLAP unset) printed no totals at all,
++    // so it could not prove it checked anything: the roll-up and the zeroing now run when
++    // either switch is on, while the chain (0129n's lead) stays overlap-only.
++    if (ggml_cl_fa_paged_overlap_on() || ggml_cl_fa_paged_verify_on()) {
++        auto & o = backend_ctx->fa_paged;
++        g_fa_paged_totals.pre_issued += o.pre_issued;
+         g_fa_paged_totals.issued    += o.issued_n;
+         g_fa_paged_totals.fell_back += o.fell_back;
+         g_fa_paged_totals.reused    += o.pre_reused;
+@@ -11799,6 +11809,7 @@
+         o.issued_n = o.fell_back = 0;
+         o.v_nodes = o.v_bytes = o.v_mismatch = 0;
+         o.last_n = (int) o.chain.size();
++        o.pre_issued = o.pre_reused = o.pre_recopied = 0;
+     }
+     backend_ctx->pair_perm_t = nullptr;
+     if (backend_ctx->f16_copy_n != backend_ctx->f16_copy_n_logged) {
+@@ -23847,15 +23858,30 @@
+ // bytes come from the USM host store, immutable for streamed pages: prepare() writes the
+ // store only when a page is saved and zeroed, and this ubatch's new K/V go to resident
+ // pages (llama-kv-cache.cpp:1730,1765 write the cache cells, which are never streamed).
++// 0129y: every early return of the prefetch names itself once a process (CLAUDE.md: no
++// silent fallbacks). Window 292 showed the lead dead with no line to say why; the reasons
++// are one-shot WARNs below, and the request-end summary carries `issued` beside reused /
++// re-copied, so "the tail never prefetched" is distinguishable from "it prefetched and the
++// next graph rejected it".
+ static void ggml_cl_fa_paged_prefetch_head(ggml_backend_opencl_context * ctx) {
+     auto & o = ctx->fa_paged;
+-    if (o.chain.empty()) return;
++    const bool warn = !o.pre_head_dead_warned;
++    if (o.chain.empty()) {
++        if (warn) { o.pre_head_dead_warned = true; GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: no paged FA in the graph's chain; nothing prefetched\n"); }
++        return;
++    }
+     const int p = ggml_cl_fa_paged_overlap_slot(ctx, o.chain[0]);
+-    if (p < 0) return;
++    if (p < 0) {
++        if (warn) { o.pre_head_dead_warned = true; GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: node 0's ring slot is not cached (a third ring, or no region); nothing prefetched\n"); }
++        return;
++    }
+     const ggml_tensor * dst = o.chain[0];
+     const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
+     const int32_t * pl = plan ? (const int32_t *) ggml_backend_opencl_usm_ptr(plan) : nullptr;
+-    if (pl == nullptr) return;   // a plan that is not USM: this lead cannot compare it later
++    if (pl == nullptr) {
++        if (warn) { o.pre_head_dead_warned = true; GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: node 0's plan is not USM host memory; nothing prefetched (a host copy at prepare() is the fix)\n"); }
++        return;   // a plan that is not USM: this lead cannot compare it later
++    }
+     std::vector<int32_t> rows, pages;
+     for (int64_t i = 0; i < plan->ne[0]; ++i) if (pl[i] >= 0) { rows.push_back(pl[i]); pages.push_back((int32_t) i); }
+     // the wait: the slot's last reader. It was set by the FA two layers back; the graph's
+@@ -23864,7 +23890,13 @@
+     cl_uint  nw = o.consumed[p] != nullptr ? 1 : 0;
+     cl_event wl[1] = { o.consumed[p] };
+     const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, dst, o.q, nw, nw ? wl : NULL);
+-    if (runs < 0) return;
++    if (runs < 0) {
++        if (warn) { o.pre_head_dead_warned = true; GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: the host store or the ring is not what the copies read (enqueue_pages -1); nothing prefetched\n"); }
++        return;
++    }
++    if (runs == 0 && warn) {   // a plan with no streamed page: correct, but say it once
++        GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: node 0's plan names no streamed page; %d issued so far\n", o.pre_issued);
++    }
+     CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.pre_ready));
+     CL_CHECK(clFlush(o.q));
+     o.pre_parity = p;
+@@ -25975,6 +26007,16 @@
+         size_t merge_lws[3] = { merge_wg, 1, 1 };
+         size_t merge_gws[3] = { merge_wg, (size_t)(n_head * n_batch), (size_t) n_q };
+         backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
++        // 0129x: window 292's DEBUG arm printed 2,240 "commands (lead)" lines and not one
++        // "next-graph lead" line, and every request-end summary read "0 reused, 0 re-copied":
++        // this branch returns here, before the tail call below, and the served decode takes it
++        // (the GQA kernel runs through fd_k_split with the merge). So 0129n's one-layer lead
++        // and 0129u's tail prefetch never ran for a decode -- every node's copies were issued
++        // by its own dispatch (`before`'s fallback), i.e. no lead at all. The tail call now
++        // sits here too, after both kernels are enqueued.
++        if (paged_overlap_copied && paged_overlap_parity >= 0) {
++            ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);
++        }
+         return;
+     }
+     // 0106: supports_op takes head size 512 on Intel only where the split

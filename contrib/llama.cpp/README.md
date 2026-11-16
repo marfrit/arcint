@@ -7995,3 +7995,27 @@ at its top, one before P V). `GGML_OPENCL_FA_DECODE_V2_BROKEN=1` is the red vari
 targets the buffer the products read, so every arm must fail. The base kernels stay built and
 are replaced only when a V2 programme builds and fits local memory; the log line carries the
 built count and the local bytes. The 1-3 row q8q4 split kernel is untouched.
+
+## 0130c-kv-stream-paged-lead-reachability-and-request-totals.patch
+
+Window 292 (`measured-here`) + `code`. This patch carries 0129x, 0129y and 0129z folded
+(numbers kept in its comments):
+- **0129x, the dead lead's cause.** `ggml_cl_fa_paged_overlap_after` -- which issues the next
+  layer's copies one layer ahead AND, at a graph's last paged FA, calls
+  `ggml_cl_fa_paged_prefetch_head` (0129u's cross-step lead) -- sat only in the tail of
+  `ggml_cl_flash_attn` (`ggml-opencl.cpp:26102`). The split-decode branch, which the served
+  decode takes (the GQA kernel runs through `fd_k_split` with `f32_merge`), `return`s at
+  :25979 (`code`), before that tail. So on a decode neither the one-layer lead nor the tail
+  prefetch ever ran: window 292's DEBUG arm printed 2,240 "commands (lead)" lines and not one
+  "next-graph lead" line, every node's copies were issued by its own dispatch (`before`'s
+  fallback), and every request-end summary read "0 reused, 0 re-copied". The branch now calls
+  the tail too, after both kernels are enqueued.
+- **0129y, no silent fallback.** Each early return of `prefetch_head` (empty chain, ring slot
+  not cached, plan not USM, `enqueue_pages` -1, and a plan with no streamed page) names itself
+  once a process, and the request-end summary now reads "next-graph lead: N issued, N reused,
+  N re-copied", so "the tail never prefetched" is distinguishable from "it prefetched and the
+  next graph rejected it".
+- **0129z, the verify-only arm's totals.** The counters rolled up only under `OVERLAP`, so
+  window 292's A-uverify arm (VERIFY=1, OVERLAP unset) printed no totals and could not show it
+  had checked anything. The roll-up and the zeroing now run when either switch is on; the
+  chain (0129n's lead) stays overlap-only. 0129s/0129t's verification itself is unchanged.
