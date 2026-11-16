@@ -1,0 +1,187 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1320,6 +1320,11 @@
+         cl_ulong slot_off[2] = { 0, 0 };
+         int issued_n = 0, fell_back = 0;
+         bool fell_back_logged = false, summary_logged = false;
++        int last_n = 0;                          // 0129s: the previous graph's chain length
++        int64_t v_nodes = 0, v_bytes = 0, v_mismatch = 0;   // 0129s: VERIFY totals, per process
++        int     v_first_bad = 0;
++        cl_program verify_prog = nullptr;        // 0129s: GGML_OPENCL_FA_PAGED_VERIFY
++        cl_kernel  verify_kernel = nullptr;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -11691,6 +11696,20 @@
+         }
+         o.issued.assign(o.chain.size(), 0);
+         o.cur = 0;
++        // 0129s: 0129q's summary was gated on the LAST chain node's dispatch tail, which
++        // needs that dispatch to reach the tail and its ov to hold; the served logs' zero
++        // count says no dispatch satisfied both. Report the previous graph's totals here,
++        // at the next graph's start, where it always runs.
++        if (!o.summary_logged && o.last_n > 0) {
++            o.summary_logged = true;
++            GGML_LOG_WARN("ggml_opencl: paged FA overlap: %d of %d nodes issued ahead, %d fell back"
++                          "; verify: %lld nodes, %lld bytes, %lld mismatches\n",
++                          o.issued_n, o.last_n, o.fell_back,
++                          (long long) o.v_nodes, (long long) o.v_bytes, (long long) o.v_mismatch);
++        }
++        o.issued_n = o.fell_back = 0;
++        o.v_nodes = o.v_bytes = o.v_mismatch = 0;
++        o.last_n = (int) o.chain.size();
+     }
+     backend_ctx->pair_perm_t = nullptr;
+     if (backend_ctx->f16_copy_n != backend_ctx->f16_copy_n_logged) {
+@@ -23806,13 +23825,6 @@
+     if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
+     CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &o.consumed[parity]));
+     if (ni + 1 < (int) o.chain.size()) ggml_cl_fa_paged_overlap_issue(ctx, ni + 1, false);
+-    // 0129q: once per process, at the last node of the first graph with streamed pages,
+-    // how many nodes the lead issued and how many fell back (no silent fallback)
+-    if (!o.summary_logged && ni + 1 >= (int) o.chain.size()) {
+-        o.summary_logged = true;
+-        GGML_LOG_WARN("ggml_opencl: paged FA overlap: %d of %d nodes issued ahead, %d fell back\n",
+-                o.issued_n, (int) o.chain.size(), o.fell_back);
+-    }
+ }
+ 
+ // 0123zzzzz3: the streamed pages of this attention layer, from the host store (USM host memory)
+@@ -23820,6 +23832,122 @@
+ // read them. Layer i's copies therefore run while layer i's own attention runs, and the slot layer
+ // i+2 reuses is only overwritten after layer i's kernels were enqueued, so no two layers share a
+ // slot's content at the time of their attention. The host store is read once per attention call.
++// 0129s: GGML_OPENCL_FA_PAGED_VERIFY=1 -- exact integrity of what each paged FA reads.
++// A hash kernel on the compute queue in that FA's position (after the lead's ready barrier,
++// so after its copies) hashes EXACTLY the ring rows the plan names as streamed for this
++// node; the host hashes the same bytes of the plan's pages in the USM host store, which
++// prepare() wrote before the graph. The FA's kernels read those same ring rows, and the ring
++// row stride equals the host page stride (K 1088*256 = 278528 = kb, V 576*256 = 147456 = vb),
++// so the bytes compared are the bytes attended. A mismatch is a WARN, not an abort.
++static bool ggml_cl_fa_paged_verify_on() {
++    static int v = -1;
++    if (v < 0) { const char * e = getenv("GGML_OPENCL_FA_PAGED_VERIFY"); v = e ? atoi(e) != 0 : 0; }
++    return v;
++}
++
++static const char * GGML_CL_FA_PAGED_VERIFY_SRC = R"(
++__kernel void fa_paged_verify(__global const uchar * base, __global const int * rows,
++                             ulong base_off, ulong stride_bytes, ulong nbytes, uint chunk,
++                             __global uint * out) {
++    const uint c = get_global_id(0);
++    const uint p = get_global_id(1);
++    const ulong row_at = base_off + (ulong) rows[p] * stride_bytes;
++    const ulong start  = row_at + (ulong) c * chunk;
++    const ulong end    = min(start + chunk, row_at + nbytes);
++    uint h = 2166136261u;
++    for (ulong i = start; i < end; ++i) { h ^= base[i]; h *= 16777619u; }
++    out[p * (uint) get_global_size(0) + c] = h;
++}
++)";
++
++static uint32_t ggml_cl_fa_paged_verify_hash(const void * p, size_t n) {
++    const unsigned char * b = (const unsigned char *) p;
++    uint32_t h = 2166136261u;
++    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 16777619u; }
++    return h;
++}
++
++static void ggml_cl_fa_paged_verify(ggml_backend_opencl_context * ctx, const ggml_tensor * dst,
++        cl_mem k_buf, cl_mem v_buf, cl_ulong k_off, cl_ulong v_off, int ps, int rb, int rvb,
++        size_t kb, size_t vb, const void * hk, const void * hv,
++        const int32_t * pl, int64_t n_pages, int node) {
++    if (!ggml_cl_fa_paged_verify_on() || hk == nullptr || hv == nullptr || pl == nullptr) return;
++    std::vector<int32_t> rows;
++    for (int64_t p = 0; p < n_pages; ++p) if (pl[p] >= 0) rows.push_back(pl[p]);
++    if (rows.empty()) return;
++    auto & o = ctx->fa_paged;
++    if (o.verify_kernel == nullptr) {
++        o.verify_prog = build_program_from_source_optional(ctx, GGML_CL_FA_PAGED_VERIFY_SRC, "");
++        if (o.verify_prog == nullptr) {
++            GGML_LOG_WARN("ggml_opencl: paged FA verify: the hash kernel did not build; no check\n");
++            ggml_cl_fa_paged_verify_on();   // the switch stays on: the message is once a process
++            return;
++        }
++        cl_int err;
++        CL_CHECK((o.verify_kernel = clCreateKernel(o.verify_prog, "fa_paged_verify", &err), err));
++    }
++    const uint32_t chunk = 4096;
++    const int64_t nk = (int64_t) ((kb + chunk - 1) / chunk);
++    const int64_t nv = (int64_t) ((vb + chunk - 1) / chunk);
++    const size_t gy = rows.size();
++    const size_t gx = (size_t) nk;
++    cl_int err;
++    cl_mem rowsbuf = clCreateBuffer(ctx->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
++            gy*sizeof(int32_t), rows.data(), &err);
++    CL_CHECK(err);
++    cl_mem out = clCreateBuffer(ctx->context, CL_MEM_WRITE_ONLY,
++            (size_t) std::max(nk, nv)*gy*sizeof(uint32_t), nullptr, &err);
++    CL_CHECK(err);
++    int64_t bad = 0;
++    int first_bad_page = -1, first_bad_row = -1, first_bad_chunk = -1;
++    for (int kv = 0; kv < 2; ++kv) {
++        const int64_t nc = kv == 0 ? nk : nv;
++        const size_t nb = kv == 0 ? kb : vb;
++        const cl_mem buf = kv == 0 ? k_buf : v_buf;
++        // the slot's base offset (k_off / v_off, ring region + view_offs) and its row stride,
++        // exactly as the copy loop computed them: the FA's kernels address their rows there
++        const cl_ulong base_off = kv == 0 ? k_off : v_off;
++        const cl_ulong stride_bytes = (cl_ulong) ps*(cl_ulong) (kv == 0 ? rb : rvb);
++        const cl_ulong nbytes = (cl_ulong) nb;
++        CL_CHECK(clSetKernelArg(o.verify_kernel, 0, sizeof(cl_mem), &buf));
++        CL_CHECK(clSetKernelArg(o.verify_kernel, 1, sizeof(cl_mem), &rowsbuf));
++        CL_CHECK(clSetKernelArg(o.verify_kernel, 2, sizeof(cl_ulong), &base_off));
++        CL_CHECK(clSetKernelArg(o.verify_kernel, 3, sizeof(cl_ulong), &stride_bytes));
++        CL_CHECK(clSetKernelArg(o.verify_kernel, 4, sizeof(cl_ulong), &nbytes));
++        CL_CHECK(clSetKernelArg(o.verify_kernel, 5, sizeof(uint32_t), &chunk));
++        CL_CHECK(clSetKernelArg(o.verify_kernel, 6, sizeof(cl_mem), &out));
++        size_t gws[2] = { (size_t) nc, gy };
++        CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, o.verify_kernel, 2, nullptr, gws, nullptr,
++                0, nullptr, nullptr));
++        std::vector<uint32_t> dev((size_t) nc*gy);
++        CL_CHECK(clEnqueueReadBuffer(ctx->queue, out, CL_TRUE, 0, dev.size()*sizeof(uint32_t),
++                dev.data(), 0, nullptr, nullptr));
++        const unsigned char * host = (const unsigned char *) (kv == 0 ? hk : hv);
++        for (size_t p = 0; p < gy; ++p) {
++            for (int64_t c = 0; c < nc; ++c) {
++                const size_t start = (size_t) c*chunk;
++                const size_t len = std::min((size_t) chunk, nb - start);
++                const uint32_t want = ggml_cl_fa_paged_verify_hash(host + p*nb + start, len);
++                if (dev[p*(size_t) nc + c] != want) {
++                    ++bad;
++                    if (first_bad_page < 0) { first_bad_page = (int) p; first_bad_row = rows[p]; first_bad_chunk = (int) c; }
++                }
++            }
++        }
++    }
++    CL_CHECK(clReleaseMemObject(rowsbuf));
++    CL_CHECK(clReleaseMemObject(out));
++    o.v_nodes++;
++    o.v_bytes += (int64_t) gy*(kb + vb);
++    o.v_mismatch += bad;
++    if (bad > 0 && !o.v_first_bad) {
++        o.v_first_bad = 1;
++        GGML_LOG_WARN("%s: paged FA verify: node %d, host page %d, ring row %d, chunk %d: %lld of %lld "
++                "chunk hashes differ\n", __func__, node, first_bad_page, first_bad_row,
++                first_bad_chunk, (long long) bad, (long long) (nk + nv)*gy);
++    }
++}
++
+ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * dst,
+         cl_mem rk_aos_buf, cl_ulong rk_aos_off, cl_ulong rk_aos_nb1,
+         cl_mem rv_aos_buf, cl_ulong rv_aos_off, cl_ulong rv_aos_nb1, int * overlap_parity, bool * overlap_copied) {
+@@ -24024,6 +24152,13 @@
+                                           hv + (size_t) p*vb, nw, nw ? wl : NULL, NULL));
+         }
+     }
++    // 0129s: VERIFY=1 -- the hash, on the compute queue here: after this node's copies
++    // (lead: their ready barrier was enqueued at the top of this dispatch; unset: the
++    // copies just above on this same queue), and before its FA kernels are enqueued. The
++    // FA kernel is enqueued after this function returns, so the hash sees exactly the rows
++    // and bytes the FA reads, at the moment it runs.
++    ggml_cl_fa_paged_verify(backend_ctx, dst, k_buf, v_buf, k_off, v_off, ps, (int) rb, (int) rvb,
++            kb, vb, hk, hv, pl, n_pages, ov_node_out);
+     if (ov) {
+         *overlap_parity = ov_node_out;
+         *overlap_copied = true;
