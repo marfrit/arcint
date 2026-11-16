@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index c7ee73a..402261e 100644
+index c7ee73a..6c190a8 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1373,8 +1373,11 @@ struct ggml_backend_opencl_context {
@@ -316,8 +316,8 @@ index c7ee73a..402261e 100644
 +                paged_overlap_parity < (int) backend_ctx->fa_paged.chain.size())
 +                ? ggml_cl_fa_paged_overlap_slot(backend_ctx, backend_ctx->fa_paged.chain[paged_overlap_parity]) : -1;
 +        ggml_cl_fa_paged_tl_host(backend_ctx, 8, paged_overlap_parity, fa_slot);   // 0130x FA dispatch entry
-+        if (ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);   // 0130y: before the readers
 +        ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 2, paged_overlap_parity, fa_slot, 0, nullptr);   // 0130p FA split start
++        if (ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);   // 0130y: before the readers, inside the FA's read window
          backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);
 -        ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 3, paged_overlap_parity, 0, nullptr);   // 0130p FA split end
 +        ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 3, paged_overlap_parity, fa_slot, 0, nullptr);   // 0130p FA split end
