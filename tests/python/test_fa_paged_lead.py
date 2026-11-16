@@ -290,6 +290,18 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.root = _llama_root()
         self.t = (self.root / OPENCL).read_text()
 
+    def test_timeline_markers_absent_with_the_switch_off_0131b(self):
+        # 0131b: tl_mark enqueues nothing unless GGML_OPENCL_FA_PAGED_TIMELINE is on; the
+        # markers 0130p added ran on every FA and copy with the switch unset (window 299:
+        # OVERLAP 451.9 ms/step vs 261-262 before). Red: the early return removed.
+        t = self.t
+        i = t.find("static void ggml_cl_fa_paged_tl_mark(")
+        self.assertGreater(i, 0)
+        j = t.find("clEnqueueMarkerWithWaitList", i)
+        self.assertGreater(j, i)
+        self.assertIn("if (!ggml_cl_fa_paged_timeline()) return;", t[i:j],
+                      "0131b: the timeline marker must return before enqueueing when the switch is off")
+
     def test_timeline_submit_times_share_the_device_axis_0131a(self):
         # 0131a: start-submit compares a device stamp (relative to the base marker's END) with a
         # host stamp; the host base is our own CLOCK_MONOTONIC beside clGetDeviceAndHostTimer and
