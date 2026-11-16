@@ -801,10 +801,10 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
 - **Why NOCONSUME=1 did not land, from the code (`code`):** every ordering that keeps a copy
   out of the slot an FA is reading, in the order that matters.
   - The copy queue is one in-order queue (`clCreateCommandQueue(ctx->context, ctx->device,
-    0, &err)`, `ggml-opencl.cpp:23927`), and a node's copies are issued at `issue` time
-    (`:24043-24086`). Copy k+2 is enqueued at `after(k+1)` (`:24148`), so it starts no earlier
+    0, &err)`, `ggml-opencl.cpp:23988`), and a node's copies are issued at `issue` time
+    (`:24094-24135`). Copy k+2 is enqueued at `after(k+1)` (`:24199`), so it starts no earlier
     than copy k+1's marker; copy k+1 starts at copy k's marker, which is exactly FA k's start,
-    because the FA waits `ready[parity] = copy k`'s marker (`before`, barrier at `:24138`).
+    because the FA waits `ready[parity] = copy k`'s marker (`before`, barrier at `:24189`).
   - The two slots alternate: copy k+1 fills the slot FA k+1 reads, copy k+2 fills FA k's
     slot. Copy k+2 reaching FA k's slot therefore needs copy k+1 shorter than FA k. Window
     289b's `measured-here` figures say the opposite: at 261k a layer's copy ~11.4 ms against
@@ -814,18 +814,18 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
     K/V ratio (`inferred` from 289b's per-layer ratio). The hazard needs FA k to hold its
     slot LONGER than copy k+1 -- that is what 0130h's delay buys.
   - `wl[1]`: `issue`'s wait list is at most two events, `consumed[parity]` first and the
-    `after_inputs` marker second (`:24050-24056`); NOCONSUME drops only the first, and the
+    `after_inputs` marker second (`:24054-24060`); NOCONSUME drops only the first, and the
     second (compute queue marker, so after the graph's stems) still bounds the first nodes'
     copies.
   - The cross-step prefetch, the one copy whose start coincides with a reader's start, keeps
     its wait unconditionally: `cl_uint nw = o.consumed[p] != nullptr ? 1 : 0;` and
-    `cl_event wl[1] = { o.consumed[p] };` (`:24005-24010`), not gated on
+    `cl_event wl[1] = { o.consumed[p] };` (`:24050-24051`), not gated on
     `ggml_cl_fa_paged_noconsume()`. 0129n-0129w's race was there: before 0130c that event was
     never armed, so the pre-0130c copy into the graph's node-0 slot could start exactly when
     the graph's last FA started reading the same slot.
   - VERIFY=3's own enqueues lockstep the host at the next graph's start:
     `ggml_cl_fa_paged_verify3_collect` calls `clWaitForEvents` on both readback events of
-    every pending pair (`:24404-24406`), and the post hash's readback was enqueued after that
+    every pending pair (`:24482`), and the post hash's readback was enqueued after that
     FA's kernels; so before the host dispatches the next graph it waits for the previous
     graph's last post hash -- i.e. its last FA -- to finish. That removes host lead across
     the graph boundary, which is where the prefetch copy would otherwise be enqueued while
@@ -836,7 +836,7 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
     exceeds copy k+1's duration -- at 261k ~2.3 ms, at 65k ~0.5 ms (`inferred` arithmetic from
     289b) -- so `DELAY=1000000` (~1-2 ms if the loop is ~4 cycles at 1.5 GHz) is a first
     value and `5000000` a safe one; raise until the red runs. With the consumed wait on the
-    same delay must read 0: `after` arms the marker on the compute queue (`:24146-24147`), so
+    same delay must read 0: `after` arms the marker on the compute queue (`:24198-24199`), so
     copy k+2 waits FA k's kernels, delay included.
 - **C9 (`code`, analysis only, pending window 291's non-paged number):** the paged GQA decode
   kernel's launch is `ggml/src/ggml-opencl/ggml-opencl.cpp:25850-25856`: gws
