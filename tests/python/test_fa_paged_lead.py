@@ -290,6 +290,17 @@ class FaPagedTimelineAndNoFix(unittest.TestCase):
         self.root = _llama_root()
         self.t = (self.root / OPENCL).read_text()
 
+    def test_common_kv_resident_flag_reaches_the_context_0131i(self):
+        # 0131i: the common tools (llama-perplexity's KL) take --kv-resident MIB into
+        # llama_context_params.kv_resident_size (bytes). Red: the flag parsed but not mapped.
+        root = self.root
+        arg = (root / "common/arg.cpp").read_text()
+        com = (root / "common/common.cpp").read_text()
+        self.assertIn('{"--kv-resident"}, "MIB"', arg, "0131i: no --kv-resident flag")
+        self.assertIn("params.kv_resident_mib = (uint32_t) value;", arg)
+        self.assertIn("cparams.kv_resident_size  = params.kv_resident_mib * 1024u * 1024u;", com,
+                      "0131i: the flag must reach the context parameters")
+
     def test_timeline_markers_absent_with_the_switch_off_0131b(self):
         # 0131b: tl_mark enqueues nothing unless GGML_OPENCL_FA_PAGED_TIMELINE is on; the
         # markers 0130p added ran on every FA and copy with the switch unset (window 299:
