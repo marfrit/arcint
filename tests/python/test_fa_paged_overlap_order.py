@@ -61,4 +61,13 @@ rb = fa[fa.index('getenv("GGML_OPENCL_FA_ROW_BLOCKS")'):]
 rb = rb[:rb.index("for (int r0 = 0; r0 < n_q; r0 += 8)")]
 check("0131m: the row blocks take no paged call", "kv_pages == nullptr" in rb)
 
+# 0131n: the after-step runs on every exit of the dispatch (the conversion returned without it,
+# window 171g). Red: the 0131m tree, which calls it at two of the exits and has no guard
+fa_body = fa[:fa.index("\n}\n")]
+k = fa_body.index("ggml_cl_fa_kv_stream_pages(backend_ctx, dst,")
+after_copy = fa_body[k:]
+check("0131n: the after-step is a guard set right after the paged copy, and no exit calls it by hand",
+      "~paged_after_guard()" in after_copy and "ggml_cl_fa_paged_overlap_after(ctx, parity)" in after_copy
+      and after_copy.count("ggml_cl_fa_paged_overlap_after(") == 1)
+
 sys.exit(1 if fail else 0)

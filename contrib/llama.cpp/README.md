@@ -8367,7 +8367,9 @@ Switching the prefetch off, or never reusing it, gave the serial answer bit for 
 a run (171b): the question's prefill (about 20 tokens, 120 rows) is the one row-block graph of
 each request, and the question's K/V cached from it changed the next request's answer. A store
 generation guarding the host store (an earlier 0131m) refused nothing and cured nothing (171c);
-`GGML_OPENCL_FA_ROW_BLOCKS=0` on the unchanged release candidate RC170K-RESULT (171e).
+`GGML_OPENCL_FA_ROW_BLOCKS=0` on the unchanged release candidate made the timing-slowed overlap equal
+to the serial stream for the first time (171e: 30k and 120k, md5, accepted drafts and verifies),
+while at full speed the answer still moved: a second defect, 0131n.
 
 Such a call now takes the conversion, whose copies the overlap orders, in the serial stream too,
 so both streams run the same kernels. The cost is the conversion on the rare short-tail ubatch
@@ -8378,4 +8380,25 @@ order on the one compute queue.
 Gate: `tests/test_fa_paged_predicate.cpp` (9-64 rows that are not wide take the conversion: 11
 tokens, a 20-token prefill, without the split, without the direct kernel, the wide verify off)
 and `tests/python/test_fa_paged_overlap_order.py` (the row-block condition excludes paged calls).
-Card arm: window 171f-RESULT.
+Card arm: with 0131n, window 171f.
+
+## 0131n-fa-paged-overlap-after-every-exit.patch
+
+The overlap's after-step (`ggml_cl_fa_paged_overlap_after`: the slot's consumed marker, the next
+layer's copies issued one layer ahead) runs on every exit of the flash-attention dispatch, through
+a guard set right after the paged copy. It ran only at the split decode's return and at the
+function's end (`code`). The prompt conversion returns earlier, after its kernels: on every
+512-row ubatch, and since 0131m on the 9-64-row calls. On such a node the copy queue had waited
+the slot's consumed event and released it, nothing set it again, and the copies of the layer two
+on, issued by their own dispatch, waited nothing while the conversion could still read the slot.
+The prompt's K/V went into the cache from attention that may have read another layer's pages.
+
+Found by the 1.7.0 gate's window 171g (`measured-here`, the B60, Q5, 256 MiB window, 30k, row
+blocks off in every arm): the overlap without the cross-step reuse (`NOREUSE` x2, `NOLEAD` x2) still
+gave three answers other than the serial one (md5 5f932b72915b x3, 4477046395ac against
+98d05d0226bc), while the arm that issues no copy ahead of its own attention (`NOAHEAD`, reuse on)
+equalled the serial stream in both runs, as did `VERIFY=4` (0 pre-read mismatches). The cross-step
+reuse was not the cause; NOLEAD's equality in 171a was timing.
+
+Gate: `tests/python/test_fa_paged_overlap_order.py` (the after-step is the guard, and no exit
+calls it by hand; red on the 0131m tree). Card arm: window 171f.
