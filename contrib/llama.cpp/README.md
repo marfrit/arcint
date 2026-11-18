@@ -8294,3 +8294,54 @@ and the serial stream without the overlap is ordered by the in-order compute que
 Gate: `tests/python/test_fa_paged_overlap_order.py` (`fa-paged-overlap-order`), red on the
 series up to 0131i (all three checks fail), green with 0131j. The card arm is the 1.7.0
 gate's KV-window smoke (window 170).
+
+## 0131k-fa-paged-predicate-gqa-kernel-and-split-slot.patch
+
+The paged FLASH_ATTN_EXT predicate (`ggml-opencl-fa-paged.h`, 0123zzzzz6) now follows the
+dispatcher's own order, and a paged call can no longer reach a kernel that does not read the page
+table without an abort. The 1.7.0 gate's op suite found the first defect, on the A770 with the new
+tools (window 170, evidence class `measured-here`): the first paged case aborted with "a paged
+decode FLASH_ATTN_EXT reached a kernel without a page table". The review of the first fix found
+the rest (`code`). arcint's serving cannot reach any of them: it refuses the KV window off the
+B60, and on the B60 with the agent's shapes (6 query heads per KV head, at most 6 tokens a decode
+step) and no switch set, both predicates accept the same shapes and the dispatch is unchanged
+(the 11-64-token calls run as row blocks either way; the old predicate called them the conversion).
+
+- **1-8 rows: the GQA decode, or nothing.** A paged decode of 1-8 rows runs on the GQA kernel.
+  The split decode (`intel_q_decode`) only opens that path; the dispatcher then needs the direct
+  GQA kernel and `(heads / KV heads) * rows <= tiles * 8`. The old clause checked the split alone.
+  The A770 builds the split but no GQA kernel (that program needs sub-group 16), so `supports_op`
+  accepted the case and the dispatcher aborted. Any other 1-8-row shape counted as the f16
+  conversion, but the conversion takes only 9+ rows (`fa_dpas_ok`). Such a call fell to the split
+  kernel (with `GGML_OPENCL_FA_INTEL_SPLIT=0`, the generic decode kernels) and read the pool
+  rows as the attended sequence, silently, because the abort checked form 1 only. Reachable on
+  the B60 with `GGML_OPENCL_FA_GQA=0`, `GGML_OPENCL_FA_INTEL_SPLIT=0`, or a model with more
+  query heads per KV head (16 heads at 5 rows), not with the agent's defaults. Those shapes are now declined: the scheduler gives them to the CPU, whose
+  FLASH_ATTN_EXT reads the page table, the plan and the host stores (`ops.cpp`).
+- **9-64 rows: the wide call, else 0028's row blocks, else the conversion.** The row blocks
+  (`GGML_OPENCL_FA_ROW_BLOCKS`, on by default) split a 9-64-row call into 8-row calls before the
+  conversion could take it, so such a shape needs the 8-row GQA decode. The predicate counted it
+  as the conversion. The caps now carry the row-block switch.
+- **The conversion needs the pair's prompt kernel.** The dispatcher's prompt branch requires
+  `kernel_fa_dpas_q_dk[0][pair]` (or `kernel_fa_dpas_dk[0]` for f16) before it reaches the
+  conversion; `kernels_prefill` now includes it.
+- **The split decode is read by its own slot, after its build.** `q_q1_split_intel` holds three
+  kernels in the dispatcher's `kvq` order (q8q8, q8q4, q4q4). Both callers indexed it with the
+  GQA arrays' index, which starts at f16: the agent's q8_0/q4_0 pair read q4q4's split, q4_0/q4_0
+  read past the array, and f16 read q8q8's instead of `f32_f16_q1_split_intel`.
+  `ggml_cl_fa_paged_split_slot` gives the slot. These kernels are built on the dispatcher's first
+  head-256 call, so `supports_op` saw none of them before it; it now builds the same program first,
+  as its head-512 branch already did.
+- **The wide call needs the merge kernel.** Its launch reads `f32_merge` unchecked; the caps
+  now carry it, so a failed f32_f16 build declines the shape instead of throwing.
+- **Loud where it was silent.** The dispatcher aborts on any paged call that reaches the decode
+  kernels off the GQA kernel (it checked form 1 only); a prompt the conversion does not take (a
+  mask narrower than the keys, which the predicate does not model) ends there. A second abort
+  before the in-place prompt kernels is defensive: no accepted shape reaches it.
+
+Gate: `tests/test_fa_paged_predicate.cpp` (`fa-paged-predicate`). Its new and changed cases fail
+by assertion on the 0131j header: a split without a GQA kernel, 6 tokens over 4 tiles, 1-8 rows
+without the split, 11 tokens past the cap (row blocks, not the conversion), the wide verify off.
+The file itself does not compile there (the slot map and the `row_blocks_on` and `merge` caps
+are new); with those removed, the listed cases fail. The card arm is the A770 and B60
+FLASH_ATTN_EXT suites and the KV-window smoke on the release tools (window 170k).

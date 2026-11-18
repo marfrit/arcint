@@ -70,6 +70,7 @@ ggml_cl_fa_paged_caps agent_caps() {
     ggml_cl_fa_paged_caps c{};
     c.kernels_gqa_direct = true; c.kernels_gqa_staged = true; c.kernels_prefill = true;
     c.split_decode = true; c.tiles = 8; c.wide_on = true; c.intel_split_on = true;
+    c.row_blocks_on = true; c.merge = true;
     return c;
 }
 
@@ -105,9 +106,40 @@ int main() {
     // the GQA work-group's cap: (query heads / KV heads) * rows <= tiles * 8. The
     // agent has 6 (head, token) rows a token, so 10 tokens fill 60 rows on 8 tiles
     { auto s = agent_decode(); s.q_ne1 = 10; s.mask_ne1 = 10; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "a 10-token (60-row) verify takes the wide GQA call"); }
-    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "11 tokens (66 rows) exceed the cap and take the conversion"); }
+    // 0131k: past the cap, 0028's row blocks take a 9-64-row call before the conversion
+    // could: 8-row calls, each a GQA decode (8 tokens at 6 heads are 48 rows)
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "11 tokens (66 rows) exceed the cap and run as 8-row GQA decodes"); }
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.row_blocks_on = false;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "11 tokens without the row blocks take the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.split_decode = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "row blocks whose 8-row calls have no decode form are refused"); }
+    // 0131k: a 1-8-row decode runs on the GQA kernel too (the split only opens the
+    // path), so it must fit the tiles: 6 tokens at 6 heads are 36 rows, over 4 tiles' 32;
+    // the conversion takes 9+ rows only, so nothing takes them
     { auto s = agent_decode(); auto c = agent_caps(); c.tiles = 4;
-      CHECK(ggml_cl_fa_paged_form(s, c) == 1, "6 rows stay on the split kernel whatever the tiles"); }
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "6 tokens (36 rows) over 4 tiles are refused"); }
+    { auto s = agent_decode(); s.q_ne1 = 5; s.mask_ne1 = 5; auto c = agent_caps(); c.tiles = 4;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 1, "5 tokens (30 rows) fit 4 tiles and take the GQA decode"); }
+    // 0131k: the A770 builds the split decode but no GQA kernel (sub-group 8) and no
+    // conversion: nothing there
+    { auto s = agent_decode(); auto c = agent_caps();
+      c.kernels_gqa_direct = false; c.kernels_gqa_staged = false; c.kernels_prefill = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "split decode without a GQA kernel or the conversion is refused"); }
+    { auto s = agent_decode(); auto c = agent_caps(); c.kernels_gqa_direct = false; c.kernels_gqa_staged = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "6 rows without a GQA kernel are refused, the conversion beside it or not"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.kernels_gqa_direct = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "9 rows without the direct kernel: no wide call, row blocks without a decode"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.kernels_gqa_direct = false; c.row_blocks_on = false;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "9 rows without the direct kernel and the row blocks take the conversion"); }
+    // 0131k: the split decode's kernel slot is the dispatcher's kvq (q8q8, q8q4, q4q4),
+    // not the GQA arrays' index, which starts at f16
+    CHECK(ggml_cl_fa_paged_split_slot(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0) == 0 &&
+          ggml_cl_fa_paged_split_slot(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) == 1 &&
+          ggml_cl_fa_paged_split_slot(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0) == 2,
+          "the quantized pairs map to the split array's three slots in kvq order");
+    CHECK(ggml_cl_fa_paged_split_slot(GGML_TYPE_F16, GGML_TYPE_F16) == -1 &&
+          ggml_cl_fa_paged_split_slot(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0) == -1,
+          "f16 and an unbuilt pair have no slot in the quantized split array");
     { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.tiles = 4; c.kernels_prefill = false;
       CHECK(!ggml_cl_fa_paged_ok(s, c), "rows beyond the cap with no conversion are refused"); }
 
@@ -118,9 +150,12 @@ int main() {
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; s.n_batch = 2;
       CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "9 tokens on two K/V batches take the conversion"); }
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.wide_on = false;
-      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "with the wide verify off, 9 tokens take the conversion"); }
+      CHECK(ggml_cl_fa_paged_form(s, c) == 1, "with the wide verify off, 9 tokens run as row blocks on the GQA decode"); }
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.split_decode = false;
       CHECK(ggml_cl_fa_paged_form(s, c) == 1, "without the split kernel the wide call still decodes"); }
+    // 0131k: the wide call's launch reads the merge kernel (which split_decode implies)
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.split_decode = false; c.merge = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "without the merge kernel 9 rows have no decode form"); }
 
     // prefill: the conversion + f16 prompt kernels carry every row count
     { auto s = agent_decode(); s.q_ne1 = 512; s.mask_ne1 = 512; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a 512-row prompt takes the conversion"); }
@@ -134,10 +169,14 @@ int main() {
     // 1 row: the staged 1-3-row form is the decode kernel's, so it is accepted
     { auto s = agent_decode(); s.q_ne1 = 1; CHECK(ggml_cl_fa_paged_ok(s, agent_caps()), "a 1-row decode is accepted"); }
     { auto s = agent_decode(); s.q_ne1 = 1; auto c = agent_caps(); c.split_decode = false;
-      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "a 1-row decode without the split takes the conversion"); }
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "a 1-row decode without the split is refused (the conversion takes 9+ rows)"); }
+    { auto s = agent_decode(); s.q_ne1 = 1; auto c = agent_caps(); c.intel_split_on = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "a 1-row decode with the split switched off is refused"); }
 
     // causal attention has no split decode: it takes the conversion
-    { auto s = agent_decode(); s.causal = true; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a causal call takes the conversion"); }
+    { auto s = agent_decode(); s.causal = true; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "a causal 6-row call has no form"); }
+    { auto s = agent_decode(); s.causal = true; s.q_ne1 = 512; s.mask_ne1 = 512;
+      CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a causal prompt takes the conversion"); }
 
     if (g_failures != 0) {
         printf("FAILED: %d\n", g_failures);
