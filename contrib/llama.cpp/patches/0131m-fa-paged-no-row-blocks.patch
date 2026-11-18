@@ -44,7 +44,23 @@
                  cp.merge = backend_ctx->fa.f32_merge.count(dk_dv) > 0;
                  const bool ok = ggml_cl_fa_paged_ok(sh, cp);
                  if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
-@@ -25548,11 +25546,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -25535,10 +25533,14 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         const int  dki_w = d_head_q == 256 && d_head_v == 256 ? 0 : d_head_q == 128 && d_head_v == 128 ? 1 : -1;
+         const int  gi_w  = is_mixed ? 0 : kvq >= 0 ? kvq + 1 : -1;
+         const int  G_w   = n_head_kv > 0 && n_head % n_head_kv == 0 ? n_head / n_head_kv : 0;
++        // 0131m: and the split's merge kernel, which the GQA launch reads (fa.f32_merge.at):
++        // without it the call took the split branch and threw; now it takes the conversion,
++        // as the paged predicate's wide clause (c.merge) already said
+         gqa_wide = wv_on && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
+             G_w > 0 && G_w * n_q <= backend_ctx->fa_gqa_tiles * 8 && dki_w >= 0 && gi_w >= 0 &&
+             backend_ctx->kernel_fa_gqa_dk[dki_w][gi_w] != nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
+-            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1;
++            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1 &&
++            backend_ctx->fa.f32_merge.count({d_head_q, d_head_v}) > 0;
+     }
+     static const char * fdbg_env = getenv("GGML_OPENCL_FA_DEBUG");
+     static const bool   fdbg_on  = fdbg_env != nullptr && atoi(fdbg_env) != 0;
+@@ -25548,11 +25550,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // take at most 8 rows, and the prefill kernel they would fall to costs a call
      // its K/V conversion: two lanes' verifies at 4k spent 4.3 ms an attention call
      // there (measured-here, B60). Rows are independent, so each block attends as
@@ -65,7 +81,7 @@
              q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
              for (int r0 = 0; r0 < n_q; r0 += 8) {
                  const int nr = std::min(8, n_q - r0);
-@@ -26467,8 +26472,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26467,8 +26476,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          cp.wide_on = wv_env2 == nullptr || atoi(wv_env2) != 0;
          static const char * fd_env2 = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
          cp.intel_split_on = fd_env2 == nullptr || atoi(fd_env2) != 0;
@@ -74,3 +90,12 @@
          cp.merge = backend_ctx->fa.f32_merge.count(pdk) > 0;
          paged_form = ggml_cl_fa_paged_form(sh, cp);
          if (paged_form == 0) {
+@@ -26496,7 +26503,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     }
+     // a paged call that reaches the decode kernels must end up on the GQA kernel;
+     // any other kernel would read the pool rows as the attended sequence. The
+-    // conversion (form 2) and the row blocks have returned above. 0131k: was form 1
++    // conversion (form 2) has returned above (0131m: paged calls take no row blocks). 0131k: was form 1
+     // only, so a form-2 shape of 1-8 rows (which the conversion does not take) ran
+     // the split kernel over the pool without a word
+     if (kv_pages && !use_fd_gqa) {

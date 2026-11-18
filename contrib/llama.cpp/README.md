@@ -8371,6 +8371,11 @@ generation guarding the host store (an earlier 0131m) refused nothing and cured 
 to the serial stream for the first time (171e: 30k and 120k, md5, accepted drafts and verifies),
 while at full speed the answer still moved: a second defect, 0131n.
 
+The wide call's dispatch condition (`gqa_wide`) also requires the split's merge kernel, which its
+launch reads: the predicate's wide clause did, so without the merge kernel a wide-shaped call was
+accepted as the conversion and dispatched to the split branch, which throws (review, `code`; the
+merge kernel is built on both cards, so no served path changes).
+
 Such a call now takes the conversion, whose copies the overlap orders, in the serial stream too,
 so both streams run the same kernels. The cost is the conversion on the rare short-tail ubatch
 (0028 measured 4.3 ms an attention call there at 4k on the B60). The serial stream was never
@@ -8391,7 +8396,9 @@ function's end (`code`). The prompt conversion returns earlier, after its kernel
 512-row ubatch, and since 0131m on the 9-64-row calls. On such a node the copy queue had waited
 the slot's consumed event and released it, nothing set it again, and the copies of the layer two
 on, issued by their own dispatch, waited nothing while the conversion could still read the slot.
-The prompt's K/V went into the cache from attention that may have read another layer's pages.
+The prompt's K/V went into the cache from attention that may have read another layer's pages
+(reasoning: that is how a wrong read in the prompt changes the next request's answer; the read
+itself was not observed, VERIFY's host waits close the window).
 
 Found by the 1.7.0 gate's window 171g (`measured-here`, the B60, Q5, 256 MiB window, 30k, row
 blocks off in every arm): the overlap without the cross-step reuse (`NOREUSE` x2, `NOLEAD` x2) still

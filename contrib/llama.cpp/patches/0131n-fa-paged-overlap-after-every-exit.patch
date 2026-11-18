@@ -2,7 +2,7 @@
 
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -25712,6 +25712,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -25716,6 +25716,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
              rk_aos ? rk_aos_buf : NULL, rk_aos ? rk_aos_off : 0, rk_aos ? rk_aos_nb1 : 0,
              rv_aos ? rv_aos_buf : NULL, rv_aos ? rv_aos_off : 0, rv_aos ? rv_aos_nb1 : 0,
              &paged_overlap_parity, &paged_overlap_copied);
@@ -24,7 +24,7 @@
  
      // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
      // after the reconstruction above a SoA tensor is a block copy too), so
-@@ -26947,10 +26962,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26951,10 +26966,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          // by its own dispatch (`before`'s fallback), i.e. no lead at all. The tail call now
          // sits here too, after both kernels are enqueued.
          ggml_cl_fa_paged_tl_host(backend_ctx, 9, paged_overlap_parity, fa_slot);   // 0130x FA dispatch exit
@@ -36,7 +36,7 @@
      }
      // 0106: supports_op takes head size 512 on Intel only where the split
      // decode or a prompt kernel above covers the call
-@@ -27075,10 +27087,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -27079,10 +27091,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      // 0130d: VERIFY=3's post hash, after the tail kernels and before the consumed marker
      ggml_cl_fa_paged_verify3_post(backend_ctx, false);
      // 0129n: this layer's kernels are enqueued: the slot may be refilled, and the next
