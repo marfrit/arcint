@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/logo/arcint-dark.svg">
+    <img src="docs/logo/arcint-light.svg" alt="arcint logo: an arc over a small neural network" width="440">
+  </picture>
+</p>
+
 # arcint
 
 An inference server for Intel Arc: OpenAI-compatible endpoints for a short

@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="560" height="160" viewBox="0 0 560 160" role="img" aria-label="arcint">
+<title>arcint</title>
+<defs><linearGradient id="g-arcint-dark" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#22D3EE"/><stop offset="1" stop-color="#A78BFA"/></linearGradient></defs>
+<g transform="translate(0 6) scale(0.75)">
+  <path d="M30 150 A130 130 0 0 1 290 150" fill="none" stroke="url(#g-arcint-dark)" stroke-width="16" stroke-linecap="round"/>
+  <circle cx="160" cy="20" r="6" fill="#FFFFFF"/>
+  <path d="M112 72 L208 85 M112 98 L208 85 M112 124 L208 85 M112 150 L208 85 M112 72 L208 137 M112 98 L208 137 M112 124 L208 137 M112 150 L208 137" fill="none" stroke="#5A6488" stroke-width="4"/>
+  <path d="M112 72 L208 111 M112 98 L208 111 M112 124 L208 111 M112 150 L208 111" fill="none" stroke="#22D3EE" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="112" cy="72" r="10" fill="#F1F5FF"/><circle cx="112" cy="98" r="10" fill="#F1F5FF"/><circle cx="112" cy="124" r="10" fill="#F1F5FF"/><circle cx="112" cy="150" r="10" fill="#F1F5FF"/>
+  <circle cx="208" cy="85" r="10" fill="#5A6488"/><circle cx="208" cy="137" r="10" fill="#5A6488"/>
+  <circle cx="208" cy="111" r="17" fill="none" stroke="#A78BFA" stroke-opacity="0.5" stroke-width="3"/>
+  <circle cx="208" cy="111" r="14" fill="#A78BFA"/>
+</g>
+<text x="262" y="106" font-family="'Space Grotesk', Inter, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="88" font-weight="700" letter-spacing="-2"><tspan fill="#F1F5FF">arc</tspan><tspan fill="#22D3EE">int</tspan></text>
+</svg>
