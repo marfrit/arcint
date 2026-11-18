@@ -258,7 +258,7 @@ Red first: op cases in `tests/test-backend-ops.cpp` at 4-7 rows, q8_0/q4_0, head
 broken variant (single buffer, barrier before the product) that must fail.
 Bar: CLAUDE.md's answer-level bar (KL within 0.03 nats of the baseline arm), op cases green.
 
-### Round 15 -- built 2026-11-16 (patch 0130b, head ac04a969)
+### Round 15 -- built 2026-11-16 (patch 0130b, head 2ca72476)
 
 The mechanism the analysis picked, behind `GGML_OPENCL_FA_DECODE_V2=1` (default off), 4-8 row
 form: **two local V stages** (16 KB each at head 256, BK 32), tile t+1's stage at the loop's
@@ -276,7 +276,7 @@ achieved rate to 75-90 GB/s (the scatter limit of 32-44 B rows on this class of 
 measured figure here), the same call is 400 MB / 80 GB/s = **~5 ms, 1.7x**; a 1.2x gain is the
 conservative floor if only the latency, not the throughput, was hidden.
 
-### Round 16 -- measured negative, window 293b (B60, build 881f4361)
+### Round 16 -- measured negative, window 293b (B60, build 7f4029f4)
 
 **V2 does not pay.** Evidence: `measured-here` for the numbers, `code` for the mechanism.
 - Op red gate: V2 BROKEN fails 0/18 on both I8 and f16 arms (8 of 8 kernels replaced; local
@@ -368,7 +368,7 @@ additional local memory to pay for it. Gate: `tests/python/test_fa_decode_v2.py`
 
 ### Round 18 -- the private memory, and 0130k (`code`; ISA measured on the card host)
 
-**The ISA (`measured-here`, ocloc 26.27.39122.11, `-device bmg`, source df1c3163, options
+**The ISA (`measured-here`, ocloc 26.27.39122.11, `-device bmg`, source f11639bf, options
 `-cl-intel-256-GRF-per-thread -DDK=256 -DGQA_SIDES=2 -DKT=1 -DVT=2`):** base, V2, PRE and
 PRE_BROKEN all report `//.private memory size 5888`, 48 dpas, no spill, no retry dump;
 instCount 6,448 / 7,418 / 8,395. Inside base's dpas span: 61 private loads, 8 private stores
@@ -419,11 +419,11 @@ dpas span, instCount above base's 6,448 for the stores.
 (`'#' is not followed by a macro parameter`, rc 1) and ocloc (rc 245, no ISA) for the base
 kernel too -- the production decode. The alternatives are whole macro definitions under
 file-level `#ifdef` and the broken zero is a value macro; `cpp -P` of the NOPRIV-off base is
-identical to 347e312b (diff 0 lines). `tests/python/test_kernel_preproc.py` runs the
+identical to 25f3b7a5 (diff 0 lines). `tests/python/test_kernel_preproc.py` runs the
 preprocessor over the kernel under every host define set (base, I8, ST, V2, PRE, PRE+BROKEN,
-NOPRIV, NOPRIV+BROKEN, NOPRIV+PRE; K/V q8q4 and f16), red on 8236e31d and green on the fix,
+NOPRIV, NOPRIV+BROKEN, NOPRIV+PRE; K/V q8q4 and f16), red on b69f5bee and green on the fix,
 and `build-deb.sh` runs the same matrix, so the recipe fails a kernel that does not
-preprocess. PRE stays a `measured-here` negative (window 295, build df1c3163: 240k no-paging
+preprocess. PRE stays a `measured-here` negative (window 295, build f11639bf: 240k no-paging
 223.3 against 279.8 ms/step, +25.3 %; 261k pool 3584 OVERLAP 262.1 against 308.4, +17.7 %;
 unset 261k 453.2, so OVERLAP -42 %; op perf 245760 base 94.0-97.6, PRE 97.3-99.1, V2
 95.7-97.4 ms/run); NOPRIV+PRE stays one optional arm, dropped if the ISA shows PRE's ~1,950

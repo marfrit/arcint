@@ -9,7 +9,7 @@ index 944df54..7b11cc2 100644
 +                // 0130k: GGML_OPENCL_FA_GQA_NOPRIV -- the same source compiled with every
 +                // private array's indexing loop unrolled and the V stage's vv[64] replaced by
 +                // component stores, so IGC keeps the arrays in GRFs (target: 0 B of private
-+                // memory against df1c3163's 5,888 B and its 61 private loads in the DPAS
++                // memory against f11639bf's 5,888 B and its 61 private loads in the DPAS
 +                // span). Only the kernel body differs; the reduction order is base's. The
 +                // BROKEN variant zeroes one V component, the red op cases.
 +                const char * fnp_env  = getenv("GGML_OPENCL_FA_GQA_NOPRIV");
@@ -62,7 +62,7 @@ index e2f9788..387d91f 100644
  #define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
  
 +// 0130k: GGML_OPENCL_FA_GQA_NOPRIV -- the 5,888 B of private memory the ISA dump shows
-+// at df1c3163, 61 private loads and 8 private stores inside the DPAS span, come from the
++// at f11639bf, 61 private loads and 8 private stores inside the DPAS span, come from the
 +// kernel's arrays being addressable: every loop that indexes one runs with its index in a
 +// register. This switch unrolls exactly those loops (constant indices then, so IGC keeps
 +// each element in a GRF) and drops the V stage's `vv[64]` array, whose 64-element store

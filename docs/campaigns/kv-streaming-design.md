@@ -682,12 +682,12 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   uploads are the only write on the compute queue that the copies must follow (0042); the
   first GDN layers write nothing the copies read. Price ~1/16 of the copy time (one of 16
   attention layers) per step, about 17 ms at 261k by window 284's 274 ms -- `inferred`.
-- **Window 288 (`measured-here`, head 48e19f15):** the lead works. Q5 UD-Q5_K_M, B60, one
+- **Window 288 (`measured-here`, head 06881b9d):** the lead works. Q5 UD-Q5_K_M, B60, one
   process an arm.
 
   | arm | pool | 4k ms | 65k ms (t/s) | 261k ms (t/s) |
   |---|---|---|---|---|
-  | old `bd68d80d` | 1024 | 74.0 | 173.1 (21.99) | - |
+  | old `048098e4` | 1024 | 74.0 | 173.1 (21.99) | - |
   | new, unset | 1024 | 73.6 | 160.8 (23.67) | - |
   | new, OVERLAP | 1024 | 74.1 | 119.9 (32.22) | - |
   | OVERLAP+NOWAIT | 1024 | 74.0 | 120.0 (31.72) | - |
@@ -750,7 +750,7 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   forwards to the attention cache (hybrid, hybrid_iswa, kv_cache_iswa), and the request's
   totals -- issued ahead, fell back, verify nodes/bytes/mismatches, reused/re-copied -- print
   at the request's end through a weak symbol, so a build without the OpenCL backend links.
-- **Window 292 (`measured-here`, 65k, c152135c + 0129w):** the verify is alive and green --
+- **Window 292 (`measured-here`, 65k, 53e8f564 + 0129w):** the verify is alive and green --
   A-self (VERIFY=2) printed "expect exactly 1 mismatching chunk, got 1" 64 times and the
   request totals read **1,040 nodes, 26,894,925,824 bytes, 64 mismatches**, one flip per graph
   seen exactly once; A-verify (VERIFY=1) read the same nodes and bytes with **0 mismatches**,
@@ -760,7 +760,7 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   takes (`ggml-opencl.cpp:25979` before :26102), so every node's copies went out in its own
   dispatch; 0130c calls it in that branch too and names every early return of the prefetch.
 - **0129n-0129w decode: no consumed wait (`code`), OVERLAP decode timings before
-  `71429597` void.** `consumed[p]` -- the event a copy into slot p waits before overwriting
+  `6f570ada` void.** `consumed[p]` -- the event a copy into slot p waits before overwriting
   bytes the FA two layers back read -- is armed only in
   `ggml_cl_fa_paged_overlap_after` (`ggml-opencl.cpp:23960-23972`), and
   `overlap_graph` clears it at every new graph (`:23890-23905`). In the split-decode branch,
@@ -772,13 +772,13 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   correct: each FA waited its own ready event, which is why VERIFY (a hash at the FA's start,
   blocking readback) read 0 mismatches -- it cannot see a write that lands *during* the FA.
   Window 288 (261k, 12.07 t/s), 289b and 292 are therefore **void as OVERLAP timings** until
-  re-measured on `71429597`; window 288 and 292 both showed the alternate opening
+  re-measured on `6f570ada`; window 288 and 292 both showed the alternate opening
   ("...exec/flash_nex" against "...exec/backend_o") at 261k in the OVERLAP arms, two windows
   running. The post-FA check (VERIFY=3: a second hash enqueued right after FA j's kernels,
   compared with the pre-FA one, non-blocking readback collected at the next graph's start and
   at the request's end) is built in 0130d: its device-free gate is green, the card number is
   owed; `GGML_OPENCL_FA_PAGED_NOCONSUME=1` drops exactly the consumed wait, its red arm (`code`).
-- **Window 293b (`measured-here`, build `881f4361`):** the race fix pays where the copies are
+- **Window 293b (`measured-here`, build `7f4029f4`):** the race fix pays where the copies are
   the critical path -- Q5 at 65k, OVERLAP against unset, 116.3 against 161.0 ms/step (-28 %),
   next-graph lead 105 issued / 105 reused, VERIFY=1 at 261k 4,032 nodes / 425.9 GB / 0
   mismatches. At 261k the OVERLAP arms open with "...exec/flash_nex" where window 288 and
@@ -789,7 +789,7 @@ If the traffic hid entirely behind the compute, ~274 ms/step, ~11 t/s (estimate)
   0130a's depth cases into the perf list (window 293b's perf arms matched 0 cases), and
   0130f is the 0130b mechanism done right -- the V halves to private registers, stored after
   P V: `GGML_OPENCL_FA_DECODE_PRE=1`, default off, the card number owed (`code`).
-- **Window 294 (`measured-here`, build 9856f644 = 0130d):** four Q5 arms, OVERLAP=1,
+- **Window 294 (`measured-here`, build dd690bca = 0130d):** four Q5 arms, OVERLAP=1,
   VERIFY=3, greedy 32-token: B-red 261k pool 3584 and A-red 65k pool 1024 with
   `GGML_OPENCL_FA_PAGED_NOCONSUME=1`, B/A-green without it. **Every arm printed
   `post-FA changes 0` and no `post-FA changed` WARN**, red and green the same time (827.7 vs

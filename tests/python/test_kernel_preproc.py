@@ -2,13 +2,13 @@
 
 0130k put `#ifdef GQA_NOPRIV` / `#else` / `#endif` inside the backslash-continued body of
 FA_GQA_STAGE_V and FA_GQA_STORE_V. In C a `#` inside a macro body is the stringize operator,
-so `cpp` fails the whole file at 8236e31d -- and the file is the production GQA decode
+so `cpp` fails the whole file at b69f5bee -- and the file is the production GQA decode
 kernel, NOPRIV off. This gate runs `cpp -x c -P` over flash_attn_gqa_dpas.cl under every
 define set the host builds (base, I8, ST, V2, PRE, PRE+BROKEN, NOPRIV, NOPRIV+BROKEN,
 NOPRIV+PRE) at DK=256, GQA_SIDES=2 and the host's K/V codes q8_0 K / q4_0 V (KT=1, VT=2) and
 f16 (KT=0, VT=0), and fails on any nonzero rc or any output on stderr.
 
-Red first: on 8236e31d's file the base set prints
+Red first: on b69f5bee's file the base set prints
   "flash_attn_gqa_dpas.cl:276:32: error: '#' is not followed by a macro parameter"
 and rc 1. Green: rc 0 for every set.
 """
@@ -62,7 +62,7 @@ class KernelPreproc(unittest.TestCase):
                     if r.returncode != 0 or r.stderr.strip():
                         bad.append((k, kvname, name, r.returncode, r.stderr.strip()[:160]))
                     # 0130o: a macro parameter left in the output = a body that ended early
-                    # (dafb1a4b: the NOPRIV stores outside FA_GQA_STAGE_V/STORE_V, which cpp
+                    # (bc6c12ac: the NOPRIV stores outside FA_GQA_STAGE_V/STORE_V, which cpp
                     # accepts and ocloc rejects: "use of undeclared identifier 'dst'")
                     elif re.search(r"\b(dst|k0i)\b", r.stdout):
                         bad.append((k, kvname, name, "residue", "macro parameter dst/k0i after cpp"))
