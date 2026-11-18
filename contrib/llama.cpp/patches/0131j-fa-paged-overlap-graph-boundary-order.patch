@@ -1,0 +1,59 @@
+0131j: the KV window's overlap keeps the slots' last readers across a graph, flushes the consumed marker, and keys the prefetch reuse by the layer's host store (1.7.0 release review).
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1356,6 +1356,9 @@ struct ggml_backend_opencl_context {
+         std::vector<int32_t> pre_rows;
+         std::vector<int32_t> pre_pages;
+         int pre_chain_n = 0;
++        // 0131j: the host store the prefetched bytes came from (node 0's layer): the plan is
++        // shared by every layer, so pairs and chain length alone do not name the layer
++        const void * pre_host_k = nullptr;
+         int pre_issued = 0, pre_reused = 0, pre_recopied = 0;
+         bool pre_head_dead_warned = false;   // 0129y: one line a process for the lead's early returns
+         // 0130d: VERIFY=3's pairs, the current dispatch's entry, and the changes seen
+@@ -24336,9 +24339,14 @@ static void ggml_cl_fa_paged_overlap_graph(ggml_backend_opencl_context * ctx) {
+                 o.tl_graphs_seen++;
+             }
+         }
++        // 0131j: consumed[] is kept across the graph boundary: it is the slot's last reader in
++        // the previous graph, and the next graph's first copies into that slot must wait it
++        // (node 1 in the reused-prefetch branch had no wait at all once it was dropped here;
++        // a later graph without a host drain between, e.g. consecutive no-logit ubatches,
++        // could overwrite slot 1 while the previous graph's last FA still read it). A kept
++        // event that has completed is a no-op wait.
+         for (int i = 0; i < 2; ++i) {
+             if (o.ready[i])    { CL_CHECK(clReleaseEvent(o.ready[i]));    o.ready[i] = nullptr; }
+-            if (o.consumed[i]) { CL_CHECK(clReleaseEvent(o.consumed[i])); o.consumed[i] = nullptr; }
+         }
+         o.gen  = ctx->graph_gen;
+         o.cur  = 0;
+@@ -24461,6 +24469,7 @@ static void ggml_cl_fa_paged_prefetch_head(ggml_backend_opencl_context * ctx) {
+     o.pre_rows   = rows;
+     o.pre_pages  = pages;
+     o.pre_chain_n = (int) o.chain.size();   // 0129v: the graph whose tail issued these bytes
++    o.pre_host_k = dst->src[GGML_FA_SRC_HOST_K] ? dst->src[GGML_FA_SRC_HOST_K]->data : nullptr;   // 0131j
+     o.pre_issued++;
+ }
+ 
+@@ -24475,6 +24484,10 @@ static bool ggml_cl_fa_paged_prefetch_same(ggml_backend_opencl_context * ctx) {
+     // prepare() numbers ring rows in plan order, so a different streamed set of the same size
+     // yields [0..n-1] too; and an MTP head graph's tail can leave its own node 0 in the slot
+     if (o.pre_chain_n != (int) o.chain.size()) return false;
++    // 0131j: and the layer: a graph computed in two splits of equal paged-FA count has a
++    // node 0 per split, on the same slot with the same plan, reading other host stores
++    const ggml_tensor * hk = o.chain[0]->src[GGML_FA_SRC_HOST_K];
++    if (hk == nullptr || hk->data != o.pre_host_k) return false;
+     const int p0 = ggml_cl_fa_paged_overlap_slot(ctx, o.chain[0]);
+     if (p0 < 0 || p0 != o.pre_parity) return false;
+     int64_t k = 0;
+@@ -24604,6 +24617,9 @@ static void ggml_cl_fa_paged_overlap_after(ggml_backend_opencl_context * ctx, in
+     if (parity < 0) return;   // that node's copies fell back to the compute queue
+     if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
+     CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &o.consumed[parity]));
++    // 0131j: the copy queue waits this marker; OpenCL requires the queue that holds a waited
++    // event's command to be flushed (a batching runtime would otherwise never submit it)
++    CL_CHECK(clFlush(ctx->queue));
+     ggml_cl_fa_paged_tl_keep(ctx, 5, ni, parity, o.consumed[parity]);   // 0130p consumed mark (node ni, ring slot)
+     if (ni + 1 < (int) o.chain.size()) ggml_cl_fa_paged_overlap_issue(ctx, ni + 1, false);
+     // 0129u: last paged FA of this graph: the other slot's last reader was two layers back,

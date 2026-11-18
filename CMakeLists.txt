@@ -745,6 +745,14 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay_model_branches.py")
     set_tests_properties(gdn-replay-model-branches PROPERTIES LABELS unit)
+    # 0131j: the KV window's copy-queue overlap keeps the slots' last readers across a
+    # graph boundary, flushes the waited compute marker, and keys the prefetch reuse by the
+    # layer's host store (the 1.7.0 release review's three overlap orderings).
+    add_test(NAME fa-paged-overlap-order
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_paged_overlap_order.py")
+    set_tests_properties(fa-paged-overlap-order PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"

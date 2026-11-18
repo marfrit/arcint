@@ -8267,3 +8267,30 @@ review that wants them apart splits the hunks).
   Four mutations run and seen failing, then restored: a marker back in the recording start,
   the copy stamps taken from no command event, the re-hash enqueued without the copy's
   ready event, VERIFY=4's pairs collected at a graph's start.
+
+## 0131j-fa-paged-overlap-graph-boundary-order.patch
+
+Three orderings of the KV window's copy-queue overlap (`GGML_OPENCL_FA_PAGED_OVERLAP=1`) that
+the 1.7.0 release review found open (evidence class `code`; none was seen failing on a card,
+and the serial stream without the overlap is ordered by the in-order compute queue):
+
+- **The slots' last readers across a graph.** `ggml_cl_fa_paged_overlap_graph` released both
+  `consumed[]` events at every new graph. In the reused-prefetch branch (0129u) node 1 is
+  issued without the input marker, so its copy then had no wait at all; with an even
+  attention chain (16 layers) slot 1's last reader is the previous graph's last FA. A decode
+  step drains the host through the logits read, so the window measured so far could not
+  meet it; a graph that follows without a drain (consecutive no-logit ubatches whose plan
+  repeats) could overwrite slot 1 while that FA still reads it. `consumed[]` is now kept
+  across the boundary: the first copies into a slot wait its last reader, and a kept event
+  that has completed is a no-op wait.
+- **The waited marker is flushed.** The consumed marker is enqueued on the compute queue and
+  waited by the copy queue; OpenCL requires the queue holding a waited event's command to be
+  flushed. `clFlush(ctx->queue)` follows the marker.
+- **The reuse key names the layer.** `ggml_cl_fa_paged_prefetch_same` compared the plan's
+  (page, row) pairs, the chain length and the slot. The plan is shared by every layer and
+  `graph_compute` runs once per scheduler split, so two splits of equal paged-FA count share
+  all three at their node 0. The key now also holds node 0's host store (`pre_host_k`).
+
+Gate: `tests/python/test_fa_paged_overlap_order.py` (`fa-paged-overlap-order`), red on the
+series up to 0131i (all three checks fail), green with 0131j. The card arm is the 1.7.0
+gate's KV-window smoke (window 170).
