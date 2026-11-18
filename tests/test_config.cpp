@@ -1326,15 +1326,16 @@ TEST(config_chat_template_kwarg_reasoning_effort_default) {
                     "--chat-template-kwarg", "reasoning_effort=high"}));
 }
 
-TEST(config_kv_resident_is_refused_for_serving_until_its_page_moves_exist) {
-    // the KV stream's per-layer page moves (I5) are not built: a budget is refused unless the development
-    // switch is set, and 4096 MiB or more never fits the 32-bit byte count libllama takes
+TEST(config_kv_resident_is_refused_for_serving_without_the_opt_in) {
+    // the KV window is an experimental opt-in: a budget is refused unless LLAMA_KV_STREAM_UNSAFE=1 is
+    // set, and 4096 MiB or more never fits the 32-bit byte count libllama takes
     // (red: drop the LLAMA_KV_STREAM_UNSAFE check in config.cpp, and the first CHECK passes the budget)
     unsetenv("LLAMA_KV_STREAM_UNSAFE");
     Config cfg;
     ArgParse r = run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "3584"}, cfg);
     CHECK(!r.ok);
-    CHECK(r.error.find("under development") != std::string::npos);
+    CHECK(r.error.find("experimental opt-in") != std::string::npos);
+    CHECK(r.error.find("LLAMA_KV_STREAM_UNSAFE=1") != std::string::npos);
     setenv("LLAMA_KV_STREAM_UNSAFE", "1", 1);
     Config cfg2;
     CHECK(run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "3584"}, cfg2).ok);

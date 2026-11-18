@@ -471,9 +471,11 @@ std::string usage_text() {
         "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
         "                            (default f16): q8_0 takes the cache to 53 %,\n"
         "                            q8_0:q4_0 to 41 %\n"
-        "  --llama-kv-resident MiB    KV streaming: resident K/V pages in VRAM, the rest from host RAM\n"
-        "                            (under development: refused unless LLAMA_KV_STREAM_UNSAFE=1;\n"
-        "                            below 4096)\n"
+        "  --llama-kv-resident MiB    the KV window (opt-in, experimental): K/V pages resident in VRAM\n"
+        "                            up to MiB, the rest in host RAM, copied in per attention layer\n"
+        "                            (refused unless LLAMA_KV_STREAM_UNSAFE=1; below 4096; the 24 GB\n"
+        "                            card, --llama-kv q8_0:q4_0; GGML_OPENCL_FA_PAGED_OVERLAP=1\n"
+        "                            copies on a second queue beside the attention)\n"
         "  --llama-kv-resident-decode MiB  the decode phase's budget (not built: refused)\n";
 }
 
@@ -563,12 +565,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             // the budget reaches libllama as a 32-bit byte count (llama_context_params::kv_resident_size)
             if (cfg.llama_kv_resident_mib >= 4096)
                 return fail("--llama-kv-resident takes at most 4095 MiB in this build (the budget is a 32-bit byte count)");
-            // KV streaming serves only once its per-layer page moves exist (I5, docs/campaigns/kv-streaming-design.md):
-            // until then a budget is refused for serving; the environment switch lets it run for its development
+            // The KV window (I5, docs/campaigns/kv-streaming-design.md) is an opt-in in 1.7.0: its per-layer page
+            // moves and the copy-queue overlap are built and measured on the 24 GB card, not production-proven.
+            // A budget is refused unless the operator sets the environment switch; this is the only serving gate
+            // (libllama's own refusal went with 0123zzzzz3).
             if (cfg.llama_kv_resident_mib > 0 &&
                 !(std::getenv("LLAMA_KV_STREAM_UNSAFE") && std::atoi(std::getenv("LLAMA_KV_STREAM_UNSAFE")) != 0))
-                return fail("--llama-kv-resident: KV streaming is under development (its per-layer page moves, I5, are not "
-                            "built) and is refused for serving; LLAMA_KV_STREAM_UNSAFE=1 enables it for development");
+                return fail("--llama-kv-resident: the KV window is an experimental opt-in and is refused unless "
+                            "LLAMA_KV_STREAM_UNSAFE=1 is set (CHANGELOG 1.7.0: what it was measured on, the known gaps)");
         } else if (arg == "--llama-kv-resident-decode") {
             if (!value(v) || !parse_int(v, cfg.llama_kv_resident_decode_mib) || cfg.llama_kv_resident_decode_mib < 0)
                 return fail("--llama-kv-resident-decode needs a size in MiB >= 0 (0: off)");
