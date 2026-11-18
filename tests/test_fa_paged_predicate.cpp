@@ -1,0 +1,186 @@
+// Patch 0123zz's device-free cell: the paged FLASH_ATTN_EXT predicate's logic.
+//
+// Claude's window 226 found every paged case "not supported [OpenCL]" on the B60
+// before the kernel had run: the predicate is in
+// ggml/src/ggml-opencl/ggml-opencl-fa-paged.h, and supports_op calls it with the
+// tensors' values. This cell drives the same function over the agent's shapes and
+// flips each clause, so a predicate that is true where the kernel cannot read the
+// case (or false where it can) is caught without a card.
+//
+// The kernel-side half -- a helper placed between
+// `__attribute__((intel_reqd_sub_group_size(16)))` and `kernel void` takes the
+// attribute for itself and makes the DPAS builtins fail, so the optional program
+// build leaves the kernel null and every paged case is declined -- is asserted in
+// tests/python/test_fa_gqa_i8.py's source-text cell (the kernel is not compiled
+// on the recipe host).
+//
+// Window 228 exposed two wrong values: the KV pair compared literals (Q4_0 is 2 in
+// ggml.h, not 4), so the agent's q8_0:q4_0 was declined while f16 passed; the test
+// now names the enums. The companion crash was the device-side page table: the
+// backend passed the tensor's base and ignored the used row, row 0 held INT32_MAX,
+// and the kernel read a pool row of 2^31 rows out of bounds -- the table row's
+// byte offset is passed now (or a host row is uploaded), see 0123zz.
+//
+// 0125 (I5 review D): the shape and the caps are one pair of plain structs,
+// and `ggml_cl_fa_paged_form` returns the form the dispatcher takes -- 1 the GQA
+// decode kernel, 2 the f16-block prefill conversion, 0 none. The dispatcher asks
+// the same function before choosing, so supports_op cannot accept a shape the
+// dispatcher would abort on: rows, mask heads, ALiBi/softcap/sinks and the
+// work-group's 64-row cap are in the shape or the caps, not in a second copy.
+//
+// Red case (kv-stream-idxs-red, the 0119 review D): `ggml_cl_fa_paged_params_ok`
+// dropped from the form's clauses, so a softcapped call passes and the param
+// checks below fail. A second red: `c.tiles` ignored, so a 64-row decode on one
+// tile passes and the row-cap check fails.
+
+#include "ggml.h"
+#include "ggml-opencl-fa-paged.h"
+#include "ggml-impl.h"   // GGML_FA_SRC_* and GGML_MAX_SRC (0126)
+
+#include <cstdio>
+
+namespace {
+
+int g_failures = 0;
+
+#define CHECK(cond, what)                                                              \
+    do {                                                                               \
+        if (!(cond)) {                                                                 \
+            printf("FAIL: %s\n", what);                                                \
+            ++g_failures;                                                              \
+        }                                                                              \
+    } while (0)
+
+// the agent: q f32, 24 query heads on 4 KV heads, 6 rows, head 256, q8_0 K /
+// q4_0 V, a whole-page ring, a full-width f16 mask over one stream, 8 tiles
+ggml_cl_fa_paged_shape agent_decode() {
+    ggml_cl_fa_paged_shape s{};
+    s.q_type = GGML_TYPE_F32; s.k_type = GGML_TYPE_Q8_0; s.v_type = GGML_TYPE_Q4_0;
+    s.q_ne1 = 6; s.q_ne2 = 24; s.q_ne3 = 1;
+    s.k_ne0 = 256; s.k_ne2 = 4; s.k_ne3 = 1;
+    s.v_ne0 = 256; s.v_ne2 = 4; s.v_ne3 = 1;
+    s.mask_present = true; s.mask_type = GGML_TYPE_F16;
+    s.mask_ne0 = 256*1024; s.mask_ne1 = 6; s.mask_ne2 = 1; s.mask_ne3 = 1;
+    s.causal = false; s.n_batch = 1;
+    s.table_ok = true; s.ring_ok = true;
+    return s;
+}
+
+ggml_cl_fa_paged_caps agent_caps() {
+    ggml_cl_fa_paged_caps c{};
+    c.kernels_gqa_direct = true; c.kernels_gqa_staged = true; c.kernels_prefill = true;
+    c.split_decode = true; c.tiles = 8; c.wide_on = true; c.intel_split_on = true;
+    c.merge = true;
+    return c;
+}
+
+} // namespace
+
+int main() {
+    // 0126: every paged FA source index fits ggml_tensor::src[] (the static_assert
+    // in ggml-impl.h is the compile-time arm; this is the value the test sees)
+    CHECK(GGML_FA_SRC_HOST_K < GGML_MAX_SRC && GGML_FA_SRC_HOST_V < GGML_MAX_SRC &&
+          GGML_FA_SRC_PLAN < GGML_MAX_SRC, "every paged FA source index is inside src[]");
+
+    // the arm that must proceed: the agent's 6-row decode shape on the split kernel
+    CHECK(ggml_cl_fa_paged_ok(agent_decode(), agent_caps()), "the agent's 6-row decode shape is accepted");
+    CHECK(ggml_cl_fa_paged_form(agent_decode(), agent_caps()) == 1, "its form is the GQA decode");
+    CHECK(ggml_cl_fa_paged_kv_ok(agent_decode()) && ggml_cl_fa_paged_shape_ok(agent_decode()),
+          "its KV pair and shapes pass their clauses");
+
+    // each clause, flipped on its own, must refuse
+    { auto s = agent_decode(); s.table_ok = false; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "a broken page table is refused"); }
+    { auto s = agent_decode(); s.k_type = GGML_TYPE_Q4_0; s.v_type = GGML_TYPE_Q8_0;
+      CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "a q4_0 K / q8_0 V pair is refused"); }
+    { auto s = agent_decode(); s.k_ne0 = 128; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "head 128 is refused"); }
+    { auto s = agent_decode(); s.q_type = GGML_TYPE_F16; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "q f16 is refused"); }
+    { auto s = agent_decode(); s.mask_type = GGML_TYPE_F32; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "an f32 mask is refused"); }
+    { auto s = agent_decode(); s.ring_ok = false; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "a ring whose K/V pair is half present is refused"); }
+    { auto s = agent_decode(); s.k_ne3 = 2; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "a multi-stream K view is refused"); }
+
+    // 0119 review D: the params the paged kernels do not take
+    { auto s = agent_decode(); s.max_bias = 8.0f; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "ALiBi (max_bias) is refused"); }
+    { auto s = agent_decode(); s.logit_softcap = 30.0f; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "a logit softcap is refused"); }
+    { auto s = agent_decode(); s.sinks_present = true; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "attention sinks are refused"); }
+
+    // the GQA work-group's cap: (query heads / KV heads) * rows <= tiles * 8. The
+    // agent has 6 (head, token) rows a token, so 10 tokens fill 60 rows on 8 tiles
+    { auto s = agent_decode(); s.q_ne1 = 10; s.mask_ne1 = 10; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "a 10-token (60-row) verify takes the wide GQA call"); }
+    // 0131m: past the cap a paged call never takes 0028's row blocks (their 8-row
+    // re-entries copied outside the overlap's chain; the 1.7.0 gate, windows 170n and
+    // 171a-e): 9-64 rows that are not wide take the conversion. Red: the row-block clause
+    // of 0131k back in the predicate, and these read 1 (or refused)
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "11 tokens (66 rows) past the cap take the conversion, not the row blocks"); }
+    { auto s = agent_decode(); s.q_ne1 = 20; s.mask_ne1 = 20; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a 20-token question prefill (120 rows) takes the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.split_decode = false;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "11 tokens without the split decode take the conversion"); }
+    // 0131k: a 1-8-row decode runs on the GQA kernel too (the split only opens the
+    // path), so it must fit the tiles: 6 tokens at 6 heads are 36 rows, over 4 tiles' 32;
+    // the conversion takes 9+ rows only, so nothing takes them
+    { auto s = agent_decode(); auto c = agent_caps(); c.tiles = 4;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "6 tokens (36 rows) over 4 tiles are refused"); }
+    { auto s = agent_decode(); s.q_ne1 = 5; s.mask_ne1 = 5; auto c = agent_caps(); c.tiles = 4;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 1, "5 tokens (30 rows) fit 4 tiles and take the GQA decode"); }
+    // 0131k: the A770 builds the split decode but no GQA kernel (sub-group 8) and no
+    // conversion: nothing there
+    { auto s = agent_decode(); auto c = agent_caps();
+      c.kernels_gqa_direct = false; c.kernels_gqa_staged = false; c.kernels_prefill = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "split decode without a GQA kernel or the conversion is refused"); }
+    { auto s = agent_decode(); auto c = agent_caps(); c.kernels_gqa_direct = false; c.kernels_gqa_staged = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "6 rows without a GQA kernel are refused, the conversion beside it or not"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.kernels_gqa_direct = false;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "9 rows without the direct kernel: no wide call, the conversion"); }
+    // 0131k: the split decode's kernel slot is the dispatcher's kvq (q8q8, q8q4, q4q4),
+    // not the GQA arrays' index, which starts at f16
+    CHECK(ggml_cl_fa_paged_split_slot(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0) == 0 &&
+          ggml_cl_fa_paged_split_slot(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0) == 1 &&
+          ggml_cl_fa_paged_split_slot(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0) == 2,
+          "the quantized pairs map to the split array's three slots in kvq order");
+    CHECK(ggml_cl_fa_paged_split_slot(GGML_TYPE_F16, GGML_TYPE_F16) == -1 &&
+          ggml_cl_fa_paged_split_slot(GGML_TYPE_Q4_0, GGML_TYPE_Q8_0) == -1,
+          "f16 and an unbuilt pair have no slot in the quantized split array");
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.tiles = 4; c.kernels_prefill = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "rows beyond the cap with no conversion are refused"); }
+
+    // 9-64 rows: the wide GQA call needs one batch and one stream's mask
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "9 tokens (54 rows) take the wide GQA call"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; s.mask_ne2 = 2;
+      CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "9 tokens over two mask heads take the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; s.n_batch = 2;
+      CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "9 tokens on two K/V batches take the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.wide_on = false;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "with the wide verify off, 9 tokens take the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.split_decode = false;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 1, "without the split kernel the wide call still decodes"); }
+    // 0131k: the wide call's launch reads the merge kernel (which split_decode implies)
+    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.split_decode = false; c.merge = false;
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "without the merge kernel 9 rows take the conversion"); }
+
+    // prefill: the conversion + f16 prompt kernels carry every row count
+    { auto s = agent_decode(); s.q_ne1 = 512; s.mask_ne1 = 512; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a 512-row prompt takes the conversion"); }
+    { auto s = agent_decode(); s.q_ne1 = 512; s.mask_ne1 = 512; auto c = agent_caps(); c.kernels_prefill = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "a prompt without the conversion+f16 kernel is refused"); }
+    { auto s = agent_decode(); auto c = agent_caps();
+      c.kernels_gqa_direct = false; c.kernels_gqa_staged = false; c.kernels_prefill = false;
+      c.split_decode = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "no kernel at all is refused"); }
+
+    // 1 row: the staged 1-3-row form is the decode kernel's, so it is accepted
+    { auto s = agent_decode(); s.q_ne1 = 1; CHECK(ggml_cl_fa_paged_ok(s, agent_caps()), "a 1-row decode is accepted"); }
+    { auto s = agent_decode(); s.q_ne1 = 1; auto c = agent_caps(); c.split_decode = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "a 1-row decode without the split is refused (the conversion takes 9+ rows)"); }
+    { auto s = agent_decode(); s.q_ne1 = 1; auto c = agent_caps(); c.intel_split_on = false;
+      CHECK(!ggml_cl_fa_paged_ok(s, c), "a 1-row decode with the split switched off is refused"); }
+
+    // causal attention has no split decode: it takes the conversion
+    { auto s = agent_decode(); s.causal = true; CHECK(!ggml_cl_fa_paged_ok(s, agent_caps()), "a causal 6-row call has no form"); }
+    { auto s = agent_decode(); s.causal = true; s.q_ne1 = 512; s.mask_ne1 = 512;
+      CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a causal prompt takes the conversion"); }
+
+    if (g_failures != 0) {
+        printf("FAILED: %d\n", g_failures);
+        return 1;
+    }
+    printf("OK: the paged FA predicate accepts the agent's shapes and refuses each flipped clause\n");
+    return 0;
+}

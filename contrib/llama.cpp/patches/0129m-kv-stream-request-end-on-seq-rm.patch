@@ -1,0 +1,64 @@
+diff --git a/src/llama-kv-stream.h b/src/llama-kv-stream.h
+--- a/src/llama-kv-stream.h	2026-11-15 21:05:25.716438050 +0100
++++ b/src/llama-kv-stream.h	2026-11-15 21:04:13.177028466 +0100
+@@ -98,6 +98,7 @@
+     // forget every page (the cache was cleared); pages that were written stay in
+     // the host store only if they were written back first
+     void clear();
++    void request_end();   // 0129m: the served path clears a request through seq_rm, not clear()
+ 
+     uint32_t n_pool() const { return n_slots; }
+     uint32_t n_ring() const { return slots[0].k ? (uint32_t) (slots[0].k->ne[1]/page_size) : 0; }
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+--- a/src/llama-kv-stream.cpp	2026-11-15 21:05:25.716531545 +0100
++++ b/src/llama-kv-stream.cpp	2026-11-15 21:04:13.177101102 +0100
+@@ -299,6 +299,22 @@
+     return res;
+ }
+ 
++// 0129m: window 284's served log held no request-end line and two prepare lines over seven
++// requests: clear() is not the call a served request ends with. The cache's seq_rm releases
++// the sequence's cells, so that is where the request's last counts are logged; clear() prints
++// through it too (a cleared cache was a request's end as well).
++void llama_kv_stream::request_end() {
++    if (!logged_first) {
++        return;
++    }
++    const uint32_t moved = streamed_last*layers.size()*2;
++    LLAMA_LOG_WARN("%s: KV streaming (request end): attended %u pages, %u resident, %u streamed, "
++            "%u page moves this request (%u ring rows; context: %u of %u pages resident)\n",
++            __func__, att_last, att_last - streamed_last, streamed_last, moved, streamed_last,
++            n_pages - n_streamed, n_pages);
++    logged_first = logged_stream = false;
++}
++
+ void llama_kv_stream::clear() {
+     page_slot.assign(n_pages, -1);
+     slot_page.assign(n_slots, -1);
+@@ -308,13 +324,7 @@
+     // 0129i: one line per request for its LAST ubatch too -- the cache clears pages at a
+     // new request's start, so the previous request's final counts are still here: the
+     // 261k request never printed before (window 283 held two lines over seven requests)
+-    if (logged_first) {
+-        const uint32_t moved = streamed_last*layers.size()*2;
+-        LLAMA_LOG_WARN("%s: KV streaming (request end): attended %u pages, %u resident, %u streamed, "
+-                "%u page moves this request (%u ring rows; context: %u of %u pages resident)\n",
+-                __func__, att_last, att_last - streamed_last, streamed_last, moved, streamed_last,
+-                n_pages - n_streamed, n_pages);
+-    }
++    request_end();
+     n_streamed = 0;
+     logged_first = logged_stream = false;
+     layout_id++;
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+--- a/src/llama-kv-cache.cpp	2026-11-15 21:05:25.688733922 +0100
++++ b/src/llama-kv-cache.cpp	2026-11-15 21:06:04.964764473 +0100
+@@ -495,6 +495,8 @@
+         return true;
+     }
+ 
++    // 0129m: a whole sequence's removal is where a served request ends
++    const bool whole_seq = p0 < 0 && p1 < 0;
+     // TODO: fix incosistent handling of `seq_id < 0` and `seq_id == -1` in the codebase [TAG_LLAMA_SEQ_ID_NEG]
+     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
+ 

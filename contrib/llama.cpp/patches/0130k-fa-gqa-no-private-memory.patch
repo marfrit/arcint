@@ -1,0 +1,412 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 944df54..7b11cc2 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -5629,6 +5629,50 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                                   "V loaded into registers at the tile's top and stored after P V, local %llu B a work-group at head 256 q8_0 K/q4_0 V\n",
+                                   fdp_broken ? " BROKEN (the red op cases)" : "", n_pre, (unsigned long long) pre_lm);
+                 }
++                // 0130k: GGML_OPENCL_FA_GQA_NOPRIV -- the same source compiled with every
++                // private array's indexing loop unrolled and the V stage's vv[64] replaced by
++                // component stores, so IGC keeps the arrays in GRFs (target: 0 B of private
++                // memory against f11639bf's 5,888 B and its 61 private loads in the DPAS
++                // span). Only the kernel body differs; the reduction order is base's. The
++                // BROKEN variant zeroes one V component, the red op cases.
++                const char * fnp_env  = getenv("GGML_OPENCL_FA_GQA_NOPRIV");
++                const bool   fnp_on   = fnp_env != nullptr && atoi(fnp_env) != 0;
++                const char * fnpb_env = getenv("GGML_OPENCL_FA_GQA_NOPRIV_BROKEN");
++                const bool   fnp_broken = fnpb_env != nullptr && atoi(fnpb_env) != 0;
++                if (fnp_on) {
++                    int n_np = 0;
++                    for (int di = 0; di < 2; ++di) {
++                        const int dk = di == 0 ? 256 : 128;
++                        for (int i = 0; i < 4; ++i) {
++                            if (backend_ctx->kernel_fa_gqa_dk[di][i] == nullptr) continue;
++                            const bool i8_arm = fi8_on && gkv[i][0] == 1;
++                            std::string np_prog_src = gqa_src;
++                            if (i8_arm) np_prog_src = gqa_i8_inc + gqa_src;
++                            std::string np_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DDK=" + std::to_string(dk) + " -DGQA_SIDES=" + std::to_string(fg_sides) +
++                                " -DKT=" + std::to_string(gkv[i][0]) +
++                                " -DVT=" + std::to_string(gkv[i][1]) +
++                                " -DGQA_NOPRIV=1" +
++                                (fnp_broken ? " -DGQA_NOPRIV_BROKEN=1" : "") +
++                                (i8_arm ? " -DGQA_I8=1" : "") +
++                                (getenv("GGML_OPENCL_FA_GQA_OPTS") ? std::string(" ") + getenv("GGML_OPENCL_FA_GQA_OPTS") : std::string());
++                            cl_program pg = build_program_from_source_optional(backend_ctx, np_prog_src.c_str(), np_opts);
++                            if (pg == nullptr) {
++                                GGML_LOG_WARN("ggml_opencl: FA GQA NOPRIV (dk %d, K %d V %d) did not build; the base kernel stays\n", dk, gkv[i][0], gkv[i][1]);
++                                continue;
++                            }
++                            cl_kernel kg = clCreateKernel(pg, "flash_attn_gqa_dpas", &err);
++                            if (err == CL_SUCCESS) {
++                                CL_CHECK(clReleaseKernel(backend_ctx->kernel_fa_gqa_dk[di][i]));
++                                backend_ctx->kernel_fa_gqa_dk[di][i] = kg;
++                                n_np++;
++                            }
++                            CL_CHECK(clReleaseProgram(pg));
++                        }
++                    }
++                    GGML_LOG_INFO("ggml_opencl: FA GQA NOPRIV (GGML_OPENCL_FA_GQA_NOPRIV=1%s): %d of 8 pair/head kernels, "
++                                  "private arrays unrolled, V components stored straight to local memory\n",
++                                  fnp_broken ? " BROKEN (the red op cases)" : "", n_np);
++                }
+                 // 0089: the 1-3 row form, the same source with GQA_ST (raw q8_0
+                 // key rows staged once a work-group), only when the int8 switch
+                 // is on and only for the q8_0 K pairs (KT 1). It is a second
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+index e2f9788..387d91f 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -88,6 +88,19 @@
+ 
+ #define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
+ 
++// 0130k: GGML_OPENCL_FA_GQA_NOPRIV -- the 5,888 B of private memory the ISA dump shows
++// at f11639bf, 61 private loads and 8 private stores inside the DPAS span, come from the
++// kernel's arrays being addressable: every loop that indexes one runs with its index in a
++// register. This switch unrolls exactly those loops (constant indices then, so IGC keeps
++// each element in a GRF) and drops the V stage's `vv[64]` array, whose 64-element store
++// loop no unroller takes. The reduction order is untouched: every loop keeps its
++// ascending order, so the greedy answer is the base's.
++#ifdef GQA_NOPRIV
++#define FA_UNROLL _Pragma("unroll")
++#else
++#define FA_UNROLL
++#endif
++
+ // 0088: the int8 Q K^T of the fork's DPAS decode attention (arc-b580
+ // fattn-dec.cpp:688-747): Q rows int8 once a call, the key's raw q8_0 codes
+ // as the b operand, the integer result scaled by dq[row][block] *
+@@ -242,6 +255,7 @@ kernel void flash_attn_gqa_dpas(
+     // this sub-group's rows: (query head, token), valid when m < n_rows
+     int  rh[8], rt[8];
+     bool rv[8];
++    FA_UNROLL
+     for (int r = 0; r < 8; ++r) {
+         const int m = tile * 8 + r;
+         rv[r] = m < n_rows;
+@@ -251,8 +265,10 @@ kernel void flash_attn_gqa_dpas(
+ 
+     float m[8];
+     float8 lv = (float8)(0.f);
++    FA_UNROLL
+     for (int r = 0; r < 8; ++r) m[r] = M_INIT;
+     float8 o[NDH];
++    FA_UNROLL
+     for (int i = 0; i < NDH; ++i) o[i] = (float8)(0.f);
+ 
+     // the V tile of BK keys into a local stage: key fastest, neighbouring lanes
+@@ -265,6 +281,78 @@ kernel void flash_attn_gqa_dpas(
+         const half16 v1 = load16(VT, vrow, 4 * c64 + 1);                                      \
+         const half16 v2 = load16(VT, vrow, 4 * c64 + 2);                                      \
+         const half16 v3 = load16(VT, vrow, 4 * c64 + 3);                                      \
++#ifdef GQA_NOPRIV
++        // 0130k: the components straight to local memory, no 64-entry array. The broken
++        // variant writes one component as zero, so the op cases fail while the registers
++        // stay: the red arm's shape.
++                (dst)[(64 * c64 + 0) * BK + key] = v0.s0;
++        (dst)[(64 * c64 + 1) * BK + key] = v0.s1;
++        (dst)[(64 * c64 + 2) * BK + key] = v0.s2;
++        (dst)[(64 * c64 + 3) * BK + key] = v0.s3;
++        (dst)[(64 * c64 + 4) * BK + key] = v0.s4;
++        (dst)[(64 * c64 + 5) * BK + key] = v0.s5;
++        (dst)[(64 * c64 + 6) * BK + key] = v0.s6;
++        (dst)[(64 * c64 + 7) * BK + key] = v0.s7;
++        (dst)[(64 * c64 + 8) * BK + key] = v0.s8;
++        (dst)[(64 * c64 + 9) * BK + key] = v0.s9;
++        (dst)[(64 * c64 + 10) * BK + key] = v0.sa;
++        (dst)[(64 * c64 + 11) * BK + key] = v0.sb;
++        (dst)[(64 * c64 + 12) * BK + key] = v0.sc;
++        (dst)[(64 * c64 + 13) * BK + key] = v0.sd;
++        (dst)[(64 * c64 + 14) * BK + key] = v0.se;
++        (dst)[(64 * c64 + 15) * BK + key] = v0.sf;
++        (dst)[(64 * c64 + 16) * BK + key] = v1.s0;
++        (dst)[(64 * c64 + 17) * BK + key] = v1.s1;
++        (dst)[(64 * c64 + 18) * BK + key] = v1.s2;
++        (dst)[(64 * c64 + 19) * BK + key] = v1.s3;
++        (dst)[(64 * c64 + 20) * BK + key] = v1.s4;
++        (dst)[(64 * c64 + 21) * BK + key] = v1.s5;
++        (dst)[(64 * c64 + 22) * BK + key] = v1.s6;
++        (dst)[(64 * c64 + 23) * BK + key] = v1.s7;
++        (dst)[(64 * c64 + 24) * BK + key] = v1.s8;
++        (dst)[(64 * c64 + 25) * BK + key] = v1.s9;
++        (dst)[(64 * c64 + 26) * BK + key] = v1.sa;
++        (dst)[(64 * c64 + 27) * BK + key] = v1.sb;
++        (dst)[(64 * c64 + 28) * BK + key] = v1.sc;
++        (dst)[(64 * c64 + 29) * BK + key] = v1.sd;
++        (dst)[(64 * c64 + 30) * BK + key] = v1.se;
++        (dst)[(64 * c64 + 31) * BK + key] = v1.sf;
++        (dst)[(64 * c64 + 32) * BK + key] = v2.s0;
++        (dst)[(64 * c64 + 33) * BK + key] = v2.s1;
++        (dst)[(64 * c64 + 34) * BK + key] = v2.s2;
++        (dst)[(64 * c64 + 35) * BK + key] = v2.s3;
++        (dst)[(64 * c64 + 36) * BK + key] = v2.s4;
++        (dst)[(64 * c64 + 37) * BK + key] = v2.s5;
++        (dst)[(64 * c64 + 38) * BK + key] = v2.s6;
++        (dst)[(64 * c64 + 39) * BK + key] = v2.s7;
++        (dst)[(64 * c64 + 40) * BK + key] = v2.s8;
++        (dst)[(64 * c64 + 41) * BK + key] = v2.s9;
++        (dst)[(64 * c64 + 42) * BK + key] = v2.sa;
++        (dst)[(64 * c64 + 43) * BK + key] = v2.sb;
++        (dst)[(64 * c64 + 44) * BK + key] = v2.sc;
++        (dst)[(64 * c64 + 45) * BK + key] = v2.sd;
++        (dst)[(64 * c64 + 46) * BK + key] = v2.se;
++        (dst)[(64 * c64 + 47) * BK + key] = v2.sf;
++        (dst)[(64 * c64 + 48) * BK + key] = v3.s0;
++        (dst)[(64 * c64 + 49) * BK + key] = v3.s1;
++        (dst)[(64 * c64 + 50) * BK + key] = v3.s2;
++        (dst)[(64 * c64 + 51) * BK + key] = v3.s3;
++        (dst)[(64 * c64 + 52) * BK + key] = v3.s4;
++        (dst)[(64 * c64 + 53) * BK + key] = v3.s5;
++        (dst)[(64 * c64 + 54) * BK + key] = v3.s6;
++        (dst)[(64 * c64 + 55) * BK + key] = v3.s7;
++        (dst)[(64 * c64 + 56) * BK + key] = v3.s8;
++        (dst)[(64 * c64 + 57) * BK + key] = v3.s9;
++        (dst)[(64 * c64 + 58) * BK + key] = v3.sa;
++        (dst)[(64 * c64 + 59) * BK + key] = v3.sb;
++        (dst)[(64 * c64 + 60) * BK + key] = v3.sc;
++        (dst)[(64 * c64 + 61) * BK + key] = v3.sd;
++        (dst)[(64 * c64 + 62) * BK + key] = v3.se;
++        (dst)[(64 * c64 + 63) * BK + key] = v3.sf;
++#ifdef GQA_NOPRIV_BROKEN
++        (dst)[(64 * c64 + 15) * BK + key] = 0.0h;   // the red op cases: one V value of every row
++#endif
++#else
+         const half vv[64] = { v0.s0, v0.s1, v0.s2, v0.s3, v0.s4, v0.s5, v0.s6, v0.s7,        \
+                               v0.s8, v0.s9, v0.sa, v0.sb, v0.sc, v0.sd, v0.se, v0.sf,        \
+                               v1.s0, v1.s1, v1.s2, v1.s3, v1.s4, v1.s5, v1.s6, v1.s7,        \
+@@ -273,7 +361,9 @@ kernel void flash_attn_gqa_dpas(
+                               v2.s8, v2.s9, v2.sa, v2.sb, v2.sc, v2.sd, v2.se, v2.sf,        \
+                               v3.s0, v3.s1, v3.s2, v3.s3, v3.s4, v3.s5, v3.s6, v3.s7,        \
+                               v3.s8, v3.s9, v3.sa, v3.sb, v3.sc, v3.sd, v3.se, v3.sf };      \
++        FA_UNROLL \
+         for (int j = 0; j < 64; ++j) (dst)[(64 * c64 + j) * BK + key] = vv[j];                   \
++#endif
+     }
+ 
+ #ifdef GQA_PRE
+@@ -283,6 +373,7 @@ kernel void flash_attn_gqa_dpas(
+     // A global load into registers does not block the thread; its value is
+     // consumed at the store, so the products run while the loads are in flight.
+ #define FA_GQA_PRE_V(k0i, R)                                                                  \
++    FA_UNROLL \
+     for (int it = 0; it < 2; ++it) {                                                          \
+         const int u = lid + it * nthr;                                                        \
+         if (u >= BK * DV / 64) continue;                                                      \
+@@ -294,10 +385,81 @@ kernel void flash_attn_gqa_dpas(
+         (R)[it][3] = load16(VT, vrow, 4 * c64 + 3);                                           \
+     }
+ #define FA_GQA_STORE_V(R, dst)                                                                \
++    FA_UNROLL \
+     for (int it = 0; it < 2; ++it) {                                                          \
+         const int u = lid + it * nthr;                                                        \
+         if (u >= BK * DV / 64) continue;                                                      \
+         const int key = u % BK, c64 = u / BK;                                                 \
++#ifdef GQA_NOPRIV
++        // 0130k: the loaded halves straight to local memory, no 64-entry array
++                (dst)[(64 * c64 + 0) * BK + key] = (R)[it][0].s0;
++        (dst)[(64 * c64 + 1) * BK + key] = (R)[it][0].s1;
++        (dst)[(64 * c64 + 2) * BK + key] = (R)[it][0].s2;
++        (dst)[(64 * c64 + 3) * BK + key] = (R)[it][0].s3;
++        (dst)[(64 * c64 + 4) * BK + key] = (R)[it][0].s4;
++        (dst)[(64 * c64 + 5) * BK + key] = (R)[it][0].s5;
++        (dst)[(64 * c64 + 6) * BK + key] = (R)[it][0].s6;
++        (dst)[(64 * c64 + 7) * BK + key] = (R)[it][0].s7;
++        (dst)[(64 * c64 + 8) * BK + key] = (R)[it][0].s8;
++        (dst)[(64 * c64 + 9) * BK + key] = (R)[it][0].s9;
++        (dst)[(64 * c64 + 10) * BK + key] = (R)[it][0].sa;
++        (dst)[(64 * c64 + 11) * BK + key] = (R)[it][0].sb;
++        (dst)[(64 * c64 + 12) * BK + key] = (R)[it][0].sc;
++        (dst)[(64 * c64 + 13) * BK + key] = (R)[it][0].sd;
++        (dst)[(64 * c64 + 14) * BK + key] = (R)[it][0].se;
++        (dst)[(64 * c64 + 15) * BK + key] = (R)[it][0].sf;
++        (dst)[(64 * c64 + 16) * BK + key] = (R)[it][1].s0;
++        (dst)[(64 * c64 + 17) * BK + key] = (R)[it][1].s1;
++        (dst)[(64 * c64 + 18) * BK + key] = (R)[it][1].s2;
++        (dst)[(64 * c64 + 19) * BK + key] = (R)[it][1].s3;
++        (dst)[(64 * c64 + 20) * BK + key] = (R)[it][1].s4;
++        (dst)[(64 * c64 + 21) * BK + key] = (R)[it][1].s5;
++        (dst)[(64 * c64 + 22) * BK + key] = (R)[it][1].s6;
++        (dst)[(64 * c64 + 23) * BK + key] = (R)[it][1].s7;
++        (dst)[(64 * c64 + 24) * BK + key] = (R)[it][1].s8;
++        (dst)[(64 * c64 + 25) * BK + key] = (R)[it][1].s9;
++        (dst)[(64 * c64 + 26) * BK + key] = (R)[it][1].sa;
++        (dst)[(64 * c64 + 27) * BK + key] = (R)[it][1].sb;
++        (dst)[(64 * c64 + 28) * BK + key] = (R)[it][1].sc;
++        (dst)[(64 * c64 + 29) * BK + key] = (R)[it][1].sd;
++        (dst)[(64 * c64 + 30) * BK + key] = (R)[it][1].se;
++        (dst)[(64 * c64 + 31) * BK + key] = (R)[it][1].sf;
++        (dst)[(64 * c64 + 32) * BK + key] = (R)[it][2].s0;
++        (dst)[(64 * c64 + 33) * BK + key] = (R)[it][2].s1;
++        (dst)[(64 * c64 + 34) * BK + key] = (R)[it][2].s2;
++        (dst)[(64 * c64 + 35) * BK + key] = (R)[it][2].s3;
++        (dst)[(64 * c64 + 36) * BK + key] = (R)[it][2].s4;
++        (dst)[(64 * c64 + 37) * BK + key] = (R)[it][2].s5;
++        (dst)[(64 * c64 + 38) * BK + key] = (R)[it][2].s6;
++        (dst)[(64 * c64 + 39) * BK + key] = (R)[it][2].s7;
++        (dst)[(64 * c64 + 40) * BK + key] = (R)[it][2].s8;
++        (dst)[(64 * c64 + 41) * BK + key] = (R)[it][2].s9;
++        (dst)[(64 * c64 + 42) * BK + key] = (R)[it][2].sa;
++        (dst)[(64 * c64 + 43) * BK + key] = (R)[it][2].sb;
++        (dst)[(64 * c64 + 44) * BK + key] = (R)[it][2].sc;
++        (dst)[(64 * c64 + 45) * BK + key] = (R)[it][2].sd;
++        (dst)[(64 * c64 + 46) * BK + key] = (R)[it][2].se;
++        (dst)[(64 * c64 + 47) * BK + key] = (R)[it][2].sf;
++        (dst)[(64 * c64 + 48) * BK + key] = (R)[it][3].s0;
++        (dst)[(64 * c64 + 49) * BK + key] = (R)[it][3].s1;
++        (dst)[(64 * c64 + 50) * BK + key] = (R)[it][3].s2;
++        (dst)[(64 * c64 + 51) * BK + key] = (R)[it][3].s3;
++        (dst)[(64 * c64 + 52) * BK + key] = (R)[it][3].s4;
++        (dst)[(64 * c64 + 53) * BK + key] = (R)[it][3].s5;
++        (dst)[(64 * c64 + 54) * BK + key] = (R)[it][3].s6;
++        (dst)[(64 * c64 + 55) * BK + key] = (R)[it][3].s7;
++        (dst)[(64 * c64 + 56) * BK + key] = (R)[it][3].s8;
++        (dst)[(64 * c64 + 57) * BK + key] = (R)[it][3].s9;
++        (dst)[(64 * c64 + 58) * BK + key] = (R)[it][3].sa;
++        (dst)[(64 * c64 + 59) * BK + key] = (R)[it][3].sb;
++        (dst)[(64 * c64 + 60) * BK + key] = (R)[it][3].sc;
++        (dst)[(64 * c64 + 61) * BK + key] = (R)[it][3].sd;
++        (dst)[(64 * c64 + 62) * BK + key] = (R)[it][3].se;
++        (dst)[(64 * c64 + 63) * BK + key] = (R)[it][3].sf;
++#ifdef GQA_NOPRIV_BROKEN
++        (dst)[(64 * c64 + 15) * BK + key] = 0.0h;
++#endif
++#else
+         const half vv[64] = { (R)[it][0].s0, (R)[it][0].s1, (R)[it][0].s2, (R)[it][0].s3,     \
+                               (R)[it][0].s4, (R)[it][0].s5, (R)[it][0].s6, (R)[it][0].s7,     \
+                               (R)[it][0].s8, (R)[it][0].s9, (R)[it][0].sa, (R)[it][0].sb,     \
+@@ -314,7 +476,9 @@ kernel void flash_attn_gqa_dpas(
+                               (R)[it][3].s4, (R)[it][3].s5, (R)[it][3].s6, (R)[it][3].s7,     \
+                               (R)[it][3].s8, (R)[it][3].s9, (R)[it][3].sa, (R)[it][3].sb,     \
+                               (R)[it][3].sc, (R)[it][3].sd, (R)[it][3].se, (R)[it][3].sf };  \
++        FA_UNROLL \
+         for (int j = 0; j < 64; ++j) (dst)[(64 * c64 + j) * BK + key] = vv[j];                 \
++#endif
+     }
+ #endif
+ 
+@@ -333,8 +497,10 @@ kernel void flash_attn_gqa_dpas(
+                 const int rhq = hk * G + (r % G), rtq = r / G;
+                 const global float * qrow = (const global float *)((const global char *) q_void + q_offset +
+                     batch * q_nb3 + rhq * q_nb2 + rtq * q_nb1) + b * 32;
++                FA_UNROLL
+                 for (int i = 0; i < 32; ++i) x[i] = qrow[i] * scale;
+             } else {
++                FA_UNROLL
+                 for (int i = 0; i < 32; ++i) x[i] = 0.f;
+             }
+             float dq; int q[32];
+@@ -350,8 +516,10 @@ kernel void flash_attn_gqa_dpas(
+     }
+ #else
+     short8 qa[KC];
++    FA_UNROLL
+     for (int c = 0; c < KC; ++c) {
+         half qv[8];
++        FA_UNROLL
+         for (int r = 0; r < 8; ++r) {
+             const global float * qrow = (const global float *)((const global char *) q_void + q_offset +
+                 batch * q_nb3 + rh[r] * q_nb2 + rt[r] * q_nb1);
+@@ -368,6 +536,7 @@ kernel void flash_attn_gqa_dpas(
+     // the device) or an uploaded host row, the byte offset given by the backend
+     const global int * ptable = table_void ? (const global int *)((const global char *) table_void + table_off) : 0;
+     const global half * mrow[8];
++    FA_UNROLL
+     for (int r = 0; r < 8; ++r) {
+         mrow[r] = mask_void != 0
+             ? (const global half *)((const global char *) mask_void + mask_offset + (batch % mask_ne3) * mask_nb3 +
+@@ -428,6 +597,7 @@ kernel void flash_attn_gqa_dpas(
+ #endif
+         // QK^T
+         float8 s[NKB];
++        FA_UNROLL
+         for (int g = 0; g < NKB; ++g) {
+ #ifdef GQA_S_SPLIT
+             if (g % GQA_SIDES != side) continue;
+@@ -454,6 +624,7 @@ kernel void flash_attn_gqa_dpas(
+                        (float8)(dk, dk, dk, dk, dk, dk, dk, dk);
+             }
+ #else
++            FA_UNROLL
+             for (int c = 0; c < KC; ++c) {
+ #ifndef GQA_K_STAGED
+                 const int8 b = kb16(KT, fa_gqa_page_row(ptable, page_size, min(k0 + g * 16 + lane, kv_end - 1),
+@@ -482,17 +653,21 @@ kernel void flash_attn_gqa_dpas(
+ #endif
+         barrier(CLK_LOCAL_MEM_FENCE);
+ #ifdef GQA_S_SPLIT
++        FA_UNROLL
+         for (int g = 0; g < NKB; ++g) {
+             if (g % GQA_SIDES == side) continue;
+             s[g] = vload8(0, sx + ((tile * NKB + g) * 16 + lane) * 8);
+         }
+ #endif
+         float mnew[8];
++        FA_UNROLL
+         for (int r = 0; r < 8; ++r) mnew[r] = m[r];
++        FA_UNROLL
+         for (int g = 0; g < NKB; ++g) {
+             const int key = k0 + g * 16 + lane;
+             const bool kvis = key < kv_end;
+             float mk[8];
++            FA_UNROLL
+             for (int r = 0; r < 8; ++r) {
+                 if (kvis && rv[r]) mk[r] = mrow[r] != 0 ? (float) mrow[r][key] : 0.f;
+                 else mk[r] = M_INIT;
+@@ -504,17 +679,21 @@ kernel void flash_attn_gqa_dpas(
+         }
+         // one reduction per row over all groups instead of one per (row, group)
+         float8 mx8 = s[0];
++        FA_UNROLL
+         for (int g = 1; g < NKB; ++g) mx8 = fmax(mx8, s[g]);
+         {
+             const float mv[8] = { mx8.s0, mx8.s1, mx8.s2, mx8.s3, mx8.s4, mx8.s5, mx8.s6, mx8.s7 };
++            FA_UNROLL
+             for (int r = 0; r < 8; ++r) mnew[r] = fmax(mnew[r], sub_group_reduce_max(mv[r]));
+         }
+         float corr[8];
++        FA_UNROLL
+         for (int r = 0; r < 8; ++r) {
+             corr[r] = m[r] > 0.5f * M_INIT ? exp(m[r] - mnew[r]) : 0.f;
+             m[r]  = mnew[r];
+         }
+         const float8 cv = (float8)(corr[0], corr[1], corr[2], corr[3], corr[4], corr[5], corr[6], corr[7]);
++        FA_UNROLL
+         for (int i = 0; i < NDH; ++i) o[i] *= cv;
+         lv *= cv;
+         short8 pa[NKB];
+@@ -522,6 +701,7 @@ kernel void flash_attn_gqa_dpas(
+             // P for both key groups at once, as float8 vectors
+             const float8 m8 = (float8)(m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7]);
+             const float8 mcut = (float8)(0.5f * M_INIT);
++            FA_UNROLL
+             for (int g = 0; g < NKB; ++g) {
+                 float8 e = native_exp(s[g] - m8);
+                 e = select((float8)(0.f), e, s[g] > mcut);   // M_INIT entries -> 0
+@@ -530,9 +710,11 @@ kernel void flash_attn_gqa_dpas(
+                 pa[g] = as_short8(ph);
+             }
+         }
++        FA_UNROLL
+         for (int i = 0; i < NDH; ++i) {
+             const int col = side * (DV / GQA_SIDES) + i * 16 + lane;
+             float8 acc = o[i];
++            FA_UNROLL
+             for (int g = 0; g < NKB; ++g) {
+ #if defined(GQA_V2) || defined(GQA_PRE)
+                 const int8 b = as_int8(vload8(0, (local const uint *)(vt + vcur * (DV * BK) + col * BK + g * 16)));
+@@ -562,12 +744,14 @@ kernel void flash_attn_gqa_dpas(
+ 
+     // the partial records: m and l by the left half's lane 0, O by column
+     const float larr[8] = { lv.s0, lv.s1, lv.s2, lv.s3, lv.s4, lv.s5, lv.s6, lv.s7 };
++    FA_UNROLL
+     for (int r = 0; r < 8; ++r) {
+         const float lr = sub_group_reduce_add(larr[r]);
+         if (!rv[r]) continue;
+         const ulong rec_idx = (((ulong) batch * n_head + rh[r]) * n_q + rt[r]) * n_splits + split;
+         global float * rec = partial_void + rec_idx * (ulong) PARTIAL;
+         if (side == 0 && lane == 0) { rec[0] = m[r]; rec[1] = lr; }
++        FA_UNROLL
+         for (int i = 0; i < NDH; ++i) {
+             const float ov[8] = { o[i].s0, o[i].s1, o[i].s2, o[i].s3, o[i].s4, o[i].s5, o[i].s6, o[i].s7 };
+             rec[2 + side * (DV / GQA_SIDES) + i * 16 + lane] = ov[r];

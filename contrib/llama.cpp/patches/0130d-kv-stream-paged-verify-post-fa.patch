@@ -1,0 +1,352 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -763,6 +763,24 @@ typedef void * (*ggml_cl_host_alloc_t)(cl_context, const cl_ulong *, size_t, cl_
+ typedef cl_int (*ggml_cl_mem_free_t)(cl_context, void *);
+ typedef cl_int (*ggml_cl_set_arg_ptr_t)(cl_kernel, cl_uint, const void *);
+ 
++// 0130d (VERIFY=3): one FA node's pair of hashes -- the pre one, taken at the FA's
++// position, and the post one, taken right after its kernels; both read back non-blocking
++// and compared at the next graph's start and at the request's end.
++struct fa_paged_post {
++    cl_mem rowsbuf = nullptr;
++    cl_mem buf[2]       = { nullptr, nullptr };   // the slot's K and V region
++    cl_mem out[2][2]    = {};                      // [kv][0 pre, 1 post]
++    cl_event ev[2][2]   = {};                      // the non-blocking readback event of each
++    std::vector<uint32_t> dev[2][2];               // its hashes, read into these later
++    cl_ulong base[2]    = { 0, 0 };
++    cl_ulong stride[2]  = { 0, 0 };
++    cl_ulong nbytes[2]  = { 0, 0 };
++    std::vector<int32_t> rows, pages;
++    int64_t nk = 0, nv = 0;
++    int node = -1;
++    bool post = false;                             // the post hash was enqueued
++};
++
+ struct ggml_backend_opencl_context {
+     int ref_count;
+ 
+@@ -1338,6 +1356,12 @@ struct ggml_backend_opencl_context {
+         int pre_chain_n = 0;
+         int pre_issued = 0, pre_reused = 0, pre_recopied = 0;
+         bool pre_head_dead_warned = false;   // 0129y: one line a process for the lead's early returns
++        // 0130d: VERIFY=3's pairs, the current dispatch's entry, and the changes seen
++        std::vector<fa_paged_post> post_pending;
++        int  post_cur = -1;
++        int64_t v_post_changes = 0;
++        int  v_post_warned = 0;
++        int  v_post_nopost_warned = 0;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -11752,22 +11776,32 @@ static void ggml_cl_ngpt_fused(ggml_backend_t backend, ggml_tensor * const * n)
+     backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, y);
+ }
+ 
++// 0130d: VERIFY=3's collect is defined below; the request's end flushes the last graph's
++// pairs before the summary prints, and the global names the one context that recorded them
++static void ggml_cl_fa_paged_verify3_collect(ggml_backend_opencl_context * ctx);
++static ggml_backend_opencl_context * g_fa_paged_verify3_ctx = nullptr;
++
+ // 0129w: the request's own overlap/verify totals, accumulated at each graph's start and
+ // printed at the request's end by llama_kv_stream::request_end through this weak-called
+ // function (no opencl backend in the build: the symbol is null there).
+ struct ggml_cl_fa_paged_totals {
+     int issued = 0, fell_back = 0, reused = 0, recopied = 0, pre_issued = 0;
+     long long v_nodes = 0, v_bytes = 0, v_mismatch = 0;
++    long long v_post_changes = 0;   // 0130d: VERIFY=3, a copy landed while the FA read the slot
+ };
+ static ggml_cl_fa_paged_totals g_fa_paged_totals;
+ extern "C" void ggml_backend_opencl_fa_paged_summary(void) {
++    if (g_fa_paged_verify3_ctx) ggml_cl_fa_paged_verify3_collect(g_fa_paged_verify3_ctx);
+     if (!g_fa_paged_totals.issued && !g_fa_paged_totals.v_nodes && !g_fa_paged_totals.reused &&
+-        !g_fa_paged_totals.pre_issued && !g_fa_paged_totals.fell_back) return;
++        !g_fa_paged_totals.pre_issued && !g_fa_paged_totals.fell_back &&
++        !g_fa_paged_totals.v_post_changes) return;
+     GGML_LOG_WARN("ggml_opencl: paged FA overlap (request end): %d nodes issued ahead, %d fell back; "
+-            "verify %lld nodes, %lld bytes, %lld mismatches; next-graph lead: %d issued, %d reused, %d re-copied\n",
++            "verify %lld nodes, %lld bytes, %lld mismatches; next-graph lead: %d issued, %d reused, %d re-copied; "
++            "post-FA changes %lld\n",
+             g_fa_paged_totals.issued, g_fa_paged_totals.fell_back, g_fa_paged_totals.v_nodes,
+             g_fa_paged_totals.v_bytes, g_fa_paged_totals.v_mismatch,
+-            g_fa_paged_totals.pre_issued, g_fa_paged_totals.reused, g_fa_paged_totals.recopied);
++            g_fa_paged_totals.pre_issued, g_fa_paged_totals.reused, g_fa_paged_totals.recopied,
++            g_fa_paged_totals.v_post_changes);
+     g_fa_paged_totals = {};
+ }
+ 
+@@ -11775,10 +11809,15 @@ static void ggml_cl_fewq_prepass(ggml_backend_opencl_context * ctx, const ggml_c
+ // 0129n: defined below, used by graph_compute's chain walk
+ static bool ggml_cl_fa_paged_overlap_on();
+ static bool ggml_cl_fa_paged_verify_on();   // 0129z: the verify-only arm's totals
++static int ggml_cl_fa_paged_verify_mode();   // 0130d: the graph start and the summary ask for =3
+ 
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
++    // 0130d: the previous graph's pre/post pairs: their events are waited here, the frame's
++    // first point that is not inside a dispatch
++    if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)
++        ggml_cl_fa_paged_verify3_collect(g_fa_paged_verify3_ctx);
+     // 0129n: the graph's paged FA nodes, in dispatch order, for the overlap's one-layer lead
+     if (ggml_cl_fa_paged_overlap_on()) {
+         auto & o = backend_ctx->fa_paged;
+@@ -11806,8 +11845,10 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+         g_fa_paged_totals.v_nodes    += o.v_nodes;
+         g_fa_paged_totals.v_bytes    += o.v_bytes;
+         g_fa_paged_totals.v_mismatch += o.v_mismatch;
++        g_fa_paged_totals.v_post_changes += o.v_post_changes;
+         o.issued_n = o.fell_back = 0;
+         o.v_nodes = o.v_bytes = o.v_mismatch = 0;
++        o.v_post_changes = 0;
+         o.last_n = (int) o.chain.size();
+         o.pre_issued = o.pre_reused = o.pre_recopied = 0;
+     }
+@@ -23747,6 +23788,15 @@ static bool ggml_cl_fa_paged_overlap_nowait() {
+     static const bool   on = e != nullptr && atoi(e) != 0;
+     return on;
+ }
++// GGML_OPENCL_FA_PAGED_NOCONSUME=1, development only: VERIFY=3's red arm. It drops exactly
++// one wait -- the consumed event a copy into a slot waits before overwriting bytes the FA two
++// attention layers back read -- reproducing the 0129n-0129w decode, where consumed[] stayed
++// nullptr (the marker was armed only in the unreachable tail). Nothing else changes.
++static bool ggml_cl_fa_paged_noconsume() {
++    static const char * e = getenv("GGML_OPENCL_FA_PAGED_NOCONSUME");
++    static const bool   on = e != nullptr && atoi(e) != 0;
++    return on;
++}
+ 
+ // 0129n (C7): the streamed pages of `dst` from its USM host store into its ring on `cq`.
+ // Consecutive plan rows whose ring rows are consecutive coalesce into ONE command, so a plan
+@@ -23941,7 +23991,7 @@ static bool ggml_cl_fa_paged_overlap_issue(ggml_backend_opencl_context * ctx, in
+     cl_event wl[2] = { nullptr, nullptr };
+     cl_uint  nw = 0;
+     cl_event mark = nullptr;
+-    if (o.consumed[parity]) wl[nw++] = o.consumed[parity];   // the FA two attention layers back
++    if (o.consumed[parity] && !ggml_cl_fa_paged_noconsume()) wl[nw++] = o.consumed[parity];   // the FA two attention layers back
+     if (after_inputs) {
+         CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &mark));
+         CL_CHECK(clFlush(ctx->queue));
+@@ -24079,6 +24129,21 @@ __kernel void fa_paged_verify(__global const uchar * base, __global const int *
+ }
+ )";
+ 
++// the hash kernel, built once a process; false when the device did not build it
++static bool ggml_cl_fa_paged_verify_kernel(ggml_backend_opencl_context * ctx) {
++    auto & o = ctx->fa_paged;
++    if (o.verify_kernel != nullptr) return true;
++    o.verify_prog = build_program_from_source_optional(ctx, GGML_CL_FA_PAGED_VERIFY_SRC, "");
++    if (o.verify_prog == nullptr) {
++        GGML_LOG_WARN("ggml_opencl: paged FA verify: the hash kernel did not build; no check\n");
++        ggml_cl_fa_paged_verify_on();   // the switch stays on: the message is once a process
++        return false;
++    }
++    cl_int err;
++    CL_CHECK((o.verify_kernel = clCreateKernel(o.verify_prog, "fa_paged_verify", &err), err));
++    return true;
++}
++
+ static uint32_t ggml_cl_fa_paged_verify_hash(const void * p, size_t n, bool flip = false) {
+     const unsigned char * b = (const unsigned char *) p;
+     uint32_t h = 2166136261u;
+@@ -24090,7 +24155,8 @@ static void ggml_cl_fa_paged_verify(ggml_backend_opencl_context * ctx, const ggm
+         cl_mem k_buf, cl_mem v_buf, cl_ulong k_off, cl_ulong v_off, int ps, int rb, int rvb,
+         size_t kb, size_t vb, const void * hk, const void * hv,
+         const int32_t * pl, int64_t n_pages, int node) {
+-    if (!ggml_cl_fa_paged_verify_on() || hk == nullptr || hv == nullptr || pl == nullptr) return;
++    if (!ggml_cl_fa_paged_verify_on() || ggml_cl_fa_paged_verify_mode() == 3 ||
++        hk == nullptr || hv == nullptr || pl == nullptr) return;   // 0130d: =3 runs the pair below
+     // 0129t: the plan index travels with the ring row. The copy loop takes ring row pl[p]
+     // from hk + p*kb, p the PLAN index (0129n's enqueue_pages); compacting the rows alone
+     // made the host side read page i of the store instead of the i-th page whose pl[p] >= 0,
+@@ -24100,16 +24166,7 @@ static void ggml_cl_fa_paged_verify(ggml_backend_opencl_context * ctx, const ggm
+     for (int64_t p = 0; p < n_pages; ++p) if (pl[p] >= 0) { rows.push_back(pl[p]); pages.push_back((int32_t) p); }
+     if (rows.empty()) return;
+     auto & o = ctx->fa_paged;
+-    if (o.verify_kernel == nullptr) {
+-        o.verify_prog = build_program_from_source_optional(ctx, GGML_CL_FA_PAGED_VERIFY_SRC, "");
+-        if (o.verify_prog == nullptr) {
+-            GGML_LOG_WARN("ggml_opencl: paged FA verify: the hash kernel did not build; no check\n");
+-            ggml_cl_fa_paged_verify_on();   // the switch stays on: the message is once a process
+-            return;
+-        }
+-        cl_int err;
+-        CL_CHECK((o.verify_kernel = clCreateKernel(o.verify_prog, "fa_paged_verify", &err), err));
+-    }
++    if (!ggml_cl_fa_paged_verify_kernel(ctx)) return;
+     const uint32_t chunk = 4096;
+     const int64_t nk = (int64_t) ((kb + chunk - 1) / chunk);
+     const int64_t nv = (int64_t) ((vb + chunk - 1) / chunk);
+@@ -24182,6 +24239,144 @@ static void ggml_cl_fa_paged_verify(ggml_backend_opencl_context * ctx, const ggm
+     }
+ }
+ 
++// 0130d: GGML_OPENCL_FA_PAGED_VERIFY=3 -- the pre hash at the FA's position as =1's, and a
++// post hash of the SAME rows right after the FA's kernels, before the consumed marker. Both
++// are read back non-blocking, both events kept, and the two hashes compared at the next
++// graph's start and at the request's end: a chunk whose hashes differ is a copy that landed
++// while the FA was reading the slot, the write-after-read race =1 cannot see (its hash and
++// blocking read happen at the FA's start).
++// enqueue the hash of one slot region into `out`, then read it back non-blocking into `host`
++static void ggml_cl_fa_paged_verify3_hash_read(ggml_backend_opencl_context * ctx,
++        cl_mem buf, cl_mem rowsbuf, cl_ulong base_off, cl_ulong stride_bytes, cl_ulong nbytes,
++        int64_t nc, size_t gy, cl_mem out, std::vector<uint32_t> & host, cl_event * ev) {
++    auto & o = ctx->fa_paged;
++    const uint32_t chunk = 4096;
++    CL_CHECK(clSetKernelArg(o.verify_kernel, 0, sizeof(cl_mem), &buf));
++    CL_CHECK(clSetKernelArg(o.verify_kernel, 1, sizeof(cl_mem), &rowsbuf));
++    CL_CHECK(clSetKernelArg(o.verify_kernel, 2, sizeof(cl_ulong), &base_off));
++    CL_CHECK(clSetKernelArg(o.verify_kernel, 3, sizeof(cl_ulong), &stride_bytes));
++    CL_CHECK(clSetKernelArg(o.verify_kernel, 4, sizeof(cl_ulong), &nbytes));
++    CL_CHECK(clSetKernelArg(o.verify_kernel, 5, sizeof(uint32_t), &chunk));
++    CL_CHECK(clSetKernelArg(o.verify_kernel, 6, sizeof(cl_mem), &out));
++    size_t gws[2] = { (size_t) nc, gy };
++    CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, o.verify_kernel, 2, nullptr, gws, nullptr,
++            0, nullptr, nullptr));
++    host.resize((size_t) nc*gy);
++    // CL_FALSE: the graph does not wait for it; the event is waited at the next graph's start
++    CL_CHECK(clEnqueueReadBuffer(ctx->queue, out, CL_FALSE, 0, host.size()*sizeof(uint32_t),
++            host.data(), 0, nullptr, ev));
++}
++
++static void ggml_cl_fa_paged_verify3_begin(ggml_backend_opencl_context * ctx,
++        cl_mem k_buf, cl_mem v_buf, cl_ulong k_off, cl_ulong v_off, int ps, int rb, int rvb,
++        size_t kb, size_t vb, const int32_t * pl, int64_t n_pages, int node) {
++    if (ggml_cl_fa_paged_verify_mode() != 3) return;
++    auto & o = ctx->fa_paged;
++    o.post_cur = -1;   // this dispatch's pair; `post` below finds it even when node is -1
++    if (pl == nullptr) return;
++    std::vector<int32_t> rows, pages;
++    for (int64_t p = 0; p < n_pages; ++p) if (pl[p] >= 0) { rows.push_back(pl[p]); pages.push_back((int32_t) p); }
++    if (rows.empty()) return;
++    if (!ggml_cl_fa_paged_verify_kernel(ctx)) return;
++    g_fa_paged_verify3_ctx = ctx;
++    const uint32_t chunk = 4096;
++    fa_paged_post e;
++    e.node = node;
++    e.rows = rows;
++    e.pages = pages;
++    e.nk = (int64_t) ((kb + chunk - 1) / chunk);
++    e.nv = (int64_t) ((vb + chunk - 1) / chunk);
++    e.buf[0]  = k_buf;
++    e.buf[1]  = v_buf;
++    e.base[0] = k_off;
++    e.base[1] = v_off;
++    e.stride[0] = (cl_ulong) ps*(cl_ulong) rb;
++    e.stride[1] = (cl_ulong) ps*(cl_ulong) rvb;
++    e.nbytes[0] = (cl_ulong) kb;
++    e.nbytes[1] = (cl_ulong) vb;
++    const size_t gy = rows.size();
++    const size_t out_bytes = (size_t) std::max(e.nk, e.nv)*gy*sizeof(uint32_t);
++    cl_int err;
++    CL_CHECK((e.rowsbuf = clCreateBuffer(ctx->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
++            gy*sizeof(int32_t), rows.data(), &err), err));
++    for (int kv = 0; kv < 2; ++kv) {
++        for (int pp = 0; pp < 2; ++pp) {
++            CL_CHECK((e.out[kv][pp] = clCreateBuffer(ctx->context, CL_MEM_WRITE_ONLY, out_bytes,
++                    nullptr, &err), err));
++        }
++    }
++    for (int kv = 0; kv < 2; ++kv) {
++        ggml_cl_fa_paged_verify3_hash_read(ctx, e.buf[kv], e.rowsbuf, e.base[kv], e.stride[kv],
++                e.nbytes[kv], kv == 0 ? e.nk : e.nv, gy, e.out[kv][0], e.dev[kv][0], &e.ev[kv][0]);
++    }
++    o.v_nodes++;
++    o.v_bytes += (int64_t) gy*(kb + vb);
++    o.post_pending.push_back(std::move(e));
++    o.post_cur = (int) o.post_pending.size() - 1;
++}
++
++// after this FA's kernels and before `ggml_cl_fa_paged_overlap_after`'s consumed marker
++static void ggml_cl_fa_paged_verify3_post(ggml_backend_opencl_context * ctx) {
++    if (ggml_cl_fa_paged_verify_mode() != 3) return;
++    auto & o = ctx->fa_paged;
++    if (o.post_cur < 0 || o.post_cur >= (int) o.post_pending.size()) return;
++    fa_paged_post & e = o.post_pending[o.post_cur];
++    if (e.post) return;
++    const size_t gy = e.rows.size();
++    for (int kv = 0; kv < 2; ++kv) {
++        ggml_cl_fa_paged_verify3_hash_read(ctx, e.buf[kv], e.rowsbuf, e.base[kv], e.stride[kv],
++                e.nbytes[kv], kv == 0 ? e.nk : e.nv, gy, e.out[kv][1], e.dev[kv][1], &e.ev[kv][1]);
++    }
++    e.post = true;
++}
++
++// wait the pairs of the previous graph(s) and compare pre against post
++static void ggml_cl_fa_paged_verify3_collect(ggml_backend_opencl_context * ctx) {
++    auto & o = ctx->fa_paged;
++    if (o.post_pending.empty()) return;
++    for (size_t n = 0; n < o.post_pending.size(); ++n) {
++        fa_paged_post & e = o.post_pending[n];
++        if (!e.post) {
++            if (!o.v_post_nopost_warned) {
++                o.v_post_nopost_warned = 1;
++                GGML_LOG_WARN("ggml_opencl: paged FA post-FA: node %d's post hash never ran; its pair is dropped\n", e.node);
++            }
++        } else {
++            int64_t bad = 0;
++            int first_page = -1, first_chunk = -1;
++            for (int kv = 0; kv < 2; ++kv) {
++                CL_CHECK(clWaitForEvents(1, &e.ev[kv][0]));
++                CL_CHECK(clWaitForEvents(1, &e.ev[kv][1]));
++                const size_t nc = (size_t) (kv == 0 ? e.nk : e.nv);
++                const size_t gy = e.rows.size();
++                for (size_t p = 0; p < gy; ++p) {
++                    for (size_t c = 0; c < nc; ++c) {
++                        if (e.dev[kv][0][p*nc + c] != e.dev[kv][1][p*nc + c]) {
++                            ++bad;
++                            if (first_page < 0) { first_page = e.pages[p]; first_chunk = (int) c; }
++                        }
++                    }
++                }
++            }
++            o.v_post_changes += bad;
++            if (bad > 0 && !o.v_post_warned) {
++                o.v_post_warned = 1;
++                GGML_LOG_WARN("ggml_opencl: paged FA post-FA changed: node %d page %d chunk %d\n",
++                        e.node, first_page, first_chunk);
++            }
++        }
++        for (int kv = 0; kv < 2; ++kv) {
++            for (int pp = 0; pp < 2; ++pp) {
++                if (e.out[kv][pp])  { CL_CHECK(clReleaseMemObject(e.out[kv][pp]));  e.out[kv][pp] = nullptr; }
++                if (e.ev[kv][pp])   { CL_CHECK(clReleaseEvent(e.ev[kv][pp]));       e.ev[kv][pp] = nullptr; }
++            }
++        }
++        if (e.rowsbuf) { CL_CHECK(clReleaseMemObject(e.rowsbuf)); e.rowsbuf = nullptr; }
++    }
++    o.post_pending.clear();
++    o.post_cur = -1;
++}
++
+ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * dst,
+         cl_mem rk_aos_buf, cl_ulong rk_aos_off, cl_ulong rk_aos_nb1,
+         cl_mem rv_aos_buf, cl_ulong rv_aos_off, cl_ulong rv_aos_nb1, int * overlap_parity, bool * overlap_copied) {
+@@ -24393,6 +24588,8 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+     // and bytes the FA reads, at the moment it runs.
+     ggml_cl_fa_paged_verify(backend_ctx, dst, k_buf, v_buf, k_off, v_off, ps, (int) rb, (int) rvb,
+             kb, vb, hk, hv, pl, n_pages, ov_node_out);
++    ggml_cl_fa_paged_verify3_begin(backend_ctx, k_buf, v_buf, k_off, v_off, ps, (int) rb, (int) rvb,
++            kb, vb, pl, n_pages, ov_node_out);   // 0130d: =3's pre hash, non-blocking read
+     if (ov) {
+         *overlap_parity = ov_node_out;
+         *overlap_copied = true;
+@@ -26007,6 +26204,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         size_t merge_lws[3] = { merge_wg, 1, 1 };
+         size_t merge_gws[3] = { merge_wg, (size_t)(n_head * n_batch), (size_t) n_q };
+         backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
++        // 0130d: VERIFY=3's post hash of the same rows, after the FA's kernels and before
++        // the consumed marker below (a landed copy changes these bytes; pre never sees it)
++        ggml_cl_fa_paged_verify3_post(backend_ctx);
+         // 0129x: window 292's DEBUG arm printed 2,240 "commands (lead)" lines and not one
+         // "next-graph lead" line, and every request-end summary read "0 reused, 0 re-copied":
+         // this branch returns here, before the tail call below, and the served decode takes it
+@@ -26139,6 +26339,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         size_t global_work_size[] = { (size_t)((n_q + block_m - 1) / block_m) * wg_size, (size_t)(n_head * n_batch) };
+         backend_ctx->enqueue_ndrange_kernel(kernel, 2, global_work_size, local_work_size, dst);
+     }
++    // 0130d: VERIFY=3's post hash, after the tail kernels and before the consumed marker
++    ggml_cl_fa_paged_verify3_post(backend_ctx);
+     // 0129n: this layer's kernels are enqueued: the slot may be refilled, and the next
+     // attention layer's pages go on the copy queue now (one layer of lead)
+     if (paged_overlap_copied && paged_overlap_parity >= 0) {

@@ -1,0 +1,26 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13129,6 +13129,22 @@
+             }
+         }
+     }
++    // 0130a: the 4-7 row decode kernel at the depths the agent serves, with
++    // quantized K/V: head 256, 24 query heads on 4 (G 6), 4, 5, 6 and 7 rows,
++    // K q8_0 / V q4_0 (the served pair), q8_0/q8_0 and q4_0/q4_0, at 4,096,
++    // 65,536 and 245,760 keys. 0016's depth cases stop at 131,072 and are f16
++    // only, which is how 0130b's double-buffered V stage had no quantized arm
++    // at 240k to be red against. 245,760 is eval too: the reference at that
++    // length is a CPU pass over the KV, ~2x the 131,072 arm already here.
++    for (auto kv_t : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0},
++                                                                  {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}}) {
++        for (int64_t nb : {4, 5, 6, 7}) {
++            for (int64_t kv : {4096, 65536, 245760}) {
++                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, kv, nb, true, false, 0, 0,
++                                                                GGML_PREC_F32, kv_t.first, kv_t.second));
++            }
++        }
++    }
+     // 0119/0122: paged K/V at the agent's geometry (head 256, 4 KV heads x 6,
+ // q8_0 K / q4_0 V), decode and 6-row verify, kv 1k to 262k, pools smaller than
+     // the context with every second page in the ring. The last two arms are all-ring

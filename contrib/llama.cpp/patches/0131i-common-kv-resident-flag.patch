@@ -1,0 +1,42 @@
+0131i: --kv-resident MIB for the common tools (llama-perplexity's KL with KV streaming on).
+
+--- a/common/common.h
++++ b/common/common.h
+@@ -576,6 +576,7 @@
+     bool no_perf           = false; // disable performance metrics
+     bool show_timings      = true;  // show timing information on CLI
+     bool ctx_shift         = false; // context shift on infinite text generation
++    uint32_t kv_resident_mib = 0;   // 0131i: KV streaming's resident pool in MiB (llama_context_params.kv_resident_size); 0 keeps the cache resident
+     bool swa_full          = false; // use full-size SWA cache (https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055)
+     bool kv_unified        = false; // enable unified KV cache
+ 
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1738,6 +1738,7 @@
+     cparams.no_perf           = params.no_perf;
+     cparams.op_offload        = !params.no_op_offload;
+     cparams.swa_full          = params.swa_full;
++    cparams.kv_resident_size  = params.kv_resident_mib * 1024u * 1024u;   // 0131i (bytes; < 4096 MiB)
+     cparams.kv_unified        = params.kv_unified;
+ 
+     cparams.type_k = params.cache_type_k;
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -1698,6 +1698,17 @@
+         }
+     ).set_env("LLAMA_ARG_SWA_FULL"));
+     add_opt(common_arg(
++        {"--kv-resident"}, "MIB",
++        "0131i: KV streaming, the resident pool's device MiB (0 = the whole cache resident; needs flash attention, "
++        "one sequence, q8_0 K / q4_0 V, head size 256). For the tools (perplexity's KL) what arcint's --llama-kv-resident is for the server.",
++        [](common_params & params, int value) {
++            if (value < 0 || value >= 4096) {
++                throw std::invalid_argument("--kv-resident takes 0..4095 MiB (the context parameter is 32-bit bytes)");
++            }
++            params.kv_resident_mib = (uint32_t) value;
++        }
++    ).set_env("LLAMA_ARG_KV_RESIDENT"));
++    add_opt(common_arg(
+         {"-ctxcp", "--ctx-checkpoints", "--swa-checkpoints"}, "N",
+         string_format("max number of context checkpoints to create per slot (default: %d)"
+             "[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)", params.n_ctx_checkpoints),

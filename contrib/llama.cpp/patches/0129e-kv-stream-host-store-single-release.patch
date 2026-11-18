@@ -1,0 +1,16 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23680,9 +23680,9 @@
+     if (!sync_env || atoi(sync_env) != 0) {
+         CL_CHECK(clFinish(queue));
+     }
+-    // the restore buffers live until their queued copies run (OpenCL's retain)
+-    if (hk_aos) clReleaseMemObject(hk_buf);
+-    if (hv_aos) clReleaseMemObject(hv_buf);
++    // the restore buffers are temp_hk/temp_hv's: their destructors release them, and the
++    // queued copies keep them alive (OpenCL's retain). 0129e: a second release here was
++    // the clReleaseMemObject -38 abort of window 280 (the 2-layer case's SoA host store)
+ }
+ 
+ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {

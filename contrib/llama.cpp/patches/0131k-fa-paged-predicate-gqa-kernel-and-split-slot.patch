@@ -1,0 +1,212 @@
+0131k: the paged FA predicate follows the dispatcher (GQA decode only with the GQA kernel and the tile fit, row blocks, the conversion for 9+ rows only), the caps read the split and prompt kernels by their own slot after the lazy build, and any paged call off a table-reading kernel aborts (1.7.0 release gate: the A770 op suite aborted).
+
+--- a/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h
++++ b/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h
+@@ -16,6 +16,7 @@
+ 
+ #include "ggml.h"
+ 
++#include <algorithm>
+ #include <cstdint>
+ 
+ struct ggml_cl_fa_paged_shape {
+@@ -43,6 +44,8 @@ struct ggml_cl_fa_paged_shape {
+ struct ggml_cl_fa_paged_caps {
+     // the GQA decode kernels (direct and staged) and the f16 conversion and
+     // carry prefill kernels are built, for this K/V pair at head size 256
++    // (0131k: kernels_prefill also needs the pair's own prompt kernel, which the
++    // dispatcher's prompt branch requires before it reaches the conversion)
+     bool kernels_gqa_direct, kernels_gqa_staged, kernels_prefill;
+     // the Intel split decode kernel for this pair is built (0123's q1 split)
+     bool split_decode;
+@@ -50,6 +53,11 @@ struct ggml_cl_fa_paged_caps {
+     int  tiles;
+     // GGML_OPENCL_FA_WIDE_VERIFY and GGML_OPENCL_FA_INTEL_SPLIT switches
+     bool wide_on, intel_split_on;
++    // 0131k: GGML_OPENCL_FA_ROW_BLOCKS (0028's blocks of 8 rows for 9-64-row calls)
++    bool row_blocks_on;
++    // 0131k: the split decode's merge kernel at head size 256, which every GQA decode
++    // launch reads (split_decode implies it; the wide call needs it on its own)
++    bool merge;
+ };
+ 
+ // the KV pair the kernels were built for
+@@ -65,6 +73,16 @@ static inline bool ggml_cl_fa_paged_kv_ok(const ggml_cl_fa_paged_shape & s) {
+     return kv_ok;
+ }
+ 
++// 0131k: the slot of a quantized K/V pair in the Intel split decode's kernel array
++// (q_q1_split_intel: q8q8, q8q4, q4q4, the dispatcher's kvq order); -1 for any other
++// pair. The GQA arrays index from f16 at 0, so their index is this slot + 1; the caps
++// used that index here, which read the next pair's split and, for q4/q4, past the array
++static inline int ggml_cl_fa_paged_split_slot(int k_type, int v_type) {
++    return k_type == GGML_TYPE_Q8_0 && v_type == GGML_TYPE_Q8_0 ? 0
++         : k_type == GGML_TYPE_Q8_0 && v_type == GGML_TYPE_Q4_0 ? 1
++         : k_type == GGML_TYPE_Q4_0 && v_type == GGML_TYPE_Q4_0 ? 2 : -1;
++}
++
+ // the tensor shapes the kernels index
+ static inline bool ggml_cl_fa_paged_shape_ok(const ggml_cl_fa_paged_shape & s) {
+     return s.q_type == GGML_TYPE_F32 && s.q_ne1 >= 1 && s.q_ne3 == 1 &&
+@@ -93,23 +111,36 @@ static inline int ggml_cl_fa_paged_form(const ggml_cl_fa_paged_shape & s, const
+         return 0;
+     }
+     const int64_t G = s.q_ne2 / s.k_ne2;
+-    const bool gqa_kernel = c.kernels_gqa_direct || c.kernels_gqa_staged;
+-    // decode, non-causal only: 1-8 rows on the split kernel (its own work-group
+-    // shape, not the GQA tiles), 9-64 rows on the wide GQA call (one batch, one
+-    // stream's mask, fitting the 8-row (head, token) tiles) -- the dispatcher's
+-    // intel_q_decode / gqa_wide split
++    // 0131k: the dispatcher's own order, so supports_op accepts exactly the shapes
++    // that end on a kernel reading the table. Before, the 1-8-row clause checked the
++    // split kernel alone (the A770 builds the split but no GQA kernel: accepted here,
++    // aborted there), and every other shape counted as the conversion, which takes
++    // only 9+ rows and only where the row blocks do not take them first.
++    // A decode of r rows runs on the GQA kernel, which reads the table: the split
++    // decode (intel_q_decode) only opens that path, and the dispatcher then needs
++    // the direct kernel (the staged form is built only beside it, and 4+ rows take
++    // the direct one) and G*r within the 8-row (head, token) tiles
++    const auto gqa_decode = [&](int64_t r) {
++        return c.kernels_gqa_direct && c.split_decode && c.intel_split_on && G*r <= (int64_t) c.tiles*8;
++    };
++    const bool row_call = s.n_batch == 1 && s.mask_present && s.mask_ne2 == 1;
+     if (!s.causal) {
+-        const bool rows8  = s.q_ne1 >= 1 && s.q_ne1 <= 8 && c.split_decode && c.intel_split_on;
+-        const bool rows64 = s.q_ne1 > 8 && s.q_ne1 <= 64 && gqa_kernel && c.wide_on &&
+-                            s.n_batch == 1 && s.mask_present && s.mask_ne2 == 1 &&
+-                            G*s.q_ne1 <= (int64_t) c.tiles*8;
+-        if (rows8 || rows64) {
++        // 1-8 rows: the GQA decode, or nothing (the conversion does not take them)
++        if (s.q_ne1 >= 1 && s.q_ne1 <= 8) {
++            return gqa_decode(s.q_ne1) ? 1 : 0;
++        }
++        // 9-64 rows in one wide GQA call (0124: one batch, one stream's mask)
++        if (s.q_ne1 <= 64 && row_call && c.wide_on && c.kernels_gqa_direct && c.merge &&
++            G*s.q_ne1 <= (int64_t) c.tiles*8) {
+             return 1;
+         }
++        // else 0028's row blocks take them first: 8-row calls, each the GQA decode
++        if (s.q_ne1 <= 64 && row_call && c.row_blocks_on) {
++            return gqa_decode(8) ? 1 : 0;
++        }
+     }
+-    // prefill, or any rows the split decode does not take: the f16 conversion
+-    // reads the table for every row count
+-    if (c.kernels_prefill) {
++    // 9+ rows otherwise (causal ones too): the f16 conversion, which reads the table
++    if (s.q_ne1 > 8 && c.kernels_prefill) {
+         return 2;
+     }
+     return 0;
+@@ -128,7 +159,7 @@ static inline const char * ggml_cl_fa_paged_reason(const ggml_cl_fa_paged_shape
+     if (!ggml_cl_fa_paged_mask_ok(s)) return "mask";
+     if (!ggml_cl_fa_paged_params_ok(s)) return "sinks-alibi-softcap";
+     if (!s.ring_ok)               return "ring";
+-    if (s.q_ne1 > 8 && (s.q_ne2/s.k_ne2)*s.q_ne1 > (int64_t) c.tiles*8) return "rows";
++    if ((s.q_ne2/s.k_ne2)*std::min<int64_t>(s.q_ne1, 8) > (int64_t) c.tiles*8) return "rows";
+     if (!c.kernels_gqa_direct && !c.kernels_gqa_staged &&
+         !c.kernels_prefill)       return "no-kernel";
+     return "no-form";
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13256,23 +13256,39 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                               op->src[GGML_FA_SRC_RING_V]->ne[1] == op->src[GGML_FA_SRC_RING_K]->ne[1]);
+ 
+                 load_cl_kernels(backend_ctx);
++                // 0131k: the split decode kernels live in the f32_f16 program, which the
++                // dispatcher builds on its first head-256 call; build it here too, so the
++                // caps below are the ones the dispatcher will see (the 512 branch does the same)
++                if (backend_ctx->gpu_family == INTEL) {
++                    ggml_opencl_ensure_fa_variant(backend_ctx, 256, 256, FA_VARIANT_F32_F16);
++                }
+                 const int gi = k->type == GGML_TYPE_Q8_0 ? (v->type == GGML_TYPE_Q8_0 ? 1 : 2)
+                              : k->type == GGML_TYPE_Q4_0 ? 3 : 0;
++                // 0131k: the split decode's and the prompt kernels' own slot (q8q8, q8q4, q4q4)
++                const int ss = ggml_cl_fa_paged_split_slot(k->type, v->type);
+                 ggml_cl_fa_paged_caps cp{};
+                 // head size 256: the GQA arrays' index 0 (the paged shape check refuses others)
+                 cp.kernels_gqa_direct = backend_ctx->kernel_fa_gqa_dk[0][gi] != nullptr;
+                 cp.kernels_gqa_staged = backend_ctx->kernel_fa_gqa_st_dk[0][gi] != nullptr;
+                 cp.kernels_prefill    = backend_ctx->kernel_fa_kv_to_f16 != nullptr &&
+-                                        backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr;
++                                        backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr &&
++                                        (ss >= 0 ? backend_ctx->kernel_fa_dpas_q_dk[0][ss] != nullptr
++                                                 : backend_ctx->kernel_fa_dpas_dk[0] != nullptr);
+                 const std::pair<int, int> dk_dv = {256, 256};
++                // 0131k: the split array's own slot, not the GQA index
+                 cp.split_decode = backend_ctx->fa.f32_merge.count(dk_dv) > 0 &&
+-                                  backend_ctx->fa.q_q1_split_intel.count(dk_dv) > 0 &&
+-                                  backend_ctx->fa.q_q1_split_intel.at(dk_dv)[gi] != nullptr;
++                    (ss >= 0 ? backend_ctx->fa.q_q1_split_intel.count(dk_dv) > 0 &&
++                               backend_ctx->fa.q_q1_split_intel.at(dk_dv)[ss] != nullptr
++                             : k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
++                               backend_ctx->fa.f32_f16_q1_split_intel.count(dk_dv) > 0);
+                 cp.tiles = backend_ctx->fa_gqa_tiles;
+                 static const char * wv_env2 = getenv("GGML_OPENCL_FA_WIDE_VERIFY");
+                 cp.wide_on = wv_env2 == nullptr || atoi(wv_env2) != 0;
+                 static const char * fd_env2 = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
+                 cp.intel_split_on = fd_env2 == nullptr || atoi(fd_env2) != 0;
++                static const char * rb_env2 = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
++                cp.row_blocks_on = rb_env2 == nullptr || atoi(rb_env2) != 0;
++                cp.merge = backend_ctx->fa.f32_merge.count(dk_dv) > 0;
+                 const bool ok = ggml_cl_fa_paged_ok(sh, cp);
+                 if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
+                     GGML_LOG_INFO("ggml_opencl: paged FA: form %d (reason %s) kv %d shape %d mask %d params %d ring %d "
+@@ -26056,6 +26072,10 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             }
+             return;
+         }
++        // 0131k: the in-place prompt kernels below read the pool rows as the sequence
++        if (kv_pages) {
++            GGML_ABORT("ggml_opencl: a paged prompt FLASH_ATTN_EXT reached a kernel without a page table");
++        }
+         cl_kernel kd = kd_sel;
+         // sub-group 8 built with FA_QG: Q to f16 a-operand blocks first, the
+         // kernel reads them in place of Q (q_nb* unused)
+@@ -26430,17 +26450,26 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         ggml_cl_fa_paged_caps cp{};
+         cp.kernels_gqa_direct = backend_ctx->kernel_fa_gqa_dk[0][pgi] != nullptr;
+         cp.kernels_gqa_staged = backend_ctx->kernel_fa_gqa_st_dk[0][pgi] != nullptr;
++        // 0131k: the split decode's and the prompt kernels' own slot, as supports_op reads it
++        const int pss = ggml_cl_fa_paged_split_slot(k->type, v->type);
+         cp.kernels_prefill    = backend_ctx->kernel_fa_kv_to_f16 != nullptr &&
+-                                backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr;
++                                backend_ctx->kernel_fa_dpas_carry_dk[0] != nullptr &&
++                                (pss >= 0 ? backend_ctx->kernel_fa_dpas_q_dk[0][pss] != nullptr
++                                          : backend_ctx->kernel_fa_dpas_dk[0] != nullptr);
+         const std::pair<int, int> pdk = {256, 256};
+         cp.split_decode = backend_ctx->fa.f32_merge.count(pdk) > 0 &&
+-                          backend_ctx->fa.q_q1_split_intel.count(pdk) > 0 &&
+-                          backend_ctx->fa.q_q1_split_intel.at(pdk)[pgi] != nullptr;
++            (pss >= 0 ? backend_ctx->fa.q_q1_split_intel.count(pdk) > 0 &&
++                        backend_ctx->fa.q_q1_split_intel.at(pdk)[pss] != nullptr
++                      : k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
++                        backend_ctx->fa.f32_f16_q1_split_intel.count(pdk) > 0);
+         cp.tiles = backend_ctx->fa_gqa_tiles;
+         static const char * wv_env2 = getenv("GGML_OPENCL_FA_WIDE_VERIFY");
+         cp.wide_on = wv_env2 == nullptr || atoi(wv_env2) != 0;
+         static const char * fd_env2 = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
+         cp.intel_split_on = fd_env2 == nullptr || atoi(fd_env2) != 0;
++        static const char * rb_env2 = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
++        cp.row_blocks_on = rb_env2 == nullptr || atoi(rb_env2) != 0;
++        cp.merge = backend_ctx->fa.f32_merge.count(pdk) > 0;
+         paged_form = ggml_cl_fa_paged_form(sh, cp);
+         if (paged_form == 0) {
+             GGML_ABORT("ggml_opencl: a paged FLASH_ATTN_EXT reached the dispatcher with a declined shape (%s)",
+@@ -26465,10 +26494,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             use_fd_intel = true;
+         }
+     }
+-    // a paged decode (form 1) must end up on the GQA kernel; any other kernel
+-    // would read the pool rows as the attended sequence. Form 2 (anything the
+-    // split decode does not take) goes through the f16 conversion below
+-    if (kv_pages && paged_form == 1 && !use_fd_gqa) {
++    // a paged call that reaches the decode kernels must end up on the GQA kernel;
++    // any other kernel would read the pool rows as the attended sequence. The
++    // conversion (form 2) and the row blocks have returned above. 0131k: was form 1
++    // only, so a form-2 shape of 1-8 rows (which the conversion does not take) ran
++    // the split kernel over the pool without a word
++    if (kv_pages && !use_fd_gqa) {
+         GGML_ABORT("ggml_opencl: a paged decode FLASH_ATTN_EXT reached a kernel without a page table");
+     }
+     if (fd_k_split == NULL &&

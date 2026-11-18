@@ -1,0 +1,115 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 46ba4c5..390610e 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23650,6 +23650,25 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+     const size_t vb = (size_t) host_v->nb[2];
+     const size_t rb = rk_aos_buf ? (size_t) rk_aos_nb1 : (size_t) ring_k->nb[1];   // the slot's row (all its heads of a cell)
+     const size_t rvb = rv_aos_buf ? (size_t) rv_aos_nb1 : (size_t) ring_v->nb[1];
++    // 0129f: window 281 failed at the barrier after this layer's copies (-5, an earlier
++    // command failed), not in the copies' synchronous errors. Each copy's offset+size is
++    // checked against the buffers' sizes before it is enqueued; a copy that would run
++    // past its buffer now aborts naming page, row, offsets and sizes, and with
++    // GGML_OPENCL_FA_PAGED_DEBUG=1 one line per dispatch prints the geometry.
++    size_t k_size = 0, v_size = 0, hk_size = 0, hv_size = 0;
++    CL_CHECK(clGetMemObjectInfo(k_buf, CL_MEM_SIZE, sizeof(k_size), &k_size, NULL));
++    CL_CHECK(clGetMemObjectInfo(v_buf, CL_MEM_SIZE, sizeof(v_size), &v_size, NULL));
++    if (hk == nullptr) {
++        cl_mem sk = hk_aos ? hk_buf : hk_r[0].mem, sv = hv_aos ? hv_buf : hv_r[0].mem;
++        CL_CHECK(clGetMemObjectInfo(sk, CL_MEM_SIZE, sizeof(hk_size), &hk_size, NULL));
++        CL_CHECK(clGetMemObjectInfo(sv, CL_MEM_SIZE, sizeof(hv_size), &hv_size, NULL));
++    }
++    if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
++        GGML_LOG_WARN("%s: paged FA copies: n_pages %d ps %d ring rows %d | kb %zu vb %zu rb %zu rvb %zu | "
++                "k_buf %zu off %llu, v_buf %zu off %llu, hk %zu, hv %zu\n", __func__, (int) n_pages, ps,
++                (int) (ring_k->ne[1]/ps), kb, vb, rb, rvb, k_size, (unsigned long long) k_off,
++                v_size, (unsigned long long) v_off, hk_size, hv_size);
++    }
+     for (int64_t p = 0; p < n_pages; ++p) {
+         const int32_t row = pl[p];
+         if (row < 0) {
+@@ -23657,27 +23676,40 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+         }
+         const cl_ulong off_k = k_off;
+         const cl_ulong off_v = v_off;
++        const cl_ulong dk = off_k + (cl_ulong) row*ps*rb, dv = off_v + (cl_ulong) row*ps*rvb;
++        if (dk + kb > k_size || dv + vb > v_size) {
++            GGML_ABORT("ggml_opencl: a paged FA copy runs past its ring slot (page %lld row %d, "
++                       "K off %llu + %zu / %zu, V off %llu + %zu / %zu)", (long long) p, row,
++                       (unsigned long long) dk, kb, k_size, (unsigned long long) dv, vb, v_size);
++        }
+         if (hk == nullptr) {
+             // a regular host store: device-to-device, AOS both sides (SoA rebuilt by
+             // the restore kernel above into hk_buf/hv_buf, a plain store from its region)
+             cl_mem sk = hk_aos ? hk_buf : hk_r[0].mem, sv = hv_aos ? hv_buf : hv_r[0].mem;
+             const cl_ulong so = hk_aos ? hk_off : hk_r[0].off, sv_off = hv_aos ? hv_off : hv_r[0].off;
++            if (so + (cl_ulong) p*kb + kb > hk_size || sv_off + (cl_ulong) p*vb + vb > hv_size) {
++                GGML_ABORT("ggml_opencl: a paged FA copy runs past its host store (page %lld, "
++                           "K %llu + %zu / %zu, V %llu + %zu / %zu)", (long long) p,
++                           (unsigned long long) (so + (cl_ulong) p*kb), kb, hk_size,
++                           (unsigned long long) (sv_off + (cl_ulong) p*vb), vb, hv_size);
++            }
+             CL_CHECK(clEnqueueCopyBuffer(queue, sk, k_buf, so + (cl_ulong) p*kb,
+-                                         off_k + (cl_ulong) row*ps*rb, (size_t) kb, 0, NULL, NULL));
++                                         dk, (size_t) kb, 0, NULL, NULL));
+             CL_CHECK(clEnqueueCopyBuffer(queue, sv, v_buf, sv_off + (cl_ulong) p*vb,
+-                                         off_v + (cl_ulong) row*ps*rvb, (size_t) vb, 0, NULL, NULL));
++                                         dv, (size_t) vb, 0, NULL, NULL));
+         } else {
+-            CL_CHECK(clEnqueueWriteBuffer(queue, k_buf, CL_FALSE, off_k + (cl_ulong) row*ps*rb, (size_t) kb,
++            CL_CHECK(clEnqueueWriteBuffer(queue, k_buf, CL_FALSE, dk, (size_t) kb,
+                                           hk + (size_t) p*kb, 0, NULL, NULL));
+-            CL_CHECK(clEnqueueWriteBuffer(queue, v_buf, CL_FALSE, off_v + (cl_ulong) row*ps*rvb, (size_t) vb,
++            CL_CHECK(clEnqueueWriteBuffer(queue, v_buf, CL_FALSE, dv, (size_t) vb,
+                                           hv + (size_t) p*vb, 0, NULL, NULL));
+         }
+     }
+-    // 0129b: GGML_OPENCL_FA_PAGED_SYNC=1 drains after this layer's page copies. The moves
+-    // and the kernels share the in-order compute queue, so the queue order alone is the
+-    // barrier; this switch makes a window tell a race from a layout error.
++    // 0129b/0129g: the moves and the kernels share the in-order compute queue, so the
++    // queue order alone is the barrier; GGML_OPENCL_FA_PAGED_SYNC=1 adds a clFinish after
++    // each layer's copies for a race-vs-layout arm. OFF by default (window 279's A/B arms
++    // were identical because the old default was ON).
+     static const char * sync_env = getenv("GGML_OPENCL_FA_PAGED_SYNC");
+-    if (!sync_env || atoi(sync_env) != 0) {
++    if (sync_env && atoi(sync_env) != 0) {
+         CL_CHECK(clFinish(queue));
+     }
+     // the restore buffers are temp_hk/temp_hv's: their destructors release them, and the
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+index 06c1d74..2b9841a 100644
+--- a/src/llama-kv-stream.cpp
++++ b/src/llama-kv-stream.cpp
+@@ -236,8 +236,13 @@ void llama_kv_stream::prepare(const std::vector<uint32_t> & cells, uint32_t n_kv
+         logged_first  = true;
+         logged_stream = n_streamed > 0;
+         const uint32_t moved = n_streamed*layers.size()*2;
+-        LLAMA_LOG_WARN("%s: KV streaming: %u of %u pages resident, %u streamed, %u page moves this request (%u ring rows)\n",
+-                __func__, n_pages - n_streamed, n_pages, n_streamed, moved, n_streamed);
++        // 0129g: attended/resident-attended/streamed for THIS request's prefix, so the
++        // pool arithmetic is checkable (window 281 read "1023 of 1024 resident" over the
++        // whole context, which counts pages nobody attends), plus the context totals
++        const uint32_t res_att = n_att - n_streamed;
++        LLAMA_LOG_WARN("%s: KV streaming: attended %u pages, %u resident, %u streamed, %u page moves this request"
++                " (%u ring rows; context: %u of %u pages resident)\n",
++                __func__, n_att, res_att, n_streamed, moved, n_streamed, n_pages - n_streamed, n_pages);
+     }
+ 
+     // the plan: the ring row of each streamed page, -1 for a resident one. The
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 8e06c57..c67d4b3 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9479,8 +9479,10 @@ struct test_flash_attn_ext_paged_layers : public test_case {
+                 std::vector<int32_t> table(2*n_pages(), INT32_MAX);
+                 int32_t res = 0, ring = 0;
+                 for (int64_t i = 0; i < n_pages(); ++i) {
++                    // 0129f: the table's ring entry must be the row the plan names
++                    // (ascending), else the kernel reads another pair's rows (window 281)
+                     const int32_t e = ring_every && i % ring_every == 0
+-                        ? -1 - (int32_t) (n_ring() - 1 - ring++) : slots[(size_t) res++];
++                        ? -1 - (int32_t) ring++ : slots[(size_t) res++];
+                     table[n_pages() + i] = e;
+                 }
+                 ggml_backend_tensor_set(t, table.data(), 0, ggml_nbytes(t));

@@ -512,6 +512,14 @@ json props(const Context& ctx) {
         // leaves it empty on purpose, which is what lets this print null
         // instead of guessing.
         {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
+        // The KV stream (0119-0122, docs/campaigns/kv-streaming-design.md): what was asked
+        // and what the card's start probe answered. `requested` false is off; `paged_fa`
+        // false with requested true can only be seen under the red switch, because the
+        // start refuses that combination.
+        {"kv_stream", {{"requested", st.kv_stream.requested},
+                       {"resident_mib", st.kv_stream.resident_mib},
+                       {"decode_mib", st.kv_stream.decode_mib},
+                       {"paged_fa", st.kv_stream.paged_fa}}},
         // The prefill-slot-loan's live state, so a refused request ("state is
         // out/poisoned/broken") is explained here. "off": no loan configured (the
         // default), "armed": the cache set one up at load, "out": lent right now.
@@ -555,7 +563,27 @@ json props(const Context& ctx) {
                          {"physical_layers", st.dory.physical_layers},
                          {"executed_layers", st.dory.executed_layers},
                          // the KV cache layers libllama built, counted from its graph at load
-                         {"kv_cache_layers", st.dory.kv_layers}};
+                         {"kv_cache_layers", st.dory.kv_layers},
+                         // --llama-dory-max-loops: the most loops a request may run (0: off, every request
+                         // runs "loops"); with it on, the effort -> loops map ("unset" is a request
+                         // that names no effort: the unit's default effort's count, else "loops").
+                         // "executed_layers" stays what a request at the unit's own count executes.
+                         // /v1/completions has no effort: it runs the unit's count.
+                         {"max_loops", st.dory.max_loops},
+                         {"effort_loops", [&]() {
+                              if (st.dory.max_loops <= 0) return json(nullptr);
+                              json m = json::object();
+                              // "unset": the unit's default effort's count when --chat-template-kwarg
+                              // reasoning_effort=... is set, else --llama-dory-loops
+                              std::string unit_effort;
+                              for (const auto& [k, text] : cfg.chat_template_kwarg_defaults) {
+                                  if (k != "reasoning_effort") continue;
+                                  const json v = json::parse(text, nullptr, /*allow_exceptions=*/false);
+                                  if (v.is_string()) unit_effort = v.get<std::string>();
+                              }
+                              for (const auto& [e, n] : dory_effort_map(st.dory.loops, st.dory.max_loops, unit_effort)) m[e] = n;
+                              return m;
+                          }()}};
          }()},
         // The unit's --chat-template-kwarg defaults, next to the sampler's: the
         // typed enable_thinking and every generic key, as the value a request
@@ -870,6 +898,25 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // here gets them (chat, /v1/responses, /tokenize's chat form).
     apply_template_kwarg_defaults(prep.req, ctx.cfg->chat_template_kwarg_defaults);
 
+    // --llama-dory-max-loops: this request's loop count from the same source as the template's
+    // effort (effective_reasoning_effort: chat_template_kwargs.reasoning_effort, else the typed field, which
+    // the unit's --chat-template-kwarg default has filled in above). The template may receive a mapped name
+    // (minimal -> low, high <-> xhigh) while the count comes from the unmapped one; each mapped pair has the
+    // same count. Decided before the render and the fit pass, so an effort 400 wins over a template or
+    // context-overflow error. A level outside the seven names, or a non-string kwarg, is a 400. With the
+    // flag off none of this runs and input.dory_loops stays 0. A typed empty string and a kwarg null
+    // read as no effort, as for the template.
+    if (const ModelStatus& dst = ctx.backend->status(); dst.dory_present && dst.dory.max_loops > 0) {
+        const EffectiveEffort eff = effective_reasoning_effort(prep.req);
+        int                   loops = 0;
+        if (const std::string no = dory_request_loops(eff.present, eff.is_string, eff.level, dst.dory.loops,
+                                                      dst.dory.max_loops, loops);
+            !no.empty())
+            return HttpResult{400, invalid_request(no, eff.present && prep.req.chat_template_kwargs.contains("reasoning_effort")
+                                                           ? "chat_template_kwargs.reasoning_effort"
+                                                           : "reasoning_effort")};
+        prep.input.dory_loops = loops;
+    }
     // A request that still says nothing is the kind of turn the model's template
     // makes of it (ChatDialect::thinks_by_default): for Gemma 4 a non-thinking
     // one. Resolved here, before the render, so the template, the non-thinking
@@ -1237,6 +1284,7 @@ HttpResult run_chat(const Context& ctx, const PreparedChat& prep, int slot) {
     // loop-guard: present only when the ladder moved, so a request without the
     // switch has the response body it always had.
     if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
+    if (dory_named(stats)) body["dory"] = dory_json(stats);
     // arcint.timings: the per-response timing object, only when the request
     // asked. llama-server's field name at the top level; absent keeps the body
     // byte-identical.
@@ -1277,6 +1325,7 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
                                            {"finish_reason", finish_reason_name(reason)}}})},
                  {"usage", usage_json(stats)}};
     if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
+    if (dory_named(stats)) body["dory"] = dory_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -1560,6 +1609,7 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
         final_delta["reasoning_closed"] = !reasoning.in_reasoning();
     json final_extra = json::object();
     if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
+    if (dory_named(stats)) final_extra["dory"] = dory_json(stats);
     // arcint.timings: with usage opted in, the object rides the usage chunk, so
     // the last data frame carries both (llama-server's shape); without usage
     // there is no such chunk, so it rides the finish chunk.
@@ -1645,6 +1695,7 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
 
     json final_extra = json::object();
     if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
+    if (dory_named(stats)) final_extra["dory"] = dory_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"text", ""},
                                              {"logprobs", nullptr},

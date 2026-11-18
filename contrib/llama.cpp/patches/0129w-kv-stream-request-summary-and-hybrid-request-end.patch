@@ -1,0 +1,172 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -11691,6 +11691,24 @@
+     backend_ctx->enqueue_ndrange_kernel(k, 1, gws, lws, y);
+ }
+ 
++// 0129w: the request's own overlap/verify totals, accumulated at each graph's start and
++// printed at the request's end by llama_kv_stream::request_end through this weak-called
++// function (no opencl backend in the build: the symbol is null there).
++struct ggml_cl_fa_paged_totals {
++    int issued = 0, fell_back = 0, reused = 0, recopied = 0;
++    long long v_nodes = 0, v_bytes = 0, v_mismatch = 0;
++};
++static ggml_cl_fa_paged_totals g_fa_paged_totals;
++extern "C" void ggml_backend_opencl_fa_paged_summary(void) {
++    if (!g_fa_paged_totals.issued && !g_fa_paged_totals.v_nodes && !g_fa_paged_totals.reused) return;
++    GGML_LOG_WARN("ggml_opencl: paged FA overlap (request end): %d nodes issued ahead, %d fell back; "
++            "verify %lld nodes, %lld bytes, %lld mismatches; next-graph lead: %d reused, %d re-copied\n",
++            g_fa_paged_totals.issued, g_fa_paged_totals.fell_back, g_fa_paged_totals.v_nodes,
++            g_fa_paged_totals.v_bytes, g_fa_paged_totals.v_mismatch,
++            g_fa_paged_totals.reused, g_fa_paged_totals.recopied);
++    g_fa_paged_totals = {};
++}
++
+ static void ggml_cl_fewq_prepass(ggml_backend_opencl_context * ctx, const ggml_cgraph * cgraph);   // 0115
+ // 0129n: defined below, used by graph_compute's chain walk
+ static bool ggml_cl_fa_paged_overlap_on();
+@@ -11708,17 +11726,16 @@
+         }
+         o.issued.assign(o.chain.size(), 0);
+         o.cur = 0;
+-        // 0129s: 0129q's summary was gated on the LAST chain node's dispatch tail, which
+-        // needs that dispatch to reach the tail and its ov to hold; the served logs' zero
+-        // count says no dispatch satisfied both. Report the previous graph's totals here,
+-        // at the next graph's start, where it always runs.
+-        if (!o.summary_logged && o.last_n > 0) {
+-            o.summary_logged = true;
+-            GGML_LOG_WARN("ggml_opencl: paged FA overlap: %d of %d nodes issued ahead, %d fell back"
+-                          "; verify: %lld nodes, %lld bytes, %lld mismatches\n",
+-                          o.issued_n, o.last_n, o.fell_back,
+-                          (long long) o.v_nodes, (long long) o.v_bytes, (long long) o.v_mismatch);
+-        }
++        // 0129w: window 290 printed the summary once at the first graph as 0 of 16 (nothing
++        // had happened yet). The graph's counters now roll into the request's totals, which
++        // llama_kv_stream::request_end prints and resets at the request's end.
++        g_fa_paged_totals.issued    += o.issued_n;
++        g_fa_paged_totals.fell_back += o.fell_back;
++        g_fa_paged_totals.reused    += o.pre_reused;
++        g_fa_paged_totals.recopied  += o.pre_recopied;
++        g_fa_paged_totals.v_nodes    += o.v_nodes;
++        g_fa_paged_totals.v_bytes    += o.v_bytes;
++        g_fa_paged_totals.v_mismatch += o.v_mismatch;
+         o.issued_n = o.fell_back = 0;
+         o.v_nodes = o.v_bytes = o.v_mismatch = 0;
+         o.last_n = (int) o.chain.size();
+@@ -24057,10 +24074,11 @@
+     }
+     CL_CHECK(clReleaseMemObject(rowsbuf));
+     CL_CHECK(clReleaseMemObject(out));
++    const bool selftest_node = ggml_cl_fa_paged_verify_mode() == 2 && o.v_nodes == 0;   // 0129w: before the increment
+     o.v_nodes++;
+     o.v_bytes += (int64_t) gy*(kb + vb);
+     o.v_mismatch += bad;
+-    if (ggml_cl_fa_paged_verify_mode() == 2 && o.v_nodes == 0) {
++    if (selftest_node) {
+         GGML_LOG_WARN("%s: paged FA verify self-test (VERIFY=2): one host byte flipped on node %d; "
+                 "expect exactly 1 mismatching chunk, got %lld\n", __func__, node, (long long) bad);
+     }
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+--- a/src/llama-kv-stream.cpp
++++ b/src/llama-kv-stream.cpp
+@@ -305,6 +305,9 @@
+ // requests: clear() is not the call a served request ends with. The cache's seq_rm releases
+ // the sequence's cells, so that is where the request's last counts are logged; clear() prints
+ // through it too (a cleared cache was a request's end as well).
++// 0129w: the OpenCL backend's request totals (weak: a build without that backend links)
++extern "C" void ggml_backend_opencl_fa_paged_summary(void) __attribute__((weak));
++
+ void llama_kv_stream::request_end() {
+     // 0129r: unconditional. 0129m gated this on logged_first, and a served request that
+     // streams after one already logged leaves that flag set -- its own prepare() line is
+@@ -316,6 +319,7 @@
+             __func__, att_last, att_last - streamed_last, streamed_last, moved, streamed_last,
+             n_pages - n_streamed, n_pages);
+     logged_first = logged_stream = false;
++    if (ggml_backend_opencl_fa_paged_summary) ggml_backend_opencl_fa_paged_summary();
+ }
+ 
+ void llama_kv_stream::clear() {
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -61,6 +61,7 @@
+     bool get_can_shift() const override;
+ 
+     void clear(bool data) override;
++    void request_end() override;   // 0129w: the attention cache carries the KV stream
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -138,6 +138,12 @@
+     return mem_attn->get_can_shift();
+ }
+ 
++// 0129w: llama_memory_i's request_end is a no-op, and a hybrid model's memory is this
++// wrapper: a served completion's request_end must reach the attention cache's KV stream.
++void llama_memory_hybrid::request_end() {
++    if (mem_attn) mem_attn->request_end();
++}
++
+ void llama_memory_hybrid::clear(bool data) {
+     mem_attn->clear(data);
+     mem_recr->clear(data);
+diff --git a/src/llama-memory-hybrid-iswa.h b/src/llama-memory-hybrid-iswa.h
+--- a/src/llama-memory-hybrid-iswa.h
++++ b/src/llama-memory-hybrid-iswa.h
+@@ -59,6 +59,7 @@
+     bool get_can_shift() const override;
+ 
+     void clear(bool data) override;
++    void request_end() override;   // 0129w: the attention cache carries the KV stream
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+diff --git a/src/llama-memory-hybrid-iswa.cpp b/src/llama-memory-hybrid-iswa.cpp
+--- a/src/llama-memory-hybrid-iswa.cpp
++++ b/src/llama-memory-hybrid-iswa.cpp
+@@ -140,6 +140,12 @@
+     return mem_attn->get_can_shift();
+ }
+ 
++// 0129w: llama_memory_i's request_end is a no-op, and a hybrid model's memory is this
++// wrapper: a served completion's request_end must reach the attention cache's KV stream.
++void llama_memory_hybrid_iswa::request_end() {
++    if (mem_attn) mem_attn->request_end();
++}
++
+ void llama_memory_hybrid_iswa::clear(bool data) {
+     mem_attn->clear(data);
+     mem_recr->clear(data);
+diff --git a/src/llama-kv-cache-iswa.h b/src/llama-kv-cache-iswa.h
+--- a/src/llama-kv-cache-iswa.h
++++ b/src/llama-kv-cache-iswa.h
+@@ -66,6 +66,7 @@
+     bool get_can_shift() const override;
+ 
+     void clear(bool data) override;
++    void request_end() override;   // 0129w: both caches carry their stream
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
+diff --git a/src/llama-kv-cache-iswa.cpp b/src/llama-kv-cache-iswa.cpp
+--- a/src/llama-kv-cache-iswa.cpp
++++ b/src/llama-kv-cache-iswa.cpp
+@@ -105,6 +105,13 @@
+             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
+ }
+ 
++// 0129w: the SWA wrapper's request_end forwards to both caches (0129p's line sits in the
++// attention cache's stream).
++void llama_kv_cache_iswa::request_end() {
++    if (kv_base) kv_base->request_end();
++    if (kv_swa)  kv_swa->request_end();
++}
++
+ void llama_kv_cache_iswa::clear(bool data) {
+     kv_base->clear(data);
+     kv_swa ->clear(data);

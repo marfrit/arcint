@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Markus Fritsche <mfritsche@reauktion.de>
+Date: Thu, 12 Nov 2026 12:00:00 +0000
+Subject: [PATCH] 0118-dory-loops-per-context
+
+---
+ include/llama.h       |  6 ++++++
+ src/llama-context.cpp | 33 +++++++++++++++++++++++++++++++++
+ src/llama-context.h   |  2 ++
+ src/llama-cparams.h   |  2 ++
+ src/llama-graph.h     |  9 +++++++++
+ src/llama-model.h     |  4 ++++
+ src/models/dory.cpp   | 28 +++++++++++++++++++++++++---
+ src/models/models.h   | 11 +++++++++++
+ 8 files changed, 92 insertions(+), 3 deletions(-)
+
+diff --git a/include/llama.h b/include/llama.h
+index 0f40aed15..84597b7df 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1208,6 +1208,12 @@ extern "C" {
+     // Returns whether the context is currently using causal attention
+     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+ 
++    // ARC-LAB 0118: Dory's loop count for the next decodes of this context, 1..llama_model_dory_loops_max
++    // (0: the model's own count). False when the model cannot run that count. The cache is not touched.
++    LLAMA_API bool llama_set_dory_loops(struct llama_context * ctx, uint32_t n_loops);
++    LLAMA_API uint32_t llama_get_dory_loops(const struct llama_context * ctx);
++    LLAMA_API uint32_t llama_model_dory_loops_max(const struct llama_model * model);
++
+     // Set whether the model is in warmup mode or not
+     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
+     //
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index c9e4acbac..6a1dd000a 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2289,6 +2289,21 @@ bool llama_context::get_causal_attn() const {
+     return cparams.causal_attn;
+ }
+ 
++// ARC-LAB 0118: the loop count of this context's next graphs. The cache is the last_loop one, the same
++// layers at every count, so the cached prefix stays as the earlier count wrote it; the compute buffers were
++// reserved for the largest count (graph_reserve). 0 goes back to the model's count.
++bool llama_context::set_dory_loops(uint32_t n_loops) {
++    if (n_loops != 0 && (n_loops > model.loops_max() || n_loops < model.loops_min())) {
++        return false;
++    }
++    cparams.dory_loops = n_loops == model.loops_default() ? 0 : n_loops;
++    return true;
++}
++
++uint32_t llama_context::get_dory_loops() const {
++    return cparams.dory_loops ? cparams.dory_loops : model.loops_default();
++}
++
+ void llama_context::set_warmup(bool value) {
+     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
+ 
+@@ -3748,7 +3763,13 @@ ggml_cgraph * llama_context::graph_reserve(
+ 
+     auto * res = gf_res_reserve.get();
+ 
++    // ARC-LAB 0118: the reserve covers the largest loop count a turn may ask for
++    const uint32_t save_dory_loops = cparams.dory_loops;
++    if (model.loops_max() > 0 && !getenv("LLAMA_DORY_RESERVE_DEFAULT")) {
++        cparams.dory_loops = model.loops_max();
++    }
+     const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
++    cparams.dory_loops = save_dory_loops;
+ 
+     res->reset();
+ 
+@@ -5308,6 +5329,18 @@ bool llama_get_causal_attn(const llama_context * ctx) {
+     return ctx->get_causal_attn();
+ }
+ 
++bool llama_set_dory_loops(llama_context * ctx, uint32_t n_loops) {
++    return ctx->set_dory_loops(n_loops);
++}
++
++uint32_t llama_get_dory_loops(const llama_context * ctx) {
++    return ctx->get_dory_loops();
++}
++
++uint32_t llama_model_dory_loops_max(const llama_model * model) {
++    return model->loops_max();
++}
++
+ void llama_set_warmup(llama_context * ctx, bool warmup) {
+     ctx->set_warmup(warmup);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 9fa3787ea..18f8e8da1 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -148,6 +148,8 @@ struct llama_context {
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
++    bool set_dory_loops(uint32_t n_loops);   // ARC-LAB 0118
++    uint32_t get_dory_loops() const;
+     void set_warmup(bool value);
+ 
+     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index bd5eadbd7..8fb6c98db 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -23,6 +23,8 @@ struct llama_cparams {
+ 
+     int32_t  nextn_layer_offset = 0;
+ 
++    uint32_t dory_loops = 0;  // ARC-LAB 0118: Dory loop count of this context's graphs; 0 = the model's
++
+     float rope_freq_base;
+     float rope_freq_scale;
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 808aecbf6..82269bb21 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -917,6 +917,15 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        // ARC-LAB 0118: another loop count is another topology. LLAMA_DORY_RED_REUSE (test only) drops the check,
++        // the deliberately wrong build of the experiment
++        if (cparams.dory_loops != other.cparams.dory_loops) {
++            static const bool red = getenv("LLAMA_DORY_RED_REUSE") != nullptr;
++            if (!red) {
++                return false;
++            }
++        }
++
+         return
+             cparams.embeddings              == other.cparams.embeddings              &&
+             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
+diff --git a/src/llama-model.h b/src/llama-model.h
+index a6582740e..93416b067 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -867,6 +867,10 @@ struct llama_model {
+     // Weight placement uses physical blocks; graph and KV indices use execution layers.
+     virtual uint32_t n_layer_physical() const { return hparams.n_layer_all; }
+     virtual int layer_physical(int il) const { return il; }
++    // ARC-LAB 0118: the loop counts a context may run (Dory: 1..max, the file's count by default); 0 elsewhere
++    virtual uint32_t loops_max() const { return 0; }
++    virtual uint32_t loops_min() const { return 0; }
++    virtual uint32_t loops_default() const { return 0; }
+ 
+     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
+ 
+diff --git a/src/models/dory.cpp b/src/models/dory.cpp
+index 2871bd73b..1940c3b8d 100644
+--- a/src/models/dory.cpp
++++ b/src/models/dory.cpp
+@@ -29,8 +29,20 @@ void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ROPE_FREQ_BASE_2, theta_2);
+     ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa);
+ 
++    n_loops_max = n_loops;
++    if (const char * env = getenv("LLAMA_DORY_MAX_LOOPS")) {
++        const int want = atoi(env);
++        if (want < 1 || want > 4) {
++            LLAMA_LOG_WARN("%s: LLAMA_DORY_MAX_LOOPS=%s is not 1..4; the file's count %u serves\n", __func__, env, n_loops);
++        } else if ((uint32_t) want > n_loops && recurrent_kv_cache_mode != "last_loop") {
++            // per_loop keeps a cache layer per executed copy: a turn at more loops would read layers no earlier turn wrote
++            LLAMA_LOG_WARN("%s: LLAMA_DORY_MAX_LOOPS=%d needs the last_loop cache; the file's count %u serves\n", __func__, want, n_loops);
++        } else if ((uint32_t) want > n_loops) {
++            n_loops_max = want;
++        }
++    }
+     const uint64_t n_physical = uint64_t(n_input) + n_recurrent + n_output;
+-    const uint64_t n_virtual = uint64_t(n_input) + uint64_t(n_recurrent)*n_loops + n_output;
++    const uint64_t n_virtual = uint64_t(n_input) + uint64_t(n_recurrent)*n_loops_max + n_output;
+     if (!n_input || !n_recurrent || !n_output || !n_loops || n_loops > 4 ||
+             n_virtual > LLAMA_MAX_LAYERS || n_physical != hparams.n_layer_all ||
+             pattern.size() != n_physical || profile.size() != n_physical ||
+@@ -60,7 +72,7 @@ void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
+     for (uint32_t i = 0; i < n_input; ++i) {
+         physical.push_back(i);
+     }
+-    for (uint32_t k = 0; k < n_loops; ++k) {
++    for (uint32_t k = 0; k < n_loops_max; ++k) {
+         for (uint32_t i = 0; i < n_recurrent; ++i) {
+             physical.push_back(n_input + i);
+         }
+@@ -82,6 +94,10 @@ void llama_model_dory::load_arch_hparams(llama_model_loader & ml) {
+         hparams.rope_pattern[il] = profile[p] != 0 && pattern[p] != '-';
+     }
+     type = LLM_TYPE_UNKNOWN;
++    if (n_loops_max != n_loops) {
++        LLAMA_LOG_INFO("%s: Dory tables for %u loops (LLAMA_DORY_MAX_LOOPS), %u executed layers; a context serves %u unless told otherwise\n",
++                       __func__, n_loops_max, (uint32_t) n_virtual, n_loops);
++    }
+ }
+ 
+ // ARC-LAB 0113: LLAMA_DORY_FOLD, read once a load: 0 the PR's graph; 1 the folded vectors only (the
+@@ -328,7 +344,10 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
+     ggml_tensor * out_ids = build_inp_out_ids();
+     auto * attn = build_attn_inp_kv_iswa();
+     ggml_tensor * input_h = nullptr;
+-    const int recurrent_end = model.n_input + model.n_recurrent * model.n_loops;
++    // ARC-LAB 0118: this context's loop count for the graph; the tables are in the index space of n_loops_max
++    const uint32_t loops = params.cparams.dory_loops ? std::min<uint32_t>(params.cparams.dory_loops, model.n_loops_max) : model.n_loops;
++    const int recurrent_end = model.n_input + model.n_recurrent * loops;
++    const int output_begin = model.n_input + model.n_recurrent * model.n_loops_max;
+     const auto norm = [&](ggml_tensor * x) { return build_gdn_l2_norm(ctx0, x, 1e-6f); };
+     const auto f32 = [&](ggml_tensor * x) { return x->type == GGML_TYPE_F32 ? x : ggml_cast(ctx0, x, GGML_TYPE_F32); };
+     // ARC-LAB 0113 (a deviation from the PR's graph, at the answer-level bar): the scale chains come
+@@ -340,6 +359,9 @@ llama_model_dory::graph::graph(const llama_model_dory & model, const llm_graph_p
+     const bool renorm = !model.renorm_dropped;
+ 
+     for (int il = 0; il < n_layer; ++il) {
++        if (il >= recurrent_end && il < output_begin) {
++            continue;   // ARC-LAB 0118: recurrent copies this turn's loop count does not run
++        }
+         const int p = model.physical[il];
+         const auto & l = model.layers[il];
+         const auto & s = model.scale[il];
+diff --git a/src/models/models.h b/src/models/models.h
+index 1509c0083..3b7550863 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -145,6 +145,12 @@ struct llm_build_rwkv7_base : public llm_graph_context {
+ struct llama_model_dory : public llama_model_base {
+     llama_model_dory(const llama_model_params & params) : llama_model_base(params) {}
+     uint32_t n_input = 0, n_recurrent = 0, n_output = 0, n_loops = 0;
++    // ARC-LAB 0118: the loop count the tables are built for. n_loops stays the file's count and is a
++    // context's default; a context may run any count in 1..n_loops_max (llama_set_dory_loops). The executed
++    // index space is the one of n_loops_max: a turn at fewer loops skips the unused recurrent copies, so the
++    // output blocks keep one index, and with it one cache layer, at every count. Equal to n_loops unless
++    // LLAMA_DORY_MAX_LOOPS asks for more (last_loop cache only).
++    uint32_t n_loops_max = 0;
+     float init_std = 0.0f, alpha_init = 0.0f, gate_init = 0.0f;
+     float theta_1 = 0.0f, theta_2 = 0.0f;
+     std::string pattern;
+@@ -154,6 +160,11 @@ struct llama_model_dory : public llama_model_base {
+     std::vector<int> cache_layer;
+     uint32_t n_layer_physical() const override { return n_input + n_recurrent + n_output; }
+     int layer_physical(int il) const override { return physical.at(il); }
++    uint32_t loops_max() const override { return n_loops_max; }
++    // per_loop keeps a cache layer per executed copy: a turn at another count would read layers the earlier turns
++    // never wrote for the older tokens, so only last_loop may change the count
++    uint32_t loops_min() const override { return recurrent_kv_cache_mode == "last_loop" ? 1 : n_loops; }
++    uint32_t loops_default() const override { return n_loops; }
+     struct scales {
+         ggml_tensor * alpha = nullptr;
+         ggml_tensor * sqk = nullptr;

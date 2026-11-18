@@ -77,6 +77,12 @@ bool loop_guard_moved(const GenerationStats& stats) {
            || stats.loop_context_closes || stats.loop_context_no_closer || stats.loop_think_closes;
 }
 
+bool dory_named(const GenerationStats& stats) { return stats.dory_loops > 0; }
+
+nlohmann::json dory_json(const GenerationStats& stats) {
+    return json{{"loops", stats.dory_loops}, {"reprefill", stats.dory_reprefill}};
+}
+
 void log_slot_line(int slot, const char* phase, int tokens, double seconds, double rate,
                    const std::string& suffix) {
     log::info(log::format("slot %d", slot), "%-7s %5d tok in %5.2f s (%5.1f t/s)%s", phase, tokens,

@@ -1,0 +1,589 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -769,16 +769,18 @@
+ struct fa_paged_post {
+     cl_mem rowsbuf = nullptr;
+     cl_mem buf[2]       = { nullptr, nullptr };   // the slot's K and V region
+-    cl_mem out[2][2]    = {};                      // [kv][0 pre, 1 post]
+-    cl_event ev[2][2]   = {};                      // the non-blocking readback event of each
+-    std::vector<uint32_t> dev[2][2];               // its hashes, read into these later
++    cl_mem out[2][3]    = {};                      // [kv][0 pre-read, 1 read, 2 re-hash] (0131d)
++    cl_event ev[2][3]   = {};                      // the non-blocking readback event of each
++    std::vector<uint32_t> dev[2][3];               // its hashes, read into these later
+     cl_ulong base[2]    = { 0, 0 };
+     cl_ulong stride[2]  = { 0, 0 };
+     cl_ulong nbytes[2]  = { 0, 0 };
+     std::vector<int32_t> rows, pages;
+     int64_t nk = 0, nv = 0;
+     int node = -1;
+-    bool post = false;                             // the post hash was enqueued
++    int slot = -1;                                 // 0131c: the ring slot, for the post-start stamp
++    bool post = false;
++    bool rehash = false;                           // 0131d: the re-hash behind the slot's next copy                             // the post hash was enqueued
+ };
+ 
+ struct ggml_backend_opencl_context {
+@@ -1360,9 +1362,13 @@
+         std::vector<fa_paged_post> post_pending;
+         int  post_cur = -1;
+         int64_t v_post_changes = 0;
++        int64_t v_read_changes = 0, v_late_changes = 0;   // 0131d: VERIFY=4's two comparisons
+         int  v_post_warned = 0;
+         int  v_post_nopost_warned = 0;
++        int  v_read_warned = 0;          // 0131d: the post-read WARN, once a process
++        int  v_rehash_missing = 0;       // 0131d: pairs whose re-hash never ran, counted
+         int  v_self3_done = 0;   // 0130g: the device-side write went out once this request
++        int  v_self4_done = 0;   // 0131d: the stage-1 write (SELFTEST=4) went out once this request
+         // 0130h: the forced race's busy-wait kernel and its sink, built once a process
+         cl_program delay_prog = nullptr;
+         cl_kernel  delay_kernel = nullptr;
+@@ -1379,7 +1385,7 @@
+         std::vector<fa_paged_tl_ev> tl;
+         long long tl_host_base = 0, tl_dev_base = 0;   // 0130x: clGetDeviceAndHostTimer at the base
+         // 0130r: what each development switch did this request, counted not asserted
+-        long long nc_drops = 0, nofix_drops = 0, delay_kernels = 0, self3_writes = 0;
++        long long nc_drops = 0, nofix_drops = 0, delay_kernels = 0, self3_writes = 0, self4_writes = 0;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -1662,7 +1668,9 @@
+         return workgroup_size;
+     }
+ 
+-    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor) {
++    // 0131c: `ev_out`, when given, receives the command's own event (retained), so the
++    // timeline stamps with the real NDRange instead of a marker beside it
++    void enqueue_ndrange_kernel(cl_kernel kernel, cl_uint work_dim, size_t *global_work_size, size_t *local_work_size, const ggml_tensor * tensor, cl_event * ev_out = nullptr) {
+         // From the spec on clEnqueueNDRangeKernel:
+         // If the device associated with command_queue is an OpenCL 2.1 or newer device,
+         // and global_work_size is NULL or the value in any passed dimension is zero,
+@@ -1682,6 +1690,7 @@
+ #ifdef GGML_OPENCL_PROFILING
+         cl_event evt;
+         CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, &evt));
++        if (ev_out != nullptr) { CL_CHECK(clRetainEvent(evt)); *ev_out = evt; }   // 0131c: the caller's stamp
+ 
+         profiling_info.emplace_back();
+         populateProfilingInfo(profiling_info.back(), evt, kernel, work_dim, global_work_size, local_work_size, tensor);
+@@ -1690,7 +1699,9 @@
+         }
+ #else
+         GGML_UNUSED(tensor);
+-        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL, NULL));
++        // 0131c: with a stamp requested the command's own event is kept; without one, no event
++        CL_CHECK(clEnqueueNDRangeKernel(queue, kernel, work_dim, NULL, global_work_size, local_work_size, 0, NULL,
++                ev_out != nullptr ? ev_out : NULL));
+ #endif
+     }
+ 
+@@ -11912,6 +11923,8 @@
+ // 0130d: VERIFY=3's collect is defined below; the request's end flushes the last graph's
+ // pairs before the summary prints, and the global names the one context that recorded them
+ static void ggml_cl_fa_paged_verify3_collect(ggml_backend_opencl_context * ctx);
++static void ggml_cl_fa_paged_verify4_rehash(ggml_backend_opencl_context * ctx, int parity, cl_event ready);   // 0131d
++static void ggml_cl_fa_paged_verify4_selftest(ggml_backend_opencl_context * ctx, int node);                  // 0131d
+ static void ggml_cl_fa_paged_tl_finish(ggml_backend_opencl_context * ctx);   // 0130p
+ static ggml_backend_opencl_context * g_fa_paged_verify3_ctx = nullptr;
+ static ggml_backend_opencl_context * g_fa_paged_ctx = nullptr;   // 0130p: the timeline's finish
+@@ -11923,19 +11936,23 @@
+     int issued = 0, fell_back = 0, reused = 0, recopied = 0, pre_issued = 0;
+     long long v_nodes = 0, v_bytes = 0, v_mismatch = 0;
+     long long v_post_changes = 0;   // 0130d: VERIFY=3, a copy landed while the FA read the slot
++    long long v_read_changes = 0, v_late_changes = 0;   // 0131d: VERIFY=4, its two comparisons
++    int     v_rehash_missing = 0;                     // 0131d
+     // 0130r: what each development switch did this request, counted, not just announced
+-    long long nc_drops = 0, nofix_drops = 0, delay_kernels = 0, self3_writes = 0;
++    long long nc_drops = 0, nofix_drops = 0, delay_kernels = 0, self3_writes = 0, self4_writes = 0;
+ };
+ static ggml_cl_fa_paged_totals g_fa_paged_totals;
+ extern "C" void ggml_backend_opencl_fa_paged_summary(void) {
+     if (g_fa_paged_verify3_ctx) {
+         ggml_cl_fa_paged_verify3_collect(g_fa_paged_verify3_ctx);
+         g_fa_paged_verify3_ctx->fa_paged.v_self3_done = 0;   // 0130g: one injected byte a request
++        g_fa_paged_verify3_ctx->fa_paged.v_self4_done = 0;   // 0131d
+     }
+     if (g_fa_paged_ctx && !g_fa_paged_ctx->fa_paged.tl.empty()) ggml_cl_fa_paged_tl_finish(g_fa_paged_ctx);   // 0130p
+     if (!g_fa_paged_totals.issued && !g_fa_paged_totals.v_nodes && !g_fa_paged_totals.reused &&
+         !g_fa_paged_totals.pre_issued && !g_fa_paged_totals.fell_back &&
+-        !g_fa_paged_totals.v_post_changes && !g_fa_paged_totals.nc_drops &&
++        !g_fa_paged_totals.v_post_changes && !g_fa_paged_totals.v_read_changes &&
++        !g_fa_paged_totals.v_late_changes && !g_fa_paged_totals.v_rehash_missing && !g_fa_paged_totals.nc_drops &&
+         !g_fa_paged_totals.nofix_drops && !g_fa_paged_totals.delay_kernels &&
+         !g_fa_paged_totals.self3_writes) return;
+     GGML_LOG_WARN("ggml_opencl: paged FA overlap (request end): %d nodes issued ahead, %d fell back; "
+@@ -11945,6 +11962,14 @@
+             g_fa_paged_totals.v_bytes, g_fa_paged_totals.v_mismatch,
+             g_fa_paged_totals.pre_issued, g_fa_paged_totals.reused, g_fa_paged_totals.recopied,
+             g_fa_paged_totals.v_post_changes);
++    // 0131d: VERIFY=4's two comparisons, said at the request's end; VERIFY=3 leaves both zero
++    if (g_fa_paged_totals.v_read_changes || g_fa_paged_totals.v_late_changes ||
++        g_fa_paged_totals.v_rehash_missing || g_fa_paged_totals.self4_writes) {
++        GGML_LOG_WARN("ggml_opencl: paged FA post-read (request end): pre-read vs read %lld mismatches, "
++                "read vs re-hash %lld, re-hash missing on %d pairs, stage-1 self-test writes %lld\n",
++                g_fa_paged_totals.v_read_changes, g_fa_paged_totals.v_late_changes,
++                g_fa_paged_totals.v_rehash_missing, g_fa_paged_totals.self4_writes);
++    }
+     // 0130r: one line per development switch arm, so the log says what ran (green and red)
+     GGML_LOG_WARN("ggml_opencl: paged FA dev switches (request end): NOCONSUME consumed waits dropped %lld; "
+             "NOFIX cross-step waits dropped %lld; delay kernels %lld; self-test writes %lld\n",
+@@ -11999,7 +12024,13 @@
+         g_fa_paged_totals.nofix_drops += o.nofix_drops;
+         g_fa_paged_totals.delay_kernels += o.delay_kernels;
+         g_fa_paged_totals.self3_writes += o.self3_writes;
++        g_fa_paged_totals.v_read_changes += o.v_read_changes;   // 0131d
++        g_fa_paged_totals.v_late_changes += o.v_late_changes;   // 0131d
++        g_fa_paged_totals.self4_writes   += o.self4_writes;     // 0131d
++        g_fa_paged_totals.v_rehash_missing += o.v_rehash_missing;
+         o.nc_drops = o.nofix_drops = o.delay_kernels = o.self3_writes = 0;
++        o.v_read_changes = o.v_late_changes = o.self4_writes = 0; o.v_rehash_missing = 0;
++        o.v_self4_done = 0;   // 0131d: one injected byte a request
+         o.issued_n = o.fell_back = 0;
+         o.v_nodes = o.v_bytes = o.v_mismatch = 0;
+         o.v_post_changes = 0;
+@@ -24063,8 +24094,10 @@
+ // that assigns ring rows in host-store order is one command a layer instead of n_pages.
+ // Returns the commands issued, 0 when the plan names no streamed page, -1 for a host store
+ // this function cannot copy (not USM): the dispatch's own path below covers those.
++// 0131c: ev_first/ev_last, when given, receive the first and last write command's own event
++// (retained): the copy's start is the first write's start, its end the last write's end
+ static int ggml_cl_fa_paged_enqueue_pages(ggml_backend_opencl_context * ctx, const ggml_tensor * dst,
+-        cl_command_queue cq, cl_uint nw, cl_event * wl) {
++        cl_command_queue cq, cl_uint nw, cl_event * wl, cl_event * ev_first = nullptr, cl_event * ev_last = nullptr) {
+     const ggml_tensor * plan   = dst->src[GGML_FA_SRC_PLAN];
+     const ggml_tensor * host_k = dst->src[GGML_FA_SRC_HOST_K];
+     const ggml_tensor * host_v = dst->src[GGML_FA_SRC_HOST_V];
+@@ -24111,10 +24144,24 @@
+                        (long long) n, (unsigned long long) dk, (size_t) n*kb, k_size,
+                        (unsigned long long) dv, (size_t) n*vb, v_size);
+         }
++        const bool want_ev = ev_first != nullptr || ev_last != nullptr;   // 0131c
++        cl_event ek = nullptr, ev = nullptr;
+         CL_CHECK(clEnqueueWriteBuffer(cq, rk[0].mem, CL_FALSE, dk, (size_t) n*kb,
+-                                      hk + (size_t) p*kb, nw, nw ? wl : NULL, NULL));
++                                      hk + (size_t) p*kb, nw, nw ? wl : NULL, want_ev ? &ek : NULL));
+         CL_CHECK(clEnqueueWriteBuffer(cq, rv[0].mem, CL_FALSE, dv, (size_t) n*vb,
+-                                      hv + (size_t) p*vb, nw, nw ? wl : NULL, NULL));
++                                      hv + (size_t) p*vb, nw, nw ? wl : NULL, want_ev ? &ev : NULL));
++        if (ek != nullptr) {   // the first K write's event, retained for the caller
++            if (ev_first != nullptr && *ev_first == nullptr) { CL_CHECK(clRetainEvent(ek)); *ev_first = ek; }
++            CL_CHECK(clReleaseEvent(ek));
++        }
++        if (ev != nullptr) {   // every V write's event; the last one is the copy's end
++            if (ev_last != nullptr) {
++                if (*ev_last != nullptr) CL_CHECK(clReleaseEvent(*ev_last));
++                CL_CHECK(clRetainEvent(ev));
++                *ev_last = ev;
++            }
++            CL_CHECK(clReleaseEvent(ev));
++        }
+         runs += 2;   // K and V: each a command
+         p += n;
+     }
+@@ -24143,20 +24190,12 @@
+     if (!ggml_cl_fa_paged_timeline() || o.tl_graph != ctx->graph_gen) return;
+     o.tl.push_back({ role, node, slot, nullptr, ggml_cl_fa_paged_tl_host_ns() });
+ }
+-// a marker carries the waits the command after it has, so its END is that command's start
+-static void ggml_cl_fa_paged_tl_mark(ggml_backend_opencl_context * ctx, cl_command_queue q, int role,
+-        int node, int slot, cl_uint nw, cl_event * wl) {
+-    // 0131b: no marker at all with the switch off. 0130p enqueued these markers (four with
+-    // events on the compute queue per FA, two on the copy queue per issue) whatever the switch
+-    // said, and window 299 measured OVERLAP at 451.9 ms/step on Q5 at 261k against 261.3 and
+-    // 262.1 before 0130p (windows 297, 295) -- the overlap's whole gain gone with TIMELINE unset.
+-    if (!ggml_cl_fa_paged_timeline()) return;
+-    cl_event ev = nullptr;
+-    // 0130v: a non-NULL list with nw 0 is CL_INVALID_EVENT_WAIT_LIST (-57), window 298's abort
+-    CL_CHECK(clEnqueueMarkerWithWaitList(q, nw, nw ? wl : nullptr, &ev));
+-    ggml_cl_fa_paged_tl_keep(ctx, role, node, slot, ev);
+-    if (ev) CL_CHECK(clReleaseEvent(ev));
+-}
++// 0131c: no marker of the timeline's own. 0130p's markers were commands the queues had to
++// schedule and events nothing consumed: window 299 measured the overlap's whole gain gone
++// (451.9 ms/step against 261.3/262.1 before 0130p). The stamps now come from the commands
++// themselves -- k_split and k_merge, the copies' write events, the consumed marker that
++// exists for the copy's wait anyway, and (VERIFY=3/4) the post hash kernel's event -- so
++// the timeline adds no command. The base is the earliest device start among the stamps.
+ static void ggml_cl_fa_paged_tl_finish(ggml_backend_opencl_context * ctx) {
+     auto & o = ctx->fa_paged;
+     if (o.tl.empty()) return;
+@@ -24188,15 +24227,20 @@
+         }
+         return;
+     }
+-    cl_ulong base_en = 0;
+     const long long hb = o.tl_host_base > 0 ? o.tl_host_base : ggml_cl_fa_paged_tl_host_ns();
++    // 0131c: the base is the earliest device start among the stamps themselves, no base command
++    cl_ulong base_en = 0;
++    bool have = false;
+     std::vector<stamp> ev;
+     for (auto & x : v) {
+-        if (x.role == -1) { base_en = x.en; if (o.tl_host_base <= 0) continue; }
+-        else ev.push_back(x);
++        if (x.st || x.en) {   // 0131c: host-only stamps (roles 8/9) carry no device time
++            if (!have || x.st < base_en) { base_en = x.st; have = true; }
++        }
++        ev.push_back(x);
+     }
+-    GGML_LOG_WARN("ggml_opencl: paged FA timeline: base the graph's first paged command; %zu stamps, ns relative to it\n",
+-            ev.size());
++    if (!have) return;
++    GGML_LOG_WARN("ggml_opencl: paged FA timeline: base the earliest device start among the stamps; "
++            "%zu stamps, ns relative to it\n", ev.size());
+     for (int slot = 0; slot < 2; ++slot) {
+         struct one { int node; long long st, en, host; };
+         std::vector<one> cs, ce, fs, fe, me, cons, post, hin, hout;
+@@ -24207,8 +24251,11 @@
+             // the host when the recording began; tl_dev_base is the device clock AT the host
+             // base. Without the timer the column is the host-relative time and says so.
+             const long long shift = o.tl_dev_base > 0 ? o.tl_dev_base - (long long) base_en : 0;
+-            const one e{ x.node, (long long) x.en - (long long) base_en,
+-                         (long long) x.en - (long long) base_en, x.host - hb + shift };
++            // 0131c: a command's event carries a start and an end; role 2 is the split's
++            // start, role 3 its end (both from the same event), role 4 the merge's end
++            const long long st = x.role == 2 || x.role == 6 ? (long long) x.st : (long long) x.en;
++            const one e{ x.node, st - (long long) base_en, (long long) x.en - (long long) base_en,
++                         x.host - hb + shift };
+             if (x.role == 0) cs.push_back(e);
+             else if (x.role == 1) ce.push_back(e);
+             else if (x.role == 2) fs.push_back(e);
+@@ -24244,7 +24291,7 @@
+         std::vector<int> cn, fn;
+         for (auto & x : ev) {
+             if (x.slot != slot) continue;
+-            if (x.role == 0) { cs.push_back((long long) x.en - (long long) base_en); cn.push_back(x.node); }
++            if (x.role == 0) { cs.push_back((long long) x.st - (long long) base_en); cn.push_back(x.node); }   // 0131c: the first write's START
+             else if (x.role == 3) { fe.push_back((long long) x.en - (long long) base_en); fn.push_back(x.node); }
+         }
+         long long mn = 0;
+@@ -24262,7 +24309,7 @@
+                 cs.size() > 1 ? cn[1] : -1, fe.empty() ? -1 : fn[0]);
+     }
+     for (auto & x : ev) {
+-        if (x.role == 7) pre_start = (long long) x.en - (long long) base_en;
++        if (x.role == 7) pre_start = (long long) x.st - (long long) base_en;   // 0131c: the prefetch's first write START
+         if (x.role == 3) last_fa = (long long) x.en - (long long) base_en;
+     }
+     GGML_LOG_WARN("ggml_opencl: paged FA timeline margin: min %lld ns over %d pairs, negative %d; "
+@@ -24307,7 +24354,7 @@
+         CL_CHECK(err);
+     }
+     if (ggml_cl_fa_paged_timeline() && o.tl_graph < 0 && o.tl_graphs_seen <= 4 && o.tl.empty()) {
+-        // start a recording: the base is the graph's first paged command
++        // start a recording
+         o.tl_graph = ctx->graph_gen;
+         // 0130x: the host and device clocks together at the base, so a submit time and a
+         // device start are in one frame. An ICD without the timer falls back to the host
+@@ -24324,10 +24371,8 @@
+             if (!o.tl_warned) { o.tl_warned = true;
+                 GGML_LOG_WARN("ggml_opencl: paged FA timeline: no clGetDeviceAndHostTimer; the submit times are host-clocked only\n"); }
+         }
+-        cl_event ev = nullptr;
+-        CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &ev));
+-        o.tl.push_back({ -1, -1, -1, ev, ggml_cl_fa_paged_tl_host_ns() });   // 0130x the base submit time
+-        o.tl_base = ev;   // released by tl_finish through the list
++        // 0131c: no base command. The base is the earliest device start among the stamps
++        // tl_finish gathers, so nothing is enqueued here at all.
+     }
+ }
+ 
+@@ -24393,8 +24438,13 @@
+     cl_uint  nw = (o.consumed[p] != nullptr && !nofix) ? 1 : 0;
+     cl_event wl[1] = { o.consumed[p] };
+     if (o.consumed[p] != nullptr && nofix) ++o.nofix_drops;   // 0130r: the drop, counted
+-    if (nw || ggml_cl_fa_paged_timeline()) ggml_cl_fa_paged_tl_mark(ctx, o.q, 7, 0, p, nw, wl);   // 0130p cross-step copy start (next graph node 0, slot p)
+-    const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, dst, o.q, nw, nw ? wl : NULL);
++    // 0131c: the copy's start is its first write's START, its end the last write's END; no marker
++    const bool tl = ggml_cl_fa_paged_timeline();
++    cl_event ev_first = nullptr, ev_last = nullptr;
++    const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, dst, o.q, nw, nw ? wl : NULL,
++            tl ? &ev_first : nullptr, tl ? &ev_last : nullptr);
++    if (tl && ev_first) { ggml_cl_fa_paged_tl_keep(ctx, 7, 0, p, ev_first); CL_CHECK(clReleaseEvent(ev_first)); }    // cross-step copy start (next graph node 0, slot p)
++    if (tl && ev_last)  { ggml_cl_fa_paged_tl_keep(ctx, 1, 0, p, ev_last);  CL_CHECK(clReleaseEvent(ev_last));  }    // cross-step copy end (slot p)
+     if (runs < 0) {
+         if (warn) { o.pre_head_dead_warned = true; GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: the host store or the ring is not what the copies read (enqueue_pages -1); nothing prefetched\n"); }
+         return;
+@@ -24402,9 +24452,11 @@
+     if (runs == 0 && warn) {   // a plan with no streamed page: correct, but say it once
+         GGML_LOG_WARN("ggml_opencl: paged FA next-graph lead: node 0's plan names no streamed page; %d issued so far\n", o.pre_issued);
+     }
+-    CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.pre_ready));
++    CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.pre_ready));   // the copy's readiness; the FA waits it
+     CL_CHECK(clFlush(o.q));
+-    ggml_cl_fa_paged_tl_mark(ctx, o.q, 1, 0, p, 0, nullptr);   // 0130p cross-step copy end (slot p)
++    // 0131d: VERIFY=4's re-hash of the previous pair on this slot, behind this copy's ready
++    // event -- a kernel on the compute queue with that event as its wait list, no host wait
++    ggml_cl_fa_paged_verify4_rehash(ctx, p, o.pre_ready);
+     o.pre_parity = p;
+     o.pre_rows   = rows;
+     o.pre_pages  = pages;
+@@ -24455,8 +24507,13 @@
+         CL_CHECK(clFlush(ctx->queue));
+         wl[nw++] = mark;
+     }
+-    if (nw || ggml_cl_fa_paged_timeline()) ggml_cl_fa_paged_tl_mark(ctx, o.q, 0, ni, parity, nw, wl);   // 0130p copy start (node ni, ring slot)
+-    const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, o.chain[ni], o.q, nw, nw ? wl : NULL);
++    // 0131c: the copy's start is its first write's START, its end the last write's END
++    const bool tl = ggml_cl_fa_paged_timeline();
++    cl_event ev_first = nullptr, ev_last = nullptr;
++    const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, o.chain[ni], o.q, nw, nw ? wl : NULL,
++            tl ? &ev_first : nullptr, tl ? &ev_last : nullptr);
++    if (tl && ev_first) { ggml_cl_fa_paged_tl_keep(ctx, 0, ni, parity, ev_first); CL_CHECK(clReleaseEvent(ev_first)); }   // copy start (node ni, ring slot)
++    if (tl && ev_last)  { ggml_cl_fa_paged_tl_keep(ctx, 1, ni, parity, ev_last);  CL_CHECK(clReleaseEvent(ev_last));  }   // copy end (node ni, ring slot)
+     if (mark) CL_CHECK(clReleaseEvent(mark));
+     if (runs < 0) {
+         // 0129q, no silent fallback: a node whose store is not USM or whose ring is not one
+@@ -24481,9 +24538,10 @@
+     }
+     o.issued_n++;
+     if (o.consumed[parity]) { CL_CHECK(clReleaseEvent(o.consumed[parity])); o.consumed[parity] = nullptr; }
+-    CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.ready[parity]));
++    CL_CHECK(clEnqueueMarkerWithWaitList(o.q, 0, nullptr, &o.ready[parity]));   // the slot's readiness; the FA waits it
+     CL_CHECK(clFlush(o.q));
+-    ggml_cl_fa_paged_tl_mark(ctx, o.q, 1, ni, parity, 0, nullptr);   // 0130p copy end (node ni, ring slot)
++    // 0131d: VERIFY=4's re-hash of the slot's previous pair, behind this copy's ready event
++    ggml_cl_fa_paged_verify4_rehash(ctx, parity, o.ready[parity]);
+     o.issued[ni] = 1;
+     return true;
+ }
+@@ -24575,6 +24633,8 @@
+         v = e ? atoi(e) : 0;
+         if (v != 0) {   // 0130r: the mode, once, so a window's log says which check ran
+             GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_VERIFY=%d: %s\n", v,
++                    v == 4 ? "pre-read, read and re-hash per streamed node, the re-hash behind the slot's "
++                             "next copy and ordered by that copy's ready event, compared at the request's end" :
+                     v == 3 ? "pre and post hashes of every streamed node, compared at the request's end" :
+                     v == 2 ? "the self-test: one host byte flipped, the check must see 1 chunk" :
+                              "the pre-FA hash of every streamed node, blocking readback");
+@@ -24626,6 +24686,7 @@
+         size_t kb, size_t vb, const void * hk, const void * hv,
+         const int32_t * pl, int64_t n_pages, int node) {
+     if (!ggml_cl_fa_paged_verify_on() || ggml_cl_fa_paged_verify_mode() == 3 ||
++        ggml_cl_fa_paged_verify_mode() == 4 ||
+         hk == nullptr || hv == nullptr || pl == nullptr) return;   // 0130d: =3 runs the pair below
+     // 0129t: the plan index travels with the ring row. The copy loop takes ring row pl[p]
+     // from hk + p*kb, p the PLAN index (0129n's enqueue_pages); compacting the rows alone
+@@ -24718,7 +24779,9 @@
+ // enqueue the hash of one slot region into `out`, then read it back non-blocking into `host`
+ static void ggml_cl_fa_paged_verify3_hash_read(ggml_backend_opencl_context * ctx,
+         cl_mem buf, cl_mem rowsbuf, cl_ulong base_off, cl_ulong stride_bytes, cl_ulong nbytes,
+-        int64_t nc, size_t gy, cl_mem out, std::vector<uint32_t> & host, cl_event * ev) {
++        int64_t nc, size_t gy, cl_mem out, std::vector<uint32_t> & host, cl_event * ev,
++        cl_event * kev = nullptr,   // 0131c: the hash kernel's own event, for the post-start stamp
++        cl_event * ws = nullptr) {   // 0131d: one event to wait, the slot's copy ready
+     auto & o = ctx->fa_paged;
+     const uint32_t chunk = 4096;
+     CL_CHECK(clSetKernelArg(o.verify_kernel, 0, sizeof(cl_mem), &buf));
+@@ -24729,8 +24792,10 @@
+     CL_CHECK(clSetKernelArg(o.verify_kernel, 5, sizeof(uint32_t), &chunk));
+     CL_CHECK(clSetKernelArg(o.verify_kernel, 6, sizeof(cl_mem), &out));
+     size_t gws[2] = { (size_t) nc, gy };
++    const cl_uint nw = ws != nullptr ? 1 : 0;   // 0131d: never a host wait, only the copy's event
++    cl_event wl[1] = { ws != nullptr ? *ws : nullptr };
+     CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, o.verify_kernel, 2, nullptr, gws, nullptr,
+-            0, nullptr, nullptr));
++            nw, nw ? wl : nullptr, kev));
+     host.resize((size_t) nc*gy);
+     // CL_FALSE: the graph does not wait for it; the event is waited at the next graph's start
+     CL_CHECK(clEnqueueReadBuffer(ctx->queue, out, CL_FALSE, 0, host.size()*sizeof(uint32_t),
+@@ -24739,8 +24804,8 @@
+ 
+ static void ggml_cl_fa_paged_verify3_begin(ggml_backend_opencl_context * ctx,
+         cl_mem k_buf, cl_mem v_buf, cl_ulong k_off, cl_ulong v_off, int ps, int rb, int rvb,
+-        size_t kb, size_t vb, const int32_t * pl, int64_t n_pages, int node) {
+-    if (ggml_cl_fa_paged_verify_mode() != 3) return;
++        size_t kb, size_t vb, const int32_t * pl, int64_t n_pages, int node, int slot) {   // 0131c: slot
++    if (ggml_cl_fa_paged_verify_mode() != 3 && ggml_cl_fa_paged_verify_mode() != 4) return;   // 0131d
+     auto & o = ctx->fa_paged;
+     o.post_cur = -1;   // this dispatch's pair; `post` below finds it even when node is -1
+     if (pl == nullptr) return;
+@@ -24752,6 +24817,7 @@
+     const uint32_t chunk = 4096;
+     fa_paged_post e;
+     e.node = node;
++    e.slot = slot;   // 0131c
+     e.rows = rows;
+     e.pages = pages;
+     e.nk = (int64_t) ((kb + chunk - 1) / chunk);
+@@ -24770,7 +24836,7 @@
+     CL_CHECK((e.rowsbuf = clCreateBuffer(ctx->context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+             gy*sizeof(int32_t), rows.data(), &err), err));
+     for (int kv = 0; kv < 2; ++kv) {
+-        for (int pp = 0; pp < 2; ++pp) {
++        for (int pp = 0; pp < 3; ++pp) {   // 0131d: pre-read, read, re-hash
+             CL_CHECK((e.out[kv][pp] = clCreateBuffer(ctx->context, CL_MEM_WRITE_ONLY, out_bytes,
+                     nullptr, &err), err));
+         }
+@@ -24807,7 +24873,7 @@
+ 
+ // after this FA's kernels and before `ggml_cl_fa_paged_overlap_after`'s consumed marker
+ static void ggml_cl_fa_paged_verify3_post(ggml_backend_opencl_context * ctx, bool decode) {
+-    if (ggml_cl_fa_paged_verify_mode() != 3) return;
++    if (ggml_cl_fa_paged_verify_mode() != 3 && ggml_cl_fa_paged_verify_mode() != 4) return;   // 0131d
+     auto & o = ctx->fa_paged;
+     if (o.post_cur < 0 || o.post_cur >= (int) o.post_pending.size()) return;
+     fa_paged_post & e = o.post_pending[o.post_cur];
+@@ -24823,13 +24889,71 @@
+                 e.node, e.pages[0]);
+     }
+     const size_t gy = e.rows.size();
++    const bool tl = ggml_cl_fa_paged_timeline();   // 0131c: the post hash's own start, no marker
+     for (int kv = 0; kv < 2; ++kv) {
++        cl_event kev = nullptr;
+         ggml_cl_fa_paged_verify3_hash_read(ctx, e.buf[kv], e.rowsbuf, e.base[kv], e.stride[kv],
+-                e.nbytes[kv], kv == 0 ? e.nk : e.nv, gy, e.out[kv][1], e.dev[kv][1], &e.ev[kv][1]);
++                e.nbytes[kv], kv == 0 ? e.nk : e.nv, gy, e.out[kv][1], e.dev[kv][1], &e.ev[kv][1],
++                tl && kv == 0 ? &kev : nullptr);
++        if (tl && kev != nullptr && kv == 0) {
++            ggml_cl_fa_paged_tl_keep(ctx, 6, e.node, e.slot, kev);   // post start (the first hash's START)
++            CL_CHECK(clReleaseEvent(kev));
++        }
+     }
+     e.post = true;
+ }
+ 
++// 0131d: VERIFY=4's re-hash. The slot's most recent read pair is re-hashed behind the
++// ready event of the copy that refills that slot: a kernel on the compute queue with that
++// one event as its wait list, no host wait, no collect. Its hash lands in out[kv][2] and
++// is compared at the request's end. A copy that lands after the reader's hash, or one
++// whose bytes the reader's hash missed, shows as read != re-hash.
++static void ggml_cl_fa_paged_verify4_rehash(ggml_backend_opencl_context * ctx, int parity, cl_event ready) {
++    if (ggml_cl_fa_paged_verify_mode() != 4 || ready == nullptr) return;
++    auto & o = ctx->fa_paged;
++    fa_paged_post * e = nullptr;
++    for (auto & c : o.post_pending) if (c.post && !c.rehash && c.slot == parity) e = &c;   // the last such pair
++    if (e == nullptr) return;
++    if (!ggml_cl_fa_paged_verify_kernel(ctx)) return;
++    const size_t gy = e->rows.size();
++    for (int kv = 0; kv < 2; ++kv) {
++        ggml_cl_fa_paged_verify3_hash_read(ctx, e->buf[kv], e->rowsbuf, e->base[kv], e->stride[kv],
++                e->nbytes[kv], kv == 0 ? e->nk : e->nv, gy, e->out[kv][2], e->dev[kv][2], &e->ev[kv][2],
++                nullptr, &ready);
++    }
++    e->rehash = true;
++}
++
++// 0131d: GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=4 -- VERIFY=4's stage-1 red arm. One byte is
++// written into the slot between the pre-read hash and the reader's split kernels, on the
++// compute queue (in order after the pre hash, before the split kernel), on one node a
++// request. The reader's hash must differ from the pre-read hash in exactly one chunk.
++static bool ggml_cl_fa_paged_selftest4() {
++    static const char * e = getenv("GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST");
++    static const bool   on = e != nullptr && atoi(e) == 4;
++    if (on) {
++        static bool said = false;
++        if (!said) { said = true; GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=4: "
++                "one byte written between the pre-read hash and the reader's split kernels, on one node a request\n"); }
++    }
++    return on;
++}
++static void ggml_cl_fa_paged_verify4_selftest(ggml_backend_opencl_context * ctx, int node) {
++    if (ggml_cl_fa_paged_verify_mode() != 4 || !ggml_cl_fa_paged_selftest4()) return;
++    auto & o = ctx->fa_paged;
++    if (o.v_self4_done) return;
++    fa_paged_post * e = nullptr;
++    for (auto & c : o.post_pending) if (!c.post && c.node == node) e = &c;
++    if (e == nullptr || e->rows.empty()) return;
++    const unsigned char pat = 0xA5;
++    const cl_ulong off = e->base[0] + (cl_ulong) e->rows[0] * e->stride[0];
++    CL_CHECK(clEnqueueFillBuffer(ctx->queue, e->buf[0], &pat, 1, off, 1, 0, nullptr, nullptr));
++    o.v_self4_done = 1;
++    ++o.self4_writes;
++    GGML_LOG_WARN("ggml_opencl: paged FA post-read self-test: node %d page %d chunk 0 one byte written "
++            "before the reader\n", e->node, e->pages[0]);
++}
++
+ // wait the pairs of the previous graph(s) and compare pre against post
+ static void ggml_cl_fa_paged_verify3_collect(ggml_backend_opencl_context * ctx) {
+     auto & o = ctx->fa_paged;
+@@ -24864,9 +24988,36 @@
+                 GGML_LOG_WARN("ggml_opencl: paged FA post-FA changed: node %d page %d chunk %d\n",
+                         e.node, first_page, first_chunk);
+             }
++            if (ggml_cl_fa_paged_verify_mode() == 4) {   // 0131d: pre-read vs read, read vs re-hash
++                o.v_read_changes += bad;   // the reader's hash against the state it started from
++                if (bad > 0 && !o.v_read_warned) {
++                    o.v_read_warned = 1;
++                    GGML_LOG_WARN("ggml_opencl: paged FA post-read changed: node %d page %d chunk %d\n",
++                            e.node, first_page, first_chunk);
++                }
++                if (!e.rehash) {
++                    ++o.v_rehash_missing;
++                    if (!o.v_post_nopost_warned) {
++                        o.v_post_nopost_warned = 1;
++                        GGML_LOG_WARN("ggml_opencl: paged FA post-read: node %d's re-hash never ran; "
++                                "read vs re-hash is not compared for it\n", e.node);
++                    }
++                } else {
++                    int64_t late = 0;
++                    for (int kv = 0; kv < 2; ++kv) {
++                        CL_CHECK(clWaitForEvents(1, &e.ev[kv][2]));
++                        const size_t nc = (size_t) (kv == 0 ? e.nk : e.nv);
++                        const size_t gy = e.rows.size();
++                        for (size_t p = 0; p < gy; ++p)
++                            for (size_t c = 0; c < nc; ++c)
++                                if (e.dev[kv][1][p*nc + c] != e.dev[kv][2][p*nc + c]) ++late;
++                    }
++                    o.v_late_changes += late;   // a copy landed after the reader's hash
++                }
++            }
+         }
+         for (int kv = 0; kv < 2; ++kv) {
+-            for (int pp = 0; pp < 2; ++pp) {
++            for (int pp = 0; pp < 3; ++pp) {   // 0131d
+                 if (e.out[kv][pp])  { CL_CHECK(clReleaseMemObject(e.out[kv][pp]));  e.out[kv][pp] = nullptr; }
+                 if (e.ev[kv][pp])   { CL_CHECK(clReleaseEvent(e.ev[kv][pp]));       e.ev[kv][pp] = nullptr; }
+             }
+@@ -25089,8 +25240,10 @@
+     // and bytes the FA reads, at the moment it runs.
+     ggml_cl_fa_paged_verify(backend_ctx, dst, k_buf, v_buf, k_off, v_off, ps, (int) rb, (int) rvb,
+             kb, vb, hk, hv, pl, n_pages, ov_node_out);
++    const int v3_slot = (ov_node_out >= 0 && ov_node_out < (int) backend_ctx->fa_paged.chain.size())
++            ? ggml_cl_fa_paged_overlap_slot(backend_ctx, backend_ctx->fa_paged.chain[ov_node_out]) : -1;
+     ggml_cl_fa_paged_verify3_begin(backend_ctx, k_buf, v_buf, k_off, v_off, ps, (int) rb, (int) rvb,
+-            kb, vb, pl, n_pages, ov_node_out);   // 0130d: =3's pre hash, non-blocking read
++            kb, vb, pl, n_pages, ov_node_out, v3_slot);   // 0130d: =3's pre hash; 0131c the slot
+     if (ov) {
+         *overlap_parity = ov_node_out;
+         *overlap_copied = true;
+@@ -26687,10 +26840,20 @@
+                 paged_overlap_parity < (int) backend_ctx->fa_paged.chain.size())
+                 ? ggml_cl_fa_paged_overlap_slot(backend_ctx, backend_ctx->fa_paged.chain[paged_overlap_parity]) : -1;
+         ggml_cl_fa_paged_tl_host(backend_ctx, 8, paged_overlap_parity, fa_slot);   // 0130x FA dispatch entry
+-        ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 2, paged_overlap_parity, fa_slot, 0, nullptr);   // 0130p FA split start
+         if (ggml_cl_fa_paged_delay_at_splits()) ggml_cl_fa_paged_delay(backend_ctx);   // 0130y: before the readers, inside the FA's read window
+-        backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst);
+-        ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 3, paged_overlap_parity, fa_slot, 0, nullptr);   // 0130p FA split end
++        // 0131d: VERIFY=4's stage-1 red arm -- one byte between the pre-read hash (enqueued in
++        // kv_stream_pages above) and the reader's split kernel below, on the compute queue
++        ggml_cl_fa_paged_verify4_selftest(backend_ctx, paged_overlap_parity);
++        // 0131c: the split's own event is both stamps -- its START is the split start, its
++        // END the split end. No marker beside it; a marker was a command and an event.
++        const bool tl_now = ggml_cl_fa_paged_timeline();
++        cl_event ev_split = nullptr;
++        backend_ctx->enqueue_ndrange_kernel(k_split, 3, fd_gws, fd_lws, dst, tl_now ? &ev_split : nullptr);
++        if (tl_now && ev_split != nullptr) {
++            ggml_cl_fa_paged_tl_keep(backend_ctx, 2, paged_overlap_parity, fa_slot, ev_split);   // FA split start
++            ggml_cl_fa_paged_tl_keep(backend_ctx, 3, paged_overlap_parity, fa_slot, ev_split);   // FA split end
++            CL_CHECK(clReleaseEvent(ev_split));
++        }
+         if (kv_tmp_table != NULL) {
+             // a temporary upload buffer: a queued kernel keeps it alive until it runs
+             clReleaseMemObject(kv_tmp_table);
+@@ -26716,9 +26879,13 @@
+         const size_t merge_wg  = (size_t) (d_head_v / 4); // one lane per float4
+         size_t merge_lws[3] = { merge_wg, 1, 1 };
+         size_t merge_gws[3] = { merge_wg, (size_t)(n_head * n_batch), (size_t) n_q };
+-        backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst);
+-        ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 4, paged_overlap_parity, fa_slot, 0, nullptr);   // 0130p merge end
+-        ggml_cl_fa_paged_tl_mark(backend_ctx, backend_ctx->queue, 6, paged_overlap_parity, fa_slot, 0, nullptr);   // 0130p post start
++        // 0131c: the merge's own END is the merge-end stamp
++        cl_event ev_merge = nullptr;
++        backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst, tl_now ? &ev_merge : nullptr);
++        if (tl_now && ev_merge != nullptr) {
++            ggml_cl_fa_paged_tl_keep(backend_ctx, 4, paged_overlap_parity, fa_slot, ev_merge);   // merge end
++            CL_CHECK(clReleaseEvent(ev_merge));
++        }
+         // 0130d: VERIFY=3's post hash of the same rows, after the FA's kernels and before
+         // the consumed marker below (a landed copy changes these bytes; pre never sees it)
+         ggml_cl_fa_paged_verify3_post(backend_ctx, true);   // 0130g: the self-test only here

@@ -1,0 +1,20 @@
+0130b1: FA decode V2 -- parenthesize the V stage macro's destination.
+
+0130b calls FA_GQA_STAGE_V(k0 + BK, vt + vn * (DV * BK)); the macro indexed
+`dst[...]`, which expands to `vt + vn * (DV * BK)[...]` and does not compile
+("subscripted value is not an array, pointer, or vector"), so every V2 programme
+failed to build and the base kernel stayed in all 8 slots (card log, measured-here).
+The base kernel's call passes plain `vt` and is unchanged by this.
+
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -271,7 +271,7 @@
+                               v2.s8, v2.s9, v2.sa, v2.sb, v2.sc, v2.sd, v2.se, v2.sf,        \
+                               v3.s0, v3.s1, v3.s2, v3.s3, v3.s4, v3.s5, v3.s6, v3.s7,        \
+                               v3.s8, v3.s9, v3.sa, v3.sb, v3.sc, v3.sd, v3.se, v3.sf };      \
+-        for (int j = 0; j < 64; ++j) dst[(64 * c64 + j) * BK + key] = vv[j];                   \
++        for (int j = 0; j < 64; ++j) (dst)[(64 * c64 + j) * BK + key] = vv[j];                   \
+     }
+ 
+     // Q (scaled, half) as the a operand: component r = row r, lane = column

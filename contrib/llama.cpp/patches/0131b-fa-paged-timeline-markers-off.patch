@@ -1,0 +1,16 @@
+0131b: the paged FA timeline enqueues no marker with GGML_OPENCL_FA_PAGED_TIMELINE unset (0130p enqueued them on every FA and copy whatever the switch said).
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -24146,6 +24146,11 @@
+ // a marker carries the waits the command after it has, so its END is that command's start
+ static void ggml_cl_fa_paged_tl_mark(ggml_backend_opencl_context * ctx, cl_command_queue q, int role,
+         int node, int slot, cl_uint nw, cl_event * wl) {
++    // 0131b: no marker at all with the switch off. 0130p enqueued these markers (four with
++    // events on the compute queue per FA, two on the copy queue per issue) whatever the switch
++    // said, and window 299 measured OVERLAP at 451.9 ms/step on Q5 at 261k against 261.3 and
++    // 262.1 before 0130p (windows 297, 295) -- the overlap's whole gain gone with TIMELINE unset.
++    if (!ggml_cl_fa_paged_timeline()) return;
+     cl_event ev = nullptr;
+     // 0130v: a non-NULL list with nw 0 is CL_INVALID_EVENT_WAIT_LIST (-57), window 298's abort
+     CL_CHECK(clEnqueueMarkerWithWaitList(q, nw, nw ? wl : nullptr, &ev));

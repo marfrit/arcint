@@ -1,0 +1,51 @@
+0131n: the overlap's after-step (consumed marker, next layer's lead) runs on every exit of the paged FA dispatch; the prompt conversion returned without it, and the copies two layers on waited nothing (1.7.0 gate, window 171g).
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -25716,6 +25716,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             rk_aos ? rk_aos_buf : NULL, rk_aos ? rk_aos_off : 0, rk_aos ? rk_aos_nb1 : 0,
+             rv_aos ? rv_aos_buf : NULL, rv_aos ? rv_aos_off : 0, rv_aos ? rv_aos_nb1 : 0,
+             &paged_overlap_parity, &paged_overlap_copied);
++    // 0131n: the overlap's after-step (the slot's consumed marker, the next layer's lead) on
++    // EVERY exit of this dispatch, once its kernels are enqueued. It ran only at the split
++    // decode's return and at the function's end, so the prompt conversion (every 512-row
++    // ubatch, and since 0131m the 9-64-row calls) returned without it: the slot's consumed
++    // event stayed released, and the copies two layers on waited nothing while the conversion
++    // still read the slot (the 1.7.0 gate, window 171g: with the row blocks off the served
++    // answer still moved with timing; the issue-ahead's arm was the one that held it). Every
++    // return below follows its kernels' enqueue; paged calls cannot reach the in-place prompt
++    // kernels (the abort after the conversion)
++    struct paged_after_guard {
++        ggml_backend_opencl_context * ctx;
++        const int  & parity;
++        const bool & copied;
++        ~paged_after_guard() { if (copied && parity >= 0) ggml_cl_fa_paged_overlap_after(ctx, parity); }
++    } paged_after { backend_ctx, paged_overlap_parity, paged_overlap_copied };
+ 
+     // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
+     // after the reconstruction above a SoA tensor is a block copy too), so
+@@ -26951,10 +26966,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         // by its own dispatch (`before`'s fallback), i.e. no lead at all. The tail call now
+         // sits here too, after both kernels are enqueued.
+         ggml_cl_fa_paged_tl_host(backend_ctx, 9, paged_overlap_parity, fa_slot);   // 0130x FA dispatch exit
+-        if (paged_overlap_copied && paged_overlap_parity >= 0) {
+-            ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);
+-        }
+-        return;
++        return;   // 0131n: paged_after runs the after-step here
+     }
+     // 0106: supports_op takes head size 512 on Intel only where the split
+     // decode or a prompt kernel above covers the call
+@@ -27079,10 +27091,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // 0130d: VERIFY=3's post hash, after the tail kernels and before the consumed marker
+     ggml_cl_fa_paged_verify3_post(backend_ctx, false);
+     // 0129n: this layer's kernels are enqueued: the slot may be refilled, and the next
+-    // attention layer's pages go on the copy queue now (one layer of lead)
+-    if (paged_overlap_copied && paged_overlap_parity >= 0) {
+-        ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);
+-    }
++    // attention layer's pages go on the copy queue now (one layer of lead) -- 0131n: by
++    // paged_after, on this exit and every earlier one
+ }
+ 
+ static void ggml_cl_mul_mat_f16_f32_tiled(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {

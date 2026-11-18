@@ -1,0 +1,83 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23839,11 +23839,15 @@
+ // prepare() wrote before the graph. The FA's kernels read those same ring rows, and the ring
+ // row stride equals the host page stride (K 1088*256 = 278528 = kb, V 576*256 = 147456 = vb),
+ // so the bytes compared are the bytes attended. A mismatch is a WARN, not an abort.
+-static bool ggml_cl_fa_paged_verify_on() {
++// 0129t: GGML_OPENCL_FA_PAGED_VERIFY=2 is the green self-test: on the first checked node
++// the host side's expected bytes have ONE byte flipped, so the comparison must report
++// exactly one mismatching chunk -- proof it can fail without a race. =1 stays the real check.
++static int ggml_cl_fa_paged_verify_mode() {
+     static int v = -1;
+-    if (v < 0) { const char * e = getenv("GGML_OPENCL_FA_PAGED_VERIFY"); v = e ? atoi(e) != 0 : 0; }
++    if (v < 0) { const char * e = getenv("GGML_OPENCL_FA_PAGED_VERIFY"); v = e ? atoi(e) : 0; }
+     return v;
+ }
++static bool ggml_cl_fa_paged_verify_on() { return ggml_cl_fa_paged_verify_mode() != 0; }
+ 
+ static const char * GGML_CL_FA_PAGED_VERIFY_SRC = R"(
+ __kernel void fa_paged_verify(__global const uchar * base, __global const int * rows,
+@@ -23860,10 +23864,10 @@
+ }
+ )";
+ 
+-static uint32_t ggml_cl_fa_paged_verify_hash(const void * p, size_t n) {
++static uint32_t ggml_cl_fa_paged_verify_hash(const void * p, size_t n, bool flip = false) {
+     const unsigned char * b = (const unsigned char *) p;
+     uint32_t h = 2166136261u;
+-    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 16777619u; }
++    for (size_t i = 0; i < n; ++i) { h ^= (flip && i == 0) ? (unsigned char) (b[i] ^ 1u) : b[i]; h *= 16777619u; }
+     return h;
+ }
+ 
+@@ -23872,8 +23876,13 @@
+         size_t kb, size_t vb, const void * hk, const void * hv,
+         const int32_t * pl, int64_t n_pages, int node) {
+     if (!ggml_cl_fa_paged_verify_on() || hk == nullptr || hv == nullptr || pl == nullptr) return;
+-    std::vector<int32_t> rows;
+-    for (int64_t p = 0; p < n_pages; ++p) if (pl[p] >= 0) rows.push_back(pl[p]);
++    // 0129t: the plan index travels with the ring row. The copy loop takes ring row pl[p]
++    // from hk + p*kb, p the PLAN index (0129n's enqueue_pages); compacting the rows alone
++    // made the host side read page i of the store instead of the i-th page whose pl[p] >= 0,
++    // which is a false red unless the streamed pages sit at the front of the plan.
++    std::vector<int32_t> rows;    // the ring row the FA reads
++    std::vector<int32_t> pages;   // its plan index, i.e. the host store page the copy read
++    for (int64_t p = 0; p < n_pages; ++p) if (pl[p] >= 0) { rows.push_back(pl[p]); pages.push_back((int32_t) p); }
+     if (rows.empty()) return;
+     auto & o = ctx->fa_paged;
+     if (o.verify_kernel == nullptr) {
+@@ -23923,14 +23932,19 @@
+         CL_CHECK(clEnqueueReadBuffer(ctx->queue, out, CL_TRUE, 0, dev.size()*sizeof(uint32_t),
+                 dev.data(), 0, nullptr, nullptr));
+         const unsigned char * host = (const unsigned char *) (kv == 0 ? hk : hv);
++        const bool selftest = ggml_cl_fa_paged_verify_mode() == 2 && o.v_nodes == 0;
+         for (size_t p = 0; p < gy; ++p) {
+             for (int64_t c = 0; c < nc; ++c) {
+                 const size_t start = (size_t) c*chunk;
+                 const size_t len = std::min((size_t) chunk, nb - start);
+-                const uint32_t want = ggml_cl_fa_paged_verify_hash(host + p*nb + start, len);
++                // 0129t: the host side reads THE PLAN INDEX's page, exactly the bytes the copy
++                // took for that ring row; =2 flips one byte of this expected value, the
++                // comparison's own copy, never the store
++                const bool flip = selftest && kv == 0 && p == 0 && c == 0;
++                const uint32_t want = ggml_cl_fa_paged_verify_hash(host + (size_t) pages[p]*nb + start, len, flip);
+                 if (dev[p*(size_t) nc + c] != want) {
+                     ++bad;
+-                    if (first_bad_page < 0) { first_bad_page = (int) p; first_bad_row = rows[p]; first_bad_chunk = (int) c; }
++                    if (first_bad_page < 0) { first_bad_page = pages[p]; first_bad_row = rows[p]; first_bad_chunk = (int) c; }
+                 }
+             }
+         }
+@@ -23940,6 +23954,10 @@
+     o.v_nodes++;
+     o.v_bytes += (int64_t) gy*(kb + vb);
+     o.v_mismatch += bad;
++    if (ggml_cl_fa_paged_verify_mode() == 2 && o.v_nodes == 0) {
++        GGML_LOG_WARN("%s: paged FA verify self-test (VERIFY=2): one host byte flipped on node %d; "
++                "expect exactly 1 mismatching chunk, got %lld\n", __func__, node, (long long) bad);
++    }
+     if (bad > 0 && !o.v_first_bad) {
+         o.v_first_bad = 1;
+         GGML_LOG_WARN("%s: paged FA verify: node %d, host page %d, ring row %d, chunk %d: %lld of %lld "

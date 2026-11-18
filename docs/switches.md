@@ -72,6 +72,8 @@ These names are not in a table:
 
 | switch | default | what it does | patch | evidence |
 |---|---|---|---|---|
+| `GGML_OPENCL_FA_PAGED_OVERLAP` | off | `1`, with the KV window on (`LLAMA_KV_STREAM_UNSAFE=1` and `--llama-kv-resident`): the streamed pages are copied on a second (copy) queue beside the attention of the layer before, ordered by events, and the next step's first layer during the current step's last ones. Experimental opt-in (1.7.0). | 0129l-0129w, 0130c, 0131j | B60, Qwen3.8-27B UD-Q5_K_M at 261k with a 3,584 MiB window: 262.1 against 453.2 ms a decode step (window 295, `measured-here`); KL equal to the serial stream's to the last digit (window 301k). |
+| `LLAMA_DORY_MAX_LOOPS` | unset: the tables are those of the file's (or `--llama-dory-loops`) count | `1`..`4`: at load, the Dory model builds its executed-layer tables for that many loops, so a context may choose any count up to it (`llama_set_dory_loops`). Above the file's count it needs the `last_loop` cache; with `per_loop`, or out of range, the library warns and the file's count serves; a value at or below the unit's count changes nothing. arcint units never set it; the flag does: arcint overwrites it from `--llama-dory-max-loops` and reads `llama_model_dory_loops_max` back, refusing the start on a mismatch; with the flag off, a value in the environment that builds larger tables than the unit runs is a refused start naming the variable and the flag. | 0118 | `measured-here`, CPU: bit-equal to a load at the count, 18 of 18 greedy cases; on the 16 GB card (OpenCL) 20 of 20 greedy answers equal a load at the count, where 2 of the 5 prompts could show a wrong count (README 0118 section). |
 | `GGML_OPENCL_BANK_STREAM` | off | Copies each expert-bank tensor whole into a VRAM ring on a second queue during prefill. | 0032 | Flash-Next needle prefill 416.1 -> 497.6 t/s, B60 (`measured-here`). The Flash-Next unit sets it. |
 | `GGML_OPENCL_DEVICES` | unset: one platform, as before | `P:D[,P:D...]` picks OpenCL devices by platform and device index, across platforms. Overrides `GGML_OPENCL_PLATFORM` / `GGML_OPENCL_DEVICE`. | 0023 | `0:0,1:0` lists both cards; unset lists the B60 alone (`measured-here`). |
 | `LLAMA_EXPERT_CACHE_MIB` | unset: no cache unless the API sets a budget | Expert-cache budget in MiB, `A,B` for one budget a device. Used only when the API gives none. | 0021, 0024 | — |
@@ -143,6 +145,7 @@ These names are not in a table:
 
 | switch | default | what it does | patch | evidence |
 |---|---|---|---|---|
+| `GGML_OPENCL_FA_WIDE_VERIFY` | on (Intel GQA kernel, 9-64 rows) | `0`: 0028's blocks of 8 rows instead of one wide GQA call. | 0124 | A 10-token tail over 122,880 tokens 561 against 653 ms; KL 0.009329 against 0.009322 (windows 243, 244, `measured-here`). |
 | `GGML_OPENCL_BANK_DIRECT` | on | `0`: the decode matvec gathers a missed expert into the card-side mirror instead of reading it from host memory. | 0022 | Flash-Next MTP 2, B60: 26.0 -> 28.2 t/s with it on (`measured-here`). |
 | `GGML_OPENCL_CONV_3D` | on | `0`: CONV_3D (the Wan VAE's 3D convs, F32 input and output, weights F16 or F32) falls back to the CPU, the baseline arm. | 0059 | `code`: 0059:83-96. |
 | `GGML_OPENCL_F16_XMX` | on | `0`: F16 / BF16 weights times 16+ columns use the tiled GEMM, not the XMX one. | 0022 | Needle prefill 342.8 -> 383.4 t/s with it on (`measured-here`). |
@@ -209,6 +212,12 @@ These names are not in a table:
 
 | switch | default | what it does | patch | evidence |
 |---|---|---|---|---|
+| `GGML_OPENCL_FA_PAGED_NOFIX` | off | `1`: the cross-step prefetch drops its wait on the slot's last reader (0130c's site); counted and said at request end. | 0130q | `code`. |
+| `GGML_OPENCL_FA_PAGED_NOCONSUME` | off | `1`: the overlap's copies drop the consumed wait (the slot's last reader); counted. From 0131j it also drops the wait kept across a graph boundary, so its count rises by one or two a graph against earlier windows. | 0130r | `code`. |
+| `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT` | off | `1`: the attention does not wait for its slot's copy. | 0129l | `code`; not in the request-end switch summary (release review). |
+| `GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST` | off | `3` / `4`: writes one byte into a slot between the verify's hash and the reader, so VERIFY=3 / 4 must report a change. | 0130g, 0131d | VERIFY=4 reported 12 mismatches for 12 self-test writes (window 301, `measured-here`). |
+| `GGML_OPENCL_FA_PAGED_DELAY`, `_DELAY_AT` | off | `<n>`: a busy-wait of n iterations in the paged FA's reads (`_DELAY_AT=splits`: inside the split kernels), to widen a race window. | 0130h, 0130w | `code`. |
+| `GGML_OPENCL_FA_DECODE_V2_BROKEN`, `GGML_OPENCL_FA_DECODE_PRE_BROKEN`, `GGML_OPENCL_FA_GQA_NOPRIV_BROKEN` | off | The red forms of the three kernel variants below. | 0130b, 0130f, 0130k | `code`. |
 | `GGML_OPENCL_BANK_STREAM_RED` | off | Each ring slot is filled from the next bank tensor. | 0032 | The run aborts at the next synchronisation (`measured-here`). |
 | `GGML_OPENCL_CONV3D_RED` | off | The conv_3d kernel ignores its weights and every output is 0, the gross red. | 0059 | `code`: 0059:184-185,355-357. |
 | `GGML_OPENCL_F16_XMX_RED` | off | The XMX F16 GEMM runs with K shortened by 16, which also shifts its row stride: every row misread, a gross red (`code`). | 0022 | — |
@@ -225,11 +234,18 @@ These names are not in a table:
 | `GGML_OPENCL_CPU_MISS_SPLIT_RED` | off | The slow path reads an IQ4_NL bank's split scales and quants as GGUF blocks (the defect fixed in 0.8.0). | 0056 | IQ3_XXS: a fault at the first request (`measured-here`). |
 | `MTMD_TTS_WAV_PAD` | off | Forces Qwen3-TTS's `GEN_WAV` graph and its input back to the padded 72-frame `wav_tfm_swa` window, the pre-patch behaviour. | 0062 | On the patch binary all 8 sentences are identical to the production padded arm (0.7285), where the default differs at <=191/32768 (0.8006) (`measured-here`). |
 | `LLAMA_SLOT_LOAN_MUTATE` | 0 | A value-coded red mutation of the loan: `1` a tensor of the last lent layer left uncopied, `2` the lend's last table row dropped, `3` the lent sizing skipped (the lend branch's dst tensor, about 0.64 GiB a chunk, measured in the resident chunk), `4` the return's re-reserve skipped, `5` a lent layer's bank row off by one (the KL gate's red). | 0068 | `code`: 0068:968-971,1299-1302. |
+| `LLAMA_DORY_RED_REUSE` | off | `1`: the loop count is left out of the graph-reuse key, so a graph built for one count is reused at another: a request is then served at a wrong count with no error. The red case of the per-count graph. Test only; never set it on a unit. | 0118 | `measured-here`, CPU: 6 of 9 probes fail with it. |
+| `LLAMA_DORY_RESERVE_DEFAULT` | off | `1`: the compute buffers are reserved at the file's count instead of the maximum, so a request at more loops than the first one grows the buffer. Breaks the no-growth property of the reserve (the test of it), not the output. Test only; never set it on a unit. | 0118 | `code`: the `graph_reserve` hunk of 0118. |
 
 ### Diagnostic
 
 | switch | default | what it does | patch | evidence |
 |---|---|---|---|---|
+| `GGML_OPENCL_FA_PAGED_VERIFY` | off | `1`..`4`: hashes of the KV window's copied pages, before the reads (1-3) and after them; 4 without a host wait, collected at request end. | 0129s-0129t, 0130d, 0131c-0131d | VERIFY=4's "read vs re-hash" counter is high on every arm and not explained (window 301). |
+| `GGML_OPENCL_FA_PAGED_TIMELINE` | off | `1`: device timestamps of the request's first split-decode graph from the commands' own events. | 0130p-0131c | Records no copy stamps yet (window 301, `measured-here`). |
+| `GGML_OPENCL_FA_PAGED_SYNC` | off | `1`: a `clFinish` after each layer's page copies (a race-against-layout arm). | 0129f | Price about 0 at 65k and 261k (`measured-here`). |
+| `GGML_OPENCL_FA_PAGED_DEBUG`, `GGML_OPENCL_FA_PAGED_DUMP`, `GGML_OPENCL_FA_DEBUG` | off | Log the paged commands, a paged launch's arguments, and each FA call's route, rows and tiles (test-backend-ops shows the last; the server's log does not). | 0123zz, 0124, 0129* | — |
+| `GGML_OPENCL_FA_DECODE_V2`, `GGML_OPENCL_FA_DECODE_PRE`, `GGML_OPENCL_FA_GQA_NOPRIV` | off | Variants of the GQA decode kernel tried for the streamed decode: a double-buffered V stage, a V register prefetch, no private memory. Set, they replace the production GQA decode kernel for every model (NOPRIV without the work-group and local-memory check). Measured negatives, kept for the KV window's development. | 0130b, 0130f, 0130k-0130o | +8.0 %, +17.7 %, neutral to +1.5 % ms a step (windows 293b, 295, 297, `measured-here`). |
 | `GGML_SCHED_TIMING` | off | Logs the host's time per graph in input copies and split computes, every 50 graphs. | 0047 | Used for the 0047 numbers (`measured-here`). |
 | `LLAMA_DECODE_TIMING` | off | Logs where a decode call spends its time. | 0022 | — |
 | `LLAMA_KV_RESERVE_LOG` | off (set at all = on) | Logs a prompt cut into smaller ubatches by the KV reserve. | 0052 | — |
@@ -254,6 +270,7 @@ read before 0.8.0 belonged to the retired OpenVINO engine
 | `ARCINT_TTS_GEN_FORCE_GPU` | red case | unset | `1` (exactly) builds the audio-generation mmproj on the card even under `--tts-gen-device cpu`, so the boot's placement check must refuse; any other value is ignored. | `measured-here`: red refuses naming the card backend, green boots with `CLIP using CPU backend` only (milestone §9.5, `tools/tts_placement_check.sh`) |
 | `ARCINT_MTP_TRACE` | diagnostic | unset (off) | <file>: one line a verify round (format `mtp2`), the input of `tools/mtp_width_replay.py`; on, every draft step's head probabilities are computed even at min-p 0 and the trace's `p=` list is the policy's input. | `code`: `src/exec/mtp_trace.h:77,111` |
 | `ARCINT_RAW_TRACE` | diagnostic | unset (off) | <file>: one JSON line a chat or Responses turn (format `raw1`: route, stream, token mode, finish, think start, the generated text before the reasoning split and the tool-call parse, the split's reasoning, the text handed to the tool-call parser, the parsed calls with their arguments, the content that remained, and the message of an exception that ended the turn), each line one `write()` on an `O_APPEND` descriptor, so processes may share a file without splitting lines (`n` counts per process, `request_id` tells them apart); a write that fails or writes nothing turns it off for the process, reported once; the file is created with mode 0600 (it holds generated text and call arguments; an existing file keeps its mode); the writer does not throw, so a trace failure never replaces a turn's answer or the route's error; for telling a malformed call body from a parser defect on served traffic. Off: one getenv a turn, nothing copied or opened. | `code`: `src/api/raw_trace.h` |
+| `LLAMA_KV_STREAM_UNSAFE` | operational (experimental opt-in) | unset (off) | `1`: lets `--llama-kv-resident MiB` start the KV window (1.7.0); without it a budget is refused at parse time, the only serving gate. The 24 GB card, `--llama-kv q8_0:q4_0`, flash attention. | `code`: `src/config.cpp`, `src/exec/kv_stream_refusal.h` |
 
 The voice-similarity tool reads `ARCINT_SIM_MODEL`, the speaker model's
 safetensors path when `--model` is not given (`tools/tts_voice_sim.py`; a

@@ -1,0 +1,34 @@
+diff --git a/src/llama-kv-stream.cpp b/src/llama-kv-stream.cpp
+--- a/src/llama-kv-stream.cpp
++++ b/src/llama-kv-stream.cpp
+@@ -236,12 +236,14 @@
+         logged_first  = true;
+         logged_stream = n_streamed > 0;
+         const uint32_t moved = n_streamed*layers.size()*2;
++        // 0129r: the last ubatch's counts are kept every prepare() (not only when a line
++        // prints), so request_end() always has this request's numbers
++        att_last = n_att;
++        streamed_last = n_streamed;
+         // 0129g: attended/resident-attended/streamed for THIS request's prefix, so the
+         // pool arithmetic is checkable (window 281 read "1023 of 1024 resident" over the
+         // whole context, which counts pages nobody attends), plus the context totals
+         const uint32_t res_att = n_att - n_streamed;
+-        att_last = n_att;
+-        streamed_last = n_streamed;
+         LLAMA_LOG_WARN("%s: KV streaming: attended %u pages, %u resident, %u streamed, %u page moves this request"
+                 " (%u ring rows; context: %u of %u pages resident)\n",
+                 __func__, n_att, res_att, n_streamed, moved, n_streamed, n_pages - n_streamed, n_pages);
+@@ -304,9 +306,10 @@
+ // the sequence's cells, so that is where the request's last counts are logged; clear() prints
+ // through it too (a cleared cache was a request's end as well).
+ void llama_kv_stream::request_end() {
+-    if (!logged_first) {
+-        return;
+-    }
++    // 0129r: unconditional. 0129m gated this on logged_first, and a served request that
++    // streams after one already logged leaves that flag set -- its own prepare() line is
++    // silent too -- so the line never printed (window 288: zero). The counts are kept by
++    // every prepare() now.
+     const uint32_t moved = streamed_last*layers.size()*2;
+     LLAMA_LOG_WARN("%s: KV streaming (request end): attended %u pages, %u resident, %u streamed, "
+             "%u page moves this request (%u ring rows; context: %u of %u pages resident)\n",

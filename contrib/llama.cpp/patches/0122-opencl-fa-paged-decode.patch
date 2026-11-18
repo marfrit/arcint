@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0122-opencl-fa-paged-decode
+
+---
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index a26f9b6..063bb6a 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -12821,12 +12821,45 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+         case GGML_OP_MEAN:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT: {
+-            // paged K/V (ggml_flash_attn_ext_set_pages) and a cross-queue sync are the CPU reference's
+-            // mechanism only until patch 0119's follow-up teaches the kernels; decline, so the scheduler
+-            // never runs a kernel that would read the pool as if it were the whole layer.
+-            if (op->src[GGML_FA_SRC_PAGES] || op->src[GGML_FA_SRC_TAG]) {
++            // 0119's paged K/V: 0122 teaches the GQA decode kernel (0016, with 0088's int8
++            // Q K^T and 0089's staged 1-3 row form) to resolve every K/V row through the
++            // page table. Accepted only for exactly the shapes that kernel handles; every
++            // other shape is declined, so the scheduler never runs a kernel that would read
++            // the pool as the whole layer. A sync tag (ready/consumed) belongs to the copy
++            // queue, I5: declined until then.
++            if (op->src[GGML_FA_SRC_TAG]) {
+                 return false;
+             }
++            if (op->src[GGML_FA_SRC_PAGES]) {
++                const ggml_tensor * q = op->src[0];
++                const ggml_tensor * k = op->src[1];
++                const ggml_tensor * v = op->src[2];
++                const ggml_tensor * pages = op->src[GGML_FA_SRC_PAGES];
++                const int32_t table_row = ggml_get_op_params_i32(op, GGML_FA_PARAM_PAGES_ROW);
++                const bool page_table_ok = pages->type == GGML_TYPE_I32 && ggml_is_contiguous(pages) &&
++                                           pages->ne[2] == 1 && pages->ne[3] == 1 &&
++                                           table_row >= 0 && table_row < pages->ne[1] &&
++                                           ggml_get_op_params_i32(op, GGML_FA_PARAM_PAGE_SIZE) == 256;
++                const bool kv_ok = (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0) ||
++                                   (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0) ||
++                                   (k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0) ||
++                                   (k->type == GGML_TYPE_F16    && v->type == GGML_TYPE_F16);
++                const bool shape_ok = q->type == GGML_TYPE_F32 && q->ne[0] == 256 && v->ne[0] == 256 &&
++                                      k->ne[0] == 256 && k->ne[3] == 1 && v->ne[3] == 1 && q->ne[3] == 1 &&
++                                      k->ne[2] > 0 && v->ne[2] == k->ne[2] && q->ne[2] % k->ne[2] == 0 &&
++                                      (q->ne[2]/k->ne[2]) * q->ne[1] <= 64 &&
++                                      (op->src[GGML_FA_SRC_RING_K] == nullptr ||
++                                       (op->src[GGML_FA_SRC_RING_K]->ne[1] % 256 == 0 &&
++                                        op->src[GGML_FA_SRC_RING_V] != nullptr));
++                const bool mask_ok = op->src[3] == nullptr ||
++                                     (op->src[3]->type == GGML_TYPE_F16 && op->src[3]->ne[0] == pages->ne[0]*256);
++                load_cl_kernels(backend_ctx);
++                const int gi = k->type == GGML_TYPE_Q8_0 ? (v->type == GGML_TYPE_Q8_0 ? 1 : 2)
++                             : k->type == GGML_TYPE_Q4_0 ? 3 : 0;
++                const bool kernel_ok = backend_ctx->kernel_fa_gqa_dk[0][gi] != nullptr ||
++                                       backend_ctx->kernel_fa_gqa_st_dk[0][gi] != nullptr;
++                return page_table_ok && kv_ok && shape_ok && mask_ok && kernel_ok;
++            }
+ #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+             if (use_fa_bin_kernels_prefill(backend_ctx, op->src[0], op->src[1], op->src[2])) {
+                 return true;
+@@ -23460,7 +23493,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
+     const int n_q = q->ne[1];
+-    const int n_kv = k->ne[1];
++    // paged K/V (0119): the attended length is the page table's pages * page_size,
++    // not the pool's rows; 0122's GQA kernel resolves every row through the table
++    const ggml_tensor * kv_pages = dst->src[GGML_FA_SRC_PAGES];
++    const int kv_page_size = kv_pages ? ggml_get_op_params_i32(dst, GGML_FA_PARAM_PAGE_SIZE) : 0;
++    const int n_kv = kv_pages ? (int) (kv_pages->ne[0]*kv_page_size) : k->ne[1];
+     const int d_head_q = q->ne[0];
+     const int d_head_v = v->ne[0];
+     const int n_head = q->ne[2];
+@@ -24444,8 +24481,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // GGML_OPENCL_FA_GQA_MIN_ROWS
+     static const char * fgr_env = getenv("GGML_OPENCL_FA_GQA_MIN_ROWS");
+     static const int    fg_min_rows = fgr_env ? atoi(fgr_env) : 4;
++    // paged K/V has no other kernel that reads a table: 1-3 rows take the staged
++    // form (0089) rather than the split kernel, which would attend the pool as
++    // the whole layer
++    const int fg_min_rows_paged = kv_pages ? 1 : fg_min_rows;
+     bool use_fd_gqa = false;
+-    if (use_fd_intel && n_q >= fg_min_rows && fa_dki >= 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
++    if (use_fd_intel && n_q >= fg_min_rows_paged && fa_dki >= 0 && max_bias == 0.0f && logit_softcap == 0.0f &&
+         n_head_kv > 0 && n_head % n_head_kv == 0 && (n_head / n_head_kv) * n_q <= 64) {
+         const int gi = is_mixed ? 0 : kvq >= 0 ? kvq + 1 : -1;
+         // 0089: 1-3 rows take the staged form when the int8 switch built it
+@@ -24459,6 +24500,11 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             use_fd_gqa = true;
+         }
+     }
++    // a paged op must end up on the GQA kernel; any other kernel would read the
++    // pool rows as the attended sequence (supports_op declines those shapes)
++    if (kv_pages && !use_fd_gqa && n_q <= 8) {
++        GGML_ABORT("ggml_opencl: a paged FLASH_ATTN_EXT reached a kernel without a page table");
++    }
+     if (fd_k_split == NULL &&
+         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+         d_head_q <= FD_MAX_DK &&
+@@ -24735,6 +24781,36 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &partial_buffer));
+         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &n_splits));
+         CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &kv_per_split));
++        if (use_fd_gqa) {
++            // paged K/V: the table, its page size, and the two ring slots' memory
++            ggml_tensor_extra_cl * extra_pages = kv_pages ? (ggml_tensor_extra_cl *)kv_pages->extra : NULL;
++            const ggml_tensor * rk = dst->src[GGML_FA_SRC_RING_K];
++            const ggml_tensor * rv = dst->src[GGML_FA_SRC_RING_V];
++            ggml_tensor_extra_cl * extra_rk = rk ? (ggml_tensor_extra_cl *)rk->extra : NULL;
++            ggml_tensor_extra_cl * extra_rv = rv ? (ggml_tensor_extra_cl *)rv->extra : NULL;
++            cl_mem   table_buffer = extra_pages ? extra_pages->data_device : NULL;
++            const cl_ulong offset_table = extra_pages ? extra_pages->offset + kv_pages->view_offs : 0;
++            GGML_UNUSED(offset_table);
++            cl_mem   rk_buffer = extra_rk ? extra_rk->data_device : NULL;
++            const cl_ulong offset_rk = extra_rk ? extra_rk->offset + rk->view_offs : 0;
++            const cl_ulong rk_nb1 = rk ? rk->nb[1] : 0, rk_nb2 = rk ? rk->nb[2] : 0, rk_nb3 = rk ? rk->nb[3] : 0;
++            cl_mem   rv_buffer = extra_rv ? extra_rv->data_device : NULL;
++            const cl_ulong offset_rv = extra_rv ? extra_rv->offset + rv->view_offs : 0;
++            const cl_ulong rv_nb1 = rv ? rv->nb[1] : 0, rv_nb2 = rv ? rv->nb[2] : 0, rv_nb3 = rv ? rv->nb[3] : 0;
++            const int page_size_arg = kv_page_size;
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &table_buffer));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &page_size_arg));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &rk_buffer));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_rk));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rk_nb1));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rk_nb2));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rk_nb3));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &rv_buffer));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_rv));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rv_nb1));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rv_nb2));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rv_nb3));
++        }
+ 
+         // MQ split kernel uses MQ_NSG_SPLIT subgroups and one WG per (kv_head, batch, split)
+         // matches Q1_WG_SIZE * NSG (MQ_GQA=4 -> 256; MQ_GQA=8 -> 192)
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+index 6c2961a..9f53f8d 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -157,6 +157,17 @@ static inline half16 load16(const int t, const global char * row, const int c16)
+ }
+ 
+ __attribute__((intel_reqd_sub_group_size(16)))
++// the row of logical key `key` in the pool or the ring (0119's page table):
++// `pool` is the caller's base including the batch and KV-head offsets, `ring`
++// is the ring's base with the same offsets; a null table reads `key` straight
++static inline const global char * fa_gqa_page_row(const global int * table, const int ps, const int key,
++        const global char * pool, ulong pool_nb1, const global char * ring, ulong ring_nb1) {
++    if (table == 0) return pool + key * pool_nb1;
++    const int e = table[key / ps];
++    const int row = (e >= 0 ? e : -1 - e) * ps + (key % ps);
++    return (e >= 0 ? pool + row * pool_nb1 : ring + row * ring_nb1);
++}
++
+ kernel void flash_attn_gqa_dpas(
+     const global void * q_void, ulong q_offset,
+     const global void * k_void, ulong k_offset,
+@@ -177,7 +188,12 @@ kernel void flash_attn_gqa_dpas(
+     const int mask_ne2, const int mask_ne3,
+     global float * partial_void,
+     const int n_splits,
+-    const int kv_per_split
++    const int kv_per_split,
++    // paged K/V (ggml_flash_attn_ext_set_pages, 0119/0122): table[key/ps] >= 0 is the
++    // pool page, < 0 is page -1-e of the ring; 0 (table_void == 0) reads k/v as before
++    const global void * table_void, const int page_size,
++    const global void * rk_void, ulong rk_offset, ulong rk_nb1, ulong rk_nb2, ulong rk_nb3,
++    const global void * rv_void, ulong rv_offset, ulong rv_nb1, ulong rv_nb2, ulong rv_nb3
+ ) {
+ #if defined(GQA_K_STAGED) && !(GQA_I8 && KT == 1)
+     local half ks[BK * DK];     // [key][DK]
+@@ -270,6 +286,9 @@ kernel void flash_attn_gqa_dpas(
+ #endif
+     const global char * kb = (const global char *) k_void + k_offset + batch * k_nb3 + hk * k_nb2;
+     const global char * vb = (const global char *) v_void + v_offset + batch * v_nb3 + hk * v_nb2;
++    const global char * rkb = (const global char *) rk_void + rk_offset + batch * rk_nb3 + hk * rk_nb2;
++    const global char * rvb = (const global char *) rv_void + rv_offset + batch * rv_nb3 + hk * rv_nb2;
++    const global int * ptable = (const global int *) table_void;
+     const global half * mrow[8];
+     for (int r = 0; r < 8; ++r) {
+         mrow[r] = mask_void != 0
+@@ -283,7 +302,7 @@ kernel void flash_attn_gqa_dpas(
+ #if defined(GQA_K_STAGED) && !(GQA_I8 && KT == 1)
+         for (int u = lid; u < BK * DK / 64; u += nthr) {
+             const int key = u / (DK / 64), c64 = u % (DK / 64), kk = min(k0 + key, kv_end - 1);
+-            const global char * krow = kb + kk * k_nb1;
++            const global char * krow = fa_gqa_page_row(ptable, page_size, kk, kb, k_nb1, rkb, rk_nb1);
+             vstore16(load16(KT, krow, 4 * c64), 0, ks + key * DK + 64 * c64);
+             vstore16(load16(KT, krow, 4 * c64 + 1), 0, ks + key * DK + 64 * c64 + 16);
+             vstore16(load16(KT, krow, 4 * c64 + 2), 0, ks + key * DK + 64 * c64 + 32);
+@@ -299,7 +318,7 @@ kernel void flash_attn_gqa_dpas(
+         // form; the fork's ST mode with nq == 1, fattn-dec.cpp:703-731)
+         for (int u = lid; u < BK * KROW; u += nthr) {
+             const int key = u / KROW, d = u % KROW, kk = min(k0 + key, kv_end - 1);
+-            ks8[key * KSTR + d] = ((const global uint *)(kb + kk * k_nb1))[d];
++            ks8[key * KSTR + d] = ((const global uint *)fa_gqa_page_row(ptable, page_size, kk, kb, k_nb1, rkb, rk_nb1))[d];
+         }
+         barrier(CLK_LOCAL_MEM_FENCE);
+ #endif
+@@ -322,7 +341,8 @@ kernel void flash_attn_gqa_dpas(
+                 dk = (float) as_half((ushort)(bp[0] | (bp[1] << 8)));
+                 bv = fa_gqa_i8_b32_l(bp + 2);
+ #else
+-                const global uchar * bp = (const global uchar *)(kb + min(k0 + g * 16 + lane, kv_end - 1) * k_nb1) + fa_gqa_i8_blk(b);
++                const global uchar * bp = (const global uchar *)fa_gqa_page_row(ptable, page_size,
++                        min(k0 + g * 16 + lane, kv_end - 1), kb, k_nb1, rkb, rk_nb1) + fa_gqa_i8_blk(b);
+                 dk = (float) vload_half(0, (const global half *) bp);
+                 bv = fa_gqa_i8_b32_g(bp + 2);
+ #endif
+@@ -332,7 +352,8 @@ kernel void flash_attn_gqa_dpas(
+ #else
+             for (int c = 0; c < KC; ++c) {
+ #ifndef GQA_K_STAGED
+-                const int8 b = kb16(KT, kb + min(k0 + g * 16 + lane, kv_end - 1) * k_nb1, c);
++                const int8 b = kb16(KT, fa_gqa_page_row(ptable, page_size, min(k0 + g * 16 + lane, kv_end - 1),
++                        kb, k_nb1, rkb, rk_nb1), c);
+ #else
+                 const int8 b = as_int8(vload8(0, (local const uint *)(ks + (g * 16 + lane) * DK + c * 16)));
+ #endif
+@@ -350,7 +371,7 @@ kernel void flash_attn_gqa_dpas(
+         // neighbouring halves
+         for (int u = lid; u < BK * DV / 64; u += nthr) {
+             const int key = u % BK, c64 = u / BK, kk = min(k0 + key, kv_end - 1);
+-            const global char * vrow = vb + kk * v_nb1;
++            const global char * vrow = fa_gqa_page_row(ptable, page_size, kk, vb, v_nb1, rvb, rv_nb1);
+             const half16 v0 = load16(VT, vrow, 4 * c64);
+             const half16 v1 = load16(VT, vrow, 4 * c64 + 1);
+             const half16 v2 = load16(VT, vrow, 4 * c64 + 2);

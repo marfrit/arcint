@@ -864,6 +864,10 @@ Measured and left out (`measured-here`, B60):
   XVE instead of 4): spills, 37 instructions a DPAS.
 - the conversion with each column read once and held in registers: 139 ->
   136 us, not kept.
+- beyond this patch's kernels: 2026-11-12, the B60 (`measured-here`): the 2D,
+  tile and ID2 kernels at their shipped tiles rebuilt at 128 GRF: faster in
+  none of the 19 timed op-suite cases at 512 tokens; the 128 arms' outputs
+  checked only in part (`docs/campaigns/research-inferzero.md`, on the `qfndev` branch).
 
 ## 0014-opencl-intel-searched-tiles.patch
 
@@ -6091,6 +6095,32 @@ builds stay the same; nothing is built for the switch when it is off.
    each; a rollback-heavy verify (a long draft, repeated cuts) is the one to
    watch.
 
+**0086/0087 fix (2026-11-14): qwen35moe had no replay branch** (`measured-here`, the
+coder on the A770 with `LLAMA_GDN_REPLAY=1`, the separate MTP head file; then
+device-free on the CPU backend). The gate in `llama_memory_recurrent` admits
+qwen35, qwen35moe and qwen4exp, and `build_recurrent_attn` takes the replay
+when `inp->s_rpl_ctrl` is set, but 0086/0087 added the state branch to
+`src/models/qwen35.cpp` and `qwen4exp.cpp` only. `qwen35moe.cpp`'s
+`build_layer_attn_linear` stayed on the snapshot gather `build_rs(inp, ...)`,
+which reads `s_copy`, so `rs_s_rpl_rows` was an input object no node consumed.
+The graph allocator gives an unread input no buffer, and the first decode's
+`rs_set_input_rpl` (`src/llama-graph.cpp:402`) asked
+`ggml_backend_buffer_is_host(s_rpl_rows->buffer)`: `GGML_ASSERT(buffer)` in
+`ggml_backend_buffer_get_type` (`ggml/src/ggml-backend.cpp:346` at the pin plus
+the series; 346 is get_type, get_usage's assert is at 341). The same command
+without the variable served, because the branch is never taken then. The fix
+is the hunk in `0000-07-gdn-and-fusions.patch` that qwen35moe's state builder
+already carried for the rows form: it gains the `gdn_rpl` branch (state
+`build_rs(ssm_states_all, s_rpl_rows, s_rpl_main, ...)`, rows form off under
+replay), the text qwen35 and qwen4exp have. With it, `rs_s_rpl_rows` is read by
+the gather (13 input tensors, 12 before), the decode passes, and the
+checkpoint's partial state save (base + pending records) writes. The same CPU
+run with replay off and on, a rollback of 4 after 22 tokens then 4 new tokens,
+gives the same logits (`after 22` and the 64-logit sum equal, `measured-here`).
+Device-free cell: `tests/python/test_gdn_replay_model_branches.py` (text, red
+on the fault with the qwen35moe branch dropped, green with it). Card arms
+unchanged; the coder's served replay arm is recorded under 0127 (window 270).
+
 ## 0088-opencl-gqa-int8-qk.patch
 
 The GQA decode kernel's Q Kᵀ on the XMX units straight from the quantized
@@ -6911,3 +6941,1479 @@ Dense Q2_K on Intel at every column count, in 0116's structure (the campaign: `d
 
 Tests (`test-backend-ops`): Q2_K at 1, 2, 3, 4, 5, 6, 8, 9, 12, 16, 17 and 512 columns on 0116's shapes (129 x 256 odd: declined), K 768, the 2D-aligned 1000 x 2048 and 1008 x 1024 at 17, 100 and 512, the broadcast and permuted src1, the AREX-2 roles (17408 x 5120, 5120 x 17408, 10240 x 5120, 6144 x 5120, 5120 x 6144, 12288 x 5120, 1024 x 5120, 248320 x 5120) at 1, 2, 6, 8, 16 and 512; `test_mul_mat_reshape3d` for Q2_K; `GET_ROWS` as for Q3_K; perf: the curve at 4096 x 14336 and the AREX-2 shapes next to Q3_K and Q4_K. Device-free (`measured-here`, the recipe host and Python): `tools/q2k_layout_emul.py` PASS, `--red` FAIL; `tests/test_planes.cpp` with the Q2_K planes against `block_q2_K`, its red R5 failing. On the cards (`measured-here`, RC 9c0c730e; the 1.6.2 gate window on both cards, the A770's red and break runs the evening before): `-o MUL_MAT -p type_a=q2_K` 193 of 193, `-DQ2K_RED` 0 of 193 (195 FAIL lines on each card), `-DQ2K_BREAK_BUILD` together with `-DQ3K_BREAK_BUILD` over both types' cases 0 cases on the card, every one declined (437 of 437 not supported on the B60), with both types' `not-built` keys (8 on the B60, 6 on the A770) and no failure; a Q2_K break alone, leaving Q3_K built, was not run on a card; Llama 2 7B Q2_K, mean KL to the gate's reference logits, 0.18746-0.18749 on both cards at ubatch 512, 8 and 1 against the CPU's 0.18828 on the same file; llama-bench pp512 / tg128 1952.29 / 77.95 (A770), 3491.61 / 98.54 t/s (B60). The perf curve next to Q3_K and Q4_K is not measured and no Q2_K model was run through the server.
 
+
+## 0118-dory-loops-per-context.patch
+
+Dory's loop count per context at run time. Before, the count was the GGUF's (`--llama-dory-loops` wrote a kv override at load), so one unit served one count. With this patch the per-layer tables are built for a maximum, and a context chooses any count from 1 to that maximum between decodes (evidence class `code` for the mechanism, `measured-here` for the figures below).
+
+**API** (`include/llama.h`): `llama_set_dory_loops(ctx, n)` (1 to the maximum; 0 is the model's own count; false when the model cannot run that count, the cache is not touched), `llama_get_dory_loops(ctx)`, `llama_model_dory_loops_max(model)` (0 for any other architecture).
+
+**Maximum.** The environment variable `LLAMA_DORY_MAX_LOOPS=N` is read at model load. It builds the executed-layer tables (`physical`, the cache layer map, the scales) for N loops, N from 1 to 4. A value above the file's count needs the `last_loop` cache: with `per_loop` the load warns and the file's count serves, because `per_loop` keeps a cache layer per executed copy and a turn at another count would read layers that earlier turns never wrote. Without the variable the maximum is the file's count and nothing changes.
+
+**Graph.** A turn at fewer loops than the maximum skips the unused recurrent copies. The output blocks keep their index in the table of the maximum, so they keep one cache layer at every count and a cache written at one count is laid out for all of them. The count is part of the graph-reuse key (`llm_graph_params::allow_reuse`), and `graph_reserve` reserves at the maximum, so the compute buffer does not grow when a request asks for more loops than the first one did.
+
+**Switches** (tests only): `LLAMA_DORY_RED_REUSE=1` leaves the count out of the graph-reuse key (the red case: a graph built for one count is reused at another); `LLAMA_DORY_RESERVE_DEFAULT=1` reserves at the file's count.
+
+**Measured, CPU** (`measured-here`, 2026-11-12, the CPU backend, Dory1.0-4B Q5_K_M file, f16 KV cache, context 4,096, micro-batch 512, 8 threads, six made-up fixture conversations, tables for 4 loops, `last_loop` cache; probe: `tools/dory_turn_probe.cpp`, aggregator `tools/dory_turn_probe_agg.py`, fixtures `tools/dory_turn_cases.txt`; the probe is built by hand against a llama.cpp tree with this series applied, not by the arcint build): the 9 load probes bit-equal to loads at a fixed count; 18 of 18 greedy cases gave the same tokens and 2,252 logit rows bit-equal to a model loaded at that count (1, 2 and 4); 4,504 rows bit-equal to a state-transfer arm; weight, cache and compute buffer sizes equal to the unpatched library at 1, 2 and 4 loops (the unpatched library's lines and texts come from an earlier run of a probe without the new API calls, which is not in the repository: the committed probe links only against a patched tree); with `LLAMA_DORY_RED_REUSE=1` 6 of 9 probes fail. This red case is the one that fails; it is the CPU probe's.
+
+**Continuing a cache written at another count** (`measured-here`, same setup, the probe's PAIR output). "Floor" is the same count, batched teacher-forcing against step-by-step decode, which differs by 0.002-0.004 nats and 98.0-98.6 % argmax agreement by itself. "Mixed" is the history cached at count X and the final turn run at Y in the same context, against a model loaded at Y. dKL and dAgree are mixed minus floor; "worst case" is the agreement change of the worst single conversation, in points.
+
+| X->Y | rows | mixed KL | agree % | floor KL | agree % | dKL | dAgree | worst case |
+|---|---|---|---|---|---|---|---|---|
+| 1->2 | 724 | 0.0074 | 98.3 | 0.0036 | 98.6 | +0.0038 | -0.3 | -1.2 |
+| 1->4 | 763 | 0.0083 | 97.1 | 0.0030 | 98.4 | +0.0054 | -1.3 | -5.0 |
+| 2->1 | 765 | 0.0074 | 97.0 | 0.0021 | 98.0 | +0.0052 | -1.0 | -2.5 |
+| 2->4 | 763 | 0.0044 | 97.8 | 0.0030 | 98.4 | +0.0014 | -0.7 | -3.1 |
+| 4->1 | 765 | 0.0077 | 96.5 | 0.0021 | 98.0 | +0.0056 | -1.6 | -2.5 |
+| 4->2 | 724 | 0.0045 | 98.6 | 0.0036 | 98.6 | +0.0009 | +0.0 | -0.6 |
+
+Over the floor, across six count transitions of 724-765 rows each on six conversations, the mean KL rises by +0.001 to +0.006 nats and argmax agreement falls by 0 to 1.6 points; the worst single conversation lost 5.0 points (1->4). This is under the repository's answer-level bar in mean KL (0.03 nats) but not in agreement (1 point) for three of the six transitions (1->4 -1.31, 2->1 -1.05, 4->1 -1.57 points unrounded: 741 against 751 of 763 rows, 742 against 750 of 765, 738 against 750 of 765), which is why a caller that changes the count re-prefills (arcint does, `--llama-dory-max-loops`). The other documents point at this table.
+
+**Measured, card** (`measured-here`, 2026-11-12, the 16 GB card (Arc A770), OpenCL, Dory1.0-4B Q5_K_M, the served unit's own arguments: 196,608 cells, q8_0:q4_0 cache, `last_loop`, 2 loops, micro-batch 512; greedy; a dev build of this feature before its last review round, which moved the effort decision ahead of the template render in the request handler, made an empty typed effort read as unset and changed no decode path; five fresh processes on a free card; made-up prompts: a one-word capital question, a bicycle question, a 2,000-token text with a needle, a primes list, an arithmetic question with thinking; served spot check `tools/dory_loops_spot.py`):
+
+1. Three processes were loaded at a fixed count of 1, 2 and 4 loops without the flag (the reference texts) and one at 2 loops with `--llama-dory-max-loops 4`. On the flagged process 20 of 20 greedy answers (5 prompts x effort unset, medium, low, high) equal the text (answer and thinking text) of the process loaded at that count, with equal prompt token counts; Paris and the needle were right in every group. The reference answers differ between any two counts in 2 of the 5 prompts, so 3 of the 5 prompts could not have shown a wrong count.
+2. Every response named its count: chat (`dory` object), chat stream (one chunk), Responses (`arcint.dory`), token mode (the final event); `/props` carried `max_loops: 4` and the effort map (`unset: 2`).
+3. A conversation whose effort changed turn by turn (medium, medium, high, high, unset, xhigh): each change re-prefilled (`reprefill: true`) and each repeat did not; the server's lane lines show 9 re-prefills in 29 requests, each naming the tokens held and the count they were written at.
+4. Card memory of the process (the kernel driver's per-client count): 14,665.9 MiB after the load in all five processes and 15,358.2 to 15,359.2 MiB after the requests in all five; the tables for 4 loops cost 0.0 MiB against a load at 1, 2 or 4. llama.cpp's own lines are equal in all five: weights on the card 2,853.58 MiB, cache 2,808.01 + 8,424.03 MiB, compute buffer 446.02 MiB.
+5. Time, single requests, one run each (walls, not rates): the 2,000-token prompt plus its 7 answer tokens took 1.06 / 1.61 / 2.71 s at 1 / 2 / 4 loops; the bicycle answer 88 tokens in 1.54 s, 80 in 2.06 s, 103 in 4.30 s. The flagged process matched the fixed-count processes to 0.01 s in every cell.
+6. The library's red switch did not fail on the served route: with `LLAMA_DORY_RED_REUSE=1` (the count left out of the graph-reuse key) 5 of 5 answers of the high group still equalled the 4-loop reference. Reason, evidence class `code`, not measured: `allow_reuse` in `llama-graph.h` compares the micro-batch shape (`n_tokens`, `n_seqs` and the rest) and returns false on a difference before it reaches the count check this patch adds. A count change makes the server re-prefill, the first batch after it has another shape than the last decode batch, so the graph is rebuilt whatever the key says. The red case that fails stays the CPU probe (6 of 9 probes with that switch). The served spot check has no red run of its own; its ability to fail rests on point 1's "2 of 5".
+
+**Not measured:** a deep prompt (the re-prefill cost at depth is the prefill cost; the unit's prefill at 98k-177k tokens was 51 t/s at 2 loops in an earlier run the same day on the same card with the same unit arguments, `measured-here`, so a level change deep in a session costs a full prefill), the B60, KL on the card, any sampled run. No served unit carries the flag. The patch does not touch the kernels.
+
+## 0119-ggml-fa-paged-kv.patch
+
+Paged K/V for `GGML_OP_FLASH_ATTN_EXT`, its CPU reference, and the backend
+refusal that keeps an unported backend from reading a pool as if it were the
+whole layer (design: `docs/campaigns/kv-streaming-design.md` (on the `qfndev` branch), increment I1;
+reference: the fork's `1f6e1fccc`, `ggml/include/ggml.h:2528-2560`). Evidence
+class `code` for the mechanism (the fork's checkout at `b540a4b9b`), `code`
+for arcint; the cell below is the only number and it is not a rate.
+
+- **API** (`ggml/include/ggml.h`): `ggml_flash_attn_ext_set_pages(a, pages,
+  table, page_size, ring_k, ring_v)`: `k`/`v` hold a pool of `page_size`-row
+  pages (`[n_embd, n_pool_rows, n_head_kv, 1]`, the cache's row layout), the
+  attended sequence is `pages->ne[0]*page_size` rows, `pages` is `I32
+  [n_pages, n_tables]` with row `table` used, entry `>= 0` is a pool page and
+  entry `< 0` is page `-1 - entry` of the ring (same row layout). It asserts
+  the mask's `ne[0]` is at most the attended length -- a narrow mask covers the
+  last `mask->ne[0]` keys, the keys before it count as visible (the fork's
+  `1ca44251c` form, `ggml_flash_attn_ext_mask_col0`) -- that the pool's and the
+  ring's rows are whole pages, and that the ring's types and head counts equal
+  the pool's.
+  `ggml_flash_attn_ext_set_sync(a, tag, ready, consumed)` carries the
+  cross-queue flags (`I32 [1]` tag in device memory, host-visible `ready` and
+  `consumed`); `ggml_flash_attn_ext_set_page_runs(a, runs)` carries the table
+  as runs of consecutive pool or ring pages, which a backend may split on. The
+  last two are plumbing for increments I2/I4: nothing reads them here.
+- **Op state** (`ggml/src/ggml-impl.h`): the op params `GGML_FA_PARAM_*`
+  (page size 5, ready 6-7, consumed 8-9, page table row 10, page runs 11-12,
+  per-row log-sum-exp 13-14, the backend-internal one) and the src slots
+  `GGML_FA_SRC_PAGES` 5, `RING_K` 6, `RING_V` 7, `TAG` 8, appended after the
+  mask src so the existing kernels' indices do not move; the getters
+  `ggml_flash_attn_ext_n_kv` / `mask_col0` / `get_pages` / `get_ready` /
+  `get_consumed` / `get_page_runs`.
+- **CPU reference** (`ggml/src/ggml-cpu/ops.cpp`, `..._flash_attn_ext_paged`):
+  wait for `ready >= tag[0]` if a tag is set (one thread, then a barrier), copy
+  each logical row from `table[i/page_size]`'s pool page or ring page into
+  contiguous K/V and widen a narrower mask into the attended length (its first
+  `col0` columns zero, its mask columns copied at `col0`), run the existing
+  contiguous path on those copies, then store `consumed = tag[0]`. A node with a
+  narrow mask but no page table takes the same entry point (`mask_col0 > 0`),
+  which is how the compact-mask case without a ring exercises the widening. The
+  copies are plain memory moves, so the output is byte-equal to the unpaged
+  path's on the same bytes. `ggml/src/ggml-cpu/ggml-cpu.c` reserves the copies
+  and the widened mask in the graph plan's work buffer.
+- **Refusal** (`ggml/src/ggml-opencl/ggml-opencl.cpp`, `supports_op`): a
+  `FLASH_ATTN_EXT` with a page table or a sync tag is declined. Its kernels do
+  not take pages yet (that is the design's I3), and a backend returning true
+  would read the pool as the whole layer. The scheduler then places the node
+  on the CPU reference; no backend reads a table it does not understand.
+- **Test** (`tests/test_fa_paged.cpp`, arcint's `arcint-fa-paged`, ctest
+  `fa-paged`, LABELS unit): four cases over the same bytes, unpaged against
+  paged with shuffled pool slots, unused slots filled `0x5a`, a ring for every
+  second/third/all page in reverse order, a two-row table with a garbage row 0,
+  a causal mask, 1 thread: f16 at 1,024 keys / 6 rows with 4 KV heads x 6
+  queries; q8_0:q4_0 at 2,048 keys / 6 rows with a ring every 3 pages; q8_0:q4_0
+  at 1,024 keys / 2 rows without a ring; f16 at 512 keys / 1 row, one KV head,
+  a ring every page; q8_0:q4_0 at 1,024 keys with a compact mask covering the
+  last 768 keys (`col0=256`) and a ring every 2 pages; f16 at 1,024 keys with a
+  compact mask covering the last 512 keys (`col0=512`) and no ring. The f32 outputs are compared with `memcmp` -- the gather is
+  a copy, so equality is expected, not an NMSE -- and the reference must be
+  finite, so a read of the fill shows.
+- **Red cases** (each run and seen failing before the patch was restored): the
+  gather's `e >= 0 ? pool : ring` becomes `pool`, so a ring page reads a pool
+  row -- 3 of 4 cases fail then (the ring arms; the no-ring arm cannot fail on
+  it); and the widening's `memcpy(out + col0, ...)` becomes `memcpy(out, ...)`,
+  so the visible columns sit at the wrong keys -- the two compact-mask cases
+  fail and the four full-mask cases stay green, which is what shows the
+  widening runs. Restored, all 6 cases pass.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
+  tree's own `arcint-fa-paged`, 1 thread): 6 of 6 cases byte-equal (full and
+  compact masks), the ring red build 3 of 4 failing, the widening red build 2
+  of the 2 compact-mask cases failing. The recipe at the widening's red tree
+  (`kv-stream-red-widen`, `b4a8cd98`): 38 with 1 failure, `fa-paged` failing
+  exactly those two cases, EXIT 8. The recipe at the green tree: 37 of 37 unit tests
+  pass, EXIT 0, the .deb built; at the red tree (`kv-stream-red`, `fcbbfe90`):
+  36 of 37, `fa-paged` the one failure, EXIT 8, no .deb -- it compiles and
+  fails. Not a rate and not on a card.
+- **Not measured:** any card; any speed of the CPU gather; the cross-queue
+  flags' paths (`set_sync`, `set_page_runs`) and the OpenCL kernels, which this
+  patch deliberately does not touch (I3/I4).
+
+## 0120-llama-kv-stream-map.patch
+
+The adaptive KV stream's page map, host store, eviction/write-back and page
+table (design: `docs/campaigns/kv-streaming-design.md` (on the `qfndev` branch), increment I2; reference:
+the fork's `src/llama-kv-stream.{h,cpp}` at `b540a4b9b`). Evidence class `code`
+for the mechanism; the I1 paged op (`0119`) is what reads the pages. Not wired
+into the KV cache yet -- that is I3's prerequisite, named below.
+
+- **What** (`src/llama-kv-stream.{h,cpp}`, added to `src/CMakeLists.txt`): one
+  sequence's attention layers keep their K/V in pages of 256 cells. The pool
+  tensors are the cache's (`[n_embd_gqa, n_slots*page_size]`); a host store
+  buffer of the pool's buffer type holds every page that left the pool, per
+  layer K pages then V pages in page order. `prepare(cells, n_kv)`:
+  - makes the pages a ubatch writes resident, evicting the oldest non-written
+    page when no slot is free and asserting the pool holds at least a ubatch;
+  - gives free slots to the newest attended pages;
+  - marks the written pages dirty;
+  - packs the attended pages that are not resident into the layer's ring slot
+    (two slots, alternating by layer parity) and records the ring index, so
+    `synced()` reports a ubatch that streams;
+  - `assign` reads a returning page back from the host store, `evict` writes a
+    dirty page back exactly; `set_input_pages` fills the `I32
+    [n_kv/page_size, n_layer]` table (slot >= 0, or `-1 - ring index`), `runs`
+    gives the resident attended pages as runs for a gather, `row` maps a cell,
+    `layout()` changes whenever a page moves (a graph built around the layout is
+    not reused), `get_rows`/`set_rows` read and write wherever the rows live
+    (the checkpoint path and the cell's integrity probe), and
+    `set_debug_rotate(true)` moves every resident page through the host store
+    before every ubatch (the fork's `LLAMA_KV_STREAM_DEBUG=rotate`, which needs
+    the pool to hold the context).
+- **Deviations from the fork, named**: no copier or publisher thread, no copy
+  engine, no `ready`/`consumed` flags, no prefetch -- page moves are synchronous
+  `ggml_backend_tensor_set/get` on the owning backend; I3/I5 put them on the
+  second in-order OpenCL queue with events and add the kernel-side wait
+  (0032/0044's form, 0056's doorbell). Slots are sized by the caller (`n_ring`
+  pages), not by a probe of the backend's paged attention or by the streamed
+  pages a phase needs -- I3 adds the probe and that sizing. No phase budgets and
+  no pool resize (I5). Nothing is wired into `llama_kv_cache` yet: the pool
+  views, the graph inputs and the prepare call are I3's, because the CPU arm is
+  a cell, not a served model.
+- **Test** (`tests/test_kv_stream_map.cpp`, arcint's `arcint-kv-stream-map`,
+  ctest `kv-stream-map`, LABELS unit, CPU backend, 1 thread):
+  - the map: written pages resident, the newest attended pages take free slots,
+    a full pool evicts the oldest non-written page, an attended page reads the
+    bytes that were written, rotation writes every page back and reads the same
+    bytes, a two-page pool over four pages streams pages 1 and 2 packed at ring
+    rows 0 and 256, a written page outside the attended range is resident while
+    an unattended one is not, table rows agree;
+  - the pages through attention: four ubatches of 256 cells over a 1,024-cell
+    f16 cache with a two-page pool and a four-page ring; each ubatch prepares,
+    writes its cells through `set_rows`, and runs a 6-row causal paged
+    attention over the pool and the ring; its f32 output is `memcmp`-equal to
+    the same attention over a contiguous cache holding the same bytes. At the
+    fourth ubatch two of four pages stream.
+- **The graph's write** (review of 0120): a cell written straight into the pool
+  tensor (as `cpy_k`/`cpy_v` write it on the device) is marked dirty only by
+  `prepare`; the cell evicts after a second ubatch takes its slot, and the host
+  store must return the bytes it wrote. The no-op mutation of
+  `for (uint32_t c : cells) dirty[c/page_size] = 1;` fails that cell (4 checks)
+  and nothing else -- the section is the only place the graph's write is made. The branch `kv-stream-red4`
+  (`487e82b1`) is that no-op: recipe EXIT 8, 1 of 40 failing, `kv-stream-map`
+  the one, its four graph-write checks red.
+- **Red case** (branch `kv-stream-red2`): `evict` drops the write-back
+  (`dirty[page]` -> `false`). It compiles and fails 6 checks -- the rotation
+  cell (a dirty page evicted without its write-back reads different bytes) and
+  the third and fourth ubatch's attention (an evicted page streams what the host
+  store last held). Restored, every check passes.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patch's
+  own cell, 1 thread): green all checks, the red build 6 failing. The recipe at
+  the green tree (`99d94fe0`): 38 of 38 unit tests, EXIT 0, the .deb built,
+  `kv-stream-map` among them and `kv-stream-refuse` reported Not Run (Disabled);
+  at the red tree (`kv-stream-red2`, `5a01de69`): 38 with 1 failure,
+  `kv-stream-map` failing, EXIT 8, no .deb.
+- **Not measured:** any card; the copier/publisher threads, the second queue,
+  the sync flags and the pool sizing (I3/I5); a served model (the CPU arm is
+  the cell; arcint's llama engine requires an OpenCL card at start).
+
+## 0122-opencl-fa-paged-decode.patch
+
+The B60's GQA decode kernel learns 0119's page table and ring, and the backend
+accepts a paged `FLASH_ATTN_EXT` exactly for the shapes it now handles (design:
+`docs/campaigns/kv-streaming-design.md` (on the `qfndev` branch), increment I3; reference: the fork's
+`1f6e1fccc`/`2a5beae21` page addressing at `b540a4b9b`, `code`).
+
+- **Kernel** (`ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl`): one
+  helper, `fa_gqa_page_row(table, ps, key, pool, pool_nb1, ring, ring_nb1)`:
+  `table[key/ps] >= 0` reads row `e*ps + key%ps` of the pool, `e < 0` reads
+  `(-1-e)*ps + key%ps` of the ring; a null table reads `key` rows as before. The
+  kernel gains 12 trailing args (table, page size, and the two ring slots'
+  pointer, offset and nb1/nb2/nb3). Its five K/V row reads go through the
+  helper: staging (`GQA_K_STAGED`), the int8 staged rows (0089), the int8 Q K^T's
+  direct and staged b operands (0088), and the V staging. **Deviation from the
+  fork, named:** the fork makes paging a compile-time `PAGED` switch; here one
+  build carries the helper with a `table == 0` runtime check, so an unpaged call
+  pays one uniform compare per key row (the rows are 544 B and up for K, so the
+  read dominates; the cost is to be measured, not inferred). A separate build
+  per switch is not taken because arcint's kernels are built once per type pair.
+- **Dispatch** (`ggml/src/ggml-opencl/ggml-opencl.cpp`): `n_kv` of a paged op
+  is `pages->ne[0]*page_size` (the attended length), not the pool's rows; a
+  paged op routes to the GQA kernel from **1** row (the 0089 staged form for
+  1-3 instead of the split kernel, which would attend the pool as the whole
+  layer); the 12 args are set for that launch only; a paged op that would reach
+  another kernel aborts with a message (`GGML_ABORT`, no silent path).
+- **`supports_op`**: true for a paged `FLASH_ATTN_EXT` only when the page table
+  is `I32`, contiguous, `[n_pages, n_tables]` with a valid row and page size
+  256; K/V is q8_0/q4_0, q8_0/q8_0, q4_0/q4_0 or f16/f16; head size 256, GQA
+  `(q heads/kv heads)*rows <= 64`, `q` f32; a full-width mask (the compact mask
+  is I5's); the ring rows are whole pages; and the GQA kernel of that pair is
+  built. A **sync tag** (`ready`/`consumed`) is still declined (I5's queue);
+  every other paged shape is declined. No CPU fallback is relied on: a served
+  start must refuse before this point (design §4.3, I5's marker cell).
+- **Test** (`0123`): paged cases in `test-backend-ops`, the agent's geometry.
+- **Not compiled here**: the recipe host builds the OpenCL C++ (EXIT 0) but has
+  no `ocloc`/driver, so the kernel text is compiled only in Claude's card
+  window. **Not measured:** any card, any speed, KL. The card commands are in
+  the handover and the design's I3.
+
+## 0123-tests-fa-paged-backend.patch
+
+Paged `FLASH_ATTN_EXT` cases in `test-backend-ops`, so the card window runs
+0122's kernel over the agent's shapes (design: increment I3).
+
+- **Case** `test_flash_attn_ext_paged`: head 256, `nh` KV heads, `nr` query
+  heads a KV head, `kv` keys, `nb` rows, K/V types, `ring_every`, `n_slots`.
+  The pool is the KV cache's layout (`[hs*nh, rows]`, all heads of a token in a
+  row) with `n_slots` resident pages in shuffled slots and unused pages between
+  them; every `ring_every`-th page from page 0 is in the ring, in reverse order
+  behind an unused page. The table is row 1 of two; row 0 is garbage. `n_slots`
+  smaller than `kv/256` is what makes pages stream.
+- **Registered**: at the agent's geometry (24 query heads on 4 KV heads, G 6),
+  6-row verify at kv 1,024 / 8,192 / 65,536 / 262,144 with the pool half the
+  context (ring every 2), and 1-row decode at the same kv with every page in
+  the ring and a 4-page pool; f16 K/V at 8,192; and the all-resident arm
+  (`ring_every=0`) at 8,192. 10 cases.
+- **Run**: `test-backend-ops test -o FLASH_ATTN_EXT -p 'n_slots=' -b <card>`,
+  and `perf` with the same filter (the case's `op_flops` prices a paged run).
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host, the patched
+  tree's `test-backend-ops`, `-p 'n_slots='`): 10 of 10 OK, including the
+  262,144-key arms, against the CPU paged reference. That is the case plumbing
+  and the CPU path; it is **not** a card result and says nothing about 0122's
+  kernel.
+- **Not measured:** the card (Claude's window; the commands are in the
+  handover), paged against unpaged time, KL.
+
+## 0121-llama-kv-stream-cache.patch
+
+The KV stream reaches `llama_kv_cache` and the graph, off by default (design:
+`docs/campaigns/kv-streaming-design.md` (on the `qfndev` branch), increment I3's prerequisite; reference:
+the fork's `143b62090`/`c68455740` cache and graph wiring at `b540a4b9b`,
+`code`). Not wired to the copy queue or the phase budgets (I5), and the graph
+reuse check is conservative (below).
+
+- **Parameter** (`include/llama.h`, `src/llama-cparams.h`): `kv_resident_size`,
+  device bytes of the resident KV pages, default **0 = off**, copied into
+  cparams (`llama-context.cpp`). arcint sets it from `--llama-kv-resident`
+  (`src/exec/backend_llama.cpp`, I5): a 32-bit byte count, so at most 4095 MiB.
+- **Cache** (`llama-kv-cache.cpp`): with the flag on, the cache validates the
+  paged kernel's shapes -- one stream (or unified), no V transpose, no shared
+  source cache, no SWA, no windows, q8_0 K / q4_0 V, head 256 -- refusing
+  otherwise at construction, never falling back. It sizes `n_slots` from the
+  bytes (`slots_for`, at least 8 pages), shrinks the K/V tensors to
+  `n_slots*256` rows, and constructs `llama_kv_stream` with the pool tensors, a
+  ring of `n_pages-n_slots` pages and the pool's buffer type. `get_k`/`get_v`
+  return the whole pool's view under streaming (the attention reads it through
+  the table). `apply_ubatch` calls `prepare(idxs[0], get_n_kv(sinfo))` before
+  the graph, so the written pages are resident before the graph's store and the
+  streamed pages are in the ring slots before its attention.
+- **Graph** (`llama-graph.cpp/.h`): the KV input carries the page table
+  (`I32 [n_kv/256, n_layer]`, a host input filled in `set_input`) and every
+  attention layer's ring views; `build_attn` sets them on the fused
+  `FLASH_ATTN` node with the layer's table row and expands the inputs.
+  **Deviation, named:** a stream-on graph is never reused
+  (`llm_graph_input_attn_kv::can_reuse` returns false), because a page move
+  changes what the views mean; the fork compares its `layout_id` instead. The
+  cost is one graph build per ubatch, to be measured with the stream on.
+- **Not in this patch**: the copy queue and the ready/consumed flags (I5), the
+  phase budgets and the pool resize, the table's device upload for OpenCL (the
+  scheduler places the host input; the OpenCL kernel argument takes the tensor's
+  extra, which I5's queue path owns), and any served run.
+- **Test** (`tests/test_kv_stream_cache.cpp`, `arcint-kv-stream-cache`, ctest
+  `kv-stream-cache`): reads the patched tree's source and checks the wiring's
+  shape (default 0, the validation strings, the shrunk rows, the stream's
+  construction, `prepare` in `apply_ubatch`, the table and ring views on the FA
+  node, the fill in `set_input`, the reuse refusal, the pool views in `get_k`).
+  Red: the default set to 1 fails the first check; a normal start would then
+  ask for a stream nobody requested.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the cell
+  passes at the green tree (`5886672e`: 39 of 39 unit tests, EXIT 0, deb built;
+  `kv-stream-cache` among them); the patched library builds.
+  **Not measured:** a stream-on model run -- no GGUF and no card on the recipe
+  host, and arcint's llama engine needs an OpenCL card at start. The device-free
+  behavioural evidence stays `kv-stream-map` (green) with its reds
+  `kv-stream-red2` (eviction) and `kv-stream-red3` (a one-page table shift).
+
+## 0123z-opencl-fa-paged-prefill.patch
+
+I4: a paged prompt's pages are gathered into f16 blocks and the f16 prompt
+kernel runs on them; the decode path's page table is uploaded to the device
+(I5's table upload). Design: increment I4; reference: the fork's `9e9e46f86`
+chunked paged prefill at `b540a4b9b` (`code`) -- **deviation, named**: the fork
+attends page runs as chunks merged by log-sum-exp; here the rows are gathered
+by 0037's conversion kernel into its two 32 MiB blocks and the existing f16
+kernel runs with its carry, which is the fork's own gather form. The chunk size
+is 0037's block (`GGML_OPENCL_FA_DPAS_F16KV_BLOCK`), not the fork's
+`GGML_CUDA_PREFILL_CHUNK`; the page-runs merge is left to I5's card round.
+
+- **Conversion kernel** (`flash_attn_dpas.cl`): `flash_attn_kv_to_f16` gains
+  eight trailing args (the table, page size, the logical key base `kv0`, and the
+  ring's pointer, offset and nb1/nb2/nb3). With a table, logical key `kv0+key`
+  reads pool page `e` (entry >= 0) or ring page `-1-e` with the ring's own
+  strides; a null table reads the contiguous view as before.
+- **Dispatch** (`ggml-opencl.cpp`): a paged op with more than 64 GQA rows (a
+  prompt) forces the 0037 gather path; the table row is uploaded once to a
+  device buffer on the compute queue and released after the queued conversions
+  (a queued command holds it). The 0038 f16 kernel then reads the blocks. The
+  decode path's table is uploaded the same way when the page tensor is not
+  already a device buffer. Cost: 4 KiB per ubatch at 262,144 cells.
+- **`supports_op`**: a paged prefill is accepted when the conversion kernel and
+  the f16 prompt kernel are built; the GQA row cap now applies only to the
+  decode shape, so a 512-row prompt is not declined (and cannot slip to the CPU
+  reference).
+- **Cases** (`test-backend-ops`): paged prefill at the agent's geometry, 512
+  rows, kv 8,192 and 4,096, q8_0:q4_0 and f16, pools half the context and the
+  whole one (3 cases, next to 0123's).
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the five
+  paged cases with `n_slots=16` (the three prefill arms among them) 5 of 5 OK on
+  the CPU. **Not compiled or measured on a card**: the OpenCL C++ builds
+  (recipe), the kernel text's first build is Claude's window, and the gather
+  path's speed is unmeasured.
+
+## 0123zz-opencl-fa-paged-predicate.patch
+
+The paged `FLASH_ATTN_EXT` predicate as tested logic, and the kernel fix that
+window 226 exposed: every paged case reported "not supported [OpenCL]" on the
+B60, 0 of 10 run, because the GQA program failed its optional build and the
+kernel stayed null. Evidence `code` (the source order) + `measured-here`
+(window 226: unpaged agent shapes supported and passing on the same tree).
+
+- **The kernel** (`flash_attn_gqa_dpas.cl`): 0122 put `fa_gqa_page_row` between
+  `__attribute__((intel_reqd_sub_group_size(16)))` and `kernel void
+  flash_attn_gqa_dpas`. An intervening declaration takes the attribute for
+  itself, so the kernel compiled without a required sub-group size, the DPAS
+  builtins failed, `build_program_from_source_optional` returned null, and
+  `supports_op`'s `kernels_decode` was false for every pair. The helper now
+  sits before the attribute; nothing is between the attribute and the kernel.
+- **The predicate** (`ggml-opencl-fa-paged.h`, new): the supports_op logic as
+  plain data -- `ggml_cl_fa_paged_shape`, `_kv_ok`, `_shape_ok`, `_ok`. True
+  exactly where the kernels handle a paged case: I32 contiguous table with a
+  valid row and page size 256, the four KV pairs, head 256, one stream, GQA
+  divisibility; a full-width mask; a whole-page ring (or no ring); and the
+  kernel of the shape (GQA for `(q heads/kv heads)*rows <= 64`, the conversion
+  + f16 prompt kernel for a prompt). `ggml_opencl_supports_op` fills it from the
+  tensors and calls it.
+- **Diagnostics**: `GGML_OPENCL_FA_PAGED_DEBUG=1` logs the clauses (table, kv,
+  shape, mask, ring, the two kernel flags) and the verdict as one INFO line, so
+  a declined paged case names its clause on the card.
+  `GGML_OPENCL_FA_PAGED_DUMP=1` logs what a paged launch is handed: `n_kv`,
+  page size, the table row and its byte offset, the pool's and the ring's row
+  counts and nb1/nb2 for K and V, and the table row's entries read back.
+- **Window 232's bindings are right and the failure is inside one type path.**
+  The dump shows, for a failing q8_0:q4_0 ring case and the passing f16 ring case
+  at the same shape, the same table, the same pool/ring row counts and the
+  strides the tensors have (q8_0 K 1088/272, q4_0 V 576/144; f16 2048/512); the
+  table row maps every ring page to a small `-1-e` and every resident page to a
+  slot within the pool. The row formula therefore indexes inside the pool and
+  the ring, and no stride is wrong. What is left is a *type path*: the staged K
+  loader for q8_0 (`GQA_K_STAGED`), the q4_0 V staging, or the 0088 int8 b
+  operand -- f16 reads the ring through `kb16`/`load16(VT=0)` and passes.
+  Isolation runs, one per arm, same line (no kernel change between them):
+  - `GGML_OPENCL_FA_GQA_OPTS=-DGQA_K_DIRECT` -- q8_0 K read per lane instead of
+    staged: a pass names the staged loader, a NaN keeps it in V/int8.
+  - `GGML_OPENCL_FA_GQA_I8=0` explicitly -- excludes 0088's int8 b operand.
+  - `GGML_OPENCL_FA_DPAS_F16KV_BLOCK=4096` on the prefill cases -- moves the
+    conversion's block boundary; a NaN that moves with the block names the
+    conversion, one that stays at the same output index is the row read.
+  **The fix is owed after those three lines**; this patch carries no kernel
+  change for window 232.
+- **Tests**: arcint's `tests/test_fa_paged_predicate.cpp` (`fa-paged-predicate`,
+  ctest LABELS unit) drives `ggml_cl_fa_paged_ok` over the agent's decode shape
+  (true) and flips every clause (each must refuse), plus prompts and 1-row
+  decode; `tests/python/test_fa_gqa_i8.py` asserts the attribute is immediately
+  followed by the kernel (nothing between).
+- **Window 228's two bugs, fixed:** the KV clause compared enum *literals*
+  (`Q4_0` is 2 in ggml.h, not 4), so the agent's q8_0:q4_0 pair was declined
+  while f16 passed; the header now names `GGML_TYPE_*`. And the table row: the
+  backend passed a device tensor's base and ignored the used row, so the kernel
+  read row 0 -- `INT32_MAX` in the paged case -- and a pool row of 2^31 rows went
+  out of bounds (the CL_EXEC_STATUS_ERROR and the assertion in window 228). The
+  used row is now passed with its byte offset (`ulong table_off`, a device
+  tensor's row), or a host row is uploaded; the conversion kernel takes the same
+  offset. The debug line reports both: `kv` and the kernel-clause flags.
+- **Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the
+  predicate cell passes, the source-text gate passes, the recipe is green
+  (`b3d290fe`: 41 of 41, EXIT 0); the red branch `kv-stream-red6` (`7683bf7b`,
+  the `kernels_ok` clause dropped) fails 2 checks -- a prompt without its
+  kernels and no-kernel-at-all -- recipe EXIT 8. A second, safe red (no kernel
+  executes): the KV clause's `GGML_TYPE_Q4_0` written as the literal `4` -- the
+  predicate logs `kv 0` and declines the agent's pair. **Not compiled on a card**: the
+  kernel's next build is Claude's window; the diagnostic line is the clause
+  evidence to collect there.
+
+## 0123zzz-tests-fa-paged-pair-isolation.patch
+
+Window 232's pair isolation, three paged cases next to 0123's (design: increment
+I3; no kernel change). The bindings were cleared by the dump: a failing
+q8_0:q4_0 ring case and the passing f16 ring case at the same shape get the same
+table, pool/ring row counts and the strides those tensors have. So the failure
+is inside one type path, and two pair arms name it in one run:
+
+- `q8_0 / q8_0`, 8,192 keys, 6 rows, ring every 2, a 16-page pool;
+- `q4_0 / q4_0`, the same shape;
+- `q8_0 / q8_0`, 512 rows (prefill), the same shape.
+
+If `q8_0 / q8_0` passes while `q8_0 / q4_0` fails, the defect is the q4_0 V
+staging (decode) or V's conversion (prefill); if both quantized pairs fail, it
+is the K side; if `q4_0 / q4_0` alone fails, it is the q4_0 K staged loader.
+
+**Measured, CPU** (`measured-here`, 2026-11-14, the recipe host): the three
+cases with a ring pass on the CPU (3 of 3), so the case data and table are
+well-formed. **Not on a card:** the next window's run.
+
+## 0123zzzz-opencl-fa-paged-ring-aos.patch
+
+The paged kernels read the ring slots as q8_0 / q4_0 blocks, but a ring slot
+written through `set_tensor` as a whole tensor (the op suite's ring inputs) is
+split into SoA planes by the OpenCL upload. The FA dispatcher now rebuilds a
+flattened ring K and V to blocks before the paged decode and the paged prefill
+gather read them (`ggml_cl_flash_attn_reconstruct_aos` on
+`GGML_FA_SRC_RING_K/V`), as it already did for K and V. The prefill
+conversion released its page-table row unconditionally, and a device-resident
+table row is not its to release: only an uploaded row is released now (the
+op suite's heap corruption, "corrupted double-linked list"). Measured on the
+B60 (`measured-here`, 2026-11-13): 15 of 16 paged cases passed with it, every
+q8_0 / q4_0 case among them; the 16th, f16 prefill with a ring, is
+0123zzzzz's.
+
+## 0123zzzzz-opencl-fa-paged-f16-in-place.patch
+
+A paged f16 prompt took the f16 in-place branch of the prompt kernel
+(`flash_attn_dpas2.cl` reading K/V in place). That branch reads the K/V view
+row after row over the call's `n_kv` keys, so with paged K/V it attended the
+pool's rows as the sequence: it missed the page table and the ring, and when
+the table names more pages than the pool holds it read past the pool (the open
+case `kv=8192, nb=512, f16, ring_every=2, n_slots=16`: 8,192 keys over a
+4,096-row pool). The quantized pairs already took the gather (each key's row
+from the pool or the ring into f16 blocks, then the f16 kernel); paged f16 now
+takes it too. One condition, `kv_pages == nullptr`, on the in-place branch
+(`code`).
+
+Measured on the B60 (`measured-here`, 2026-11-14, window 250): all 18 paged
+cases pass on the series through this patch (pin + 8658e830); the tree without
+it (03fcccd9) fails exactly the f16 ring prefill (17 of 18). The full
+`FLASH_ATTN_EXT` suite on the fixed tree: 3,115 of 3,115.
+
+## 0123zzzzz1-llama-kv-stream-hybrid-layers.patch
+
+The KV stream's ring views were built for every layer with `has_kv(il)`, over
+`n_layer_all`. On a hybrid model (the dense 27B, `LLM_ARCH_QWEN35`: gated
+delta-net and attention layers) `has_kv` is true for the recurrent layers too,
+while the attention cache holds only `il < n_layer() && !is_recr(il)`; the
+cache's `map_layer_ids.at()` then threw at context creation
+(`llama_init_from_model: failed to initialize the context: unordered_map::at`,
+`measured-here`, B60, windows 252 and 253: the agent's command line with
+UD-Q5_K_M and `--llama-kv-resident 3584`, with and without MTP). The ring
+views are now built only for the layers the cache holds
+(`llama_kv_cache::kv_has_layer`); the page table is set on those layers' FA
+nodes as before, and the recurrent layers stay in their own memory. Until now
+the stream ran only in op tests and unit cases, none of them on a hybrid model.
+
+## 0123zzzzz2-kv-stream-partial-writes-refusal.patch
+
+The first served run of the KV stream beyond its pool (window 255, the dense 27B
+as UD-Q5_K_M at 262,144 with `--llama-kv-resident 3584`, B60) served to 131,072
+tokens and then ended in a page fault: xe reset the compute and copy engines
+(`measured-here`, no wedge). Two defects, both in the stream's page moves
+(`code`):
+
+- **The fault.** The OpenCL `set_tensor` splits every contiguous q8_0 / q4_0
+  tensor into SoA planes, writing `ggml_nbytes(tensor)` from `data` at `offset`
+  whatever `size` is. The stream moves single pages into its pool and ring
+  slots with `ggml_backend_tensor_set(slot, page, offset, bytes)`, so its first
+  move read past the host page and wrote planes past the slot. A partial write
+  of a q8_0 / q4_0 tensor that is not a weight now takes the plain copy (the
+  attention reads these as blocks), when the tensor is not a view and was
+  never split; every other write keeps the old paths. The cache itself never
+  met this: `SET_ROWS` writes it. (A first form asserted on a partial write
+  into a split tensor; `test-backend-ops` initializes such tensors in parts
+  and stopped on it, window 266, so the old paths stay for them.)
+- **The page moves are not per layer.** The stream has two ring slots, a layer
+  using `slots[ikv % 2]`, and `prepare()` fills them for every layer before the
+  graph runs, so each layer but the last two would read another layer's pages.
+  The design copies layer i's pages while layer i-1 computes (I5's copy queue),
+  which is not built. The cache now refuses a budget that does not hold the
+  context ("the resident budget holds N of M pages; streaming the rest needs the
+  per-layer copy (I5)"), so a start that would stream is refused instead of
+  serving wrong attention; `LLAMA_KV_STREAM_UNSAFE=1` lets the stream run for
+  its development.
+
+Measured on the B60 (`measured-here`, 2026-11-14, window 257, UD-Q5_K_M at
+262,144 with a 3,584 MiB budget): the start is refused ("the resident budget
+holds 551 of 1024 pages; streaming the rest needs the per-layer copy (I5)").
+With `LLAMA_KV_STREAM_UNSAFE=1` the server answers the capital and then ends
+inside a 150k prompt with another page fault, this time the copy engine alone
+(`engine_class=bcs`): the planar split was one fault source, not the only one.
+Streaming beyond the pool stays refused until I5.
+
+## 0125-kv-stream-review-fixes.patch
+
+Applies after 0124, not before: its dispatcher hunks sit beside the wide-verify
+block 0124 adds, so the glob order of `patches/*.patch` puts it last of the
+series. (0123zzzzz3 and 0123zzzzz5 still apply before 0124.)
+
+Fixes the four defects an outside review of the KV stream found on qfndev, each
+with a device-free arm (`code`):
+
+- C, the store indices: `set_input_k_idxs` and `set_input_v_idxs` write
+  `llama_kv_stream::row(cell)` once the stream is on, so `SET_ROWS` writes a
+  cell's pool row instead of its cell index; beyond the pool that index would
+  land past the pool (`k->ne[1]` is the resident rows). The state save and
+  restore go through `get_rows`/`set_rows` for the same reason, `clear()`
+  calls `stream->clear()`, and a KV window, several streams in an ubatch or a
+  transposed V are refused at `apply_ubatch` / the cache's construction rather
+  than mapped wrong. The V-transposed branch is unreachable with the stream on
+  because the cache refuses `v_trans` at construction.
+- D, one paged predicate: `ggml-opencl-fa-paged.h` now carries the shape's
+  rows, mask heads, op params (ALiBi, softcap, sinks) and the caps' built
+  kernels, and `ggml_cl_fa_paged_form` names the form the dispatcher takes (1
+  the GQA decode kernel, 2 the f16-block prefill conversion, 0 none). The
+  dispatcher calls the same function before choosing and aborts on a declined
+  shape; supports_op calls it too, so the two cannot disagree. The old
+  `kernel_fa_dpas_q_dk[0] != nullptr` (always true, an array's address) is
+  gone, and the prefill half asks for the conversion and carry kernels it
+  actually uses.
+- E, the CPU plan's widened mask: `ggml-cpu.c` reserves it whenever
+  `ggml_flash_attn_ext_mask_col0(node) > 0`, with or without a page table, so
+  a non-paged call with an offset mask no longer runs past the work buffer.
+- G, the refusal: a stream-on graph whose fused node is not
+  `LLM_FUSED_OP_FLASH_ATTN` throws instead of asserting, and arcint's refusal
+  rule's red switch (`ARCINT_KV_STREAM_REFUSE_OFF=1`) is compiled only into
+  the unit target (`ARCINT_KV_STREAM_REFUSE_RED`), never into the served
+  binary.
+
+Red arms, run on this host (`measured-here`, device-free): the cache cell's
+mapping removed (`data[...] = c`) fails its page-map check; the predicate's
+`ggml_cl_fa_paged_params_ok` clause dropped accepts ALiBi, softcap and sinks
+(three checks fail); the CPU plan's `n_kv` taken from the page table alone
+fails the mask-width check. The per-layer red (the copy guarded off) is the
+kv-stream-layers cell from 0123zzzzz3.
+
+## 0126-ggml-max-src-paged-attention.patch
+
+`GGML_MAX_SRC` 10 -> 12. `ggml_tensor::src[]` had 10 entries while 0123zzzzz3's
+KV stream puts three sources at 9/10/11 (`GGML_FA_SRC_HOST_K/HOST_V/PLAN`,
+ggml-impl.h), so `ggml_flash_attn_ext_set_host` wrote past the array into the
+tensor's following fields and every FA node read garbage as its plan. Measured
+on the B60, window 266 (`measured-here`): the first `FLASH_ATTENTION_EXT` op case
+asserted `host_k && host_v && ring_k && ring_v` at ggml-opencl.cpp:23577 before
+any OK; the CPU arm passed because its nodes did not reach the OpenCL check.
+`ggml-impl.h` now carries a `static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC)` for
+C and C++. The constant's users (`ggml.c`'s graph loops, `ggml-backend.cpp`'s
+scheduling, the RPC structs, the Vulkan/SYCL loops and Vulkan's debug `srci_name`
+table) are all sized by the macro and grow with it; `srci_name` lists ten names
+and zero-fills the rest, and no reader indexes past the ten in debug output.
+Device-free arms: the predicate cell checks every index, and the layers cell
+reads the node's sources back (`src[HOST_K/V] == host store`, `src[PLAN] == plan`)
+after `set_host` -- at 10 that read is outside the array.
+
+Red arm, run here (`measured-here`, device-free): a translation unit with
+`GGML_MAX_SRC` forced to 10 before ggml-impl.h fails to compile
+("static assertion failed: GGML_MAX_SRC must hold every paged FA source"); the
+layers cell's source read would then read outside `src[]`.
+
+## 0129-kv-stream-usm-clear-and-test-host-store.patch
+
+Two defects the round-3 build hit on the B60, window 269 (`measured-here`).
+
+1. The served start never came up: the stream's USM host buffer is a placeholder
+   `cl_mem` of 64 bytes beside host bytes, and `buffer_clear` filled
+   `buffer->size` (the pool's MiB) into that placeholder. The device logged
+   `Fault response: Unsuccessful -ENOENT` three times, coredumped, and
+   `clFinish(queue)` returned -5. `buffer_clear` now `memset`s the USM bytes and
+   returns; the placeholder is never filled. The earlier arm passed because
+   below the pool the stream's host store is small or untouched by graph fill.
+
+2. The op suite's two-layer paged case aborted on "a paged attention with a host
+   store that is not USM host memory": test-backend-ops allocates the host store
+   in the backend's ordinary buffer, while the serving stream uses USM. The
+   dispatcher now copies a regular host store on the device (`clEnqueueCopyBuffer`
+   from the host store's one AOS region, the plan through `clEnqueueReadBuffer`,
+   at most 1024 pages) and keeps the USM write path for serving. Window 273 then
+   showed the same case aborting on "neither USM nor one AOS region": the op test
+   uploads its host store whole, and a whole q8_0/q4_0 write splits it into SoA
+   planes (`measured-here`, 2026-11-14, window 273, facet 2). The dispatcher now
+   rebuilds a SoA store with the restore kernel into a temporary AOS buffer (the
+   same form the ring's reconstruct uses) and copies pages from it; a store whose
+   K and V layouts differ aborts with its own message.
+
+The copy geometry is now asserted where the offsets are built (`measured-here`,
+reasoned from window 269's fault): the plan's page count equals both host
+stores' page counts, a host page's bytes equal the ring's page row span, and the
+ring's row stride equals a row of all its heads. A mismatch aborts with the
+message instead of faulting the device; the layers cell checks the same three
+relations device-free at the reserve shapes.
+
+Red arm, run device-free here (`measured-here`): the layers cell with a plan
+row shifted by two pages fails `FAIL layers copy geometry: a page copy runs
+outside its ring view or the page bytes differ`; at its real rows it prints
+`OK: every attention layer reads its own streamed pages`.
+
+Red arm, device-free here: the `memset` arm and the copy arm are both
+reachable only through the OpenCL path, so the red evidence is the card's log
+above (the placeholder fill and the dispatcher abort); the guard is that a
+non-USM store with a split region (SoA) aborts rather than byte-copying.
+
+## 0124-opencl-fa-wide-verify.patch
+
+## 0123zzzzz3-kv-stream-per-layer-pages.patch
+
+Fixes the second defect of 0123zzzzz2: the stream's page moves are now per
+attention layer, so a KV window beyond its pool serves correctly (`code`). The
+refusal 0123zzzzz2 added is removed with it; a budget below the context streams
+and serves.
+
+- **The stream.** `llama_kv_stream::prepare()` no longer copies any page into
+  the ring; it fills the plan `I32 [n_pages]` (the ring row of each streamed
+  page, `-1` for a resident one). The host store is now one USM host-memory K
+  and V tensor per attention layer, `[n_embd_gqa, page_size, n_pages]`, made
+  through `ggml_backend_opencl_set_alloc_host(true)` and accessed by the slice
+  entry points (`host_set_page/host_get_page`); the whole class still runs on a
+  CPU buffer type for the device-free arm. A device without the USM entry point
+  refuses at construction instead of putting the host store on the card.
+- **The API** (`0123zzzzz3`, ggml): `ggml_flash_attn_ext_set_host(a, host_k,
+  host_v, plan)` adds the stream's tensors as FA srcs 9/10/11. They are leaves
+  in the stream's own buffer, expanded in the graph so the scheduler places
+  the FA node on their backend.
+- **The copies.** Each FA dispatch reads the plan and enqueues, before its own
+  kernels, one `clEnqueueWriteBuffer` per streamed page from the USM host store
+  into the K/V ring slot at `row*page_size*row_size`, on the in-order compute
+  queue. Layer i+2 reuses slot `ikv % 2` only after layer i's commands were
+  enqueued, so in-order execution gives every layer its own pages. The CPU
+  paged op does the same copy (host memory), so the CPU reference is
+  self-consistent and the graph can be tested device-free. This is step one
+  of I5: correct, not hidden. The second queue, per-slot events,
+  ready/consumed flags and the after-graph prefetch are the overlap, still
+  deferred (design §1.5, §4.3).
+- **Not built**: the backend probe that sizes the slots (I3's item); bytes over
+  the link equal the copies' (each page is read once per attention call), but
+  they are not hidden behind compute.
+
+Test: `tests/test_kv_stream_layers.cpp` in arcint's suite
+(`arcint-kv-stream-layers`, device-free): three layers share one ring slot, one
+pool page and two streamed pages; each layer's output is byte-equal to a
+contiguous attention over its own cells and the slot ends with the last
+layer's pages. The CPU arm is green; the red arm guards the copy off
+(`if (false && plan)`) and fails all three layers' outputs and the slot check.
+Not compiled on a card: the OpenCL dispatch's first build is Claude's window.
+
+## 0123zzzzz5-test-backend-ops-paged-layers.patch
+
+`test-backend-ops` gains `test_flash_attn_ext_paged_layers`: two attention
+layers in one graph, sharing one ring and one plan (the stream's
+`slots[ikv % 2]` are shared across layers), each with its own pool, host store
+and table row; the two outputs are joined by an ADD, so one output covers both
+layers. Decode (1 row) and a 6-row verify at kv 8,192 with a pool of 16 pages
+and every second page in the ring. The CPU reference performs the same
+per-layer copy, so a backend that copies every layer up front reads the last
+layer's pages and the summed output differs; a correct backend passes.
+The previous paged cases used ONE attention layer, which is how the defect
+above was missed. Added but not yet run on a card; the CPU-side shapes are
+compiled (`code`), the card run is Claude's window.
+
+
+
+A verify of 9 to 64 query rows (more than 8 drafts, several lanes' verifies in
+one ubatch, a short prompt tail) runs as one call of the GQA decode kernel
+(`flash_attn_gqa_dpas.cl`) when its (head, token) rows fit the kernel's 8 row
+tiles (64 rows: 10 tokens at the dense 27B's 6 query heads a KV head), instead
+of 0028's blocks of 8 rows. K/V is then staged once per work-group for all
+rows, where the blocks stage it once per block. The kernel is unchanged.
+
+- **Routing:** the decision is made after the op parameters are read (it needs
+  the K/V pair, ALiBi and softcap) and only when the GQA kernel for the pair is
+  built. A wide call skips the prompt kernel (`flash_attn_dpas.cl`) and the K/V
+  dequantization, and runs with the Intel decode settings of the 4-8-row GQA
+  calls (split size, partial buffer). Calls that do not fit keep the blocks;
+  4-8-row calls route as before. Paged K/V takes the same call (the kernel reads
+  the page table). The A770 builds no GQA kernel (it has 8-wide sub-groups), so
+  nothing changes there (`code`).
+- **Switches:** `GGML_OPENCL_FA_WIDE_VERIFY=0` keeps the blocks;
+  `GGML_OPENCL_FA_DEBUG=1` logs each call's form, rows and tiles (test-backend-ops
+  shows it; the server's log does not).
+- **Tests:** `test-backend-ops` cases at the agent's geometry, 9, 10, 17, 21 and
+  32 tokens, f16 (4,096 and 8,192 keys) and q8_0 / q4_0 (8,192 and 65,536), and
+  two paged verifies (10 and 17 rows).
+
+Measured on the B60 (`measured-here`, 2026-11-14):
+
+- **Op suite** (window 242, trees of 38f96336): wide calls take `form=gqa`; every
+  q8_0 / q4_0 and paged case passes, wide and switched off. The red copy (a wide
+  call launches one tile fewer) fails exactly the wide cases (9 and 10 rows,
+  the paged 10; ERR 0.07-0.23); the block cases stay green. f16 at 32,768 keys
+  misses the 5e-4 bound (0.0007) on every route, the switch-off blocks included,
+  hence the 4,096 / 8,192 arms. Full `FLASH_ATTN_EXT` suite: 3,109 of 3,115, the
+  failures those f16 cases and the f16 paged prefill with a ring (0123's open
+  case).
+- **Served** (window 243, dev binary of f165bf9c at 8 tiles, the agent's
+  command line, a 122,880-token prefix, 16 follow-up tails each, arms in
+  A B C C B A order): a 10-token tail took 561 / 560 ms against 653 / 652 with
+  the switch off (-14 %); a 20-token tail (120 rows, the blocks) 851 ms on both;
+  prefill 232.4-232.7 s on every arm. Decode's 4-8-row verify keeps its kernel and
+  route (`code`); at 8 tiles it took 144.5-147.5 ms a verify step (window 245).
+- **Answers** (window 244, `llama-perplexity`, the agent's Q4_K_M with q8_0 /
+  q4_0 KV and FA against the Q8_0 CPU reference, 32 chunks of 512 at ubatch 10,
+  so 60-row calls): mean KLD 0.009329 against 0.009322 switched off, same top
+  96.752 % against 96.777 % (bar: 0.03 nats, 1 point). The red build gives
+  0.888 / 78.63 %, so the arm runs the path.
+
+**16 tiles (128 rows): left out, open.** A 16-tile build passes the op suite
+(wide calls to 21 tokens, the red fails them), served a 20-token tail in 747 ms
+against 851 (-12 %, window 243), and at ubatch 20 gives the switched-off KL
+bit for bit (window 244). Its 4-8-row verify step, which runs the same kernel
+built with larger local arrays, took 147.7-148.7 ms against 144.5-147.5 at 8
+tiles (window 245, on greedy texts that diverged), so the trade between those
+tails and every decode step is not measured yet. It needs the tile switch and
+the tile-sized kernel arrays back (wide-verify3 f165bf9c has them).
+
+*Retracted* (2026-11-14, windows 245-249). A first reading called the 16-tile
+build defective: one greedy 256-token answer after a 22-token question over
+122,880 tokens came back empty in all five 16-tile arms. Window 248 then gave
+the same empty answer at 8 tiles, and window 249 measured the position: the
+package 1.6.2 itself answers it empty, and 30 samples at temperature 1 end at
+once 16 times on the package, 12 on this patch and 11 with it switched off.
+The model puts about 40-50 % on ending there, so the greedy pick flips with the
+B60's rounding on any build; it is no defect of the kernel or the route.
+
+History. The first form of this patch never ran its kernel. Wide calls reached
+the prompt kernel first, and its two red cases mutated dead code. Its perf
+figures (32 rows at 64k keys: 44.5 ms against 139) were the prompt kernel in one
+call. Served, that one call is slower than the blocks: a 20-23-token tail over
+122,880 tokens took 1,178 ms against 845 ms (window 240, package 1.6.2 with
+`GGML_OPENCL_FA_ROW_BLOCKS=0`), which confirms 0028's own measurement.
+`test-backend-ops` perf is no basis for that comparison with quantized K/V: its
+K/V tensors are flattened, and the dispatcher rebuilds them to blocks once per
+call, so the blocks pay it once per block. Its 24-tile builds measured the
+`flash_attn_f32_f16` fallback (the kernel does not build at 256 GRF), and its
+first launches on wide rows crashed on a base that read the page table of an
+unpaged call (fixed in kv-ringaos).
+
+## 0127-opencl-replay-subgroup.patch
+
+Fixes 0086/0087's OpenCL replay kernel (`GDN_RPL`, `kernel_gated_delta_net_rpl`): it carried no
+`__attribute__((intel_reqd_sub_group_size(SG)))`, while the generation (`tg`) and prompt (`pp`)
+kernels do. The replay body is the generation kernel's per-token step with a replay prologue and
+a record epilogue, and its `intel_sub_group_block_read/write` and `sub_group_reduce_add` work over
+one sub-group of SG work-items with every index `m*SG` (SG 8 on the A770, 16 on the B60). Without
+the declaration the compiler's sub-group size is not pinned to SG, and the kernel's indexing holds
+only at SG; which size the compiler picked was not read back (`inferred`). The card result below
+is the evidence: the replay state is wrong from the first launch without the declaration and
+right with it.
+
+**Measured (`measured-here`, 2026-11-14, window 267, the replay-coder tree before this patch,
+`test-backend-ops -b GPUOpenCL -o 'GATED_DELTA_NET.*'`, `LLAMA_GDN_REPLAY=1`, one process an
+arm)**: 58/66 on the A770 **and** 58/66 on the B60, the same 8 `GATED_DELTA_NET_REPLAY` chain
+cases failing on both (4 shapes × exact/precision). The exact arms, `[replay != snapshot: max
+|diff| 1.54019 / 1.54458 / 1.47103 / 1.31309]` (A770) and 1.381 / 1.537 / 1.645 / 1.393 (B60);
+the precision arms `[CONCAT] ERR 0.10-0.24`. Every non-replay `GATED_DELTA_NET` case passed. So
+the op is wrong on the cards and not only on the A770's SG 8; the dense agent's served replay
+arms passed the answer-level bar without this (their KL/needle did not see the state), which is
+why the defect survived: the chain cases had never run on a card — the plain `-o
+GATED_DELTA_NET` matches that name exactly and excludes every `GATED_DELTA_NET_REPLAY` case, and
+the earlier card arms used it.
+
+**Red before, green after** (`measured-here`, 2026-11-14, window 270, the tree with 0127 and
+0128): 68/68 on the A770 and 68/68 on the B60; the same tree without 0127 (the red) 58/68 on the
+A770, the 8 chain cases failing again (max `|diff|` 1.50). The no-replay cases stay green. The
+device-free cell is `tests/python/test_gdn_replay_model_branches.py`'s 0127 checks: the replay
+kernel declares the sub-group size, as the other two kernels do (red on the pre-patch tree).
+0128 adds the coder's chain geometry (16 key heads, 2 v repeats = 32 value heads, K 5) beside
+the existing shapes, so the served unit's head counts are in the op suite. Served (window 270):
+the coder with `LLAMA_GDN_REPLAY=1` on the A770 answers the capital, prefills 32k at 1031.5 t/s
+(1065.9 without replay), decodes at 65k at 34.6-39.7 t/s and scores the acceptance task 10/10;
+the dense agent with replay on the B60 answers the capital, no assert.
+
+## 0129h-kv-stream-paged-read-bounds-and-request-end-log.patch
+
+Two follow-ups of window 283 (`measured-here`). The paged FA's copy bounds
+(0129f) cover what the copies write, not what the kernel reads: under
+`GGML_OPENCL_FA_PAGED_DEBUG=1` the dispatch now reads this layer's table row
+(`GGML_FA_PARAM_PAGES_ROW`), prints its largest ring index and slot against
+the ring pages in the layer's view and the pool's pages, and aborts on either
+out of range. The stream's second line: `clear()` prints the previous
+request's last ubatch counts (`KV streaming (request end)`) before it resets,
+so a served request that never prints a second prepare line still shows what
+it streamed.
+
+## 0129j-kv-stream-paged-layers-table-both-rows.patch
+
+Window 284 (`measured-here`) read `max slot 2147483647 of pool pages 19, max
+ring -1` for the 2-layer op case: its `initialize_tensors` filled only one
+table row (`table[n_pages() + i]`), so row 0 held the `INT32_MAX` fill and
+layer 0's kernel read slot `INT32_MAX` / no ring entry, and the queue failed
+at the next synchronize (`-5`). Both rows are now filled (each with ascending
+ring entries, 0129f). Red first: the pre-patch case printed that line; the
+throwaway arm that only raises the pool pages passes, the real fix removes
+the sentinel.
+
+## 0129k-kv-stream-paged-read-sentinel-abort.patch
+
+`INT32_MAX` (an unwritten table row's fill) now aborts under
+`GGML_OPENCL_FA_PAGED_DEBUG=1` beside the range checks: window 284's arm
+printed a violation and continued, and a check that prints and continues is
+not a check. It cannot fire on a correct table; the sentinel is named in the
+abort message.
+
+## 0129l-kv-stream-paged-overlap-copy-queue.patch
+
+I5's step two, Intel, opt-in (`GGML_OPENCL_FA_PAGED_OVERLAP=1`): the paged
+FA's page moves leave the compute queue for their own in-order queue, so
+layer L's copies run while layer L-1's kernels do. Two parities (one per
+slot), as FreeToken's prefill double buffer orders its staging copies
+(`python/freetoken/moe/offload_cache.py`, `prefetch_prefill_layer` and
+`release_prefill_layer`) and Strata's chunk ring its halves
+(`src/dsv41/ds4_model.cu`, `copy_ahead` and the flow's waits): a copy into a
+slot waits for the FA that last read it (`consumed`, a marker on the compute
+queue after the layer's kernels), a copy also waits for a marker of the
+compute queue taken when it is enqueued (0032's `gmark` pattern), and the FA
+waits for its copy (`ready`). It deviates from the fork: no copier threads
+and no per-layer atomics; the host enqueues one layer ahead and the two
+queues order the rest. Default off, unset leaves every copy on the compute
+queue as 0129zzzzz3 had it. `GGML_OPENCL_FA_PAGED_OVERLAP_NOWAIT=1` is the
+development red arm: the copies stay on the copy queue, the FA does not wait
+for its ready event, so a race can show as wrong bytes or a failing check; a
+red arm that reads right proves nothing. `synchronize` drains the copy queue.
+
+## 0129m-kv-stream-request-end-on-seq-rm.patch
+
+Window 284's served log: seven requests, two prepare lines, no request-end
+line. The served path ends a request by removing its sequence from the cache
+(`llama_kv_cache::seq_rm`), not by `clear()`. The stream's `request_end()` is
+now called there when the removal covers the whole sequence (`p0 < 0 &&
+p1 < 0`); `clear()` calls it too, so a cleared cache logs its last counts
+once and not twice.
+
+## 0129n-kv-stream-paged-overlap-one-layer-lead.patch
+
+Window 286 (`code` + `measured-here`) shows 0129l's form is serial by
+construction: its copies sit inside their own layer's FA dispatch and wait a
+marker of the compute queue taken there, so a copy starts only when the
+compute queue reaches that layer, and the FA waits for it -- plus a marker, a
+barrier and two flushes a layer, +8 ms/step at 261k. `0129n` gives the copies
+real lead: `graph_compute` walks the graph's paged FA nodes once (dispatch
+order, `op == FLASH_ATTN_EXT` with `src[PLAN]`); at the first paged FA, node 0's
+copies wait a marker of the compute queue (after the input uploads, per 0042's
+measured placement) and node 1's follow immediately; every other node's pages
+are enqueued at the END of the previous node's dispatch, right after its
+kernels. A copy waits only its parity's `consumed` event -- the FA two
+attention layers back. Nothing waits the compute queue besides node 0's
+marker: the streamed pages' source (the USM host store) and the plan are
+written by the host before the graph and nothing on the device writes them
+during it (this ubatch's new K/V land in the pool through `set_rows`; the ring
+receives bytes only from these copies). The same switch, default off; NOWAIT
+still drops only the FA's ready wait, so a slot is read mid-copy.
+`0129n` also coalesces: consecutive plan pages with consecutive ring rows go
+as ONE command a run (C7); under DEBUG the dispatch prints commands before and
+after coalescing and the bytes. The plan-text byte count is `2 x pages` before.
+
+## 0129p-kv-stream-request-end-api.patch
+
+Window 286 (`measured-here`): zero request-end lines in four served arms. A
+served request is not ended by `seq_rm` -- the cache keeps the prefix for reuse
+and the removal comes at the NEXT request on the divergent tail. The line now
+sits where a completion ends: `llama_memory_request_end(mem)` (llama.h;
+`llama_kv_cache::request_end` calls the stream's), called from arcint's
+`generate` and `generate_spec_lane` before their return, so one line per
+completion with the stream's counts since its last line.
+
+## 0129q-kv-stream-paged-overlap-slot-and-no-fallback.patch
+
+Five corrections to `0129n`, all from reading it (`code`):
+- No silent fallback (CLAUDE.md). `ggml_cl_fa_paged_overlap_issue` returns -1 when the ring is
+  not one region or the host store is not USM; each such node now WARNs once a process
+  ("node %d of %d fell back to the compute queue"), and `overlap_after` prints once a process,
+  at the last node of the first graph with streamed pages, "%d of %d nodes issued ahead,
+  %d fell back". `issue` prints its own DEBUG line tagged "(lead)". The dispatch's DEBUG
+  "bytes" field prints bytes now, not the command count.
+- `issue`'s guard read `o.issued[ni]` out of range: `before()` asks for node 1 on a one-node
+  chain. It now returns false for `ni >= size` before touching the vector.
+- The parity is keyed by the RING SLOT, not by the node's place: `overlap_slot` reads the
+  node's K ring's buffer and `view_offs` (`ggml_cl_regions == 1`) and matches it against two
+  remembered slot keys. The stream's slots are `slots[ikv % 2]` (llama-kv-stream.h, 0120);
+  the node's index in the chain happens to match today, but the MTP head's graph or a graph
+  that skips an attention layer need not keep that order. A third distinct slot aborts under
+  DEBUG with both keys; without DEBUG that node falls back.
+- Node 0's copies still wait a compute-queue marker taken at the first paged FA, so they wait
+  the first GDN layers as well as the input uploads. Kept: the uploads are the only compute-
+  queue write the copies must follow (0042), and moving the marker to `graph_compute` would
+  not shorten it. Price ~1/16 of the copy time (`inferred`, about 17 ms a step at 261k).
+- The op suite does not reach this path: its host store is a plain buffer (not USM) and its
+  2-layer ring is SoA (`nrk = 2`), so coalescing and the lead both take the fallback. An op
+  case that reaches `ggml_cl_fa_paged_enqueue_pages` needs USM allocations and a single-region
+  q8_0/q4_0 ring; not built yet, so the served NOWAIT arm is the only red evidence.
+
+## 0129r-kv-stream-request-end-counts.patch
+
+Window 288 (`code` + `measured-here`): zero request-end lines with 0129p in every served
+arm, though `generate_spec_lane` calls it (backend_llama.cpp:2605, the MTP-5 path). From the
+code: `llama_kv_stream::request_end()` returned when `logged_first` was false, but
+`logged_first` stays true after the first line a stream ever printed, and `prepare()` prints
+only when `!logged_first || (n_streamed > 0 && !logged_stream)` -- a later request that
+streams after one already logged prints nothing and never clears the flag. Warmup and a
+short probe log; the 65k/261k requests do not. The counts were also only assigned inside
+that print gate. Now `prepare()` keeps `att_last`/`streamed_last` every ubatch, and
+`request_end()` prints unconditionally (one line per completion) and resets both flags.
+
+## 0129s-kv-stream-paged-verify-and-overlap-summary.patch
+
+- `GGML_OPENCL_FA_PAGED_VERIFY=1`: exact integrity of what each paged FA reads, on the card.
+  `ggml_cl_fa_paged_verify` builds a small FNV kernel (`fa_paged_verify`) and enqueues it on
+  the compute queue at the FA's position: after the lead's ready barrier (so after its
+  copies) and, in the unset/sync arms, after the copies just enqueued on that same queue;
+  the FA's own kernels are enqueued after this function returns. It hashes EXACTLY the ring
+  rows the plan names as streamed for this node, at the slot's own base offset and row
+  stride, in 4096-byte chunks, K then V. The host hashes the same bytes of the plan's pages
+  in the USM host store, which `prepare()` wrote before the graph. The ring row stride
+  equals the host page stride (K 1088*256 = 278528 = `kb`, V 576*256 = 147456 = `vb`), so
+  the compared bytes are the attended bytes; the check reads the slot after the copies in
+  the same queue position, so it observes the state FA j sees. What it does not prove is the
+  kernel's own addressing (it validates the copies, not the paged kernel's row math).
+  Per process the first mismatch WARNs with node, host page, ring row and chunk; totals are
+  in the summary line. A mismatch is a WARN, not an abort, and `NOWAIT` is the red arm: a
+  slot read mid-copy must show chunk hashes differ. If it stays clean, the copies are far
+  enough ahead (or the sync drain covers them) and the check is not reaching the race --
+  say so rather than claim it; the arm's log then does.
+- The overlap summary line: 0129q printed it from the LAST chain node's dispatch tail, which
+  needs that dispatch to take the tail and its `ov` to hold; window 288's zero count says no
+  dispatch satisfied both, while the DEBUG lead lines prove the 16 issues. It is printed at
+  the next graph's start now -- `ggml_backend_opencl_graph_compute` always runs -- with the
+  previous graph's "issued ahead / fell back" and the VERIFY totals.
+
+## 0129t-kv-stream-paged-verify-plan-index-and-selftest.patch
+
+Read-back of 0129s (`code`): `ggml_cl_fa_kv_stream_pages`' copy loop takes ring row `pl[p]`
+from `hk + p*kb`, `p` the PLAN index; the verify compacted the streamed rows alone and then
+read `host + i*nb` with `i` the compacted index, so the host side compared page i of the
+store against the i-th streamed row -- a false red whenever the streamed pages are not the
+front of the plan. From the code, the served layout does put them at the front while the
+pool is short of the attended pages: `prepare()` assigns the newest attended pages first
+("free slots take the newest attended pages", llama-kv-stream.cpp:224-228) and the streamed
+pages are that oldest prefix, so 0129s would have passed on a fresh 261k decode -- and
+failed as soon as evictions (the victim is the oldest non-written page) break the prefix.
+The plan index now travels with the ring row (`pages` beside `rows`), the host hash reads
+`host + pages[i]*nb`, and the first-mismatch WARN prints that plan index as "host page".
+`GGML_OPENCL_FA_PAGED_VERIFY=2` is a green self-test: on the first checked node one byte of
+the host-side expected value (the comparison's copy, never the store) is flipped, so exactly
+one chunk must mismatch -- proof the comparison can fail without a race. `=1` unchanged.
+
+## 0129u-kv-stream-paged-next-graph-head-lead.patch
+
+Window 289b (`measured-here`) + `0129n`'s code: node 0's copies are the exposed 28.0 ms gap
+before the first paged FA of every graph. From the code, node 0's copy waits a compute-queue
+marker taken at that dispatch, so it starts only after every kernel before FA 0 (the graph's
+stems and the first GDN layers), and node 1's copies follow it on one in-order copy queue;
+FA 0 waits only `ready[slot 0]`, but 28 ms > one layer's ~11 ms is the marker's start delay
+plus the copy, not node 1's wait. `0129u` removes it from the graph: at the LAST paged FA of
+a graph, `ggml_cl_fa_paged_prefetch_head` copies the NEXT graph's node 0 pages into their
+slot, waiting the `consumed` event of the FA that last read that slot (two attention layers
+back), so they run beside this graph's last FA, its last layer, the output head and the
+host's sampling. At the next graph's `before(0)`, `ggml_cl_fa_paged_prefetch_same` compares
+this graph's node 0 plan rows with the rows those copies filled; equal rows reuse the copy
+(FA 0 waits its ready event and copies nothing), a difference re-copies (counted). Valid
+because streamed pages are immutable in the host store: `prepare()`
+(`src/llama-kv-stream.cpp:172-259`) writes the store only through `zero_host`/`host_set_page`
+for pages it saves, and this ubatch's new K/V go to resident cache cells
+(`src/llama-kv-cache.cpp:1730,1765`), never to streamed pages. First graph: no pre-copy, the
+old path. After a `seq_rm` or a pool change: the next `prepare()` reassigns ring rows and the
+comparison re-copies. No invariant conflicts: the pool partition and slots are unchanged,
+nothing is evicted for the prefetch. DEBUG prints per graph "node 0 reused N pages" or
+"rows differ, re-copied", with the running issued/reused/re-copied counts.
+
+## 0129v-kv-stream-paged-prefetch-pairs-and-chain-key.patch
+
+Read-back of 0129u (`code`): `prefetch_same` compared the sequence of ring rows only.
+`prepare()` numbers ring rows in plan order (`src/llama-kv-stream.cpp:225-230`: streamed pages
+get `n_streamed++` as the plan walks), so two plans with the same number of streamed pages but
+a different set both give `[0..n-1]`, and node 0 would reuse rows holding the previous plan's
+pages. The prefetch now records `(plan page, ring row)` pairs and the issuing graph's chain
+length and first-node slot; reuse needs all three identical. From the code, a same-count set
+change is reachable in a decode: an eviction swaps the oldest non-written page for a slot
+(`llama-kv-stream.cpp:207-216`), a request's prefix reuse moves which pages are resident, and
+the MTP head's graph is its own chain whose tail can leave its own node 0 in the slot. The
+DEBUG line now carries both chain lengths ("chain %d, prefetched by chain %d").
+
+## 0129w-kv-stream-request-summary-and-hybrid-request-end.patch
+
+Window 290 (`measured-here` + `code`): the VERIFY=2 self-test fired correctly (1 of 312 chunk
+hashes differed, the flipped byte), but three lines stayed silent.
+- The self-test line tested `o.v_nodes == 0` after `o.v_nodes++`, so it could never print;
+  the flag is taken before the increment.
+- The once-per-process summary printed at the first graph with the counters still zero ("0 of
+  16 nodes issued ahead"). The graph's counters now roll into a process total, and
+  `ggml_backend_opencl_fa_paged_summary` (weak-called from `llama_kv_stream::request_end`)
+  prints the REQUEST's totals at the request's end -- issued ahead, fell back, verify nodes /
+  bytes / mismatches, next-graph reused / re-copied -- and resets them. The fallback WARN
+  stays once per process.
+- The request-end line never reached the stream: 0129p overrides `request_end()` only on
+  `llama_kv_cache`, and the served hybrid model's memory is `llama_memory_hybrid`
+  (`src/llama-model.cpp:3317-3324`, the QWEN3NEXT/QWEN35/QWEN35MOE branch without SWA or an
+  indexer), which kept the `llama_memory_i` no-op. `llama_memory_hybrid` now forwards to
+  `mem_attn`; `llama_memory_hybrid_iswa` does the same, and `llama_kv_cache_iswa` (which had
+  no override) forwards to its base and SWA caches. `llama_memory_hybrid_idx` inherits the
+  hybrid override.
+
+## 0130a-fa-decode-depth-op-cases.patch
+
+The red half of 0130b (`code`): the 4-7 row decode kernel's depths with quantized K/V had no
+op case. 0016's depth arms stop at 131,072 and are f16, and the 0088 arms reach 131,072 at 1-3
+rows only, so the served decode (q8_0 K / q4_0 V, head 256, 24 query heads on 4, 4-7 rows) was
+tested at 4,096 and 1,013 but never at 65k or 240k. Added: those types at 4, 5, 6 and 7 rows,
+4,096 / 65,536 / 245,760 keys, eval and perf. Window 291's unitrace says a call at 240k reads
+~938 keys a split and takes 8.34 ms in this form, so this is the case the switch is red against.
+
+## 0130b-fa-decode-v2-double-buffered-v-stage.patch
+
+`GGML_OPENCL_FA_DECODE_V2=1` (default off), 4-8 row form of `flash_attn_gqa_dpas.cl`
+(`code`): the kernel staged each tile's V between its Q K^T and its P V, so the global loads
+sat on the critical path and the DPAS units were idle while they ran -- window 291 measures
+~48 GB/s at 240k, and the 2026-10-04 ablations showed staging and products adding up rather
+than overlapping. Now two V stages (16 KB each at head 256, BK 32 -> `local` 42 KB becomes
+58 KB a work-group, still one work-group a core per 0045, 64 KB device limit), the tile t+1
+stage runs at the loop's top before t's Q K^T, P V reads the buffer of this tile, and the
+consumed buffer toggles at the tile's end. Barrier count is unchanged (one WAR fence a tile
+at its top, one before P V). `GGML_OPENCL_FA_DECODE_V2_BROKEN=1` is the red variant: the stage
+targets the buffer the products read, so every arm must fail. The base kernels stay built and
+are replaced only when a V2 programme builds and fits local memory; the log line carries the
+built count and the local bytes. The 1-3 row q8q4 split kernel is untouched.
+
+## 0130c-kv-stream-paged-lead-reachability-and-request-totals.patch
+
+Window 292 (`measured-here`) + `code`. This patch carries 0129x, 0129y and 0129z folded
+(numbers kept in its comments):
+- **0129x, the dead lead's cause.** `ggml_cl_fa_paged_overlap_after` -- which issues the next
+  layer's copies one layer ahead AND, at a graph's last paged FA, calls
+  `ggml_cl_fa_paged_prefetch_head` (0129u's cross-step lead) -- sat only in the tail of
+  `ggml_cl_flash_attn` (`ggml-opencl.cpp:26102`). The split-decode branch, which the served
+  decode takes (the GQA kernel runs through `fd_k_split` with `f32_merge`), `return`s at
+  :25979 (`code`), before that tail. So on a decode neither the one-layer lead nor the tail
+  prefetch ever ran: window 292's DEBUG arm printed 2,240 "commands (lead)" lines and not one
+  "next-graph lead" line, every node's copies were issued by its own dispatch (`before`'s
+  fallback), and every request-end summary read "0 reused, 0 re-copied". The branch now calls
+  the tail too, after both kernels are enqueued.
+- **0129y, no silent fallback.** Each early return of `prefetch_head` (empty chain, ring slot
+  not cached, plan not USM, `enqueue_pages` -1, and a plan with no streamed page) names itself
+  once a process, and the request-end summary now reads "next-graph lead: N issued, N reused,
+  N re-copied", so "the tail never prefetched" is distinguishable from "it prefetched and the
+  next graph rejected it".
+- **0129z, the verify-only arm's totals.** The counters rolled up only under `OVERLAP`, so
+  window 292's A-uverify arm (VERIFY=1, OVERLAP unset) printed no totals and could not show it
+  had checked anything. The roll-up and the zeroing now run when either switch is on; the
+  chain (0129n's lead) stays overlap-only. 0129s/0129t's verification itself is unchanged.
+
+## 0130d-kv-stream-paged-verify-post-fa.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session). The gate is
+device-free: `tests/python/test_fa_paged_lead.py`'s `FaPagedPostFA`, three mutations run and
+seen failing.
+- **VERIFY=3, the post-FA hash.** 0129s/0129t's `fa_paged_verify` hashes the streamed rows
+  the FA reads, but at the FA's start and with a blocking read: it proves what FA j reads
+  when it starts, not what the slot holds while j runs. `=3` enqueues the same hash at that
+  start (pre), then the SAME rows again right after FA j's kernels (post), both on the
+  compute queue, both read back `CL_FALSE` with an event. On the split-decode branch the
+  post sits after `k_merge` and before `ggml_cl_fa_paged_overlap_after`'s consumed marker;
+  on the prompt tail after the tail kernels and before the same call. The pairs are awaited
+  at the next graph's start and at the request's end; a chunk whose two hashes differ means
+  a copy landed while the FA read the slot. WARN once a process:
+  `paged FA post-FA changed: node %d page %d chunk %d`, and the request summary gains
+  `post-FA changes N` (`code`).
+- **The red arm.** `GGML_OPENCL_FA_PAGED_NOCONSUME=1`, development only, drops exactly the
+  consumed wait in `ggml_cl_fa_paged_overlap_issue` -- the 0129n-0129w decode, where
+  `consumed[]` stayed nullptr, so a copy into a slot could start while the FA two layers
+  back read it. The prefetch's own consumed wait is untouched (`code`).
+- **Why the post is before the marker.** The consumed marker waits the queue's prior work,
+  the post hash included; a copy that waits the marker cannot land inside the FA it guards.
+  With the wait dropped the only ordering left is the copy queue's own, which is the race
+  `=3` is built to see (`code`).
+
+## 0130e-fa-decode-perf-depth-cases.patch
+
+`code` for the mechanism; the timed number is owed (no GPU in this session). 0130a added the
+4-7 row decode kernel's depth cases to the TEST list only; `make_test_cases_perf()` builds
+its own list, so window 293b's perf arms matched nothing (`test-backend-ops perf -o
+FLASH_ATTN_EXT -p '<depth regex>'` ran 0 cases). This patch puts the same 3 K/V pairs x
+{4,5,6,7} rows x {4,096, 65,536, 245,760} keys into the perf list, so a red-first run of the
+filter prints `us/run` for the kernel's own served shapes.
+
+## 0130f-fa-decode-v-register-prefetch.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session). 0130b's V2
+double buffer stores the loaded halves to local memory immediately after the loads, so the
+thread stalls at the store before tile t's products run; the second buffer hides nothing
+within a sub-group. 0130f loads tile t+1's V halves into the thread's private registers at
+the loop's top, runs tile t's QK^T, softmax and P V, and stores the registers to the other
+stage only after P V, so the load's value is consumed after the products. Two stages and
+the same local footprint as V2 (58,224 B at head 256 q8_0 K/q4_0 V); the build option set is
+identical, one switch apart: `GGML_OPENCL_FA_DECODE_PRE=1`, default off, replacing a pair's
+kernel only after it built and fits local memory, with a WARN and the base kernel when it
+does not. `GGML_OPENCL_FA_DECODE_PRE_BROKEN=1` is a separate build whose store goes to the
+buffer P V reads, before the products: the red op cases. The gate is device-free,
+`tests/python/test_fa_decode_v2.py`'s `FaDecodePre`, three mutations run and seen failing.
+
+## 0130g-fa-paged-post-selftest.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session). Window 294's
+NOCONSUME arms printed `post-FA changes 0` on every request-end line at both depths, so
+VERIFY=3's collect and compare path had never been seen to fire. `GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=3`
+writes ONE byte (pattern 1 byte, offset = the first streamed row's chunk 0) into the K slot on
+the compute queue inside `verify3_post`, after the FA's kernels and before the post hash, on
+one node a request (the first streamed node of the first decode graph); the post hash must
+differ from the pre hash in exactly one chunk, so exactly one
+`paged FA post-FA changed: node %d page %d chunk %d` WARN and `post-FA changes 1` in the
+summary. One K byte of one streamed key is corrupted in the ring slot until the next copy
+refills it: the answer on that node's decode chain may change, so this arm is not for serving.
+Gate: `tests/python/test_fa_paged_lead.py`'s `FaPagedPostSelftest`, three mutations run and
+seen failing.
+
+## 0130h-fa-paged-forced-race-delay.patch
+
+`code` for the mechanism; the card number is owed (no GPU in this session).
+`GGML_OPENCL_FA_PAGED_DELAY=<n>`, development only: a busy-wait of n iterations in its own
+one-work-item kernel on the compute queue, enqueued BETWEEN this FA's split kernels and its
+`k_merge`, so it lengthens FA j's hold of its slot and adds nothing before FA j starts. With
+`NOCONSUME=1` the copy into that slot two layers later no longer waits the marker and lands
+inside FA j (nonzero `post-FA changes`); with the consumed wait on, the same delay reads
+`post-FA changes 0` -- the measured proof of 0130c. The cross-step prefetch's consumed wait is
+not part of NOCONSUME (0130d's exactly-one-wait arm): it stays unconditional, which is why
+window 294's red arm could not land. Gate: `FaPagedForcedRace`, three mutations run and seen
+failing.
+
+## 0130k-fa-gqa-no-private-memory.patch
+
+`code` for the mechanism; the ISA is the card host's (ocl 26.27, `-device bmg`, `-DDK=256
+-DGQA_SIDES=2 -DKT=1 -DVT=2`): base/V2/PRE all reported `//.private memory size 5888`, 61
+private loads and 8 private stores inside the dpas span. `GGML_OPENCL_FA_GQA_NOPRIV=1`, default
+off, compiles the same source with `FA_UNROLL` (`_Pragma("unroll")`) on every loop that indexes
+a private array (8, NDH, KC, NKB, PRE's 2: all compile-time) and the V stage's `vv[64]`
+replaced by 64 component stores straight to local memory, in both stage macros; the reduction
+order is base's, no reassociation. BROKEN is a separate build that writes value 15 of every
+staged V row as zero, the red op cases. Expected: `//.private memory size 0`. Gate:
+`tests/python/test_fa_decode_v2.py`'s `FaDecodeNoPriv`, three mutations run and seen failing.
+
+## 0130l-fa-gqa-no-private-file-level-directives.patch
+
+`code` and `measured-here` (recipe host, cpp 14.2.0): 0130k broke compilation of the
+production GQA decode kernel, NOPRIV off. It put `#ifdef GQA_NOPRIV` / `#else` / `#endif`
+inside the backslash-continued bodies of `FA_GQA_STAGE_V` and `FA_GQA_STORE_V`; a `#` inside
+a macro body is the stringize operator, so `cpp -x c -P -DDK=256 -DGQA_SIDES=2 -DKT=1
+-DVT=2 flash_attn_gqa_dpas.cl` on b69f5bee's file prints `276:32: error: '#' is not followed
+by a macro parameter`, rc 1, and ocloc 26.27.39122.11 `-device bmg` gave rc 245 with no ISA
+for every form (base, NOPRIV, NOPRIV_BROKEN, NOPRIV+PRE, PRE). The alternatives are now
+whole macro definitions under file-level `#ifdef`, the broken zero is a value macro
+(`#define FA_GQA_V15(x) 0.0h` vs `(x)`), and `FA_UNROLL` is wrapped in
+`#if defined(GQA_NOPRIV)` so its empty branch leaves no blank line: `cpp -P` of the fixed
+base is identical to the pre-0130k file (25f3b7a5), diff 0 lines. Everything else in 0130k is
+unchanged: the unrolled private-array loops, the 64 component stores, base's reduction order.
+Gate: `tests/python/test_kernel_preproc.py` runs `cpp -x c -P` over the kernel under every
+define set the host builds (base, I8, ST, V2, PRE, PRE+BROKEN, NOPRIV, NOPRIV+BROKEN,
+NOPRIV+PRE) at DK=256, GQA_SIDES=2, K/V q8_0/q4_0 (KT=1, VT=2) and f16 (KT=0, VT=0); red on
+b69f5bee, green here, and one mutation (a directive inside the continued body) run and seen
+failing. `build-deb.sh` runs the same matrix after the patch loop, so the recipe fails on a
+kernel that does not preprocess.
+
+## 0130n-fa-gqa-no-private-host-route.patch
+
+`code`, no host change: the host builds the GQA kernel through
+`build_program_from_source_optional`, so a refused programme is never silent. Base failing
+(`pg == nullptr`) leaves `kernel_fa_gqa_dk[di][i]` null; the V2/PRE/NOPRIV arms skip that pair
+and each warns; the tail prints `ggml_opencl: flash_attn_gqa_dpas.cl not built;
+flash_attn_f32_f16.cl takes decode` with the downgrade record `path=fallback
+reason=not-built what=fa_gqa_dpas`, and decode takes `flash_attn_f32_f16.cl`. This entry
+records that route so 0130k's build failure cannot be mistaken for a silent fallback.
+
+## 0130o-fa-gqa-nopriv-macro-continuations.patch
+
+`measured-here` (ocl 26.27, `-device bmg`, q8_0 K / q4_0 V, head 256, 2 sides): 0130l's
+component-store lines in the NOPRIV stage/store bodies carried no trailing backslash, so
+each macro ended after its four loads and the stores landed at file scope. `cpp` accepts
+that; ocloc did not (rc 245, `use of undeclared identifier 'dst'`) for every NOPRIV form,
+while the base form was unaffected. 0130o adds the continuations, and the cpp gate now
+fails when a macro parameter (`dst`, `k0i`) survives preprocessing: red on 0130l in 6 of 18
+sets, green with 0130o. ISA (`measured-here`, same window): base 5,888 B private, 101
+private loads / 54 stores, instCount 6,448; NOPRIV 0 B, 0 private messages, 3,840 B spill
+(6,921 inst); NOPRIV+PRE 6,144 B private (10,176 B spill). Lesson: a cpp-clean file is not a
+compiling file; check that the body ends where intended.
+
+## 0130p-fa-paged-timeline.patch
+
+`code`: `GGML_OPENCL_FA_PAGED_TIMELINE=1`, development only. Markers on both queues carry
+the waits of the command after them, so their END is that command's start: per slot copy
+start/end, FA split start/end, merge end, the consumed marker and the post hash start of the
+request's first split-decode graph (a prompt graph is dropped and the next one recorded),
+each in device ns relative to the graph's first paged command; then the derived margin
+`copy(k+2).start - FA(k).split end` with its minimum and negative count per slot, and the
+cross-step prefetch's copy start against that slot's first FA split end and against the last
+FA's split end. The copy queue is created with `CL_QUEUE_PROFILING_ENABLE` only when the
+switch is on; the compute queue's stamps need `GGML_OPENCL_PROFILING` in the build, and a
+build without it warns once instead of printing zeros. No host wait is added.
+
+## 0130q-fa-paged-nofix-dev-switch-lines.patch
+
+`code`: `GGML_OPENCL_FA_PAGED_NOFIX=1`, development only, drops exactly the cross-step
+prefetch's consumed wait -- 0130c's own site -- and `NOCONSUME` keeps its meaning (the
+intra-graph wait in `issue` only). Every development switch prints one line with its value
+when first read (NOCONSUME, NOFIX, DELAY n, VERIFY mode, VERIFY_SELFTEST, TIMELINE), and
+the request-end summary gains `NOCONSUME consumed waits dropped N; NOFIX cross-step waits
+dropped N; delay kernels N; self-test writes N`, so window 296's defect -- no line saying
+the red arm had run red -- cannot recur.
+
+## 0130r-fa-paged-timeline-nofix-gate.patch
+
+`code`: `tests/python/test_fa_paged_lead.py`'s `FaPagedTimelineAndNoFix`, source-text
+cells for the timeline's marks, the margin arithmetic and the negative count, the two
+profiling sources, NOFIX called exactly once in the prefetch and NOCONSUME once in `issue`,
+every switch's startup line and the request-end counts. Mutations run and seen failing,
+then restored: the split start stamp moved after the merge, NOFIX added to `issue`'s wait,
+the summary's dev-switch line renamed.
+
+## 0130w-fa-paged-timeline-slot-and-host-time.patch
+
+`code`: window 298b's timeline paired once per ring slot and could not say why a copy did
+not land inside an FA, so this patch carries the three mechanisms as one file -- they are
+one timeline build's measurements, and none changes a runtime default.
+
+- **The event carries node and slot separately** (0130w's slot fix): the FA stamps passed
+  the dispatch's *node index* in the slot field, so only nodes 0/1 matched a ring slot and
+  the margin compared one pair per slot. `struct fa_paged_tl_ev` gains `node` beside
+  `slot`; the FA's slot is `ggml_cl_fa_paged_overlap_slot` of the chain node (the copy
+  stamps already used the issue's slot), the lines print "slot %d node %d", and the margin
+  pairs copy k+2 against FA k per slot.
+- **The host submit time** (0130x): each stamp keeps the host time it was submitted at
+  (`CLOCK_MONOTONIC`), the base takes `clGetDeviceAndHostTimer` so both clocks are in one
+  frame (an ICD without it warns once and keeps the device stamps relative to the base
+  event), the FA's dispatch entry and exit are stamped host-only, and each copy prints
+  `start-submit` -- 'the host submitted late' and 'the device held the copy' separate.
+- **`GGML_OPENCL_FA_PAGED_DELAY_AT=splits`** (0130y): moves 0130h's spin before the split
+  kernels, the only placement that widens the ring's read window; the default `merge`
+  keeps its meaning. For the cross-step prefetch to land inside a reader, the FA to
+  lengthen is the slot's last reader two attention layers before the graph's last FA --
+  the FA whose `overlap_after` armed `consumed[p]` (`code`).
+
+Gate: `FaPagedTimelineSlotHostDelay` in `tests/python/test_fa_paged_lead.py`; three
+mutations run and seen failing, restored: an FA stamp back to the node in the slot field,
+the AT=splits spin removed, the submit time dropped from the kept stamps.
+
+## 0131c-fa-paged-timeline-no-marker.patch
+
+`code`: the timeline's stamps are the commands' own events; it enqueues no command of its
+own and waits no host in a graph. This file also carries 0131d (one file, one build; a
+review that wants them apart splits the hunks).
+
+- **0131c, no marker.** 0130p stamped with `clEnqueueMarkerWithWaitList`, four with output
+  events on the compute queue per split-decode FA, a copy-start marker carrying the copy's
+  same wait list and an unflushed copy-end marker on the copy queue. Window 299 measured
+  the overlap's whole gain gone with the switch unset (451.9 ms/step against 261.3/262.1
+  before 0130p) and 0131b's early return only hid it while the switch was off. Now:
+  `enqueue_ndrange_kernel` hands out its command's event on request, `k_split`'s event is
+  both the split start (its start) and the split end (its end), `k_merge`'s end is the merge
+  end, `enqueue_pages` hands out its first and last write command's events (the copy's
+  start and end), the consumed marker is stamped as it is (role 5, the marker the next copy
+  waits anyway), the post hash kernel's start is the post-start stamp when VERIFY=3/4 runs.
+  The base is no longer a command: `tl_finish` takes the earliest device start among the
+  stamps. The overlap's remaining markers are the ones the schedule needs (`o.ready`,
+  `o.pre_ready`, the after-inputs order, `o.consumed`) -- none of them the timeline's.
+- **Which call serialized, from the code (`code`; the cost mechanism `inferred`):** the
+  copy-start marker was enqueued whenever `nw` was non-zero, i.e. also with the switch off
+  (`if (nw || ggml_cl_fa_paged_timeline())`), so every issue put an extra command with a
+  cross-queue wait list and an output event nobody consumed on the queue that carries the
+  copies. The compute-side markers ran only under the switch. A marker is a command: ICC
+  schedules it as its own node, and its event exists only to be released. Whether that
+  costs 190 ms/step as a submission boundary or as an event-scheduling stall cannot be
+  decided on this host; window 299's numbers are the measurement that matters.
+- **0131d, VERIFY=4: a post-read pair that waits nothing in the graph.** The same pre-read
+  hash 0130s/0130d use, plus a hash of the slot's rows enqueued after the reader's split
+  kernels and merge (`verify3_post`'s second hash), plus a re-hash when the slot's next
+  copy has been issued: a kernel on the compute queue whose only wait list is that copy's
+  `o.ready` event, no readback in the graph and no host wait. The pair is collected only at
+  the request's end: pre-read against the reader's hash is `read` (a copy landing inside
+  the read), the reader's hash against the re-hash is `late` (a copy landing after it), and
+  a missing re-hash is counted, not silently skipped. `VERIFY=3`'s collect at a graph's
+  start ordered the next graph's dispatch behind the previous graph's last FA (the host
+  waited the readback events); VERIFY=4 does not collect there at all. Line:
+  `paged FA post-read (request end): pre-read vs read N mismatches, read vs re-hash M,
+  re-hash missing on K pairs, stage-1 self-test writes S`; a difference WARNs
+  `ggml_opencl: paged FA post-read changed: node %d page %d chunk %d`, once a process.
+  `GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=4` is its stage-1 red arm: one byte written into
+  the slot between the pre-read hash and the reader's split kernel, on one node a request.
+- **Why TIMELINE on and off gave different greedy texts (`code` for the dependencies,
+  `inferred` for the cause):** the markers added no wait to the compute queue and the copy
+  queue's copy-start marker carried exactly the wait list its writes carried, so no
+  buffer's reader/producer order changed -- the math kernels see the same dependencies.
+  What changed is when the copies run relative to the readers: 190 ms/step of extra
+  schedule. A copy landing inside a reader's window changes bytes that reader sees, and
+  that is a data race, not rounding; the alternative is the B60's per-forward
+  nondeterminism (CLAUDE.md's 0.136-nat floor). VERIFY=4, with its self-test proving the
+  detector fires, decides which -- on the card.
+- **Gate:** `FaPagedTimelineNoMarkerAndPostRead` in `tests/python/test_fa_paged_lead.py`.
+  Four mutations run and seen failing, then restored: a marker back in the recording start,
+  the copy stamps taken from no command event, the re-hash enqueued without the copy's
+  ready event, VERIFY=4's pairs collected at a graph's start.
+
+## 0131j-fa-paged-overlap-graph-boundary-order.patch
+
+Three orderings of the KV window's copy-queue overlap (`GGML_OPENCL_FA_PAGED_OVERLAP=1`) that
+the 1.7.0 release review found open (evidence class `code`; none was seen failing on a card,
+and the serial stream without the overlap is ordered by the in-order compute queue):
+
+- **The slots' last readers across a graph.** `ggml_cl_fa_paged_overlap_graph` released both
+  `consumed[]` events at every new graph. In the reused-prefetch branch (0129u) node 1 is
+  issued without the input marker, so its copy then had no wait at all; with an even
+  attention chain (16 layers) slot 1's last reader is the previous graph's last FA. A decode
+  step drains the host through the logits read, so the window measured so far could not
+  meet it; a graph that follows without a drain (consecutive no-logit ubatches whose plan
+  repeats) could overwrite slot 1 while that FA still reads it. `consumed[]` is now kept
+  across the boundary: the first copies into a slot wait its last reader, and a kept event
+  that has completed is a no-op wait.
+- **The waited marker is flushed.** The consumed marker is enqueued on the compute queue and
+  waited by the copy queue; OpenCL requires the queue holding a waited event's command to be
+  flushed. `clFlush(ctx->queue)` follows the marker.
+- **The reuse key names the layer.** `ggml_cl_fa_paged_prefetch_same` compared the plan's
+  (page, row) pairs, the chain length and the slot. The plan is shared by every layer and
+  `graph_compute` runs once per scheduler split, so two splits of equal paged-FA count share
+  all three at their node 0. The key now also holds node 0's host store (`pre_host_k`).
+
+Gate: `tests/python/test_fa_paged_overlap_order.py` (`fa-paged-overlap-order`), red on the
+series up to 0131i (all three checks fail), green with 0131j. The card arm is the 1.7.0
+gate's KV-window smoke (window 170).
+
+## 0131k-fa-paged-predicate-gqa-kernel-and-split-slot.patch
+
+The paged FLASH_ATTN_EXT predicate (`ggml-opencl-fa-paged.h`, 0123zzzzz6) now follows the
+dispatcher's own order, and a paged call can no longer reach a kernel that does not read the page
+table without an abort. The 1.7.0 gate's op suite found the first defect, on the A770 with the new
+tools (window 170, evidence class `measured-here`): the first paged case aborted with "a paged
+decode FLASH_ATTN_EXT reached a kernel without a page table". The review of the first fix found
+the rest (`code`). arcint's serving cannot reach any of them: it refuses the KV window off the
+B60, and on the B60 with the agent's shapes (6 query heads per KV head, at most 6 tokens a decode
+step) and no switch set, both predicates accept the same shapes and the dispatch is unchanged
+(the 11-64-token calls run as row blocks either way; the old predicate called them the conversion).
+0131m then took paged calls out of the row blocks altogether (below).
+
+- **1-8 rows: the GQA decode, or nothing.** A paged decode of 1-8 rows runs on the GQA kernel.
+  The split decode (`intel_q_decode`) only opens that path; the dispatcher then needs the direct
+  GQA kernel and `(heads / KV heads) * rows <= tiles * 8`. The old clause checked the split alone.
+  The A770 builds the split but no GQA kernel (that program needs sub-group 16), so `supports_op`
+  accepted the case and the dispatcher aborted. Any other 1-8-row shape counted as the f16
+  conversion, but the conversion takes only 9+ rows (`fa_dpas_ok`). Such a call fell to the split
+  kernel (with `GGML_OPENCL_FA_INTEL_SPLIT=0`, the generic decode kernels) and read the pool
+  rows as the attended sequence, silently, because the abort checked form 1 only. Reachable on
+  the B60 with `GGML_OPENCL_FA_GQA=0`, `GGML_OPENCL_FA_INTEL_SPLIT=0`, or a model with more
+  query heads per KV head (16 heads at 5 rows), not with the agent's defaults. Those shapes are now declined: the scheduler gives them to the CPU, whose
+  FLASH_ATTN_EXT reads the page table, the plan and the host stores (`ops.cpp`).
+- **9-64 rows: the wide call, else 0028's row blocks, else the conversion** (superseded by 0131m:
+  paged calls no longer take the row blocks). The row blocks
+  (`GGML_OPENCL_FA_ROW_BLOCKS`, on by default) split a 9-64-row call into 8-row calls before the
+  conversion could take it, so such a shape needs the 8-row GQA decode. The predicate counted it
+  as the conversion. The caps now carry the row-block switch.
+- **The conversion needs the pair's prompt kernel.** The dispatcher's prompt branch requires
+  `kernel_fa_dpas_q_dk[0][pair]` (or `kernel_fa_dpas_dk[0]` for f16) before it reaches the
+  conversion; `kernels_prefill` now includes it.
+- **The split decode is read by its own slot, after its build.** `q_q1_split_intel` holds three
+  kernels in the dispatcher's `kvq` order (q8q8, q8q4, q4q4). Both callers indexed it with the
+  GQA arrays' index, which starts at f16: the agent's q8_0/q4_0 pair read q4q4's split, q4_0/q4_0
+  read past the array, and f16 read q8q8's instead of `f32_f16_q1_split_intel`.
+  `ggml_cl_fa_paged_split_slot` gives the slot. These kernels are built on the dispatcher's first
+  head-256 call, so `supports_op` saw none of them before it; it now builds the same program first,
+  as its head-512 branch already did.
+- **The wide call needs the merge kernel.** Its launch reads `f32_merge` unchecked; the caps
+  now carry it, so a failed f32_f16 build declines the shape instead of throwing.
+- **Loud where it was silent.** The dispatcher aborts on any paged call that reaches the decode
+  kernels off the GQA kernel (it checked form 1 only); a prompt the conversion does not take (a
+  mask narrower than the keys, which the predicate does not model) ends there. A second abort
+  before the in-place prompt kernels is defensive: no accepted shape reaches it.
+
+Gate: `tests/test_fa_paged_predicate.cpp` (`fa-paged-predicate`). Its new and changed cases fail
+by assertion on the 0131j header: a split without a GQA kernel, 6 tokens over 4 tiles, 1-8 rows
+without the split, 11 tokens past the cap (row blocks, not the conversion), the wide verify off.
+The file itself does not compile there (the slot map and the `row_blocks_on` and `merge` caps
+are new); with those removed, the listed cases fail. The card arm is the A770 and B60
+FLASH_ATTN_EXT suites and the KV-window smoke on the release tools (window 170k).
+
+## 0131m-fa-paged-no-row-blocks.patch
+
+A paged FLASH_ATTN_EXT never takes 0028's row blocks. The blocks split a 9-64-row call that does
+not fit the wide GQA call into 8-row calls, re-entering the dispatcher with a stack copy of the
+node. Under `GGML_OPENCL_FA_PAGED_OVERLAP=1` the overlap recognises its nodes by the graph's own
+node (`chain[cur] == dst`), so those 8-row calls copied their pages on the compute queue, outside
+the overlap's chain, and the outer node never took its turn: the previous graph's cross-step
+prefetch into ring slot 0 was neither waited nor invalidated, and the next graph found the same
+(host page, ring row) pairs and reused a slot the blocks had since filled with another layer's
+pages (`code`).
+
+Found by the 1.7.0 gate (`measured-here`, the B60, Qwen3.8-27B UD-Q5_K_M, q8_0:q4_0, MTP 5): with
+the overlap the served answer moved with timing and differed from the serial stream's (window
+170n at 120k; 171a at 30k with a 256 MiB window: answer md5 1759821941af against 5f932b72915b).
+Switching the prefetch off, or never reusing it, gave the serial answer bit for bit (171a);
+`VERIFY=1` found node 0's reused ring row 0 different from host page 0 in all 8,216 chunks, once
+a run (171b): the question's prefill (about 20 tokens, 120 rows) is the one row-block graph of
+each request, and the question's K/V cached from it changed the next request's answer. A store
+generation guarding the host store (an earlier 0131m) refused nothing and cured nothing (171c);
+`GGML_OPENCL_FA_ROW_BLOCKS=0` on the unchanged release candidate made the timing-slowed overlap equal
+to the serial stream for the first time (171e: 30k and 120k, md5, accepted drafts and verifies),
+while at full speed the answer still moved: a second defect, 0131n.
+
+The wide call's dispatch condition (`gqa_wide`) also requires the split's merge kernel, which its
+launch reads: the predicate's wide clause did, so without the merge kernel a wide-shaped call was
+accepted as the conversion and dispatched to the split branch, which throws (review, `code`; the
+merge kernel is built on both cards, so no served path changes).
+
+Such a call now takes the conversion, whose copies the overlap orders, in the serial stream too,
+so both streams run the same kernels. The cost is the conversion on the rare short-tail ubatch
+(0028 measured 4.3 ms an attention call there at 4k on the B60). The serial stream was never
+wrong: with the overlap off there is no copy queue, and the blocks' copies and kernels are in
+order on the one compute queue.
+
+Gate: `tests/test_fa_paged_predicate.cpp` (9-64 rows that are not wide take the conversion: 11
+tokens, a 20-token prefill, without the split, without the direct kernel, the wide verify off)
+and `tests/python/test_fa_paged_overlap_order.py` (the row-block condition excludes paged calls).
+Card arm: with 0131n, window 171f (below).
+
+## 0131n-fa-paged-overlap-after-every-exit.patch
+
+The overlap's after-step (`ggml_cl_fa_paged_overlap_after`: the slot's consumed marker, the next
+layer's copies issued one layer ahead) runs on every exit of the flash-attention dispatch, through
+a guard set right after the paged copy. It ran only at the split decode's return and at the
+function's end (`code`). The prompt conversion returns earlier, after its kernels: on every
+512-row ubatch, and since 0131m on the 9-64-row calls. On such a node the copy queue had waited
+the slot's consumed event and released it, nothing set it again, and the copies of the layer two
+on, issued by their own dispatch, waited nothing while the conversion could still read the slot.
+The prompt's K/V went into the cache from attention that may have read another layer's pages
+(reasoning: that is how a wrong read in the prompt changes the next request's answer; the read
+itself was not observed, VERIFY's host waits close the window).
+
+Found by the 1.7.0 gate's window 171g (`measured-here`, the B60, Q5, 256 MiB window, 30k, row
+blocks off in every arm): the overlap without the cross-step reuse (`NOREUSE` x2, `NOLEAD` x2) still
+gave three answers other than the serial one (md5 5f932b72915b x3, 4477046395ac against
+98d05d0226bc), while the arm that issues no copy ahead of its own attention (`NOAHEAD`, reuse on)
+equalled the serial stream in both runs, as did `VERIFY=4` (0 pre-read mismatches). The cross-step
+reuse was not the cause; NOLEAD's equality in 171a was timing.
+
+Gate: `tests/python/test_fa_paged_overlap_order.py` (the after-step is the guard, and no exit
+calls it by hand; red on the 0131m tree). Card arms: window 171f (0131m + 0131n, the B60, Q5): the
+overlap at full speed equal to the serial stream bit for bit (md5, accepted and proposed drafts,
+verifies) in 3 runs at 30k (256 MiB window) and 3 at 120k (1,024 MiB, both requests), with the
+host's timing varied, `VERIFY=1` (1,232 nodes, 0 mismatches) and `VERIFY=4` (0); the release
+candidate without either fix with `VERIFY=1`: node 0's ring row 0 wrong in all 8,216 chunks. Window
+171h (0131m without 0131n): the overlap at full speed differs from the serial stream in both runs
+(md5 5f932b72915b, c1da3368f9af against 98d05d0226bc), and equals it under `VERIFY=1`, whose host
+waits close the race. Decode at 30k 92.5 ms a step with the overlap against 127.0; at 120k 170.6
+against 292.6.

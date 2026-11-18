@@ -1,0 +1,479 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Date: Sat, 14 Nov 2026 00:00:00 +0000
+Subject: [PATCH] 0121-llama-kv-stream-cache
+
+---
+diff --git a/include/llama.h b/include/llama.h
+index d91e93e..6ee488d 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -454,6 +454,11 @@ extern "C" {
+         // batch's ubatches are cut so that ubatch tokens x cells stay within n_ubatch x n_kv_reserve:
+         // a long context does not reserve a full-context prompt's buffers for the whole session
+         uint32_t n_kv_reserve;
++
++        // KV streaming (0119-0122, docs/campaigns/kv-streaming-design.md): device bytes of the
++        // resident KV pages; 0 keeps the whole cache in device memory. Requires flash attention,
++        // one sequence, q8_0 K / q4_0 V, head size 256 (the paged kernel's shapes).
++        uint32_t kv_resident_size;
+     };
+ 
+     struct llama_model_tensor_override {
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 48074d4..0a0ca8b 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -343,6 +343,7 @@ llama_context::llama_context(
+     cparams.n_ubatch_reserve = std::min(cparams.n_ubatch, params.n_ubatch_reserve == 0 ? cparams.n_ubatch : params.n_ubatch_reserve);
+     reserve_ubatch = cparams.n_ubatch_reserve;
+     cparams.n_kv_reserve = params.n_kv_reserve == 0 ? 0 : GGML_PAD(params.n_kv_reserve, 256);
++    cparams.kv_resident_size = params.kv_resident_size;
+ 
+     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
+     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
+@@ -5135,6 +5136,7 @@ llama_context_params llama_context_default_params() {
+         /*.n_sampler                   =*/ 0,
+         /*.ctx_other                   =*/ nullptr,
+         /*.n_kv_reserve                =*/ 0,
++        /*.kv_resident_size            =*/ 0,
+     };
+ 
+     return result;
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 8c7bb4a..6ded57e 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -14,6 +14,7 @@ struct llama_cparams {
+     uint32_t n_ubatch;
+     uint32_t n_ubatch_reserve; // the ubatch the buffers are reserved for (0: n_ubatch)
+     uint32_t n_kv_reserve;    // the cells the compute buffers are reserved for, 0 = all (llama_context_params)
++    uint32_t kv_resident_size = 0; // KV streaming: device bytes of the resident pages (0119-0122)
+     uint32_t n_seq_max;
+     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+     uint32_t n_outputs_max;   // max outputs supported by the context
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 89b1cab..fef5699 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -596,6 +596,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
+     if (self_v_rot && self_v_rot->buffer) {
+         mctx->set_input_v_rot(self_v_rot);
+     }
++
++    // KV streaming: the page table is filled per ubatch; the ring views are the slots
++    if (self_kv_pages && self_kv_pages->buffer) {
++        mctx->set_input_kv_pages(self_kv_pages);
++    }
+ }
+ 
+ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+@@ -608,6 +613,11 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
+     // the parts' views carry their windows' offsets and sizes
+     res &= mctx->get_win_parts() == win_parts;
+ 
++    // KV streaming: pages move between ubatches and the views carry pool rows
++    if (mctx->kv_stream_on()) {
++        res = false;
++    }
++
+     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
+   //res &= self_v_idxs->ne[0] == params.ubatch.n_tokens; // TODO: need to move this to the unified cache and check there
+ 
+@@ -3289,6 +3299,19 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
+     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
+     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
+ 
++    // KV streaming (I3): the page table input and every attention layer's ring views
++    if (mctx_cur->kv_stream_on()) {
++        inp->self_kv_pages = mctx_cur->build_input_kv_pages(ctx0);
++        inp->kv_layout     = mctx_cur->kv_stream_layout();
++        inp->self_kv_ring_k.assign(hparams.n_layer_all, nullptr);
++        inp->self_kv_ring_v.assign(hparams.n_layer_all, nullptr);
++        for (int32_t il = 0; il < (int32_t) hparams.n_layer_all; ++il) {
++            if (!hparams.has_kv(il)) continue;
++            inp->self_kv_ring_k[il] = mctx_cur->build_ring_k(ctx0, il);
++            inp->self_kv_ring_v[il] = mctx_cur->build_ring_v(ctx0, il);
++        }
++    }
++
+     return inp;
+ }
+ 
+@@ -3398,6 +3421,18 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
+     cb(cur, "kqv_out", il);
+ 
++    // KV streaming (I3): the attention reads the pool through the layer's page table and
++    // the streamed pages from its ring slot; build_attn_mha already expanded the node
++    if (inp->self_kv_pages && inp->self_kv_ring_k[(size_t) il] != nullptr) {
++        const auto & fa = res->get_fused_nodes().back();
++        GGML_ASSERT(fa.op == LLM_FUSED_OP_FLASH_ATTN && fa.il == il);
++        ggml_flash_attn_ext_set_pages(fa.tensor, inp->self_kv_pages, mctx_cur->kv_layer_index(il),
++                llama_kv_stream::page_size, inp->self_kv_ring_k[(size_t) il], inp->self_kv_ring_v[(size_t) il]);
++        ggml_build_forward_expand(gf, inp->self_kv_pages);
++        ggml_build_forward_expand(gf, inp->self_kv_ring_k[(size_t) il]);
++        ggml_build_forward_expand(gf, inp->self_kv_ring_v[(size_t) il]);
++    }
++
+     if (inp->self_v_rot) {
+         cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+     }
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 1a87d51..b9abd0d 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -388,6 +388,13 @@ public:
+     ggml_tensor * self_k_rot = nullptr;
+     ggml_tensor * self_v_rot = nullptr;
+ 
++    // KV streaming (I3, 0119/0122): the page table [n_kv/256, n_layer] as a host input,
++    // each attention layer's ring slot views, and the layout the graph was built around
++    ggml_tensor * self_kv_pages = nullptr;
++    std::vector<ggml_tensor *> self_kv_ring_k;
++    std::vector<ggml_tensor *> self_kv_ring_v;
++    uint64_t kv_layout = 0;
++
+     // note: these have to be copies because in order to be able to reuse a graph, its inputs
+     //       need to carry these parameters with them. otherwise, they can point to freed
+     //       llm_graph_params from a previous batch, causing stack-use-after-return
+diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
+index 92ca529..1086e51 100644
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -79,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
+     const layer_filter_cb & filter,
+     const  layer_reuse_cb & reuse,
+     const  layer_share_cb & share,
+-             const char *   name_tag) :
++             const char *   name_tag,
++                 uint32_t   stream_resident_bytes) :
+     model(model), hparams(hparams), v_trans(v_trans),
+     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
+     other(static_cast<llama_kv_cache *>(mem_other)),
+@@ -99,6 +100,39 @@ llama_kv_cache::llama_kv_cache(
+ 
+     GGML_ASSERT(kv_size % n_pad == 0);
+ 
++    // KV streaming (I3): the K/V tensors become a pool of resident pages; the rest of the
++    // context lives in a host store and is read through a page table (0119/0122)
++    uint32_t stream_n_rows = kv_size;
++    if (stream_resident_bytes > 0) {
++        if (n_stream != 1 || v_trans || other || reuse || share || swa_type != LLAMA_SWA_TYPE_NONE) {
++            throw std::runtime_error("KV streaming requires Flash Attention, one sequence (or a unified cache) "
++                                     "and a cache with plain attention layers");
++        }
++        if (type_k != GGML_TYPE_Q8_0 || type_v != GGML_TYPE_Q4_0) {
++            throw std::runtime_error("KV streaming requires a q8_0 K cache and a q4_0 V cache");
++        }
++        size_t bytes_per_cell = 0;
++        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
++            if (!hparams.has_kv(il) || (filter && !filter(il))) continue;
++            if (hparams.n_embd_head_k(il) != 256 || hparams.n_embd_head_v(il) != 256) {
++                throw std::runtime_error("KV streaming requires a head size of 256");
++            }
++            bytes_per_cell += ggml_row_size(type_k, hparams.n_embd_k_gqa(il)) +
++                              ggml_row_size(type_v, hparams.n_embd_v_gqa(il));
++        }
++        const uint32_t n_pages = (kv_size + llama_kv_stream::page_size - 1)/llama_kv_stream::page_size;
++        stream_n_slots = std::min<uint32_t>(n_pages, llama_kv_stream::slots_for(stream_resident_bytes, bytes_per_cell));
++        if (stream_n_slots < std::min<uint32_t>(n_pages, 8u)) {
++            throw std::runtime_error("KV streaming: the resident budget holds " + std::to_string(stream_n_slots) +
++                                     " pages, at least 8 are needed");
++        }
++        stream_n_rows = stream_n_slots*llama_kv_stream::page_size;
++        stream_n_ring = std::max<uint32_t>(1, n_pages > stream_n_slots ? n_pages - stream_n_slots : 1);
++        this->stream_n_slots = stream_n_slots;
++        this->stream_n_ring  = stream_n_ring;
++        this->stream_n_rows  = stream_n_rows;
++    }
++
+     const uint32_t n_layer = hparams.n_layer_all;
+ 
+     // define a comparator for the buft -> ctx map to ensure that the order is well-defined:
+@@ -230,8 +264,9 @@ llama_kv_cache::llama_kv_cache(
+         const bool has_k = true;
+         const bool has_v = !is_mla;
+ 
+-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
++        // KV streaming: the tensors are the resident pool, n_rows cells
++        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, stream_n_rows, n_stream) : nullptr;
++        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, stream_n_rows, n_stream) : nullptr;
+ 
+         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
+@@ -240,8 +275,12 @@ llama_kv_cache::llama_kv_cache(
+         std::vector<ggml_tensor *> v_stream;
+ 
+         for (uint32_t s = 0; s < n_stream; ++s) {
+-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+-            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
++            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, stream_n_rows, k->nb[1], s*k->nb[2]) : nullptr);
++            v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, stream_n_rows, v->nb[1], s*v->nb[2]) : nullptr);
++        }
++
++        if (stream_resident_bytes > 0 && stream_buft == nullptr) {
++            stream_buft = buft;
+         }
+ 
+         map_layer_ids[il] = layers.size();
+@@ -249,6 +288,16 @@ llama_kv_cache::llama_kv_cache(
+         layers.push_back({ il, k, v, k_stream, v_stream, });
+     }
+ 
++    if (stream_resident_bytes > 0) {
++        std::vector<llama_kv_stream::layer> sl;
++        for (const auto & l : layers) {
++            sl.push_back({ l.k, l.v });
++        }
++        stream = std::make_unique<llama_kv_stream>(sl, stream_n_slots, stream_n_ring, kv_size, stream_buft);
++        LLAMA_LOG_INFO("%s: KV streaming: %u of %u pages resident, %u ring pages\n", __func__,
++                stream_n_slots, (kv_size + llama_kv_stream::page_size - 1)/llama_kv_stream::page_size, stream_n_ring);
++    }
++
+     if (reuse) {
+         LLAMA_LOG_DEBUG("%s: reusing layers:\n", __func__);
+ 
+@@ -1236,6 +1285,14 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch &
+         return;
+     }
+ 
++    // KV streaming: place the ubatch's pages (written pages resident, the oldest evicted
++    // with its write-back) and copy the attended pages that stream into the ring slots,
++    // before the graph's store writes and its attention reads them
++    if (stream) {
++        GGML_ASSERT(sinfo.n_stream() == 1);
++        stream->prepare(sinfo.idxs[0], get_n_kv(sinfo));
++    }
++
+     // keep track of the max sequence position that we would overwrite with this ubatch
+     // for non-SWA cache, this would be always empty
+     llama_seq_id seq_pos_max_rm[LLAMA_MAX_SEQ];
+@@ -1534,6 +1591,11 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
+ 
+     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+ 
++    // KV streaming: the attention reads the whole pool through the page table (0119/0122)
++    if (stream) {
++        n_kv = k->ne[1];
++    }
++
+     return ggml_view_4d(ctx, k,
+             hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv, ns,
+             ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+@@ -1555,6 +1617,11 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+ 
+     const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+ 
++    // KV streaming: the attention reads the whole pool through the page table (0119/0122)
++    if (stream) {
++        n_kv = v->ne[1];
++    }
++
+     if (!v_trans) {
+         // note: v->nb[1] <= v->nb[2]
+         return ggml_view_4d(ctx, v,
+@@ -1574,6 +1641,38 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
+             ggml_row_size(v->type, kv_size*n_embd_v_gqa)*sinfo.s0 + ggml_row_size(v->type, sinfo.kv_off));
+ }
+ 
++ggml_tensor * llama_kv_cache::build_input_kv_pages(ggml_context * ctx, uint32_t n_kv) const {
++    if (!stream) {
++        return nullptr;
++    }
++    ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv/llama_kv_stream::page_size, (int64_t) layers.size());
++    ggml_set_input(res);
++    ggml_set_name(res, "attn_inp_kv_pages");
++    return res;
++}
++
++ggml_tensor * llama_kv_cache::build_ring_k(ggml_context * ctx, int32_t il) const {
++    const int32_t ikv = map_layer_ids.at(il);
++    ggml_tensor * slot = stream->slot_k(ikv);
++    return ggml_view_4d(ctx, slot,
++            hparams.n_embd_head_k(il), slot->ne[1], hparams.n_head_kv(il), 1,
++            slot->nb[1], ggml_row_size(slot->type, hparams.n_embd_head_k(il)), ggml_nbytes(slot), 0);
++}
++
++ggml_tensor * llama_kv_cache::build_ring_v(ggml_context * ctx, int32_t il) const {
++    const int32_t ikv = map_layer_ids.at(il);
++    ggml_tensor * slot = stream->slot_v(ikv);
++    return ggml_view_4d(ctx, slot,
++            hparams.n_embd_head_v(il), slot->ne[1], hparams.n_head_kv(il), 1,
++            slot->nb[1], ggml_row_size(slot->type, hparams.n_embd_head_v(il)), ggml_nbytes(slot), 0);
++}
++
++void llama_kv_cache::prepare_stream(const std::vector<uint32_t> & cells, uint32_t n_kv) {
++    if (stream) {
++        stream->prepare(cells, n_kv);
++    }
++}
++
+ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+     GGML_UNUSED(sinfo);
+ 
+@@ -3176,6 +3275,34 @@ uint32_t llama_kv_cache_context::get_kv_off() const {
+     return sinfos.empty() ? 0 : sinfos[i_cur].kv_off;
+ }
+ 
++bool llama_kv_cache_context::kv_stream_on() const {
++    return kv->kv_stream_on();
++}
++
++int32_t llama_kv_cache_context::kv_layer_index(int32_t il) const {
++    return kv->kv_layer_index(il);
++}
++
++uint64_t llama_kv_cache_context::kv_stream_layout() const {
++    return kv->kv_stream_on() ? kv->get_kv_stream()->layout() : 0;
++}
++
++ggml_tensor * llama_kv_cache_context::build_input_kv_pages(ggml_context * ctx) const {
++    return kv->build_input_kv_pages(ctx, n_kv);
++}
++
++ggml_tensor * llama_kv_cache_context::build_ring_k(ggml_context * ctx, int32_t il) const {
++    return kv->build_ring_k(ctx, il);
++}
++
++ggml_tensor * llama_kv_cache_context::build_ring_v(ggml_context * ctx, int32_t il) const {
++    return kv->build_ring_v(ctx, il);
++}
++
++void llama_kv_cache_context::set_input_kv_pages(ggml_tensor * dst) const {
++    kv->get_kv_stream()->set_input_pages(dst);
++}
++
+ ggml_type llama_kv_cache_context::type_k() const {
+     return kv->type_k();
+ }
+diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
+index d5c3ce7..b48834d 100644
+--- a/src/llama-kv-cache.h
++++ b/src/llama-kv-cache.h
+@@ -3,6 +3,7 @@
+ #include "llama-batch.h"
+ #include "llama-graph.h"
+ #include "llama-kv-cells.h"
++#include "llama-kv-stream.h"
+ #include "llama-memory.h"
+ 
+ #include <unordered_map>
+@@ -119,7 +120,9 @@ public:
+         const  layer_reuse_cb & reuse,
+         const  layer_share_cb & share,
+         // a model can hold more than one cache, so the tensor names have to stay unique
+-                 const char *   name_tag = "");
++                 const char *   name_tag = "",
++        // KV streaming (0119-0122): device bytes for the resident KV pages, 0 = the whole cache
++                     uint32_t   stream_resident_bytes = 0);
+ 
+     ~llama_kv_cache() = default;
+ 
+@@ -212,6 +215,18 @@ public:
+ 
+     // get views of the current state of the cache
+     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
++
++    // KV streaming (0119-0122, docs/campaigns/kv-streaming-design.md, I3)
++    bool kv_stream_on() const { return stream != nullptr; }
++    int32_t kv_layer_index(int32_t il) const { return map_layer_ids.at(il); }
++    llama_kv_stream * get_kv_stream() const { return stream.get(); }
++    // the page table as a host I32 graph input: [n_kv/page_size, n_layer]
++    ggml_tensor * build_input_kv_pages(ggml_context * ctx, uint32_t n_kv) const;
++    // a layer's ring slot as the attention reads it: [head, n_ring*256, kv heads, 1]
++    ggml_tensor * build_ring_k(ggml_context * ctx, int32_t il) const;
++    ggml_tensor * build_ring_v(ggml_context * ctx, int32_t il) const;
++    // place the ubatch's pages and copy the streamed ones into the slots, before the graph
++    void prepare_stream(const std::vector<uint32_t> & cells, uint32_t n_kv);
+     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+ 
+     // store k_cur and v_cur in the cache based on the provided head location
+@@ -349,6 +364,16 @@ private:
+ 
+     std::vector<kv_layer> layers;
+ 
++    // KV streaming (I3): non-null keeps the resident K/V pages in this pool, the rest in a
++    // host store, and the attention reads them through a page table (0119/0122)
++    std::unique_ptr<llama_kv_stream> stream;
++    // the stream's sizing: resident pages, the ring pages a ubatch can stream, and the
++    // buffer type the slots and the host store take (the pool tensors')
++    uint32_t               stream_n_slots = 0;
++    uint32_t               stream_n_ring  = 0;
++    uint32_t               stream_n_rows  = 0;
++    ggml_backend_buffer_type_t stream_buft = nullptr;
++
+     // model layer id -> KV cache layer id
+     std::unordered_map<int32_t, int32_t> map_layer_ids;
+ 
+@@ -442,6 +467,15 @@ public:
+     ggml_tensor * get_k_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const;
+     ggml_tensor * get_v_part(ggml_context * ctx, int32_t il, const llama_kv_cache::win_part & p) const;
+ 
++    // KV streaming (I3): the page table input and the ring views the attention reads
++    bool         kv_stream_on() const;
++    int32_t      kv_layer_index(int32_t il) const;
++    uint64_t     kv_stream_layout() const;
++    ggml_tensor * build_input_kv_pages(ggml_context * ctx) const;
++    ggml_tensor * build_ring_k(ggml_context * ctx, int32_t il) const;
++    ggml_tensor * build_ring_v(ggml_context * ctx, int32_t il) const;
++    void         set_input_kv_pages(ggml_tensor * dst) const;
++
+     ggml_type type_k() const;
+     ggml_type type_v() const;
+ 
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index bbd4bee..66443a2 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -29,7 +29,8 @@ llama_memory_hybrid::llama_memory_hybrid(
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn,
+-    const layer_filter_cb & filter_recr) :
++    const layer_filter_cb & filter_recr,
++                 uint32_t   attn_stream_resident_bytes) :
+     hparams(model.hparams),
+     mem_attn(new llama_kv_cache(
+         model,
+@@ -49,7 +50,9 @@ llama_memory_hybrid::llama_memory_hybrid(
+             [&](int32_t il) { return !hparams.is_recr(il); }
+             : filter_attn,
+         nullptr,
+-        nullptr
++        nullptr,
++        "",
++        attn_stream_resident_bytes
+     )),
+     mem_recr(new llama_memory_recurrent(
+         model,
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb..27b09a2 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -39,7 +39,9 @@ public:
+                      bool   unified,
+                             /* layer filters */
+     const layer_filter_cb & filter_attn = nullptr,
+-    const layer_filter_cb & filter_recr = nullptr);
++    const layer_filter_cb & filter_recr = nullptr,
++    // KV streaming (0119-0122): device bytes of the attention cache's resident pages, 0 = off
++                 uint32_t   attn_stream_resident_bytes = 0);
+ 
+     ~llama_memory_hybrid() = default;
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index a29c863..bcc7421 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -3326,7 +3326,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* offload           */ cparams.offload_kqv,
+                             /* unified           */ cparams.kv_unified,
+                             /* filter_attn       */ std::move(filter_attn),
+-                            /* filter_recr       */ std::move(filter_recr));
++                            /* filter_recr       */ std::move(filter_recr),
++                            /* attn_stream       */ cparams.kv_resident_size);
+                     }
+                 } else {
+                     llama_kv_cache::layer_filter_cb filter = nullptr;

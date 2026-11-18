@@ -1,0 +1,37 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 6319c6e..e427bee 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -221,7 +221,14 @@
+ 
+ #define GGML_MAX_DIMS           4
+ #define GGML_MAX_PARAMS         2048
+-#define GGML_MAX_SRC            10
++// 0126: 12, so the paged FLASH_ATTN_EXT sources fit. The KV stream puts
++// GGML_FA_SRC_HOST_K/V and GGML_FA_SRC_PLAN at 9/10/11 (ggml-impl.h); at 10 the
++// set_host call wrote past src[] into the tensor's following fields, and every
++// FA node then read garbage as its plan (measured on the B60, window 266: the
++// first FLASH_ATTN_EXT case asserted host_k && host_v && ring_k && ring_v). A
++// source index beyond the array is undefined behaviour; the static_assert in
++// ggml-impl.h keeps the two constants in step.
++#define GGML_MAX_SRC            12
+ #define GGML_MAX_N_THREADS      512
+ #define GGML_MAX_OP_PARAMS      64
+ 
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index 34bc169..9bcc075 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -197,6 +197,12 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
+ #define GGML_FA_SRC_HOST_K      9   // the host store of this attention layer: [n_embd, page_size, n_pages]
+ #define GGML_FA_SRC_HOST_V      10
+ #define GGML_FA_SRC_PLAN        11  // I32 [n_pages]: the ring row of each streamed page, -1 for a resident one
++// the sources live in ggml_tensor::src[GGML_MAX_SRC]; an index past it is UB (window 266)
++#ifdef __cplusplus
++static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
++#else
++_Static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
++#endif
+ 
+ static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
+     const uint32_t * p;

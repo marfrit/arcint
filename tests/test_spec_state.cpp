@@ -23,7 +23,7 @@ std::vector<uint8_t> ramp(size_t n) {
 TEST(spec_state_round_trip_returns_the_bytes) {
     for (size_t n : {size_t{0}, size_t{1}, size_t{4 * 5120}, size_t{100003}}) {
         const std::vector<uint8_t> payload = ramp(n);
-        const std::vector<uint8_t> s       = spec_state_pack(SpecStateKind::DflashWindow, 4096, payload.data(), n);
+        const Bytes s                    = spec_state_pack(SpecStateKind::DflashWindow, 4096, payload.data(), n);
         CHECK_EQ(s.size(), kSpecStateHeader + n);
         SpecStateView v;
         CHECK(spec_state_view(s, SpecStateKind::DflashWindow, 4096, v));
@@ -36,7 +36,7 @@ TEST(spec_state_mtp_row_round_trip) {
     // the MTP drafter's carried row: floats through the same bytes
     std::vector<float> row(5120);
     for (size_t i = 0; i < row.size(); ++i) row[i] = static_cast<float>(i) * 0.25f - 300.0f;
-    const std::vector<uint8_t> s = spec_state_pack(SpecStateKind::MtpRow, 77, row.data(), row.size() * sizeof(float));
+    const Bytes s = spec_state_pack(SpecStateKind::MtpRow, 77, row.data(), row.size() * sizeof(float));
     SpecStateView v;
     CHECK(spec_state_view(s, SpecStateKind::MtpRow, 77, v));
     CHECK_EQ(v.size, row.size() * sizeof(float));
@@ -46,29 +46,35 @@ TEST(spec_state_mtp_row_round_trip) {
 }
 
 TEST(spec_state_alloc_leaves_the_payload_to_fill) {
-    std::vector<uint8_t> s = spec_state_alloc(SpecStateKind::DflashWindow, 9, 3);
-    s[kSpecStateHeader + 0] = 1;
-    s[kSpecStateHeader + 2] = 3;
+    // the payload is the caller's (Bytes, exec/bytes.h): it writes every byte
+    // it reads, so nothing here reads one it did not write
+    Bytes s = spec_state_alloc(SpecStateKind::DflashWindow, 9, 3);
+    CHECK_EQ(s.size(), kSpecStateHeader + 3);
     SpecStateView v;
     CHECK(spec_state_view(s, SpecStateKind::DflashWindow, 9, v));
-    CHECK(std::vector<uint8_t>(v.data, v.data + v.size) == std::vector<uint8_t>({1, 0, 3}));
+    CHECK(v.data == s.data() + kSpecStateHeader);
+    CHECK_EQ(v.size, size_t{3});
+    s[kSpecStateHeader + 0] = 1;
+    s[kSpecStateHeader + 1] = 2;
+    s[kSpecStateHeader + 2] = 3;
+    CHECK(std::vector<uint8_t>(v.data, v.data + v.size) == std::vector<uint8_t>({1, 2, 3}));
 }
 
 TEST(spec_state_refuses_another_drafter_or_position) {
     const std::vector<uint8_t> payload = ramp(64);
-    const std::vector<uint8_t> s       = spec_state_pack(SpecStateKind::DflashWindow, 4096, payload.data(), 64);
+    const Bytes s                    = spec_state_pack(SpecStateKind::DflashWindow, 4096, payload.data(), 64);
     SpecStateView v;
     CHECK(!spec_state_view(s, SpecStateKind::MtpRow, 4096, v));         // another drafter's
     CHECK(v.data == nullptr && v.size == 0);
     CHECK(!spec_state_view(s, SpecStateKind::DflashWindow, 4095, v));   // another checkpoint's position
     CHECK(!spec_state_view({}, SpecStateKind::DflashWindow, 4096, v));  // none stored
-    std::vector<uint8_t> cut = s;
+    Bytes cut = s;
     cut.pop_back();
     CHECK(!spec_state_view(cut, SpecStateKind::DflashWindow, 4096, v));   // truncated
-    std::vector<uint8_t> pad = s;
+    Bytes pad = s;
     pad.push_back(0);
     CHECK(!spec_state_view(pad, SpecStateKind::DflashWindow, 4096, v));   // padded
-    std::vector<uint8_t> bad = s;
+    Bytes bad = s;
     bad[0] ^= 1;
     CHECK(!spec_state_view(bad, SpecStateKind::DflashWindow, 4096, v));   // not a state
     CHECK(spec_state_view(s, SpecStateKind::DflashWindow, 4096, v));      // the original still reads

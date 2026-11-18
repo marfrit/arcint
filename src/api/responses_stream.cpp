@@ -482,6 +482,12 @@ private:
                 resource["arcint"] = json::object();
             resource["arcint"]["timings"] = timings_json(stats);
         }
+        // --llama-dory-max-loops: the count the request ran at, on the same extension object
+        if (dory_named(stats)) {
+            if (!resource.contains("arcint") || !resource["arcint"].is_object())
+                resource["arcint"] = json::object();
+            resource["arcint"]["dory"] = dory_json(stats);
+        }
         if (!send(json{{"type", type}, {"response", resource}})) return false;
         // store=true retains the turn; store=false and an entries=0 store keep
         // nothing. A failed turn is not stored (the failed() path).

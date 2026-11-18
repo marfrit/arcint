@@ -3,6 +3,7 @@
 #include "exec/llama_layer_split.h"
 #include "harness.h"
 
+#include <cstdlib>
 #include <cstdio>
 #include <vector>
 
@@ -789,6 +790,65 @@ TEST(config_llama_dory_loops_and_kv) {
     CHECK(rejected({"--stub", "--llama-dory-kv", "per_loop"}));
 }
 
+// --llama-dory-max-loops N (contrib/llama.cpp 0118): opt-in, and every combination that cannot run
+// is a refusal at parse time, never a quiet fallback to the unit's count.
+TEST(config_llama_dory_max_loops) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 0);   // off by default
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "4"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 4);
+    }
+    {
+        Config cfg;   // N equal to the unit's count is allowed
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-loops", "2",
+                   "--llama-dory-max-loops", "2"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 2);
+    }
+    {
+        Config cfg;   // 0 is off and needs nothing else
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-max-loops", "0"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 0);
+    }
+    {
+        Config cfg;   // the mode is the resolved one: none given, the file's own decides at the load
+        CHECK(run({"--gguf", "/m/d.gguf", "--llama-dory-max-loops", "4"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dory_max_loops, 4);
+        CHECK(cfg.llama_dory_kv.empty());
+    }
+    // a given per_loop is refused here (a file whose own mode is per_loop is refused at the load)
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "per_loop", "--llama-dory-max-loops", "4"}));
+    // N below the unit's own count
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-loops", "3",
+                    "--llama-dory-max-loops", "2"}));
+    // out of range, not a number, no value
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "5"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "-1"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "x"}));
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--llama-dory-kv", "last_loop", "--llama-dory-max-loops"}));
+    // a projector: not on a dory model
+    CHECK(rejected({"--gguf", "/m/d.gguf", "--mmproj", "/m/p.gguf", "--llama-dory-kv", "last_loop",
+                    "--llama-dory-max-loops", "4"}));
+    // the speech path: --tts is a projector too. The same line without the flag is fine, so the
+    // refusal is the flag's and names it.
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/d.gguf", "--mmproj", "/m/p.gguf", "--tts", "--tts-profiles", "/m/voices"}, cfg).ok);
+        Config cfg2;
+        const ArgParse r = run({"--gguf", "/m/d.gguf", "--mmproj", "/m/p.gguf", "--tts", "--tts-profiles", "/m/voices",
+                                "--llama-dory-kv", "last_loop", "--llama-dory-max-loops", "4"}, cfg2);
+        CHECK(!r.ok);
+        CHECK(r.error.find("--llama-dory-max-loops") != std::string::npos);
+        CHECK(r.error.find("--tts") != std::string::npos);
+    }
+    // the libllama engine's option only
+    CHECK(rejected({"--stub", "--llama-dory-max-loops", "4"}));
+}
+
 // --llama-expert-cache A,B: a cache per card, in --device order
 TEST(config_llama_expert_cache_per_card) {
     {
@@ -1264,4 +1324,28 @@ TEST(config_chat_template_kwarg_reasoning_effort_default) {
     CHECK(r1.error.find("contradicts") != std::string::npos);
     CHECK(rejected({"--stub", "--chat-template-kwarg", "enable_thinking=false",
                     "--chat-template-kwarg", "reasoning_effort=high"}));
+}
+
+TEST(config_kv_resident_is_refused_for_serving_without_the_opt_in) {
+    // the KV window is an experimental opt-in: a budget is refused unless LLAMA_KV_STREAM_UNSAFE=1 is
+    // set, and 4096 MiB or more never fits the 32-bit byte count libllama takes
+    // (red: drop the LLAMA_KV_STREAM_UNSAFE check in config.cpp, and the first CHECK passes the budget)
+    unsetenv("LLAMA_KV_STREAM_UNSAFE");
+    Config cfg;
+    ArgParse r = run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "3584"}, cfg);
+    CHECK(!r.ok);
+    CHECK(r.error.find("experimental opt-in") != std::string::npos);
+    CHECK(r.error.find("LLAMA_KV_STREAM_UNSAFE=1") != std::string::npos);
+    setenv("LLAMA_KV_STREAM_UNSAFE", "1", 1);
+    Config cfg2;
+    CHECK(run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "3584"}, cfg2).ok);
+    CHECK_EQ(cfg2.llama_kv_resident_mib, 3584);
+    Config cfg3;
+    r = run({"--gguf", "/m/q.gguf", "--llama-kv-resident", "4096"}, cfg3);
+    CHECK(!r.ok);
+    CHECK(r.error.find("4095 MiB") != std::string::npos);
+    unsetenv("LLAMA_KV_STREAM_UNSAFE");
+    Config cfg4;
+    CHECK(run({"--gguf", "/m/q.gguf"}, cfg4).ok);   // no budget: nothing changes
+    CHECK_EQ(cfg4.llama_kv_resident_mib, 0);
 }

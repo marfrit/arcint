@@ -21,6 +21,9 @@
 #include <gguf.h>
 #include <llama.h>
 #include "ggml-opencl.h"
+#include "ggml.h"
+#include "ggml-backend.h"
+#include "exec/kv_stream_refusal.h"
 #include <llama-ext.h>   // llama_expert_route_trace_flush (contrib/llama.cpp 0069)
 
 #ifdef ARCINT_MTMD
@@ -56,6 +59,7 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "config.h"
 #include "core/reasoning.h"
 #include "core/sampler.h"
+#include "exec/bytes.h"   // Bytes: a checkpoint's state, allocated and not written
 #include "exec/chat_json.h"
 #include "exec/llama_layer_split.h"
 #include "exec/llama_spec.h"
@@ -296,6 +300,36 @@ bool peer_gone(const GenerationInput& in, clock_type::time_point& last_check) {
     return !in.peer_alive();
 }
 
+// The KV stream's start probe (I5): one paged FLASH_ATTN_EXT node at the agent's
+// geometry, asked of the first GPU device through supports_op. The node is the one
+// llama_kv_cache builds -- 0119's page table, 0122's kernel -- so the answer is the
+// answer the graph will get. No allocation: the tensors live in a no_alloc context.
+static bool kv_stream_probe(int64_t n_head_kv, int64_t n_head, int64_t rows) {
+    ggml_init_params ip = { /*.mem_size =*/ 8*ggml_tensor_overhead(), /*.mem_buffer =*/ nullptr, /*.no_alloc =*/ true };
+    ggml_context * ctx = ggml_init(ip);
+    if (ctx == nullptr) return false;
+
+    ggml_tensor * k = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, 256*n_head_kv, 256);
+    ggml_tensor * v = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0, 256*n_head_kv, 256);
+    ggml_tensor * k4 = ggml_view_4d(ctx, k, 256, 256, n_head_kv, 1, k->nb[1], ggml_row_size(k->type, 256), ggml_nbytes(k), 0);
+    ggml_tensor * v4 = ggml_view_4d(ctx, v, 256, 256, n_head_kv, 1, v->nb[1], ggml_row_size(v->type, 256), ggml_nbytes(v), 0);
+    ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 256, rows, n_head, 1);
+    ggml_tensor * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 256, rows, 1, 1);
+    ggml_tensor * pages = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, 1);
+    ggml_tensor * fa = ggml_flash_attn_ext(ctx, q, k4, v4, mask, 1.0f/std::sqrt(256.0f), 0.0f, 0.0f);
+    ggml_flash_attn_ext_set_pages(fa, pages, 0, 256, nullptr, nullptr);
+
+    bool ok = false;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        ok = ggml_backend_dev_supports_op(dev, fa);
+        break;
+    }
+    ggml_free(ctx);
+    return ok;
+}
+
 // The OpenCL card --device names: its platform, its index among the
 // platform's devices as ggml-opencl numbers them (every device type, as
 // GGML_OPENCL_DEVICES takes it), and its name. "GPU.N" is the N-th platform
@@ -398,10 +432,17 @@ int gguf_block_count(const std::string& path, int* nextn = nullptr) {
     return n;
 }
 
+// The target model's load: libllama logs one "<buffer> model buffer size = X MiB" line per weight
+// buffer (load_tensors), the only place it says how much of the file went to the card. The Dory
+// forecast reads its weight term from those lines (core/dory.h); captured on the loading thread only.
+thread_local std::string* g_model_buffer_capture = nullptr;
+
 void route_llama_log(ggml_log_level level, const char* text, void*) {
     std::string s(text != nullptr ? text : "");
     while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
     if (s.empty()) return;
+    if (g_model_buffer_capture != nullptr && s.find(" model buffer size =") != std::string::npos)
+        g_model_buffer_capture->append(s).append("\n");
     if (level == GGML_LOG_LEVEL_ERROR) log::error("llama", "%s", s.c_str());
     else if (level == GGML_LOG_LEVEL_WARN) log::warn("llama", "%s", s.c_str());
     else log::verbose("llama", "%s", s.c_str());
@@ -496,10 +537,10 @@ class LlamaBackend final : public Backend {
     // A context checkpoint (--llama-checkpoints): what a lane holds after
     // n_tokens tokens
     struct Checkpoint {
-        size_t               n_tokens = 0;
-        uint64_t             req      = 0;   // the prefill that made it
-        std::vector<uint8_t> state;          // the memory's PARTIAL_ONLY state
-        std::vector<uint8_t> dft_state;      // the drafter's (exec/spec_state.h): MTP's carried row, DFlash2's window
+        size_t n_tokens = 0;
+        uint64_t req    = 0;   // the prefill that made it
+        Bytes    state;        // the memory's PARTIAL_ONLY state (exec/bytes.h: allocated, not written)
+        Bytes    dft_state;    // the drafter's (exec/spec_state.h): MTP's carried row, DFlash2's window
     };
 
 public:
@@ -533,6 +574,21 @@ public:
         }
         llama_log_set(route_llama_log, nullptr);
         llama_backend_init();
+
+        // KV streaming (I5): does the selected device take a paged FLASH_ATTN_EXT? The
+        // probe is the node the cache will build (0119's API, 0122's kernel), asked
+        // through the device's supports_op before any model loads; a flag it cannot
+        // honour is refused, never run on the CPU reference.
+        if (cfg.llama_kv_resident_mib > 0 || cfg.llama_kv_resident_decode_mib > 0) {
+            const arcint::KvStreamAsk ask{ cfg.llama_kv_resident_mib, cfg.llama_kv_resident_decode_mib,
+                                   kv_stream_probe(/*n_head_kv*/ 4, /*n_head*/ 24, /*rows*/ 6),
+                                   cards[0].name.find("B60") != std::string::npos,
+                                   /*flash attention*/ true, /* --llama-kv */ llama_kv_dtype(cfg) };
+            const std::string no = arcint::kv_stream_refusal(ask);
+            if (!no.empty()) throw std::runtime_error(no);
+            kv_stream_paged_ = ask.has_paged_fa;
+        }
+
         // --llama-expert-route-trace: set before the model's load, which reads
         // it once at the expert cache's init. Empty unsets, so an inherited
         // variable cannot turn the trace on behind the operator's back.
@@ -655,13 +711,24 @@ public:
         // architecture, before the load, and hand libllama the loop count and the recurrent KV
         // mode the operator named as metadata overrides. Neither flag: the file's own values serve,
         // read back and reported below.
-        const DoryOptions dory_opt{ cfg.llama_dory_loops, cfg.llama_dory_kv };
+        const DoryOptions dory_opt{ cfg.llama_dory_loops, cfg.llama_dory_kv, cfg.llama_dory_max_loops };
         {
             const std::string arch_pre = gguf_architecture(cfg.gguf_path);
             if (const std::string no = dory_option_refusal(arch_pre, cfg.llama_mtp > 0 || !cfg.llama_mtp_gguf.empty(),
-                                                           cfg.llama_dflash_on(), cfg.llama_layer_split > 0, dory_opt);
+                                                           cfg.llama_dflash_on(), cfg.llama_layer_split > 0, dory_opt,
+                                                           cfg.tts || !cfg.mmproj_path.empty());
                 !no.empty())
                 throw std::runtime_error(no);
+            if (dory_opt.max_loops > 0) {
+                // contrib/llama.cpp 0118: libllama builds the tables for the maximum at the load and reads it
+                // from the environment; the flag is refused where the library cannot take it, and the
+                // tables' maximum is read back below (llama_model_dory_loops_max)
+#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
+                setenv("LLAMA_DORY_MAX_LOOPS", std::to_string(dory_opt.max_loops).c_str(), 1);
+#else
+                throw std::runtime_error("--llama-dory-max-loops: this build's llama.cpp lacks contrib/llama.cpp patch 0118");
+#endif
+            }
             if (arch_pre == "dory" && dory_opt.any()) {
                 auto put = [&](const char* key, llama_model_kv_override_type tag) {
                     llama_model_kv_override o{};
@@ -680,7 +747,17 @@ public:
             }
         }
         const auto t_load     = clock_type::now();
-        model_                = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);
+        std::string model_buffer_lines;
+        {
+            // cleared on every way out of the load, a throw included: the pointer names a local
+            struct CaptureScope {
+                explicit CaptureScope(std::string* to) { g_model_buffer_capture = to; }
+                ~CaptureScope() { g_model_buffer_capture = nullptr; }
+                CaptureScope(const CaptureScope&)            = delete;
+                CaptureScope& operator=(const CaptureScope&) = delete;
+            } capture(&model_buffer_lines);
+            model_ = llama_model_load_from_file(cfg.gguf_path.c_str(), mp);
+        }
         if (model_ == nullptr)
             throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.gguf_path.c_str()));
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
@@ -801,6 +878,13 @@ public:
             if (const std::string no = dory_resolve(dg, dory_opt, ds); !no.empty()) throw std::runtime_error(no);
             // the layers libllama built must be the ones the loop count implies: a loop count that
             // did not take effect is a refusal, never a quiet fallback to the file's
+#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
+            // with the flag on the tables are those of N loops; with it off they are the unit's, and an
+            // inherited LLAMA_DORY_MAX_LOOPS that built larger ones is named here, before the layer count
+            // check reports it as a loop count that did not take effect
+            if (const std::string no = dory_check_max(ds.max_loops, ds.loops, llama_model_dory_loops_max(model_)); !no.empty())
+                throw std::runtime_error(no);
+#endif
             if (const std::string no = dory_check_loaded(ds, llama_model_n_layer(model_), llama_model_n_layer_physical(model_));
                 !no.empty())
                 throw std::runtime_error(no);
@@ -897,6 +981,8 @@ public:
         if (cfg.prefill_ubatch > 0) cp.n_ubatch = static_cast<uint32_t>(std::min(n_batch_, cfg.prefill_ubatch));
         cp.n_kv_reserve    = cfg.llama_reserve_cells;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
+        // 0121: the KV stream's resident budget, bytes; 0 = the whole cache in VRAM
+        cp.kv_resident_size = cfg.llama_kv_resident_mib > 0 ? (uint32_t) cfg.llama_kv_resident_mib * 1024u * 1024u : 0;
         cp.type_k          = kv_type(cfg.llama_kv_k);
         cp.type_v          = kv_type(cfg.llama_kv_v);
         // CPU threads: the CPU-side experts' decode is memory-bound, and the
@@ -944,11 +1030,22 @@ public:
 #endif
 #ifdef ARCINT_LLAMA_DORY
         if (status_.dory_present) {
-            // forecast the cache against the card before the allocation: the default context of 32768
-            // cells at f16 is about 12 GiB over 96 layers, which the A770 cannot hold with the weights
-            const std::uint64_t kvb = dory_kv_bytes(status_.dory.kv_layers, 4, 256, pool, cfg.llama_kv_k, cfg.llama_kv_v);
-            if (const std::string w = dory_fit_warning(kvb, llama_model_size(model_), cards[0].mem_bytes, pool,
-                                                       status_.dory.kv_layers, cfg.llama_kv_k, cfg.llama_kv_v);
+            // forecast the card memory before the allocation, term by term (core/dory.h), log it for every
+            // start and warn when it passes the card's OpenCL figure. The weight term is what libllama
+            // said it placed on the card; without such a line the whole file's tensor bytes stand in.
+            // The cells are libllama's own (the pool and a lane's share padded to 256). The mask of the compute
+            // term spans one sequence's cells: the pool under a unified cache or one lane, a lane's share
+            // otherwise (libllama's n_ctx_seq), and --llama-reserve-cells caps it (the buffer stays at the
+            // reserve and deeper batches take smaller micro-batches). dory_start_forecast composes all of it
+            const std::uint64_t wcard = dory_card_weight_bytes(model_buffer_lines);
+            const DoryStartForecast st =
+                dory_start_forecast(wcard > 0 ? wcard : llama_model_size(model_), status_.dory.kv_layers, cfg.llama_kv_k,
+                                    cfg.llama_kv_v, pool, lanes_, cp.kv_unified, cfg.llama_reserve_cells,
+                                    static_cast<int>(cp.n_ubatch));
+            log::info("load", "%s",
+                      dory_forecast_line(st.card, cards[0].mem_bytes, static_cast<int>(cp.n_ubatch), wcard > 0).c_str());
+            if (const std::string w = dory_fit_warning(st.card, cards[0].mem_bytes, st.cells, status_.dory.kv_layers,
+                                                       cfg.llama_kv_k, cfg.llama_kv_v);
                 !w.empty())
                 log::warn("load", "%s", w.c_str());
         }
@@ -972,7 +1069,7 @@ public:
             if (tctx == nullptr) throw std::runtime_error("dory: could not create the context that counts the KV cache layers");
             int built = 0;
             if (ggml_cgraph* gr = llama_graph_reserve(tctx, 8, 1, 8)) {
-                for (int il = 0; il < status_.dory.executed_layers; ++il) {
+                for (int il = 0; il < status_.dory.table_layers; ++il) {
                     const std::string nm = "cache_k_l" + std::to_string(il);
                     if (ggml_graph_get_tensor(gr, nm.c_str()) != nullptr) ++built;
                 }
@@ -1078,6 +1175,15 @@ public:
         status_.dflash_enabled = dflash_;
         status_.dflash_drafts  = dflash_ ? n_draft_ : 0;
         slot_tokens_.resize(static_cast<size_t>(lanes_));
+        // --llama-dory-max-loops: the count each lane's cells were written at, and the one the context
+        // is set to. Every request is served at one count (generate), a decode sets it under mu_
+        if (status_.dory_present && status_.dory.max_loops > 0) {
+            if (spec_)
+                throw std::runtime_error("--llama-dory-max-loops: a drafter shares the context's decodes; start without --llama-mtp/-dflash");
+            dory_turn_       = true;
+            dory_ctx_loops_  = status_.dory.loops;
+            slot_loops_.assign(static_cast<size_t>(lanes_), status_.dory.loops);
+        }
         comb_decoding_.assign(static_cast<size_t>(lanes_), false);
         comb_stalled_.assign(static_cast<size_t>(lanes_), false);
         // context checkpoints only where llama.cpp makes them: a memory that
@@ -1172,6 +1278,10 @@ public:
         status_.n_layer     = status_.dory_present ? status_.dory.physical_layers : llama_model_n_layer(model_);
         status_.weights_bytes = llama_model_size(model_);
         status_.kv_precision  = llama_kv_dtype(cfg);
+        status_.kv_stream.resident_mib = cfg.llama_kv_resident_mib;
+        status_.kv_stream.decode_mib   = cfg.llama_kv_resident_decode_mib;
+        status_.kv_stream.paged_fa     = kv_stream_paged_;
+        status_.kv_stream.requested    = cfg.llama_kv_stream_on();
         status_.arch          = arch;
         {
             // llama_model_desc is "<arch> <size label> <file type>"; the file
@@ -1619,6 +1729,8 @@ public:
         const int cap = cap_[static_cast<size_t>(seq)];   // the lane's context
         const std::vector<int> prompt = prompt_tokens(in);
         stats.prompt_tokens = static_cast<int>(prompt.size());
+        // the count this request is served at, named in the response even where it ends before a decode
+        if (dory_turn_) stats.dory_loops = dory_run_loops(in.dory_loops, status_.dory.loops);
         if (prompt.empty()) return FinishReason::Stop;
         if (static_cast<int>(prompt.size()) >= cap) {
             log::warn("slot", "lane %d: prompt of %zu tokens does not fit n_ctx %d", seq, prompt.size(), cap);
@@ -1657,6 +1769,9 @@ public:
             // always run, for its logits. A recurrent state cannot step back:
             // where llama.cpp refuses the partial removal the lane resumes from
             // its newest checkpoint inside the prefix, else it starts over.
+            // --llama-dory-max-loops: a slot whose cells were written at another count is dropped before the
+            // match, so the whole prompt is prefilled at this request's count
+            dory_prepare_locked(seq, in, have, stats);
             size_t common = 0;
             while (common < have.size() && common < prompt.size() && have[common] == prompt[common]) ++common;
             if (common == prompt.size()) --common;
@@ -1759,6 +1874,9 @@ public:
         report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         report_loop_guard(seq, sampler, stats);
         log_expert_cache(seq);
+        // 0129p: the request's end (a served request is not ended by seq_rm: the cache keeps
+        // the prefix for reuse, so the stream's counts need this call). One line per request.
+        llama_memory_request_end(llama_get_memory(ctx_));
         return reason;
     }
 
@@ -2482,6 +2600,9 @@ private:
         report_tool_grammar(seq, tool_grammar.get(), sampler, stats);
         report_loop_guard(seq, sampler, stats);
         log_expert_cache(seq);
+        // 0129p: the request's end (a served request is not ended by seq_rm: the cache keeps
+        // the prefix for reuse, so the stream's counts need this call). One line per request.
+        llama_memory_request_end(llama_get_memory(ctx_));
         return reason;
     }
 
@@ -2932,7 +3053,50 @@ private:
         return r.rc;
     }
 
+    // --llama-dory-max-loops: the request's loop count for this lane. A re-prefill is decided here, before
+    // the prefix match (the sites that can reuse cached cells: generate's match, generate_spec_lane's, the
+    // multimodal and speech paths, which clear the lane; a projector and the speech path are refused with
+    // the flag at the start by dory_option_refusal, a drafter at the context below). Caller holds mu_.
+    void dory_prepare_locked(int seq, const GenerationInput& in, std::vector<int>& have, GenerationStats& stats) {
+        if (!dory_turn_) return;
+        const int unit = status_.dory.loops;
+        const int want = dory_run_loops(in.dory_loops, unit);
+        if (want < 1 || want > status_.dory.max_loops)
+            throw std::runtime_error(log::format("dory: a request for %d loops; this unit serves 1 to %d", want, status_.dory.max_loops));
+        int&         cur       = slot_loops_[static_cast<size_t>(seq)];
+        const size_t held      = have.size();
+        const int    was       = cur;
+        const bool   reprefill = dory_reuse(cur, want, held) == DoryReuse::Reprefill;
+        if (reprefill) {
+            llama_memory_seq_rm(llama_get_memory(ctx_), seq, -1, -1);
+            have.clear();
+            ckpts_[static_cast<size_t>(seq)].clear();
+        }
+        cur                  = want;
+        stats.dory_loops     = want;
+        stats.dory_reprefill = reprefill;
+        if (reprefill)
+            log::info("slot", "lane %d: dory %d loop%s, the slot held %zu tokens written at %d: re-prefill", seq, want,
+                      want == 1 ? "" : "s", held, was);
+        else
+            log::info("slot", "lane %d: dory %d loop%s, no re-prefill (%zu tokens held)", seq, want, want == 1 ? "" : "s", held);
+    }
+
     bool decode_locked(int seq, const int* toks, size_t n, size_t pos, bool want_last) {
+#ifdef ARCINT_LLAMA_DORY_TURN_LOOPS
+        // the count is the context's, and another lane's request may have set it since: set it before
+        // every decode, under the lock that serialises them (one llama_decode carries one lane's rows here)
+        if (dory_turn_) {
+            const int want = slot_loops_[static_cast<size_t>(seq)];
+            if (want != dory_ctx_loops_) {
+                if (!llama_set_dory_loops(ctx_, static_cast<uint32_t>(want))) {
+                    log::error("llama", "llama_set_dory_loops(%d) refused", want);
+                    return false;
+                }
+                dory_ctx_loops_ = want;
+            }
+        }
+#endif
         llama_batch b = llama_batch_init(static_cast<int32_t>(n), 0, 1);
         for (size_t i = 0; i < n; ++i) {
             b.token[i]     = toks[i];
@@ -3072,6 +3236,9 @@ private:
     uint64_t                              n_uneven_      = 0;   // of them, verifies of different lengths
     std::chrono::microseconds             comb_wait_{ 20000 };
     std::vector<std::vector<int>>         slot_tokens_;
+    bool                                  dory_turn_      = false;   // --llama-dory-max-loops is on
+    int                                   dory_ctx_loops_ = 0;       // the count the context is set to
+    std::vector<int>                      slot_loops_;               // per lane: the count its cached cells were written at
     std::unique_ptr<LlamaSpec>            spec_;      // --llama-mtp, --llama-dflash-gguf
     int                                   n_draft_ = 0;
     std::atomic<unsigned long long>       mtp_req_{0};   // requests served, the trace's `req`
@@ -3082,6 +3249,7 @@ private:
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;
     bool                                  ckpt_on_   = false;   // a hybrid or recurrent model, N > 0
+    bool                                  kv_stream_paged_ = false;   // the start probe: the card takes paged FA
     int                                   ckpt_max_  = 32;
     size_t                                ckpt_step_ = 8192;
     uint64_t                              ckpt_req_  = 0;

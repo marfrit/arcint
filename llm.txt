@@ -17,7 +17,7 @@
 > Cydonia 24B (llama architecture) for writing. One engine: libllama
 > (llama.cpp at pinned commit 3e4dfa8) with ggml's OpenCL backend and
 > arcint's Intel kernel series (contrib/llama.cpp/patches: 0001-0096
-> folded into 12 files, then 0097-0117; FOLDED.md resolves old numbers).
+> folded into 12 files, then 0097-0131n; FOLDED.md resolves old numbers).
 > arcint owns the HTTP surface, chat templates, tool calls, the sampler,
 > named lanes, MTP speculative decoding, context checkpoints and the expert
 > cache's policy. The OpenVINO engine of 0.1-0.7.12 was retired in 0.8.0;
@@ -28,6 +28,13 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.7.0 (2026-11-18): the KV window, NEW and opt-in (experimental): LLAMA_KV_STREAM_UNSAFE=1 plus
+  --llama-kv-resident MiB keeps a pool of KV pages on the 24 GB card and streams the rest from USM host memory per
+  attention layer; GGML_OPENCL_FA_PAGED_OVERLAP=1 copies on a second queue beside the attention (0119-0123,
+  0125, 0126, 0129-0131n; refused without the switch; development switches for verify, self-test, delay, timeline). Verify rows
+  9-64 in one GQA call on the B60 (0124, on by default). The GDN replay right on both cards and on qwen35moe (0127,
+  0128). Dory: the loop count per request by reasoning effort (--llama-dory-max-loops, 0118) and a measured memory
+  forecast. Checkpoint bytes allocated without a zero fill. GGML_MAX_SRC 12 (0126).
 - Version 1.6.2 (2026-11-12): --chat-template-kwarg KEY=VALUE and --chat-template-file; force_nonempty_content as
   vLLM's Nemotron-V3 parser acts on it (a stream sends the promoted reasoning as text, no tool-call parse);
   --tool-grammar enforces listed string values and takes an inline parameter closer; ARCINT_RAW_TRACE; OpenCL: Q4_0,
@@ -226,7 +233,8 @@
   engine admits general.architecture qwen35, qwen35moe, qwen4exp, qwen2vl, llama
   at the Mistral Small 24B and Llama 2 7B geometries, gemma4 at the E4B geometry
   granite at the 8B geometry and dory at the 1.0-4B geometry (72 physical
-  blocks; --llama-dory-loops, --llama-dory-kv) (code: src/core/admission.cpp);
+  blocks; --llama-dory-loops, --llama-dory-kv, opt-in --llama-dory-max-loops:
+  a loop count per request by its reasoning effort) (code: src/core/admission.cpp);
   anything else, an untested size included, is refused at load. Dory1.0-4B
   is served on a card (a leg of the 1.6.2 gate); Gemma 4 E4B has card numbers (1.6.1) and no unit; Granite 4.2 8B is
   admitted, not yet run on a card. No

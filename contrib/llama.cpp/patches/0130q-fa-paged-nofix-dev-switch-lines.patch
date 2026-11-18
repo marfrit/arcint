@@ -1,0 +1,181 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1375,6 +1375,8 @@
+         cl_event tl_base = nullptr;
+         struct fa_paged_tl_ev { int role; int slot; cl_event ev; };
+         std::vector<fa_paged_tl_ev> tl;
++        // 0130r: what each development switch did this request, counted not asserted
++        long long nc_drops = 0, nofix_drops = 0, delay_kernels = 0, self3_writes = 0;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+     ggml_cl_kq_tile kq_mm_plain, kq_mm_id;
+@@ -11905,7 +11907,10 @@
+ struct ggml_cl_fa_paged_totals {
+     int issued = 0, fell_back = 0, reused = 0, recopied = 0, pre_issued = 0;
+     long long v_nodes = 0, v_bytes = 0, v_mismatch = 0;
+-    long long v_post_changes = 0;   // 0130d: VERIFY=3, a copy landed while the FA read the slot};
++    long long v_post_changes = 0;   // 0130d: VERIFY=3, a copy landed while the FA read the slot
++    // 0130r: what each development switch did this request, counted, not just announced
++    long long nc_drops = 0, nofix_drops = 0, delay_kernels = 0, self3_writes = 0;
++};
+ static ggml_cl_fa_paged_totals g_fa_paged_totals;
+ extern "C" void ggml_backend_opencl_fa_paged_summary(void) {
+     if (g_fa_paged_verify3_ctx) {
+@@ -11915,7 +11920,9 @@
+     if (g_fa_paged_ctx && !g_fa_paged_ctx->fa_paged.tl.empty()) ggml_cl_fa_paged_tl_finish(g_fa_paged_ctx);   // 0130p
+     if (!g_fa_paged_totals.issued && !g_fa_paged_totals.v_nodes && !g_fa_paged_totals.reused &&
+         !g_fa_paged_totals.pre_issued && !g_fa_paged_totals.fell_back &&
+-        !g_fa_paged_totals.v_post_changes) return;
++        !g_fa_paged_totals.v_post_changes && !g_fa_paged_totals.nc_drops &&
++        !g_fa_paged_totals.nofix_drops && !g_fa_paged_totals.delay_kernels &&
++        !g_fa_paged_totals.self3_writes) return;
+     GGML_LOG_WARN("ggml_opencl: paged FA overlap (request end): %d nodes issued ahead, %d fell back; "
+             "verify %lld nodes, %lld bytes, %lld mismatches; next-graph lead: %d issued, %d reused, %d re-copied; "
+             "post-FA changes %lld\n",
+@@ -11923,6 +11930,11 @@
+             g_fa_paged_totals.v_bytes, g_fa_paged_totals.v_mismatch,
+             g_fa_paged_totals.pre_issued, g_fa_paged_totals.reused, g_fa_paged_totals.recopied,
+             g_fa_paged_totals.v_post_changes);
++    // 0130r: one line per development switch arm, so the log says what ran (green and red)
++    GGML_LOG_WARN("ggml_opencl: paged FA dev switches (request end): NOCONSUME consumed waits dropped %lld; "
++            "NOFIX cross-step waits dropped %lld; delay kernels %lld; self-test writes %lld\n",
++            g_fa_paged_totals.nc_drops, g_fa_paged_totals.nofix_drops,
++            g_fa_paged_totals.delay_kernels, g_fa_paged_totals.self3_writes);
+     g_fa_paged_totals = {};
+ }
+ 
+@@ -11931,6 +11943,7 @@
+ static bool ggml_cl_fa_paged_overlap_on();
+ static bool ggml_cl_fa_paged_verify_on();   // 0129z: the verify-only arm's totals
+ static int ggml_cl_fa_paged_verify_mode();   // 0130d: the graph start and the summary ask for =3
++static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summary ask for its counters
+ 
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+@@ -11956,7 +11969,7 @@
+     // 0129z: window 292's A-uverify arm (VERIFY=1, OVERLAP unset) printed no totals at all,
+     // so it could not prove it checked anything: the roll-up and the zeroing now run when
+     // either switch is on, while the chain (0129n's lead) stays overlap-only.
+-    if (ggml_cl_fa_paged_overlap_on() || ggml_cl_fa_paged_verify_on()) {
++    if (ggml_cl_fa_paged_overlap_on() || ggml_cl_fa_paged_verify_on() || ggml_cl_fa_paged_timeline()) {
+         auto & o = backend_ctx->fa_paged;
+         g_fa_paged_totals.pre_issued += o.pre_issued;
+         g_fa_paged_totals.issued    += o.issued_n;
+@@ -11967,6 +11980,11 @@
+         g_fa_paged_totals.v_bytes    += o.v_bytes;
+         g_fa_paged_totals.v_mismatch += o.v_mismatch;
+         g_fa_paged_totals.v_post_changes += o.v_post_changes;
++        g_fa_paged_totals.nc_drops   += o.nc_drops;
++        g_fa_paged_totals.nofix_drops += o.nofix_drops;
++        g_fa_paged_totals.delay_kernels += o.delay_kernels;
++        g_fa_paged_totals.self3_writes += o.self3_writes;
++        o.nc_drops = o.nofix_drops = o.delay_kernels = o.self3_writes = 0;
+         o.issued_n = o.fell_back = 0;
+         o.v_nodes = o.v_bytes = o.v_mismatch = 0;
+         o.v_post_changes = 0;
+@@ -23916,6 +23934,28 @@
+ static bool ggml_cl_fa_paged_noconsume() {
+     static const char * e = getenv("GGML_OPENCL_FA_PAGED_NOCONSUME");
+     static const bool   on = e != nullptr && atoi(e) != 0;
++    if (on) {
++        static bool said = false;
++        if (!said) { said = true; GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_NOCONSUME=1: "
++                "the consumed wait in issue() is dropped (the 0129n-0129w decode's red arm)\n"); }
++    }
++    return on;
++}
++// 0130q: GGML_OPENCL_FA_PAGED_NOFIX=1, development only -- the red at 0130c's own site. It
++// drops exactly the wait the cross-step prefetch keeps (`prefetch_head`: the slot's last
++// reader's consumed event), so the copy filling the next graph's node-0 slot may run beside
++// the FA that last read that slot, which is the 0129n-0129w race 0130c fixed. NOCONSUME's
++// meaning is unchanged (it drops `issue`'s wait only). Run it with TIMELINE=1, never with
++// VERIFY=3: that mode's collect blocks the host at the next graph's start, which serializes
++// the prefetch behind the last FA and hides this race by construction.
++static bool ggml_cl_fa_paged_nofix() {
++    static const char * e = getenv("GGML_OPENCL_FA_PAGED_NOFIX");
++    static const bool   on = e != nullptr && atoi(e) != 0;
++    if (on) {
++        static bool said = false;
++        if (!said) { said = true; GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_NOFIX=1: "
++                "the cross-step prefetch's consumed wait is dropped (0130c's site, the red)\n"); }
++    }
+     return on;
+ }
+ // 0130p: GGML_OPENCL_FA_PAGED_TIMELINE=1, development only -- device stamps for the request's
+@@ -23947,6 +23987,11 @@
+ static long ggml_cl_fa_paged_delay_n() {
+     static const char * e = getenv("GGML_OPENCL_FA_PAGED_DELAY");
+     static const long   n = e != nullptr ? atol(e) : 0;
++    if (n > 0) {   // 0130r: a development switch says its value once, never silently
++        static bool said = false;
++        if (!said) { said = true; GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_DELAY=%ld: "
++                "a spin of that many iterations between the split kernels and the merge\n", n); }
++    }
+     return n;
+ }
+ static const char * GGML_CL_FA_PAGED_DELAY_SRC =
+@@ -23976,6 +24021,7 @@
+     CL_CHECK(clSetKernelArg(o.delay_kernel, 1, sizeof(cl_uint), &nn));
+     const size_t gws[1] = { 1 };
+     CL_CHECK(clEnqueueNDRangeKernel(ctx->queue, o.delay_kernel, 1, nullptr, gws, nullptr, 0, nullptr, nullptr));
++    ++o.delay_kernels;   // 0130r: the request's summary says how many spans were lengthened
+ }
+ 
+ // 0129n (C7): the streamed pages of `dst` from its USM host store into its ring on `cq`.
+@@ -24250,8 +24296,11 @@
+     // the wait: the slot's last reader. It was set by the FA two layers back; the graph's
+     // last FA is on the other slot, so this copy runs beside it and the layers after it.
+     if (o.pre_ready) { CL_CHECK(clReleaseEvent(o.pre_ready)); o.pre_ready = nullptr; }
+-    cl_uint  nw = o.consumed[p] != nullptr ? 1 : 0;
++    // 0130q: NOFIX drops exactly this wait (0130c's site). Unset keeps it unconditionally.
++    const bool nofix = ggml_cl_fa_paged_nofix();
++    cl_uint  nw = (o.consumed[p] != nullptr && !nofix) ? 1 : 0;
+     cl_event wl[1] = { o.consumed[p] };
++    if (o.consumed[p] != nullptr && nofix) ++o.nofix_drops;   // 0130r: the drop, counted
+     if (nw || ggml_cl_fa_paged_timeline()) ggml_cl_fa_paged_tl_mark(ctx, o.q, 7, p, nw, wl);   // 0130p cross-step copy start
+     const int runs = ggml_cl_fa_paged_enqueue_pages(ctx, dst, o.q, nw, nw ? wl : NULL);
+     if (runs < 0) {
+@@ -24306,7 +24355,9 @@
+     cl_event wl[2] = { nullptr, nullptr };
+     cl_uint  nw = 0;
+     cl_event mark = nullptr;
+-    if (o.consumed[parity] && !ggml_cl_fa_paged_noconsume()) wl[nw++] = o.consumed[parity];   // the FA two attention layers back
++    const bool nocons = ggml_cl_fa_paged_noconsume();   // 0130r: read once, counted below
++    if (o.consumed[parity] && !nocons) wl[nw++] = o.consumed[parity];   // the FA two attention layers back
++    else if (o.consumed[parity] && nocons) ++o.nc_drops;                 // 0130r: the drop, said
+     if (after_inputs) {
+         CL_CHECK(clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &mark));
+         CL_CHECK(clFlush(ctx->queue));
+@@ -24430,6 +24481,12 @@
+     if (v < 0) {
+         const char * e = getenv("GGML_OPENCL_FA_PAGED_VERIFY");
+         v = e ? atoi(e) : 0;
++        if (v != 0) {   // 0130r: the mode, once, so a window's log says which check ran
++            GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_VERIFY=%d: %s\n", v,
++                    v == 3 ? "pre and post hashes of every streamed node, compared at the request's end" :
++                    v == 2 ? "the self-test: one host byte flipped, the check must see 1 chunk" :
++                             "the pre-FA hash of every streamed node, blocking readback");
++        }
+     }
+     return v;
+ }
+@@ -24648,6 +24705,11 @@
+ static bool ggml_cl_fa_paged_selftest3() {
+     static const char * e = getenv("GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST");
+     static const bool   on = e != nullptr && atoi(e) == 3;
++    if (on) {   // 0130r
++        static bool said = false;
++        if (!said) { said = true; GGML_LOG_WARN("ggml_opencl: paged FA switch GGML_OPENCL_FA_PAGED_VERIFY_SELFTEST=3: "
++                "one byte written after the FA's kernels, before the post hash, on one node a request\n"); }
++    }
+     return on;
+ }
+ 
+@@ -24664,6 +24726,7 @@
+         const cl_ulong off = e.base[0] + (cl_ulong) e.rows[0] * e.stride[0];
+         CL_CHECK(clEnqueueFillBuffer(ctx->queue, e.buf[0], &pat, 1, off, 1, 0, nullptr, nullptr));
+         o.v_self3_done = 1;
++        ++o.self3_writes;   // 0130r: the request's summary counts the injected write
+         GGML_LOG_WARN("ggml_opencl: paged FA post-FA self-test: node %d page %d chunk 0 one byte written after the FA\n",
+                 e.node, e.pages[0]);
+     }

@@ -1,0 +1,31 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c67d4b3..c5a4e93 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -9476,14 +9476,19 @@ struct test_flash_attn_ext_paged_layers : public test_case {
+                 std::vector<int32_t> slots(n_slots);
+                 std::iota(slots.begin(), slots.end(), 0);
+                 std::shuffle(slots.begin(), slots.end(), std::mt19937(1234));
++                // 0129j: every layer's row, not only row 1 (window 284: row 0 held the
++                // INT32_MAX fill, so layer 0's kernel read slot INT32_MAX / no ring entry
++                // and the queue failed at the next synchronize)
+                 std::vector<int32_t> table(2*n_pages(), INT32_MAX);
+-                int32_t res = 0, ring = 0;
+-                for (int64_t i = 0; i < n_pages(); ++i) {
+-                    // 0129f: the table's ring entry must be the row the plan names
+-                    // (ascending), else the kernel reads another pair's rows (window 281)
+-                    const int32_t e = ring_every && i % ring_every == 0
+-                        ? -1 - (int32_t) ring++ : slots[(size_t) res++];
+-                    table[n_pages() + i] = e;
++                for (int64_t l = 0; l < 2; ++l) {
++                    int32_t res = 0, ring = 0;
++                    for (int64_t i = 0; i < n_pages(); ++i) {
++                        // 0129f: the table's ring entry must be the row the plan names
++                        // (ascending), else the kernel reads another pair's rows (window 281)
++                        const int32_t e = ring_every && i % ring_every == 0
++                            ? -1 - (int32_t) ring++ : slots[(size_t) res++];
++                        table[(size_t) l*n_pages() + i] = e;
++                    }
+                 }
+                 ggml_backend_tensor_set(t, table.data(), 0, ggml_nbytes(t));
+             } else if (strcmp(t->name, "plan") == 0) {

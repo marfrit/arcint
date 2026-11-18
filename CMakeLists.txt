@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.6.2 LANGUAGES CXX)
+project(arcint VERSION 1.7.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -192,6 +192,14 @@ if(ARCINT_LLAMA)
   if(ARCINT_LLAMA_EXT_H MATCHES "llama_model_n_layer_physical")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_DORY=1)
   endif()
+  # contrib/llama.cpp 0118: Dory's loop count per context (llama_set_dory_loops in llama.h);
+  # without it --llama-dory-max-loops is refused at start
+  if(ARCINT_LLAMA_H MATCHES "llama_set_dory_loops")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_DORY_TURN_LOOPS=1)
+    message(STATUS "contrib/llama.cpp 0118 present: --llama-dory-max-loops is built")
+  else()
+    message(STATUS "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0118: --llama-dory-max-loops is refused at start")
+  endif()
   # contrib/llama.cpp 0111: the weights the device declined at load, placed in host memory,
   # counted (llama_placement_downgrades in llama-ext.h); /props downgrades carries them
   if(ARCINT_LLAMA_EXT_H MATCHES "llama_placement_downgrades")
@@ -285,6 +293,7 @@ if(ARCINT_TESTS)
     tests/test_draft_policy.cpp
     tests/test_dflash_walk.cpp
     tests/test_spec_state.cpp
+    tests/test_bytes.cpp
     tests/test_token_ids.cpp
     tests/test_mtp_head_file.cpp
     tests/test_props.cpp
@@ -302,6 +311,7 @@ if(ARCINT_TESTS)
     tests/test_stream_golden.cpp
     tests/test_admission.cpp
     tests/test_dory.cpp
+    tests/test_dory_request.cpp
     tests/test_gemma4.cpp
     tests/test_markers.cpp
     tests/test_stream_utf8.cpp
@@ -578,6 +588,84 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-gdn-state-rows PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME gdn-state-rows COMMAND arcint-gdn-state-rows)
     set_tests_properties(gdn-state-rows PROPERTIES LABELS unit)
+    # patch 0119's device-free cell: a paged FLASH_ATTN_EXT over a shuffled pool,
+    # a ring and a two-row page table is byte-equal to the unpaged op on the CPU
+    # backend. Design: docs/campaigns/kv-streaming-design.md, increment I1.
+    add_executable(arcint-fa-paged tests/test_fa_paged.cpp)
+    target_link_libraries(arcint-fa-paged PRIVATE arcint_core)
+    target_include_directories(arcint-fa-paged PRIVATE "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-fa-paged PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME fa-paged COMMAND arcint-fa-paged)
+    set_tests_properties(fa-paged PROPERTIES LABELS unit)
+    # patch 0120's device-free cell: the KV stream's page map, host store,
+    # eviction/write-back and table, and the pages through 0119's CPU paged
+    # attention over four ubatches. Design: docs/campaigns/kv-streaming-design.md,
+    # increment I2.
+    add_executable(arcint-kv-stream-map tests/test_kv_stream_map.cpp)
+    target_link_libraries(arcint-kv-stream-map PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-map PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_options(arcint-kv-stream-map PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-map COMMAND arcint-kv-stream-map)
+    set_tests_properties(kv-stream-map PROPERTIES LABELS unit)
+    # patch 0123zzzzz3's device-free cell: the stream's page moves are per attention
+    # layer. Three layers share one ring slot (the stream's slots[ikv % 2]); every
+    # attention call copies its own host-store pages into the slot before it reads
+    # them, and the CPU paged op does that copy too. Design: increment I5.
+    add_executable(arcint-kv-stream-layers tests/test_kv_stream_layers.cpp)
+    target_link_libraries(arcint-kv-stream-layers PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-layers PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include" "${ARCINT_LLAMA_DIR}/ggml/src")
+    target_compile_options(arcint-kv-stream-layers PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-layers COMMAND arcint-kv-stream-layers)
+    set_tests_properties(kv-stream-layers PROPERTIES LABELS unit)
+    # 0129b: the stream beyond its pool has to read right -- two layers, four pages
+    # streaming, q8_0:q4_0 and f16, compared byte for byte with the all-resident run
+    add_executable(arcint-kv-stream-deep tests/test_kv_stream_deep.cpp)
+    target_link_libraries(arcint-kv-stream-deep PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-deep PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include" "${ARCINT_LLAMA_DIR}/ggml/src")
+    target_compile_options(arcint-kv-stream-deep PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-deep COMMAND arcint-kv-stream-deep)
+    set_tests_properties(kv-stream-deep PROPERTIES LABELS unit)
+    # patch 0121's device-free cell: the stream reaches llama_kv_cache and the graph and
+    # stays off by default; reads the patched tree's source (a GGUF and a card are not
+    # available here). Design: increment I3's prerequisite.
+    add_executable(arcint-kv-stream-cache tests/test_kv_stream_cache.cpp)
+    target_link_libraries(arcint-kv-stream-cache PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-cache PRIVATE
+        "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/ggml/include")
+    target_compile_definitions(arcint-kv-stream-cache PRIVATE
+        ARCINT_KV_STREAM_SRC_DIR="${ARCINT_LLAMA_DIR}/src"
+        ARCINT_KV_STREAM_LLAMA_DIR="${ARCINT_LLAMA_DIR}")
+    target_compile_options(arcint-kv-stream-cache PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME kv-stream-cache COMMAND arcint-kv-stream-cache)
+    set_tests_properties(kv-stream-cache PROPERTIES LABELS unit)
+    # 0123zz's device-free cell: the paged FLASH_ATTN_EXT predicate's logic, over the
+    # agent's shapes with every clause flipped. The header lives in the pinned tree's
+    # ggml-opencl, built only when the patch is present.
+    if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h")
+      add_executable(arcint-fa-paged-predicate tests/test_fa_paged_predicate.cpp)
+      target_link_libraries(arcint-fa-paged-predicate PRIVATE arcint_core)
+      target_include_directories(arcint-fa-paged-predicate PRIVATE
+          "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl" "${ARCINT_LLAMA_DIR}/ggml/src"
+          "${ARCINT_LLAMA_DIR}/ggml/include")
+      target_compile_options(arcint-fa-paged-predicate PRIVATE -Wall -Wextra -Wpedantic)
+      add_test(NAME fa-paged-predicate COMMAND arcint-fa-paged-predicate)
+      set_tests_properties(fa-paged-predicate PROPERTIES LABELS unit)
+    endif()
+    # I5, design section 4.3: the start refusal that stops the scheduler's silent CPU
+    # placement of a paged FA. The rules are src/exec/kv_stream_refusal.h; the red
+    # branch sets ARCINT_KV_STREAM_REFUSE_OFF=1 in the cell's main, which accepts an
+    # ask the card cannot honour and fails the refusals.
+    add_executable(arcint-kv-stream-refusal tests/test_kv_stream_refusal.cpp)
+    target_link_libraries(arcint-kv-stream-refusal PRIVATE arcint_core)
+    target_include_directories(arcint-kv-stream-refusal PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(arcint-kv-stream-refusal PRIVATE -Wall -Wextra -Wpedantic)
+    # the unit's red switch; the served binary compiles the rule without it
+    target_compile_definitions(arcint-kv-stream-refusal PRIVATE ARCINT_KV_STREAM_REFUSE_RED=1)
+    add_test(NAME kv-stream-refusal COMMAND arcint-kv-stream-refusal)
+    set_tests_properties(kv-stream-refusal PROPERTIES LABELS unit)
     # patch 0081's source-slot cell: the GDN family takes src[6] once (the rows
     # index; the replay's records in its own op), the mode word op_params[1]
     # selects the state path, and the raw gating projections of patch 0051 ride
@@ -648,6 +736,31 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay_hybrid_input.py")
     set_tests_properties(gdn-replay-hybrid-input PROPERTIES LABELS unit)
+    # 0086/0087's model list, read out of the patched tree (LLAMA_SRC): every
+    # architecture the replay gate admits builds its GDN state with s_rpl_rows;
+    # qwen35moe stayed on the snapshot gather and rs_s_rpl_rows was an unread
+    # input with no buffer (the first decode's GGML_ASSERT(buffer)).
+    add_test(NAME gdn-replay-model-branches
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_gdn_replay_model_branches.py")
+    set_tests_properties(gdn-replay-model-branches PROPERTIES LABELS unit)
+    # 0131j: the KV window's copy-queue overlap keeps the slots' last readers across a
+    # graph boundary, flushes the waited compute marker, and keys the prefetch reuse by the
+    # layer's host store (the 1.7.0 release review's three overlap orderings).
+    add_test(NAME fa-paged-overlap-order
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_paged_overlap_order.py")
+    set_tests_properties(fa-paged-overlap-order PROPERTIES LABELS unit)
+    # 0129x-0131d: the KV window's lead, verify, self-test, forced race, timeline and NOFIX
+    # cells (29 source-text cases). Before 1.7.0 the file ran by hand only, and its
+    # unittest.main() sat after the first class, so a script run took 3 of them.
+    add_test(NAME fa-paged-lead
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_paged_lead.py")
+    set_tests_properties(fa-paged-lead PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"

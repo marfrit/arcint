@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: arcint <dev@arcint.invalid>
+Subject: [PATCH] 0123zzzz-opencl-fa-paged-ring-aos
+
+Paged FLASH_ATTN_EXT: a ring tensor of q8_0 or q4_0 that the OpenCL buffer
+holds flattened (SoA, as set_tensor stores quantized tensors) is rebuilt to
+blocks before the paged decode and the prefill conversion read it, as the
+dispatcher already does for K and V. The generic extra cast does not hold
+for a SoA tensor: the ring was read in the wrong layout (NaN on every
+q8_0:q4_0 case with ring pages; f16 rings were right).
+
+The prefill conversion released its page-table buffer whether or not it had
+uploaded it; a device table's own buffer was freed (heap corruption after the
+prefill case). It now releases only an uploaded row.
+
+---
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -23877,6 +23877,16 @@
+                                        k_data_device, offset_k, k_nb1, k_nb2, k_nb3);
+     ggml_cl_flash_attn_reconstruct_aos(backend_ctx, v, temp_v_aos,
+                                        v_data_device, offset_v, v_nb1, v_nb2, v_nb3);
++    // paged K/V: a SoA-flattened q8_0/q4_0 ring (set_tensor flattens quantized tensors) is rebuilt to blocks
++    // like K/V above; the paged kernels read blocks, and the generic extra cast does not hold for SoA
++    ggml_cl_flash_attn_temp_buffer temp_rk_aos;
++    ggml_cl_flash_attn_temp_buffer temp_rv_aos;
++    cl_mem rk_aos_buf = NULL, rv_aos_buf = NULL;
++    cl_ulong rk_aos_off = 0, rk_aos_nb1 = 0, rk_aos_nb2 = 0, rk_aos_nb3 = 0, rv_aos_off = 0, rv_aos_nb1 = 0, rv_aos_nb2 = 0, rv_aos_nb3 = 0;
++    const bool rk_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, dst->src[GGML_FA_SRC_RING_K], temp_rk_aos,
++                                                           rk_aos_buf, rk_aos_off, rk_aos_nb1, rk_aos_nb2, rk_aos_nb3);
++    const bool rv_aos = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, dst->src[GGML_FA_SRC_RING_V], temp_rv_aos,
++                                                           rv_aos_buf, rv_aos_off, rv_aos_nb1, rv_aos_nb2, rv_aos_nb3);
+ 
+     // The Intel kernels read K/V as they are (f16, or q8_0 / q4_0 blocks:
+     // after the reconstruction above a SoA tensor is a block copy too), so
+@@ -24146,6 +24156,7 @@
+             // the page table's used row, beside the K/V blocks' conversions
+             cl_mem conv_table = NULL;
+             cl_ulong conv_table_off = 0;
++            bool conv_table_uploaded = false;   // only an uploaded host row is ours to release
+             const int conv_ps = kv_page_size;
+             const ggml_tensor * conv_ring_k = kv_pages ? dst->src[GGML_FA_SRC_RING_K] : nullptr;
+             const ggml_tensor * conv_ring_v = kv_pages ? dst->src[GGML_FA_SRC_RING_V] : nullptr;
+@@ -24154,6 +24165,7 @@
+                 const ggml_cl_fa_table tb = ggml_cl_fa_table_row(backend_ctx, kv_pages, tr);
+                 conv_table     = tb.mem;
+                 conv_table_off = tb.off;
++                conv_table_uploaded = tb.uploaded;
+             }
+             // rows [kv0, kv0 + nb) of a K/V view to [dim][key][head][batch] f16
+             auto dequant = [&](const ggml_tensor * t, cl_mem src, cl_ulong off, cl_ulong nb1, cl_ulong nb2, cl_ulong nb3,
+@@ -24176,9 +24188,10 @@
+                 CL_CHECK(clSetKernelArg(kq, 9, sizeof(cl_mem),   &out));
+                 if (kv_pages) {
+                     const ggml_tensor * rt = is_v ? conv_ring_v : conv_ring_k;
+-                    ggml_tensor_extra_cl * er = rt ? (ggml_tensor_extra_cl *) rt->extra : nullptr;
+-                    cl_mem   rbuf = er ? er->data_device : NULL;
+-                    const cl_ulong roff = er ? er->offset + rt->view_offs : 0;
++                    const bool raos = is_v ? rv_aos : rk_aos;
++                    ggml_tensor_extra_cl * er = rt && !raos ? (ggml_tensor_extra_cl *) rt->extra : nullptr;
++                    cl_mem   rbuf = raos ? (is_v ? rv_aos_buf : rk_aos_buf) : er ? er->data_device : NULL;
++                    const cl_ulong roff = raos ? (is_v ? rv_aos_off : rk_aos_off) : er ? er->offset + rt->view_offs : 0;
+                     const cl_ulong rnb1 = rt ? rt->nb[1] : 0, rnb2 = rt ? rt->nb[2] : 0, rnb3 = rt ? rt->nb[3] : 0;
+                     CL_CHECK(clSetKernelArg(kq, 10, sizeof(cl_mem),   &conv_table));
+                     CL_CHECK(clSetKernelArg(kq, 11, sizeof(cl_ulong), &conv_table_off));
+@@ -24229,7 +24242,7 @@
+                 run_fa(v2 ? k2c : kc, v2, kf.buffer, 0, fk1, fk2, fk3, vf.buffer, 0, fv1, fv2, fv3, nb,
+                        true, carry, kv0, kv0 > 0, kv0 + nb < n_kv);
+             }
+-            if (conv_table != NULL) {
++            if (conv_table != NULL && conv_table_uploaded) {
+                 // a queued conversion keeps the upload alive until it runs
+                 clReleaseMemObject(conv_table);
+             }
+@@ -24891,11 +24904,11 @@
+                 if (tb.uploaded) kv_tmp_table = tb.mem;
+             }
+             GGML_UNUSED(extra_pages);
+-            cl_mem   rk_buffer = extra_rk ? extra_rk->data_device : NULL;
+-            const cl_ulong offset_rk = extra_rk ? extra_rk->offset + rk->view_offs : 0;
++            cl_mem   rk_buffer = rk_aos ? rk_aos_buf : extra_rk ? extra_rk->data_device : NULL;
++            const cl_ulong offset_rk = rk_aos ? rk_aos_off : extra_rk ? extra_rk->offset + rk->view_offs : 0;
+             const cl_ulong rk_nb1 = rk ? rk->nb[1] : 0, rk_nb2 = rk ? rk->nb[2] : 0, rk_nb3 = rk ? rk->nb[3] : 0;
+-            cl_mem   rv_buffer = extra_rv ? extra_rv->data_device : NULL;
+-            const cl_ulong offset_rv = extra_rv ? extra_rv->offset + rv->view_offs : 0;
++            cl_mem   rv_buffer = rv_aos ? rv_aos_buf : extra_rv ? extra_rv->data_device : NULL;
++            const cl_ulong offset_rv = rv_aos ? rv_aos_off : extra_rv ? extra_rv->offset + rv->view_offs : 0;
+             const cl_ulong rv_nb1 = rv ? rv->nb[1] : 0, rv_nb2 = rv ? rv->nb[2] : 0, rv_nb3 = rv ? rv->nb[3] : 0;
+             const int page_size_arg = kv_page_size;
+             CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &table_buffer));

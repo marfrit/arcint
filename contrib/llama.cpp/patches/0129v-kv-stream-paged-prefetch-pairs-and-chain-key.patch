@@ -1,0 +1,80 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1330,7 +1330,12 @@
+         // layers, the head and the host's sampling instead of before FA 0
+         cl_event pre_ready = nullptr;
+         int pre_parity = -1;
+-        std::vector<int32_t> pre_rows;   // the plan rows those copies filled, in page order
++        // 0129v: the plan index next to the ring row, and the chain that issued it: reuse
++        // needs both identical, a row sequence alone is not enough (two plans with the same
++        // count of streamed pages share [0..n-1] while holding different host pages)
++        std::vector<int32_t> pre_rows;
++        std::vector<int32_t> pre_pages;
++        int pre_chain_n = 0;
+         int pre_issued = 0, pre_reused = 0, pre_recopied = 0;
+     } fa_paged;
+     int             kq_mm_sg = 16;
+@@ -23774,8 +23779,8 @@
+     const ggml_tensor * plan = dst->src[GGML_FA_SRC_PLAN];
+     const int32_t * pl = plan ? (const int32_t *) ggml_backend_opencl_usm_ptr(plan) : nullptr;
+     if (pl == nullptr) return;   // a plan that is not USM: this lead cannot compare it later
+-    std::vector<int32_t> rows;
+-    for (int64_t i = 0; i < plan->ne[0]; ++i) if (pl[i] >= 0) rows.push_back(pl[i]);
++    std::vector<int32_t> rows, pages;
++    for (int64_t i = 0; i < plan->ne[0]; ++i) if (pl[i] >= 0) { rows.push_back(pl[i]); pages.push_back((int32_t) i); }
+     // the wait: the slot's last reader. It was set by the FA two layers back; the graph's
+     // last FA is on the other slot, so this copy runs beside it and the layers after it.
+     if (o.pre_ready) { CL_CHECK(clReleaseEvent(o.pre_ready)); o.pre_ready = nullptr; }
+@@ -23787,6 +23792,8 @@
+     CL_CHECK(clFlush(o.q));
+     o.pre_parity = p;
+     o.pre_rows   = rows;
++    o.pre_pages  = pages;
++    o.pre_chain_n = (int) o.chain.size();   // 0129v: the graph whose tail issued these bytes
+     o.pre_issued++;
+ }
+ 
+@@ -23797,10 +23804,17 @@
+     const ggml_tensor * plan = o.chain[0]->src[GGML_FA_SRC_PLAN];
+     const int32_t * pl = plan ? (const int32_t *) ggml_backend_opencl_usm_ptr(plan) : nullptr;
+     if (pl == nullptr) return false;
++    // 0129v: (host page, ring row) pairs and the issuing graph's chain, not the row sequence:
++    // prepare() numbers ring rows in plan order, so a different streamed set of the same size
++    // yields [0..n-1] too; and an MTP head graph's tail can leave its own node 0 in the slot
++    if (o.pre_chain_n != (int) o.chain.size()) return false;
++    const int p0 = ggml_cl_fa_paged_overlap_slot(ctx, o.chain[0]);
++    if (p0 < 0 || p0 != o.pre_parity) return false;
+     int64_t k = 0;
+     for (int64_t i = 0; i < plan->ne[0]; ++i) {
+         if (pl[i] < 0) continue;
+-        if (k >= (int64_t) o.pre_rows.size() || o.pre_rows[k] != pl[i]) return false;
++        if (k >= (int64_t) o.pre_rows.size()) return false;
++        if (o.pre_rows[k] != pl[i] || o.pre_pages[k] != (int32_t) i) return false;   // row AND page
+         ++k;
+     }
+     return k == (int64_t) o.pre_rows.size();
+@@ -23874,8 +23888,9 @@
+                     o.pre_reused++;
+                     if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
+                         GGML_LOG_WARN("%s: paged FA next-graph lead: node 0 reused %zu pages, "
+-                                "issued %d, reused %d, re-copied %d\n", __func__, o.pre_rows.size(),
+-                                o.pre_issued, o.pre_reused, o.pre_recopied);
++                                "issued %d, reused %d, re-copied %d, chain %d (prefetched by chain %d)\n",
++                                __func__, o.pre_rows.size(), o.pre_issued, o.pre_reused,
++                                o.pre_recopied, (int) o.chain.size(), o.pre_chain_n);
+                     }
+                     ggml_cl_fa_paged_overlap_issue(ctx, 1, false);   // node 1's lead unchanged
+                 }
+@@ -23885,8 +23900,9 @@
+                 o.pre_recopied++;
+                 if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
+                     GGML_LOG_WARN("%s: paged FA next-graph lead: node 0 rows differ, re-copied "
+-                            "(issued %d, reused %d, re-copied %d)\n", __func__, o.pre_issued,
+-                            o.pre_reused, o.pre_recopied);
++                            "(issued %d, reused %d, re-copied %d, chain %d, prefetched by chain %d)\n",
++                            __func__, o.pre_issued, o.pre_reused, o.pre_recopied,
++                            (int) o.chain.size(), o.pre_chain_n);
+                 }
+                 if (ggml_cl_fa_paged_overlap_issue(ctx, 0, true)) ggml_cl_fa_paged_overlap_issue(ctx, 1, false);
+             }

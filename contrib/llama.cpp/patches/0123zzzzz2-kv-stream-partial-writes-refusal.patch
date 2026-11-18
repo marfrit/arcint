@@ -1,0 +1,53 @@
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13929,6 +13929,24 @@
+     }
+ 
+ #ifdef GGML_OPENCL_SOA_Q
++    // 0123zzzzz2: a partial write of a q8_0 / q4_0 tensor that is not a weight, not a view and never split
++    // takes a plain copy. The KV stream moves single pages into its pool and ring slots, which the attention
++    // reads as blocks; the SoA split below converts a whole tensor (it writes ggml_nbytes from `data` at
++    // `offset`, so a page move ran past the slot: a B60 page fault, window 255). Every other write keeps the
++    // paths below as they were (a view returns there, a split tensor is split again).
++    const bool cl_plain_part = (tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q4_0) &&
++        ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
++        (offset != 0 || size != ggml_nbytes(tensor)) && tensor->view_src == nullptr &&
++        !(tensor->type == GGML_TYPE_Q8_0 ? ggml_cl_is_q8_0_soa(tensor) : ggml_cl_is_q4_0_soa(tensor));
++    if (cl_plain_part) {
++        ggml_tensor_extra_cl * extra_plain = (ggml_tensor_extra_cl *) tensor->extra;
++        GGML_ASSERT(extra_plain);
++        if (!ggml_cl_stage_write(backend_ctx, buffer, extra_plain->data_device, extra_plain->offset + offset, data, size)) {
++            CL_CHECK(clEnqueueWriteBuffer(queue, extra_plain->data_device, CL_TRUE, extra_plain->offset + offset,
++                                          size, data, 0, NULL, NULL));
++        }
++        return;
++    }
+     if (tensor->type == GGML_TYPE_Q1_0) {
+         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
+         GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");
+--- a/src/llama-kv-cache.cpp
++++ b/src/llama-kv-cache.cpp
+@@ -1,5 +1,7 @@
+ #include "llama-kv-cache.h"
+ 
++#include <cstdlib>
++
+ #include "llama-impl.h"
+ #include "llama-io.h"
+ #include "llama-model.h"
+@@ -126,6 +128,15 @@
+             throw std::runtime_error("KV streaming: the resident budget holds " + std::to_string(stream_n_slots) +
+                                      " pages, at least 8 are needed");
+         }
++        // a context the pool cannot hold would stream pages, and the stream's per-layer copy (I5: layer i's
++        // pages into a ring slot while layer i-1 computes) is not built: prepare() fills the two ring slots
++        // for every layer before the graph, so each layer but the last two would read another layer's pages.
++        // Refused until it is; LLAMA_KV_STREAM_UNSAFE=1 lets the stream run for its development
++        if (stream_n_slots < n_pages && !(getenv("LLAMA_KV_STREAM_UNSAFE") && atoi(getenv("LLAMA_KV_STREAM_UNSAFE")) != 0)) {
++            throw std::runtime_error("KV streaming: the resident budget holds " + std::to_string(stream_n_slots) + " of " +
++                                     std::to_string(n_pages) + " pages; streaming the rest needs the per-layer copy (I5), "
++                                     "which is not built: raise the budget or shorten the context");
++        }
+         stream_n_rows = stream_n_slots*llama_kv_stream::page_size;
+         stream_n_ring = std::max<uint32_t>(1, n_pages > stream_n_slots ? n_pages - stream_n_slots : 1);
+         this->stream_n_slots = stream_n_slots;

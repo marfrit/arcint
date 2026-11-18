@@ -1,9 +1,9 @@
 # arcint — Design
 
-State as of 2026-11-12: arcint **1.6.2** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches`: 33 patch files, the 12 folded ones
+State as of 2026-11-18: arcint **1.7.0** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches`: 98 patch files, the 12 folded ones
 (`0000-01` to `0000-12`, the former 0001-0096; `FOLDED.md` there resolves the old
-numbers) and 0097-0117. One engine: libllama with
+numbers) and 0097-0131n (0119-0123, 0125, 0126 and 0129-0131n are the KV window, an opt-in; 0126 also widens `GGML_MAX_SRC` for every tensor). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
@@ -190,7 +190,86 @@ measured on 2026-11-07.
   start, from the GGUF's architecture and before the load: `--llama-mtp` (no head),
   `--llama-dflash-gguf` (no drafter) and `--llama-layer-split` (the placement counts
   the physical and the executed layers apart, a split of that is untested), and
-  the two dory flags on any other architecture. `last_loop` makes a token's hidden
+  the two dory flags on any other architecture.
+
+  **A loop count per request** (`--llama-dory-max-loops N`, contrib/llama.cpp
+  0118, off by default). With N the load builds libllama's tables for N loops
+  (`LLAMA_DORY_MAX_LOOPS`, read back with `llama_model_dory_loops_max`, a mismatch
+  refuses the start) and a request runs 1 to N. The count comes from the same
+  source as the effort the chat template is rendered with
+  (`effective_reasoning_effort`, `src/core/chat.cpp`: an explicit
+  `chat_template_kwargs.reasoning_effort` wins over the typed `reasoning_effort` /
+  Responses `reasoning.effort`, which holds the unit's `--chat-template-kwarg
+  reasoning_effort` default when the request names none). The template may
+  receive a mapped name (minimal as low, high and xhigh swapped by what the
+  template quotes) while the count comes from the unmapped one; each mapped pair
+  has the same count. The seven names are exact
+  and lower case: none, off, minimal, low map to 1, medium to 2, high, xhigh to 4,
+  capped at N. An effective effort that is present and is not one of them, or a
+  kwarg that is not a string, is a 400 (`dory_request_loops`, `src/core/dory.cpp`),
+  never a fallback to the unit's count. A typed `reasoning_effort` that is the
+  empty string and a `chat_template_kwargs.reasoning_effort` that is `null` read
+  as no effort, as they do for the template (the flag does not change how a request
+  is read); a kwarg that is the empty string is present and is a 400. A request that names no effort runs the
+  count of the unit's default effort when `--chat-template-kwarg reasoning_effort=...`
+  is set (a default outside the seven names is refused at the start, with or without
+  this flag), else `--llama-dory-loops` (the file's count without it);
+  `/props` `dory.effort_loops.unset` says which. `/v1/completions` has no effort and
+  always runs the unit's `--llama-dory-loops` count, whatever default effort the
+  unit has. The recurrent KV must resolve to `last_loop` (`--llama-dory-kv`, or the
+  file's own mode; with `per_loop`, either way, the start is refused: a request at
+  another count would read cache layers no earlier request wrote). The start is also
+  refused for N below the unit's count, a build without the 0118 symbol, a GGUF that
+  is not a Dory model (the message names the flag), and a drafter, a projector or
+  `--tts`. A slot whose cells were
+  written at another count is dropped and the prompt prefilled again at the new
+  one, never continued: continuing moved the mean KL by +0.001 to +0.006 nats over
+  the floor and cost 0 to 1.6 points of argmax agreement over six count
+  transitions of 724-765 rows each on six conversations, the worst single
+  conversation losing 5.0 points (1->4); the table with its floor is in the 0118
+  section of `contrib/llama.cpp/README.md` (`measured-here`, CPU, Dory1.0-4B
+  Q5_K_M, f16 cache, context 4,096, micro-batch 512, 8 threads, patch 0118). That
+  is under the answer-level bar in mean KL and not in agreement for three of the
+  six transitions (1->4 -1.3, 2->1 -1.05, 4->1 -1.6 points), which is no equivalence, while a load at N loops and a request at N
+  loops on tables for 4 were bit-equal in logits (18 greedy cases, 2,252 rows). The
+  count is set on the context before every decode under the decode lock; one
+  `llama_decode` carries one lane's rows on this path. Every answer names the count
+  (`dory: {loops, reprefill}`). `reprefill: true` is exactly what the code computes
+  (`dory_reuse`): the slot held at least one cached token, written at a count other
+  than this request's. It is also true when the new prompt shares no prefix with
+  those tokens, where nothing would have been reused anyway; a slot that held nothing,
+  or held cells at this count, reports false. `/props` `dory` carries `max_loops`
+  and the map; its `executed_layers` stays what a request at the unit's own count
+  executes, with the flag on or off (the tables of the maximum are `table_layers`
+  internally and are what the load checks and the cache-layer count read).
+  Known limit: slot choice does not look at the count, so with more than one
+  slot a request can land on a slot written at another count and re-prefill
+  where another slot would have served it; and two lanes at different counts
+  switch the count, rebuild the graph and re-plan the allocation on every decode
+  (neither cost is measured). With the flag off nothing a request or a response
+  sees changes, with two documented exceptions: a Dory start that inherits
+  `LLAMA_DORY_MAX_LOOPS` above the unit's count is refused when the recurrent cache
+  is `last_loop` (with patch 0118 the library would build larger tables than the
+  unit asked for; with `per_loop` the library ignores the variable and the start
+  proceeds), and `/props` `dory`
+  always carries `max_loops` (0 when off) and `effort_loops` (null when off).
+
+  Card record (`measured-here`, 2026-11-12, the 16 GB card, OpenCL, Dory1.0-4B
+  Q5_K_M, the served unit's arguments, greedy, five fresh processes, made-up
+  prompts; figures and arms in the 0118 section of `contrib/llama.cpp/README.md`,
+  tool `tools/dory_loops_spot.py`): on the flagged process (2 loops, maximum 4)
+  20 of 20 answers equal those of the process loaded at that count, but the
+  reference answers differ between counts in only 2 of 5 prompts, so 3 of 5
+  could not have shown a wrong count; chat, chat stream, Responses and token mode
+  named their count; a changing
+  effort re-prefilled on each change and not on a repeat; card memory is equal
+  to a load at 1, 2 or 4 loops (tables for 4 cost 0.0 MiB). The library's red
+  switch did not fail on this route (cause by code reading, in the README); the
+  served check has no red run of its own. Not measured: a deep prompt (a level
+  change deep in a session costs a full prefill), the B60, KL on the card, any
+  sampled run. No served unit carries the flag.
+
+  `last_loop` makes a token's hidden
   state depend on where the chunk boundaries of its prefill fall (loop i attends to
   loop i's KV inside the chunk and to the last loop's KV before it; upstream's own
   test compares such a model only against the same batch), so equivalence across
@@ -209,17 +288,96 @@ measured on 2026-11-07.
   tensors, which must be 96 at 4 loops under `per_loop` (8 + 20 x 4 + 8 attention
   blocks) and 36 under `last_loop`, or the start fails (`dory_check_kv`). A file that
   carries per-tensor `.scale` tensors is refused by the patch (the generic scale pass
-  would read them by executed layer). Sizing (`code`, arithmetic on the GGUF's
-  numbers; 4 KV heads of 256, the sliding layers kept at full length by `swa_full`):
-  the default context of 32,768 cells costs 12.0 GiB at f16 over 96 layers, 4.9 GiB at
-  `q8_0:q4_0`, and 4.5 GiB at f16 under `last_loop` (36 layers); the Q5_K_M file is
-  3.4 GiB. On the A770 (16 GiB) f16 at 4 loops per_loop is 15.4 GiB with the weights and
-  does not fit with the compute buffers; `q8_0:q4_0` (8.3 GiB) does. The B60 (24 GiB)
-  holds the f16 default. The start logs a warning when weights plus cache exceed 92 % of
-  the card's OpenCL global memory (`dory_fit_warning`): a forecast against the total,
-  because arcint cannot read an OpenCL card's free memory; it is not a refusal.
+  would read them by executed layer). Sizing of the cache (`code`, arithmetic on the
+  GGUF's numbers; 4 KV heads of 256, the sliding layers kept at full length by
+  `swa_full`): the default context of 32,768 cells costs 12.0 GiB at f16 over 96
+  layers, 4.9 GiB at `q8_0:q4_0`, and 4.5 GiB at f16 under `last_loop` (36 layers);
+  the Q5_K_M file is 3.4 GiB. With the terms below (`code`, the forecast's arithmetic;
+  its constants are measured at 2 loops `last_loop` only) f16 at 4 loops `per_loop`
+  comes to 16,126 MiB at 32,768 cells, past the A770's 15,473.6 MiB (OpenCL's figure), and `q8_0:q4_0` to
+  8,830 MiB, which fits. The B60 (24 GiB) holds the f16 default.
+  The card's memory by term (`measured-here`, 2026-11-12, the A770, 1.6.2, Q5_K_M, 2
+  loops, `last_loop`, `q8_0:q4_0`, one lane, contexts of 8,192 to 131,072 cells,
+  micro-batch 512 at every size with prompts filling 90 % of it; at micro-batch 256
+  the load lines at 8,192 and 131,072 cells and one filled peak, at 8,192; the
+  driver's resident VRAM for the process against libllama's own lines): the cache is 59,904 bytes a
+  cell, the arithmetic's figure, which libllama's own KV lines match to 0.04 MiB at
+  131,072 cells; the weights on the card are 2,854 MiB
+  of the file's 3,496, the other 642 MiB being libllama's host buffer (`code`: the
+  input layer, which holds the token embedding, is not offloaded); the compute buffer
+  is micro-batch x (127,020 + 4 x cells) bytes, where the part that grows with the
+  context is the attention mask, [cells, micro-batch] in f16, once for the global
+  layers and once for the sliding ones (`code`: libllama's `build_attn_inp_kq_mask`
+  and `build_attn_inp_kv_iswa`; the cells are one sequence's, so with `--parallel N`
+  a lane's share, which has not been run; libllama pads the pool, and a lane's
+  share, to 256 cells, and the forecast takes the padded counts; with
+  `--llama-reserve-cells R` libllama keeps the buffer at R cells and a batch deeper
+  in the cache takes smaller micro-batches (`code`: `llama_context::decode`, contrib
+  llama.cpp 0052), so the forecast's mask spans R cells at most, which has not been
+  run for Dory; that code's floor of 2 rows a micro-batch with one lane gives a
+  batch deeper than 256 x R cells a wider mask at micro-batch 512, a case the
+  forecast does not model); and up to 858 MiB sit outside libllama's
+  buffers: 134 at load, 678 more with the first request, and 14 to 46 more by the
+  deepest fill (21 to 46 at micro-batch 512, 14 at 256), which makes 833.1 / 841.2 /
+  857.3 / 857.4 MiB at the peaks of the four contexts at micro-batch 512 and 825.6 at
+  8,192 cells with micro-batch 256; the later run at 196,608 cells below made it
+  857.8 at the peak. The forecast carries the largest of the six, rounded up. Prompt
+  depth and context size moved
+  together in these runs, so which one the last part follows is not separated, and
+  what allocates any of it is not measured. The sum, 3,774 MiB + 61,952 bytes a cell
+  at micro-batch 512, gives 4,258 / 5,710 / 7,646 / 11,518 MiB at 8,192 / 32,768 /
+  65,536 / 131,072 cells against measured peaks of 4,233 / 5,693 / 7,645 / 11,517 with
+  prompts filling 90 % of each context: 24.9 / 16.8 / 0.7 / 0.6 MiB above them, so
+  the two deepest points of this series leave under 1 MiB (the constants come from
+  it; the run at 196,608 cells below is the one point measured after them, and
+  no prompt deeper than its 176,888 tokens has been run). Up to and including 1.6.2 the forecast
+  was the file's tensor bytes plus the
+  cache against 92 % of the card's OpenCL figure: as a figure it was 269 / 325 / 405
+  / 533 MiB below those four peaks (the host-held 642 MiB counted, the compute buffer
+  and the backend memory not), and its 8 % margin stood in for the difference.
+  The start now logs the forecast with its terms (`dory_forecast_line`; the weight
+  term is read from libllama's "model buffer size" lines of the load) and warns when
+  the sum passes the card's OpenCL global memory (`dory_fit_warning`), which Intel's
+  runtime reports as 16,225,243,136 bytes (15,473.6 MiB) for the A770's 16,288 MiB
+  (`measured-here`, clinfo's `CL_DEVICE_GLOBAL_MEM_SIZE` on the card host, the query
+  the start itself makes for the card figure; ggml prints it truncated as 15473 MB,
+  the forecast line rounded as 15474). Against that figure (`code`, the forecast's
+  arithmetic): 196,608 cells forecast 15,390 MiB
+  and do not warn, 204,800 cells forecast 15,874 and do, 262,144 cells 19,262; the
+  first cell count that warns is 198,030 at micro-batch 512 and 201,892 at 256 by
+  the arithmetic. libllama allocates in steps of 256 cells, so the last `--n-ctx`
+  without a warning is 197,888 (201,728 at micro-batch 256) and anything above it
+  allocates 198,144 cells (201,984) and warns. The new rule is the more permissive
+  one: the old one warned from about 187,996 cells, where the new forecast stands
+  593 MiB under the OpenCL figure at micro-batch 512 (807 at 256; the old rule did
+  not read the micro-batch), and the new one warns about 10,034 cells later
+  with no margin of its own. Between OpenCL's figure and the card's memory by the
+  driver's count lie 814 MiB on the A770. A start at 196,608 cells (`measured-here`,
+  2026-11-12, the A770, a build of this change with the arguments of a served Dory
+  start) logged a forecast of 15,390 MiB and held 15,389.1 MiB resident with prompts
+  of 49,096, 98,250 and 176,888 tokens (peak 15,389.4; the needle found at each
+  depth; no line of the process' log matches `RESOURCES`, `ALLOCATION_FAILURE`,
+  `alloc.*fail`, `out of memory`, `CL_OUT`, `CL_MEM` or `error`): the peak is 0.2 MiB
+  under the forecast's 15,389.6 and the resident figure 0.5 under, both 84 MiB under
+  OpenCL's figure. At 8,192 cells the line read 4,258 MiB against a filled peak of
+  4,232.7. The binary of that window and the committed code differ in comments,
+  tests and one function that composes the same calls (`dory_start_forecast`, which
+  the start and the tests share; `code`, a diff of the two sources); the arithmetic
+  is the same, and the tests hold the window's forecast lines at 196,608 and 204,800
+  cells and its warning character for character.
+  It is a forecast against that figure, because arcint cannot read an OpenCL card's
+  free memory, and not a refusal: a start past it is not stopped. In the same
+  window a start at 204,800 cells logged 15,874 MiB and the warning, loaded, and
+  answered prompts of 18, 600 and 2,000 tokens with 15,838.9 MiB resident, 365 MiB
+  past OpenCL's figure and 449 MiB under the driver's count; a deep prompt at that
+  size has not been run, so where a start past the figure fails is not known. The
+  compute and backend constants are that card's and that configuration's: 4 loops,
+  `per_loop`, f16, more than one lane and the B60 have not been measured, and the
+  forecast applies the same constants there.
   Card results (`measured-here`, 2026-11-07, build 6fa32c1e, Q5_K_M; decode over
-  400 tokens including the prefill, prefill over 5.9k tokens): A770 2 loops
+  400 tokens including the prefill, prefill over 5.9k tokens; the record does not
+  state the context size of these runs, so their peaks are no check of the forecast
+  above): A770 2 loops
   q8_0:q4_0 23.7 t/s, 512-665 t/s, peak 5.2 GiB; 2 loops f16 24.9 t/s, 727 t/s,
   7.1 GiB; 4 loops q8_0:q4_0 14.3 t/s, 396 t/s, 6.2 GiB; 4 loops `last_loop`
   14.3 t/s, 392 t/s, 4.7 GiB. B60 2 loops q8_0:q4_0 36.4 t/s / 1,287 t/s, 2
@@ -336,9 +494,9 @@ The cards (`measured-here` unless marked):
 
 ### 3.2 Kernels: the patch series
 
-`contrib/llama.cpp/patches` holds 33 patch files against the pin: 0001-0096
+`contrib/llama.cpp/patches` holds 34 patch files against the pin: 0001-0096
 folded into 12 (`0000-01` to `0000-12`; `FOLDED.md` there resolves the old
-numbers, which stay as labels in the record) and 0097-0117, each with its
+numbers, which stay as labels in the record) and 0097-0118, each with its
 measurement, KL, red case and review in `contrib/llama.cpp/README.md`
 (`measured-here` throughout). By what they change:
 

@@ -1207,6 +1207,7 @@ json response_resource(const ResponseRequest& req, const PreparedChat& prep,
     // loop guard's counters use.
     if (prep.truncation.blocks_dropped > 0) ext["truncated"] = truncation_json(prep.truncation);
     if (loop_guard_moved(gen.stats)) ext["loop_guard"] = loop_guard_json(gen.stats);
+    if (dory_named(gen.stats)) ext["dory"] = dory_json(gen.stats);
     // arcint.timings: the per-response timing object, only when the request
     // asked; the extension namespace is the spec-typed surface's own.
     if (req.timings) ext["timings"] = timings_json(gen.stats);

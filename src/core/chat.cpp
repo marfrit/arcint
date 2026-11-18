@@ -661,6 +661,24 @@ std::vector<std::string> template_reasoning_effort_levels(std::string_view templ
     return out;
 }
 
+EffectiveEffort effective_reasoning_effort(const ChatRequest& req) {
+    EffectiveEffort e;
+    if (req.chat_template_kwargs.is_object()) {
+        const auto it = req.chat_template_kwargs.find("reasoning_effort");
+        if (it != req.chat_template_kwargs.end()) {   // the explicit kwarg wins over the typed field
+            e.present   = true;
+            e.is_string = it->is_string();
+            if (e.is_string) e.level = it->get<std::string>();
+            return e;
+        }
+    }
+    if (!req.reasoning_effort.empty()) {
+        e.present = true;
+        e.level   = req.reasoning_effort;
+    }
+    return e;
+}
+
 nlohmann::json template_context(const ChatRequest& req, std::string& error,
                                 std::string_view template_src) {
     error.clear();
@@ -680,12 +698,14 @@ nlohmann::json template_context(const ChatRequest& req, std::string& error,
     }
     if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
     if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
-    // The explicit kwarg wins (it is already in extra), as enable_thinking does.
-    if (!req.reasoning_effort.empty() && !extra.contains("reasoning_effort")) {
-        const std::string level = template_reasoning_effort(req.reasoning_effort, template_src);
+    // The explicit kwarg wins (it is already in extra), as enable_thinking does:
+    // effective_reasoning_effort is the one place that decides it.
+    if (const EffectiveEffort eff = effective_reasoning_effort(req);
+        eff.present && !req.chat_template_kwargs.contains("reasoning_effort")) {
+        const std::string level = template_reasoning_effort(eff.level, template_src);
         if (!level.empty()) {
             log::debug("req", "reasoning_effort %s reaches the template context as %s",
-                       req.reasoning_effort.c_str(), level.c_str());
+                       eff.level.c_str(), level.c_str());
             extra["reasoning_effort"] = level;
         }
     }
