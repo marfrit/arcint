@@ -154,7 +154,7 @@ int main() {
       CHECK(ggml_cl_fa_paged_form(s, c) == 1, "without the split kernel the wide call still decodes"); }
     // 0131k: the wide call's launch reads the merge kernel (which split_decode implies)
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.split_decode = false; c.merge = false;
-      CHECK(!ggml_cl_fa_paged_ok(s, c), "without the merge kernel 9 rows have no decode form"); }
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "without the merge kernel 9 rows take the conversion"); }
 
     // prefill: the conversion + f16 prompt kernels carry every row count
     { auto s = agent_decode(); s.q_ne1 = 512; s.mask_ne1 = 512; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a 512-row prompt takes the conversion"); }

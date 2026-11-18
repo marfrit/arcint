@@ -45,10 +45,14 @@ class FaPagedLead(unittest.TestCase):
         self.assertTrue(i >= 0, "0129x's note is absent")
         j = t.rfind("const size_t merge_wg", 0, i)
         self.assertTrue(j >= 0)
-        block = t[j:t.find("        return;\n", i)]
-        self.assertIn("if (paged_overlap_copied && paged_overlap_parity >= 0) {", block,
-                      "the split branch must call the tail before it returns")
-        self.assertIn("ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);", block)
+        r = t.find("        return;", i)
+        block = t[j:r]
+        # 0131n: the after-step is the dispatch's guard (paged_after), which runs at this return,
+        # after both kernels; before 0131n it was an explicit call in this block
+        guarded = ("~paged_after_guard()" in t and "return;   // 0131n: paged_after runs the after-step here" in t[r:r + 80])
+        explicit = ("if (paged_overlap_copied && paged_overlap_parity >= 0) {" in block
+                    and "ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);" in block)
+        self.assertTrue(guarded or explicit, "the split branch must run the tail before it returns")
         # the served decode takes this branch; the tail call below it is unreachable there
         self.assertIn("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst, tl_now ? &ev_merge : nullptr);", block,
                       "the call must follow both kernels")
