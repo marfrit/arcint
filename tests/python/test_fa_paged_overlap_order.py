@@ -54,4 +54,11 @@ check("0131j: the prefetch reuse key names node 0's host store",
       "hk->data != o.pre_host_k) return false;" in same
       and "o.pre_host_k = dst->src[GGML_FA_SRC_HOST_K] ? dst->src[GGML_FA_SRC_HOST_K]->data" in head)
 
+# 0131m: a paged call never takes 0028's row blocks (their 8-row re-entries ran outside the
+# overlap's chain). Red: the 0131k tree, whose row-block condition has no kv_pages clause
+fa = src[src.index("static void ggml_cl_flash_attn("):]
+rb = fa[fa.index('getenv("GGML_OPENCL_FA_ROW_BLOCKS")'):]
+rb = rb[:rb.index("for (int r0 = 0; r0 < n_q; r0 += 8)")]
+check("0131m: the row blocks take no paged call", "kv_pages == nullptr" in rb)
+
 sys.exit(1 if fail else 0)

@@ -1,0 +1,76 @@
+0131m: paged FLASH_ATTN_EXT never takes 0028's row blocks; under the overlap their 8-row re-entries copied outside its chain, so the next graph reused a ring slot they had overwritten (1.7.0 gate, windows 170n, 171a-171e).
+
+--- a/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h
++++ b/ggml/src/ggml-opencl/ggml-opencl-fa-paged.h
+@@ -53,8 +53,6 @@ struct ggml_cl_fa_paged_caps {
+     int  tiles;
+     // GGML_OPENCL_FA_WIDE_VERIFY and GGML_OPENCL_FA_INTEL_SPLIT switches
+     bool wide_on, intel_split_on;
+-    // 0131k: GGML_OPENCL_FA_ROW_BLOCKS (0028's blocks of 8 rows for 9-64-row calls)
+-    bool row_blocks_on;
+     // 0131k: the split decode's merge kernel at head size 256, which every GQA decode
+     // launch reads (split_decode implies it; the wide call needs it on its own)
+     bool merge;
+@@ -115,7 +113,7 @@ static inline int ggml_cl_fa_paged_form(const ggml_cl_fa_paged_shape & s, const
+     // that end on a kernel reading the table. Before, the 1-8-row clause checked the
+     // split kernel alone (the A770 builds the split but no GQA kernel: accepted here,
+     // aborted there), and every other shape counted as the conversion, which takes
+-    // only 9+ rows and only where the row blocks do not take them first.
++    // only 9+ rows.
+     // A decode of r rows runs on the GQA kernel, which reads the table: the split
+     // decode (intel_q_decode) only opens that path, and the dispatcher then needs
+     // the direct kernel (the staged form is built only beside it, and 4+ rows take
+@@ -134,10 +132,8 @@ static inline int ggml_cl_fa_paged_form(const ggml_cl_fa_paged_shape & s, const
+             G*s.q_ne1 <= (int64_t) c.tiles*8) {
+             return 1;
+         }
+-        // else 0028's row blocks take them first: 8-row calls, each the GQA decode
+-        if (s.q_ne1 <= 64 && row_call && c.row_blocks_on) {
+-            return gqa_decode(8) ? 1 : 0;
+-        }
++        // 0131m: 0028's row blocks take no paged call (they ran outside the overlap's
++        // chain); the rest goes to the conversion below
+     }
+     // 9+ rows otherwise (causal ones too): the f16 conversion, which reads the table
+     if (s.q_ne1 > 8 && c.kernels_prefill) {
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13286,8 +13286,6 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 cp.wide_on = wv_env2 == nullptr || atoi(wv_env2) != 0;
+                 static const char * fd_env2 = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
+                 cp.intel_split_on = fd_env2 == nullptr || atoi(fd_env2) != 0;
+-                static const char * rb_env2 = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
+-                cp.row_blocks_on = rb_env2 == nullptr || atoi(rb_env2) != 0;
+                 cp.merge = backend_ctx->fa.f32_merge.count(dk_dv) > 0;
+                 const bool ok = ggml_cl_fa_paged_ok(sh, cp);
+                 if (getenv("GGML_OPENCL_FA_PAGED_DEBUG")) {
+@@ -25548,11 +25546,18 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // take at most 8 rows, and the prefill kernel they would fall to costs a call
+     // its K/V conversion: two lanes' verifies at 4k spent 4.3 ms an attention call
+     // there (measured-here, B60). Rows are independent, so each block attends as
+-    // the whole call would. GGML_OPENCL_FA_ROW_BLOCKS=0 keeps one call
++    // the whole call would. GGML_OPENCL_FA_ROW_BLOCKS=0 keeps one call.
++    // 0131m: never for paged K/V. The blocks re-enter this function with a stack copy of the
++    // node, so under GGML_OPENCL_FA_PAGED_OVERLAP the copies of a 9-64-row paged call ran
++    // outside the overlap's chain: the previous graph's cross-step prefetch into slot 0 was
++    // neither waited nor invalidated, and the next graph reused a slot the blocks had
++    // overwritten (the 1.7.0 gate: a question's prefill of ~20 tokens; windows 170n,
++    // 171a-e). A paged call of 9-64 rows that is not wide takes the conversion, whose
++    // copies the overlap orders, in both streams
+     {
+         static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
+         static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
+-        if (rb_on && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
++        if (rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
+             q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
+             for (int r0 = 0; r0 < n_q; r0 += 8) {
+                 const int nr = std::min(8, n_q - r0);
+@@ -26467,8 +26472,6 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         cp.wide_on = wv_env2 == nullptr || atoi(wv_env2) != 0;
+         static const char * fd_env2 = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
+         cp.intel_split_on = fd_env2 == nullptr || atoi(fd_env2) != 0;
+-        static const char * rb_env2 = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
+-        cp.row_blocks_on = rb_env2 == nullptr || atoi(rb_env2) != 0;
+         cp.merge = backend_ctx->fa.f32_merge.count(pdk) > 0;
+         paged_form = ggml_cl_fa_paged_form(sh, cp);
+         if (paged_form == 0) {

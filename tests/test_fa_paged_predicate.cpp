@@ -70,7 +70,7 @@ ggml_cl_fa_paged_caps agent_caps() {
     ggml_cl_fa_paged_caps c{};
     c.kernels_gqa_direct = true; c.kernels_gqa_staged = true; c.kernels_prefill = true;
     c.split_decode = true; c.tiles = 8; c.wide_on = true; c.intel_split_on = true;
-    c.row_blocks_on = true; c.merge = true;
+    c.merge = true;
     return c;
 }
 
@@ -106,13 +106,14 @@ int main() {
     // the GQA work-group's cap: (query heads / KV heads) * rows <= tiles * 8. The
     // agent has 6 (head, token) rows a token, so 10 tokens fill 60 rows on 8 tiles
     { auto s = agent_decode(); s.q_ne1 = 10; s.mask_ne1 = 10; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "a 10-token (60-row) verify takes the wide GQA call"); }
-    // 0131k: past the cap, 0028's row blocks take a 9-64-row call before the conversion
-    // could: 8-row calls, each a GQA decode (8 tokens at 6 heads are 48 rows)
-    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 1, "11 tokens (66 rows) exceed the cap and run as 8-row GQA decodes"); }
-    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.row_blocks_on = false;
-      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "11 tokens without the row blocks take the conversion"); }
+    // 0131m: past the cap a paged call never takes 0028's row blocks (their 8-row
+    // re-entries copied outside the overlap's chain; the 1.7.0 gate, windows 170n and
+    // 171a-e): 9-64 rows that are not wide take the conversion. Red: the row-block clause
+    // of 0131k back in the predicate, and these read 1 (or refused)
+    { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "11 tokens (66 rows) past the cap take the conversion, not the row blocks"); }
+    { auto s = agent_decode(); s.q_ne1 = 20; s.mask_ne1 = 20; CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "a 20-token question prefill (120 rows) takes the conversion"); }
     { auto s = agent_decode(); s.q_ne1 = 11; s.mask_ne1 = 11; auto c = agent_caps(); c.split_decode = false;
-      CHECK(!ggml_cl_fa_paged_ok(s, c), "row blocks whose 8-row calls have no decode form are refused"); }
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "11 tokens without the split decode take the conversion"); }
     // 0131k: a 1-8-row decode runs on the GQA kernel too (the split only opens the
     // path), so it must fit the tiles: 6 tokens at 6 heads are 36 rows, over 4 tiles' 32;
     // the conversion takes 9+ rows only, so nothing takes them
@@ -128,9 +129,7 @@ int main() {
     { auto s = agent_decode(); auto c = agent_caps(); c.kernels_gqa_direct = false; c.kernels_gqa_staged = false;
       CHECK(!ggml_cl_fa_paged_ok(s, c), "6 rows without a GQA kernel are refused, the conversion beside it or not"); }
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.kernels_gqa_direct = false;
-      CHECK(!ggml_cl_fa_paged_ok(s, c), "9 rows without the direct kernel: no wide call, row blocks without a decode"); }
-    { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.kernels_gqa_direct = false; c.row_blocks_on = false;
-      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "9 rows without the direct kernel and the row blocks take the conversion"); }
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "9 rows without the direct kernel: no wide call, the conversion"); }
     // 0131k: the split decode's kernel slot is the dispatcher's kvq (q8q8, q8q4, q4q4),
     // not the GQA arrays' index, which starts at f16
     CHECK(ggml_cl_fa_paged_split_slot(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0) == 0 &&
@@ -150,7 +149,7 @@ int main() {
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; s.n_batch = 2;
       CHECK(ggml_cl_fa_paged_form(s, agent_caps()) == 2, "9 tokens on two K/V batches take the conversion"); }
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.wide_on = false;
-      CHECK(ggml_cl_fa_paged_form(s, c) == 1, "with the wide verify off, 9 tokens run as row blocks on the GQA decode"); }
+      CHECK(ggml_cl_fa_paged_form(s, c) == 2, "with the wide verify off, 9 tokens take the conversion"); }
     { auto s = agent_decode(); s.q_ne1 = 9; s.mask_ne1 = 9; auto c = agent_caps(); c.split_decode = false;
       CHECK(ggml_cl_fa_paged_form(s, c) == 1, "without the split kernel the wide call still decodes"); }
     // 0131k: the wide call's launch reads the merge kernel (which split_decode implies)

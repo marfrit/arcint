@@ -8306,6 +8306,7 @@ the rest (`code`). arcint's serving cannot reach any of them: it refuses the KV 
 B60, and on the B60 with the agent's shapes (6 query heads per KV head, at most 6 tokens a decode
 step) and no switch set, both predicates accept the same shapes and the dispatch is unchanged
 (the 11-64-token calls run as row blocks either way; the old predicate called them the conversion).
+0131m then took paged calls out of the row blocks altogether (below).
 
 - **1-8 rows: the GQA decode, or nothing.** A paged decode of 1-8 rows runs on the GQA kernel.
   The split decode (`intel_q_decode`) only opens that path; the dispatcher then needs the direct
@@ -8318,7 +8319,8 @@ step) and no switch set, both predicates accept the same shapes and the dispatch
   the B60 with `GGML_OPENCL_FA_GQA=0`, `GGML_OPENCL_FA_INTEL_SPLIT=0`, or a model with more
   query heads per KV head (16 heads at 5 rows), not with the agent's defaults. Those shapes are now declined: the scheduler gives them to the CPU, whose
   FLASH_ATTN_EXT reads the page table, the plan and the host stores (`ops.cpp`).
-- **9-64 rows: the wide call, else 0028's row blocks, else the conversion.** The row blocks
+- **9-64 rows: the wide call, else 0028's row blocks, else the conversion** (superseded by 0131m:
+  paged calls no longer take the row blocks). The row blocks
   (`GGML_OPENCL_FA_ROW_BLOCKS`, on by default) split a 9-64-row call into 8-row calls before the
   conversion could take it, so such a shape needs the 8-row GQA decode. The predicate counted it
   as the conversion. The caps now carry the row-block switch.
@@ -8345,3 +8347,35 @@ without the split, 11 tokens past the cap (row blocks, not the conversion), the 
 The file itself does not compile there (the slot map and the `row_blocks_on` and `merge` caps
 are new); with those removed, the listed cases fail. The card arm is the A770 and B60
 FLASH_ATTN_EXT suites and the KV-window smoke on the release tools (window 170k).
+
+## 0131m-fa-paged-no-row-blocks.patch
+
+A paged FLASH_ATTN_EXT never takes 0028's row blocks. The blocks split a 9-64-row call that does
+not fit the wide GQA call into 8-row calls, re-entering the dispatcher with a stack copy of the
+node. Under `GGML_OPENCL_FA_PAGED_OVERLAP=1` the overlap recognises its nodes by the graph's own
+node (`chain[cur] == dst`), so those 8-row calls copied their pages on the compute queue, outside
+the overlap's chain, and the outer node never took its turn: the previous graph's cross-step
+prefetch into ring slot 0 was neither waited nor invalidated, and the next graph found the same
+(host page, ring row) pairs and reused a slot the blocks had since filled with another layer's
+pages (`code`).
+
+Found by the 1.7.0 gate (`measured-here`, the B60, Qwen3.8-27B UD-Q5_K_M, q8_0:q4_0, MTP 5): with
+the overlap the served answer moved with timing and differed from the serial stream's (window
+170n at 120k; 171a at 30k with a 256 MiB window: answer md5 1759821941af against 5f932b72915b).
+Switching the prefetch off, or never reusing it, gave the serial answer bit for bit (171a);
+`VERIFY=1` found node 0's reused ring row 0 different from host page 0 in all 8,216 chunks, once
+a run (171b): the question's prefill (about 20 tokens, 120 rows) is the one row-block graph of
+each request, and the question's K/V cached from it changed the next request's answer. A store
+generation guarding the host store (an earlier 0131m) refused nothing and cured nothing (171c);
+`GGML_OPENCL_FA_ROW_BLOCKS=0` on the unchanged release candidate RC170K-RESULT (171e).
+
+Such a call now takes the conversion, whose copies the overlap orders, in the serial stream too,
+so both streams run the same kernels. The cost is the conversion on the rare short-tail ubatch
+(0028 measured 4.3 ms an attention call there at 4k on the B60). The serial stream was never
+wrong: with the overlap off there is no copy queue, and the blocks' copies and kernels are in
+order on the one compute queue.
+
+Gate: `tests/test_fa_paged_predicate.cpp` (9-64 rows that are not wide take the conversion: 11
+tokens, a 20-token prefill, without the split, without the direct kernel, the wide verify off)
+and `tests/python/test_fa_paged_overlap_order.py` (the row-block condition excludes paged calls).
+Card arm: window 171f-RESULT.
