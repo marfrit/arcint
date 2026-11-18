@@ -116,6 +116,9 @@ class FaPagedPostFA(unittest.TestCase):
         k = block.find("backend_ctx->enqueue_ndrange_kernel(k_merge, 3, merge_gws, merge_lws, dst, tl_now ? &ev_merge : nullptr);")
         p = block.find(post)
         a = block.find("ggml_cl_fa_paged_overlap_after(backend_ctx, paged_overlap_parity);")
+        guarded = "~paged_after_guard()" in t
+        if a < 0 and guarded:
+            a = len(block)   # 0131n: the guard runs the after-step at this branch's return
         self.assertTrue(k >= 0 and p >= 0 and a >= 0, "the split branch lacks kernel, post or marker")
         self.assertGreater(p, k, "the post hash must follow the FA's kernels")
         self.assertLess(p, a, "the post hash must precede the consumed marker")
@@ -123,6 +126,8 @@ class FaPagedPostFA(unittest.TestCase):
         i = t.find("// 0130d: VERIFY=3's post hash, after the tail kernels and before the consumed marker")
         self.assertTrue(i >= 0, "the tail's post site is absent")
         j = t.find("if (paged_overlap_copied && paged_overlap_parity >= 0) {", i)
+        if guarded:
+            j = t.find("\n}\n", i)   # 0131n: the guard runs at the function's end
         tailblock = t[i:j]
         self.assertIn("ggml_cl_fa_paged_verify3_post(backend_ctx, false);", tailblock)
         self.assertLess(t.find(post, i), j, "the tail's post hash must precede its marker")
