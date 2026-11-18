@@ -8385,7 +8385,7 @@ order on the one compute queue.
 Gate: `tests/test_fa_paged_predicate.cpp` (9-64 rows that are not wide take the conversion: 11
 tokens, a 20-token prefill, without the split, without the direct kernel, the wide verify off)
 and `tests/python/test_fa_paged_overlap_order.py` (the row-block condition excludes paged calls).
-Card arm: with 0131n, window 171f.
+Card arm: with 0131n, window 171f (below).
 
 ## 0131n-fa-paged-overlap-after-every-exit.patch
 
@@ -8408,4 +8408,12 @@ equalled the serial stream in both runs, as did `VERIFY=4` (0 pre-read mismatche
 reuse was not the cause; NOLEAD's equality in 171a was timing.
 
 Gate: `tests/python/test_fa_paged_overlap_order.py` (the after-step is the guard, and no exit
-calls it by hand; red on the 0131m tree). Card arm: window 171f.
+calls it by hand; red on the 0131m tree). Card arms: window 171f (0131m + 0131n, the B60, Q5): the
+overlap at full speed equal to the serial stream bit for bit (md5, accepted and proposed drafts,
+verifies) in 3 runs at 30k (256 MiB window) and 3 at 120k (1,024 MiB, both requests), with the
+host's timing varied, `VERIFY=1` (1,232 nodes, 0 mismatches) and `VERIFY=4` (0); the release
+candidate without either fix with `VERIFY=1`: node 0's ring row 0 wrong in all 8,216 chunks. Window
+171h (0131m without 0131n): the overlap at full speed differs from the serial stream in both runs
+(md5 5f932b72915b, c1da3368f9af against 98d05d0226bc), and equals it under `VERIFY=1`, whose host
+waits close the race. Decode at 30k 92.5 ms a step with the overlap against 127.0; at 120k 170.6
+against 292.6.

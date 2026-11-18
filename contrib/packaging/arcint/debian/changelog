@@ -1,3 +1,28 @@
+arcint (1.7.0-1) trixie; urgency=medium
+
+  * NEW, opt-in and experimental: the KV window. LLAMA_KV_STREAM_UNSAFE=1 and
+    --llama-kv-resident MiB keep a pool of KV pages on the 24 GB card and
+    stream the rest from host memory per attention layer;
+    GGML_OPENCL_FA_PAGED_OVERLAP=1 copies on a second queue (0119-0123,
+    0125, 0126, 0129-0131n). Refused without the switch; the default path
+    changes only by GGML_MAX_SRC 12. Fixed before release (0131k): the
+    paged attention predicate follows the dispatcher (it accepted shapes
+    that aborted, or ran without the page table under switches), reads the
+    split-decode kernels by their own slot (out of bounds for q4_0/q4_0),
+    and a paged call off a table-reading kernel aborts; serving could not
+    reach any of it. Fixed before release (0131m, 0131n): with the overlap
+    the answers moved with timing (paged calls took the row blocks outside
+    the overlap's chain; the prompt conversion skipped the after-step); the
+    overlap now equals the serial stream bit for bit.
+  * OpenCL: verify rows 9 to 64 in one GQA call on the B60 (0124); the GDN
+    replay kernel declares its sub-group size and qwen35moe builds its replay
+    state (0127, 0128); GGML_MAX_SRC 12 (0126).
+  * Dory: --llama-dory-max-loops N picks the loop count per request from its
+    reasoning effort (0118); the start-time memory forecast is measured.
+  * Checkpoint and drafter state bytes are allocated without a zero fill.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 18 Nov 2026 12:00:00 +0100
+
 arcint (1.6.2-1) trixie; urgency=medium
 
   * --chat-template-kwarg KEY=VALUE (a unit default for chat_template_kwargs)

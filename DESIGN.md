@@ -1,9 +1,9 @@
 # arcint — Design
 
-State as of 2026-11-12: arcint **1.6.2** on llama.cpp **`3e4dfa8`** with the
-patch series `contrib/llama.cpp/patches`: 34 patch files, the 12 folded ones
+State as of 2026-11-18: arcint **1.7.0** on llama.cpp **`3e4dfa8`** with the
+patch series `contrib/llama.cpp/patches`: 98 patch files, the 12 folded ones
 (`0000-01` to `0000-12`, the former 0001-0096; `FOLDED.md` there resolves the old
-numbers) and 0097-0118. One engine: libllama with
+numbers) and 0097-0131n (0119-0123, 0125, 0126 and 0129-0131n are the KV window, an opt-in; 0126 also widens `GGML_MAX_SRC` for every tensor). One engine: libllama with
 ggml's OpenCL backend and arcint's Intel kernels. Three language services run
 in production on two Intel Arc cards: the dense Qwen3.8-27B agent and
 Qwen3.8-Flash-Next (125B-A6B, on demand) on the 24 GB Arc Pro B60, the MoE
