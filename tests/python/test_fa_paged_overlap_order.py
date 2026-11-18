@@ -42,7 +42,7 @@ def body(fn):
 g = body("void ggml_cl_fa_paged_overlap_graph")
 start = g[g.index("if (o.gen != ctx->graph_gen)"):g.index("o.gen  = ctx->graph_gen;")]
 check("0131j: a new graph keeps consumed[] (the slots' last readers)",
-      "clReleaseEvent(o.ready[i])" in start and "clReleaseEvent(o.consumed[i])" not in start)
+      "clReleaseEvent(o.ready[i])" in start and "o.consumed[" not in start)
 a = body("void ggml_cl_fa_paged_overlap_after")
 m = a.index("clEnqueueMarkerWithWaitList(ctx->queue, 0, nullptr, &o.consumed[parity])")
 check("0131j: the consumed marker is flushed on the compute queue before a copy waits it",
@@ -51,6 +51,7 @@ check("0131j: the consumed marker is flushed on the compute queue before a copy 
 same = body("bool ggml_cl_fa_paged_prefetch_same")
 head = body("void ggml_cl_fa_paged_prefetch_head")
 check("0131j: the prefetch reuse key names node 0's host store",
-      "pre_host_k" in same and "GGML_FA_SRC_HOST_K" in same and "o.pre_host_k =" in head)
+      "hk->data != o.pre_host_k) return false;" in same
+      and "o.pre_host_k = dst->src[GGML_FA_SRC_HOST_K] ? dst->src[GGML_FA_SRC_HOST_K]->data" in head)
 
 sys.exit(1 if fail else 0)

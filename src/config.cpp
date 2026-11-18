@@ -567,8 +567,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
                 return fail("--llama-kv-resident takes at most 4095 MiB in this build (the budget is a 32-bit byte count)");
             // The KV window (I5, docs/campaigns/kv-streaming-design.md) is an opt-in in 1.7.0: its per-layer page
             // moves and the copy-queue overlap are built and measured on the 24 GB card, not production-proven.
-            // A budget is refused unless the operator sets the environment switch; this is the only serving gate
-            // (libllama's own refusal went with 0123zzzzz3).
+            // A budget is refused unless the operator sets the environment switch; this is the only opt-in gate
+            // (libllama's own went with 0123zzzzz3; kv_stream_refusal.h then checks the card, the KV types, FA).
             if (cfg.llama_kv_resident_mib > 0 &&
                 !(std::getenv("LLAMA_KV_STREAM_UNSAFE") && std::atoi(std::getenv("LLAMA_KV_STREAM_UNSAFE")) != 0))
                 return fail("--llama-kv-resident: the KV window is an experimental opt-in and is refused unless "

@@ -81,9 +81,6 @@ class FaPagedLead(unittest.TestCase):
                       "the roll-up needs the verify switch declared above graph_compute")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class FaPagedPostFA(unittest.TestCase):
     """Patch 0130d's device-free gate: VERIFY=3 hashes the same rows after the FA, before
@@ -527,3 +524,7 @@ class FaPagedTimelineNoMarkerAndPostRead(unittest.TestCase):
         self.assertIn("if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)", t,
                       "0131d: a VERIFY=4 pair must not be waited at a graph's start")
         self.assertNotIn("verify_mode() == 3 || ggml_cl_fa_paged_verify_mode() == 4 && g_fa_paged_verify3_ctx", t)
+
+
+if __name__ == "__main__":
+    unittest.main()

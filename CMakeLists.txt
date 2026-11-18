@@ -753,6 +753,14 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_paged_overlap_order.py")
     set_tests_properties(fa-paged-overlap-order PROPERTIES LABELS unit)
+    # 0129x-0131d: the KV window's lead, verify, self-test, forced race, timeline and NOFIX
+    # cells (29 source-text cases). Before 1.7.0 the file ran by hand only, and its
+    # unittest.main() sat after the first class, so a script run took 3 of them.
+    add_test(NAME fa-paged-lead
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_paged_lead.py")
+    set_tests_properties(fa-paged-lead PROPERTIES LABELS unit)
     add_test(NAME expert-profile-save
              COMMAND "${CMAKE_COMMAND}" -E env "EXPERT_PROFILE_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
                      "${Python3_EXECUTABLE}"
