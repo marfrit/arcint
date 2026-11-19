@@ -91,6 +91,7 @@ add_library(arcint_core STATIC
   src/core/toolgrammar.cpp
   src/core/chat.cpp
   src/exec/backend_stub.cpp
+  src/exec/opencl_card_select.cpp
   src/api/auth.cpp
   src/api/error.cpp
   src/api/handlers.cpp
