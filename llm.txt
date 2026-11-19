@@ -1,7 +1,7 @@
 # arcint
 
-> Intel Arc inference server (Arc A770 16 GiB, Arc Pro B60 24 GB, xe
-> driver), with OpenAI-compatible HTTP APIs: language models through
+> Intel Arc inference server (Arc Pro B60 24 GB; the Arc A770 16 GiB gated
+> through 1.7.0, untested since: docs/a770-reference.md; xe driver), with OpenAI-compatible HTTP APIs: language models through
 > libllama, and since 1.1.0 text-to-image (Z-Image Turbo; since 1.1.1
 > Qwen-Image, FLUX.2 klein with editing, ESRGAN upscaling) through
 > stable-diffusion.cpp's sd-server built against the same patched ggml tree

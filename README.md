@@ -1,7 +1,7 @@
 # arcint
 
 An inference server for Intel Arc: OpenAI-compatible endpoints for a short
-list of models on the Arc A770 and the Arc Pro B60, from the dense
+list of models on the Arc Pro B60 and, through 1.7.0, the Arc A770, from the dense
 Qwen3.8-27B to the 512-expert Qwen3.8-Flash-Next on one card plus host RAM,
 since 1.1.0 text-to-image: Z-Image Turbo, Qwen-Image (lettering, German
 included), FLUX.2 klein with image editing, and an ESRGAN upscaler; and since
@@ -562,9 +562,12 @@ service's production flags, Flash-Next's expert cache included
   template. `chat_template_caps.template_source` is `gguf`, `file` or
   `chatml-fallback`. Not with `--stub`.
 - **Models**: the table above. Other architectures are refused at load.
-- **Cards**: the Intel Arc A770 (16 GiB, Xe-HPG) and the Arc Pro B60 (24 GB,
-  Xe2), under the xe kernel driver. One card per process, or two by layers
-  for one model (`--llama-layer-split`, DESIGN §3.10).
+- **Cards**: the Intel Arc Pro B60 (24 GB, Xe2), under the xe kernel driver.
+  One card per process, or two by layers for one model
+  (`--llama-layer-split`, DESIGN §3.10). The Arc A770 (16 GiB, Xe-HPG,
+  Alchemist) was gated through 1.7.0 and is **untested** from the next
+  release on: its paths stay in the series, no gate runs them; its last
+  measured state is [docs/a770-reference.md](docs/a770-reference.md).
 - **Images**: text-to-image and editing through `arcint-imggen` (sd.cpp's
   `sd-server`, a separate binary and process): Z-Image Turbo, Qwen-Image and
   FLUX.2 klein, one unit each, one at a time on the card
