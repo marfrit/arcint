@@ -110,6 +110,7 @@ These names are not in a table:
 | `GGML_OPENCL_KQ_2D_OPTS` | none | Extra defines for the 2D K-quant GEMM programs. | 0014 | — |
 | `GGML_OPENCL_KQ_2D_SHAPE` | `64,16,32` | `TM,WG,AT`: token tile, sub-groups, activation read height (8 or 32). | 0011 | Shape as measured in patch 0029 of marfrit-openvino (`measured-here`). |
 | `GGML_OPENCL_KQ_2D_T<i>` (i = 0, 1, 2) | unset: the `KQ_2D_SHAPE` values | `TM,WG,AT,KSYNC` for Q4_K, Q5_K, Q6_K. Read by `tools/kq_tune`. A shape that does not build is ignored with a warning. | 0014 | — |
+| `GGML_OPENCL_KQ_2D_DEVICE` | on | `0`: no card takes its own searched 2D GEMM tiles; on the Arc Pro B70 (device id 0xe223) the Q4_K int8 kernel runs on 8 sub-groups a work-group and Q5_K/Q6_K synchronise every 8 blocks. A set `GGML_OPENCL_KQ_2D_T<i>` wins over both. | 0132 | B70, dense 27B: pp4096 +0.31 % (4 of 4 interleaved pairs), the same logits (`measured-here`). |
 | `GGML_OPENCL_KQ_FEW_MIN` | 2 (sub-group 16), 4 (sub-group 8) | Least column count for the few-column K-quant kernel. | 0009 | — |
 | `GGML_OPENCL_KQ_MM_ID2_SHAPE` | 32 x 8 on sub-group 16, 32 x 16 on sub-group 8 | `XT,XSG` of the ID2 MoE GEMM. | 0006 | 32x16, 32x32, 16x32 within 3 %, 64x16 1.7x slower (A770, `measured-here`). |
 | `GGML_OPENCL_KQ_MM_ID_CACHE_MIN_TOK` | 64 | Least tokens for the MUL_MAT_ID GEMM on an expert cache's `.slots` / `.bank` tensors. | 0043 | 24 tokens ~1.9 s on the GEMM against ~0.65 s on the matvec (`measured-here`). |

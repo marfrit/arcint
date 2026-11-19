@@ -8417,3 +8417,28 @@ candidate without either fix with `VERIFY=1`: node 0's ring row 0 wrong in all 8
 (md5 5f932b72915b, c1da3368f9af against 98d05d0226bc), and equals it under `VERIFY=1`, whose host
 waits close the race. Decode at 30k 92.5 ms a step with the overlap against 127.0; at 120k 170.6
 against 292.6.
+
+## 0132-opencl-g31-kq2d-tiles.patch
+
+The Arc Pro B70 (BMG-G31: 32 Xe2 cores, 608 GB/s) runs the same kernels as the
+B60 (BMG-G21: 20 cores, 456 GB/s). On the dense 27B its prompt is +51 % at 4,096
+tokens, not the cores' +60 %. Its device profile (unitrace, `measured-here`,
+2026-11-19) puts the shortfall in the 2D K-quant GEMMs: Q4_K int8 1.52x, Q6_K
+1.39x, Q5_K 1.30x of the B60's time. The fp16-path GEMMs scale like the
+bandwidth (1.33x), not the cores.
+
+`tools/kq_tune/kqga_e2e.py` searched their tiles on the B70: two seeds of about
+100 evaluations, llama-bench pp512 against the default re-measured every 8. Both
+seeds found the default within the drift (best 0.9926 and 0.9956), and both bests
+share Q4_K's int8 kernel on 8 sub-groups (WG 8, against 16). Interleaved against
+the default, 4 pairs: pp512 +0.14 % (3 ahead, 1 equal), pp4096 with q8_0:q4_0 KV
++0.31 % (4 of 4). The change moves no arithmetic: MUL_MAT 2941/2941 both ways, and
+the mean KL of the 27B against its CPU reference at ubatch 512 is 0.011867 in both
+arms and both repeats (top-1 96.044 %).
+
+The patch reads the Intel device id (`CL_DEVICE_ID_INTEL`, as 0079 does) and,
+on 0xe223 only, builds each type's program with those tiles when no
+`GGML_OPENCL_KQ_2D_T<i>` is set, logging the tiles it took.
+`GGML_OPENCL_KQ_2D_DEVICE=0` keeps the defaults. The real gap (the fp16 Q5_K and
+Q6_K GEMMs at bandwidth) needs a structural change, an int8 path for those types,
+not a tile.

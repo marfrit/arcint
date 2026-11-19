@@ -20,6 +20,7 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased
 
+- **The B70's own 2D GEMM tiles** (patch 0132, `GGML_OPENCL_KQ_2D_DEVICE=0` turns it off): searched on the card and selected by its device id; the dense 27B's prompt +0.31 % at 4,096 tokens, the same logits to the last digit, MUL_MAT 2941/2941 (`measured-here`, the record in `docs/campaigns/kernel-autotune-ga.md`). Any other card is unchanged.
 - **Alchemist (the Arc A770) is untested from this release on.** The A770 left the development host on 2026-11-19, so 1.7.0 is the last release gated on one. Its paths stay in the kernel series (int8 DPAS without local memory, 0099 and 0102-0104; the sub-group 16 tiles); no gate runs them on a card. Its last measured state, on the 1.7.0 package with the coder it served: `docs/a770-reference.md` (`measured-here`: the needle at 104,000 of 192,000 at the service's full 196,608 context, decode 76.4 t/s at 4k and 17.2 at 192k, the acceptance task 10/10, mean KL 0.0406 / 0.0571 nats against the F16 model on two panels, the same file on the CPU 0.0413).
 
 ## 1.7.0 — 2026-11-18
