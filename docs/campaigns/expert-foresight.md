@@ -741,6 +741,35 @@ rounding-only class; the MTP draft routing is the best predictor at 76.2 %
 replacing and +0.26 blended; the blend rule is the limit, the oracle with the
 rule off +6.52 against blended +1.28. Audit 14a carries the same figures.
 
+## Queued (operator, 2026-11-19): a layer-ahead predictor
+
+Every predictor of rounds 1-5 looked 24-48 decode steps ahead (draft ids, the
+prompt prior, a learned step-space map, the MTP draft routing) and blended for
+at most +0.26 points. A predictor that looks a few LAYERS ahead for the SAME
+token was never measured here.
+
+Reference: Strata-HotRod (a Strata fork that streams experts from SSD;
+checkout `~/src/Strata-HotRod-ref` at ded1bd7, 2026-11-15; its
+`docs/HOTROD-DETAILS.md`). As relayed, not yet read here (`paper` until its
+source is read): the next 1, 2 or 4 layers' routers are predicted from the
+router's own scores plus a small learned correction (`hotrod-predictor.bin`,
+~8 MB, trained online against the top-32 router scores with a hinge loss); hit
+rate 77-79 / 66-69 / 55-58 % -> 85-88 / 76-79 / 66-71 % at 1 / 2 / 4 layers
+ahead; decode only ~+3 % from it, most of their gain from the I/O path (a
+pinned RAM tier and PCIe balance +9 %, two read-ahead threads +8-15 %).
+
+Plan, replay first, no engine build before the numbers:
+1. a trace with the hidden state at each MoE input (or the next layer's
+   router logits applied early);
+2. replay "the next layer's router on this layer's input", with and without
+   a learned correction, against the current cache baseline at 1 / 2 / 4
+   layers ahead;
+3. price the prefetch window a layer on the B70 (PCIe 4.0 x16) against the
+   decode step;
+4. only if that clears the bar: design the prefetch.
+
+Queued after the card-pinning work, on the same delegate lanes.
+
 ## Where it lives
 
 `contrib/llama.cpp/patches/0069-expert-route-trace.patch` (the trace),
