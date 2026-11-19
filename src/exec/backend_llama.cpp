@@ -1078,6 +1078,8 @@ public:
                 if (split) {
                     mtp_devs_     = { devs_[static_cast<size_t>(std::max(0, cfg.llama_mtp_card))], nullptr };
                     dp.devices    = mtp_devs_.data();
+                } else {
+                    dp.devices    = devs_.data();   // the picked card, as the target model's
                 }
                 mtp_model_            = llama_model_load_from_file(cfg.llama_mtp_gguf.c_str(), dp);
                 if (mtp_model_ == nullptr)
@@ -1106,6 +1108,7 @@ public:
             // config.cpp refuses it with --llama-mtp and under the layer split
             llama_model_params dp = llama_model_default_params();
             dp.n_gpu_layers       = 999;
+            dp.devices            = devs_.data();   // the picked card (one card here: config.cpp refuses the split)
             dflash_model_         = llama_model_load_from_file(cfg.llama_dflash_gguf.c_str(), dp);
             if (dflash_model_ == nullptr)
                 throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_dflash_gguf.c_str()));
