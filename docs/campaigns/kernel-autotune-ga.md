@@ -306,6 +306,7 @@ above an ideal 1.6x: at most ~5.6 % of the prompt.
 `kqga_e2e.py` on the B70 (two seeds, ~100 evaluations each, pp512): both seeds
 end on the default within the reference's drift (0.75 %). Their shared best
 (Q4_K int8 at WG 8) re-measured interleaved: pp512 +0.14 %, pp4096 +0.31 %, the
-logits unchanged; it is 0132. So the tile space holds no lever on G31 either; the
+logits unchanged; it is 0132 (built: pp512 +0.36 %, pp4096 +0.66 % against its own switch at 0,
+4 pairs; MUL_MAT 2941/2941; KL 0.011867 twice). So the tile space holds no lever on G31 either; the
 fp16 Q5_K/Q6_K GEMMs are bound by bandwidth, which a tile cannot change. Open: an
 int8 path for Q5_K and Q6_K, as Q4_K has (0013).
