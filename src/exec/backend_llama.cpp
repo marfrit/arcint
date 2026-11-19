@@ -17,7 +17,6 @@
 
 #ifdef ARCINT_LLAMA
 
-#include <CL/cl.h>
 #include <gguf.h>
 #include <llama.h>
 #include "ggml-opencl.h"
@@ -62,6 +61,7 @@ extern "C" int stbi_info_from_memory(unsigned char const* buffer, int len, int* 
 #include "exec/bytes.h"   // Bytes: a checkpoint's state, allocated and not written
 #include "exec/chat_json.h"
 #include "exec/llama_layer_split.h"
+#include "exec/opencl_card_select.h"
 #include "exec/llama_spec.h"
 #include "exec/llama_toolgrammar.h"
 #include "exec/spec_depth.h"   // --llama-mtp-depth-max
@@ -330,61 +330,6 @@ static bool kv_stream_probe(int64_t n_head_kv, int64_t n_head, int64_t rows) {
     return ok;
 }
 
-// The OpenCL card --device names: its platform, its index among the
-// platform's devices as ggml-opencl numbers them (every device type, as
-// GGML_OPENCL_DEVICES takes it), and its name. "GPU.N" is the N-th platform
-// with a GPU in OpenCL's enumeration (the NEO driver lists each Arc card as
-// its own platform), anything else a substring of the device name ("B60",
-// "A770"); the platform's first GPU either way. platform -1 when nothing
-// matches.
-struct ClCard {
-    int         platform = -1;
-    int         device   = 0;
-    std::string name;
-    uint64_t    mem_bytes = 0;   // CL_DEVICE_GLOBAL_MEM_SIZE: the card's total, not its free memory
-};
-
-ClCard opencl_card_for(const std::string& want) {
-    ClCard  c;
-    cl_uint np = 0;
-    if (clGetPlatformIDs(0, nullptr, &np) != CL_SUCCESS || np == 0) return c;
-    std::vector<cl_platform_id> ps(np);
-    clGetPlatformIDs(np, ps.data(), nullptr);
-    int ordinal = -1;
-    if (want.rfind("GPU", 0) == 0) {
-        ordinal = 0;
-        if (want.size() > 4 && want[3] == '.') ordinal = std::atoi(want.c_str() + 4);
-    }
-    int seen = 0;
-    for (cl_uint i = 0; i < np; ++i) {
-        cl_uint nd = 0;
-        if (clGetDeviceIDs(ps[i], CL_DEVICE_TYPE_ALL, 0, nullptr, &nd) != CL_SUCCESS || nd == 0) continue;
-        std::vector<cl_device_id> ds(nd);
-        clGetDeviceIDs(ps[i], CL_DEVICE_TYPE_ALL, nd, ds.data(), nullptr);
-        int gpu = -1;
-        for (cl_uint j = 0; j < nd && gpu < 0; ++j) {
-            cl_device_type t = 0;
-            clGetDeviceInfo(ds[j], CL_DEVICE_TYPE, sizeof(t), &t, nullptr);
-            if (t & CL_DEVICE_TYPE_GPU) gpu = static_cast<int>(j);
-        }
-        if (gpu < 0) continue;
-        char name[256] = {};
-        clGetDeviceInfo(ds[static_cast<size_t>(gpu)], CL_DEVICE_NAME, sizeof(name) - 1, name, nullptr);
-        const bool hit = ordinal >= 0 ? seen == ordinal : std::string(name).find(want) != std::string::npos;
-        if (hit) {
-            c.platform = static_cast<int>(i);
-            c.device   = gpu;
-            c.name     = name;
-            cl_ulong gm = 0;
-            clGetDeviceInfo(ds[static_cast<size_t>(gpu)], CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(gm), &gm, nullptr);
-            c.mem_bytes = gm;
-            return c;
-        }
-        ++seen;
-    }
-    return c;
-}
-
 // llama.cpp names OpenCL devices GPUOpenCL, GPUOpenCL1, ...; the logs name
 // the card (its description) instead
 const char* card_desc(const char* dev_name) {
@@ -547,31 +492,28 @@ public:
     LlamaBackend(const Config& cfg, int n_ctx) {
         // --device: one card, or the two cards of --llama-layer-split in layer order
         const std::vector<std::string> wanted = cfg.llama_devices.empty() ? std::vector<std::string>{ cfg.device } : cfg.llama_devices;
-        std::vector<ClCard> cards;
-        for (const std::string& w : wanted) {
-            ClCard c = opencl_card_for(w);
-            if (c.platform < 0) throw std::runtime_error(log::format("no OpenCL GPU matches --device %s", w.c_str()));
-            for (const ClCard& o : cards)
-                if (o.platform == c.platform && o.device == c.device)
-                    throw std::runtime_error(log::format("--device %s: %s names one card twice", cfg.device.c_str(), c.name.c_str()));
-            cards.push_back(c);
-        }
+        // one OpenCL platform may hold several cards: the pick is by device
+        // (exec/opencl_card_select.h), and GGML_OPENCL_DEVICES names exactly
+        // those devices for ggml's OpenCL backend (0023), one card or two
+        const ClPick picked = pick_cards(opencl_enumerate(), wanted);
+        if (!picked.error.empty()) throw std::runtime_error(picked.error);
+        const std::vector<ClDeviceDesc>& cards = picked.cards;
         const bool split = cards.size() > 1;
         if (split && cfg.llama_layer_split <= 0)
             throw std::runtime_error("two cards need --llama-layer-split K");
-        std::string card_names, cl_ids;
-        for (const ClCard& c : cards) {
-            card_names += (card_names.empty() ? "" : " + ") + c.name;
-            cl_ids += (cl_ids.empty() ? "" : ",") + log::format("%d:%d", c.platform, c.device);
-        }
-        if (!split) {
-            setenv("GGML_OPENCL_PLATFORM", std::to_string(cards[0].platform).c_str(), 1);
-            setenv("GGML_OPENCL_DEVICE", "0", 1);
-            unsetenv("GGML_OPENCL_DEVICES");   // it would win over the two above (0023)
-        } else {
-            // one context per card's platform, the cards in this order (0023)
-            setenv("GGML_OPENCL_DEVICES", cl_ids.c_str(), 1);
-        }
+        std::string card_names;
+        for (const ClDeviceDesc& c : cards) card_names += (card_names.empty() ? "" : " + ") + c.name;
+        const std::string cl_ids = ggml_opencl_devices_value(cards);
+        // GGML_OPENCL_DEVICES wins over the platform/device pair (0023); a value
+        // already in the environment that names other devices is replaced, named
+        // once, because leaving it would place the model on the operator's cards
+        const char* old_devices = getenv("GGML_OPENCL_DEVICES");
+        if (old_devices != nullptr && old_devices[0] != 0 && cl_ids != old_devices)
+            log::warn("load", "--device %s: GGML_OPENCL_DEVICES=%s in the environment, using %s", cfg.device.c_str(),
+                      old_devices, cl_ids.c_str());
+        setenv("GGML_OPENCL_DEVICES", cl_ids.c_str(), 1);
+        unsetenv("GGML_OPENCL_PLATFORM");
+        unsetenv("GGML_OPENCL_DEVICE");
         llama_log_set(route_llama_log, nullptr);
         llama_backend_init();
 
@@ -615,23 +557,31 @@ public:
         // the GGUF's MTP layer, for --llama-mtp (unless --llama-mtp-gguf brings it)
         mp.load_mtp           = cfg.llama_mtp > 0 && cfg.llama_mtp_gguf.empty();
         int n_layer_gguf      = 0;
+        // the GPU devices ggml lists are the cards GGML_OPENCL_DEVICES
+        // selected, in its order (the build's one GPU backend is OpenCL); one
+        // card and two alike. A build without 0023 lists one, and a platform
+        // holding two cards registered both would list both -- a count that is
+        // not the pick refuses the start, before a layer can land on the other
+        // card
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t d = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) devs_.push_back(d);
+        }
+        if (devs_.size() != cards.size())
+            throw std::runtime_error(log::format("--device %s: llama.cpp lists %zu GPU devices for GGML_OPENCL_DEVICES=%s, not %zu "
+                                                 "(contrib/llama.cpp patch 0023)", cfg.device.c_str(), devs_.size(), cl_ids.c_str(),
+                                                 cards.size()));
+        for (size_t i = 0; i < cards.size(); ++i)
+            if (cards[i].name != ggml_backend_dev_description(devs_[i]))
+                log::warn("load", "--device %s: llama.cpp's device %zu is %s (%s), OpenCL's %s", cfg.device.c_str(), i,
+                          ggml_backend_dev_name(devs_[i]), ggml_backend_dev_description(devs_[i]), cards[i].name.c_str());
+        devs_.push_back(nullptr);
+        if (!split) {
+            // exactly the picked device, so libllama cannot place a layer on
+            // another one of the platform (mp.devices, null-terminated)
+            mp.devices = devs_.data();
+        }
         if (split) {
-            // the GPU devices ggml lists are the cards GGML_OPENCL_DEVICES
-            // selected, in its order (the build's one GPU backend is OpenCL);
-            // a llama.cpp without 0023 lists one
-            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                ggml_backend_dev_t d = ggml_backend_dev_get(i);
-                if (ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU) devs_.push_back(d);
-            }
-            if (devs_.size() != cards.size())
-                throw std::runtime_error(log::format("--device %s: llama.cpp lists %zu GPU devices for GGML_OPENCL_DEVICES=%s, not %zu "
-                                                     "(contrib/llama.cpp patch 0023)", cfg.device.c_str(), devs_.size(), cl_ids.c_str(),
-                                                     cards.size()));
-            for (size_t i = 0; i < cards.size(); ++i)
-                if (cards[i].name != ggml_backend_dev_description(devs_[i]))
-                    log::warn("load", "--device %s: llama.cpp's device %zu is %s (%s), OpenCL's %s", cfg.device.c_str(), i,
-                              ggml_backend_dev_name(devs_[i]), ggml_backend_dev_description(devs_[i]), cards[i].name.c_str());
-            devs_.push_back(nullptr);
             // --llama-layer-split K: layers [0, K) on the first card, the rest
             // and the output on the second, exactly (exec/llama_layer_split.h)
             int nextn    = 0;
@@ -1431,7 +1381,7 @@ public:
         }
         log::info("load", "llama.cpp %s (%s, %.2f GiB) on %s, OpenCL %s %s, in %.1f s; %s%s",
                   desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card_names.c_str(),
-                  split ? "devices" : "platform", split ? cl_ids.c_str() : std::to_string(cards[0].platform).c_str(),
+                  split ? "devices" : "device", cl_ids.c_str(),
                   seconds_since(t_load), lane_desc.c_str(),
                   n_draft_ > 0 ? log::format("; %s drafts up to %d", dflash_ ? "DFlash2" : "MTP", n_draft_).c_str() : "");
         if (named_) {
