@@ -571,10 +571,15 @@ public:
             throw std::runtime_error(log::format("--device %s: llama.cpp lists %zu GPU devices for GGML_OPENCL_DEVICES=%s, not %zu "
                                                  "(contrib/llama.cpp patch 0023)", cfg.device.c_str(), devs_.size(), cl_ids.c_str(),
                                                  cards.size()));
+        // ggml's description is the device's CL_DEVICE_NAME, the name the pick read: a
+        // different name is a different card (e.g. a llama.cpp without 0023, which
+        // ignores GGML_OPENCL_DEVICES and registers platform 0's device), and the
+        // start is refused rather than run on a card the log does not name
         for (size_t i = 0; i < cards.size(); ++i)
             if (cards[i].name != ggml_backend_dev_description(devs_[i]))
-                log::warn("load", "--device %s: llama.cpp's device %zu is %s (%s), OpenCL's %s", cfg.device.c_str(), i,
-                          ggml_backend_dev_name(devs_[i]), ggml_backend_dev_description(devs_[i]), cards[i].name.c_str());
+                throw std::runtime_error(log::format("--device %s: llama.cpp's device %zu is %s (%s), not the picked %s",
+                                                     cfg.device.c_str(), i, ggml_backend_dev_name(devs_[i]),
+                                                     ggml_backend_dev_description(devs_[i]), cards[i].name.c_str()));
         devs_.push_back(nullptr);
         if (!split) {
             // exactly the picked device, so libllama cannot place a layer on
