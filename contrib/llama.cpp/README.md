@@ -8439,6 +8439,9 @@ arms and both repeats (top-1 96.044 %).
 The patch reads the Intel device id (`CL_DEVICE_ID_INTEL`, as 0079 does) and,
 on 0xe223 only, builds each type's program with those tiles when no
 `GGML_OPENCL_KQ_2D_T<i>` is set, logging the tiles it took.
-`GGML_OPENCL_KQ_2D_DEVICE=0` keeps the defaults. The real gap (the fp16 Q5_K and
+`GGML_OPENCL_KQ_2D_DEVICE=0` keeps the defaults. On the built patch (B70, the release tree's tools with 0132, 4 interleaved
+pairs against `GGML_OPENCL_KQ_2D_DEVICE=0`): pp512 +0.36 % (3 of 4 ahead), pp4096 q8_0:q4_0 +0.66 % (4 of 4); the tile line
+logged for all three types, none with the switch at 0 (the red case); MUL_MAT 2941/2941; the 27B's KL 0.011867 twice. The B60
+was not run: its id takes the unchanged branch (`code`). The real gap (the fp16 Q5_K and
 Q6_K GEMMs at bandwidth) needs a structural change, an int8 path for those types,
 not a tile.
