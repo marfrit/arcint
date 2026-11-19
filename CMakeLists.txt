@@ -330,6 +330,7 @@ if(ARCINT_TESTS)
     tests/test_auth.cpp
     tests/test_reqid.cpp
     tests/test_tokenize.cpp
+    tests/test_opencl_card_select.cpp
     tests/test_template_file.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
