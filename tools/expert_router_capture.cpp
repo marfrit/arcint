@@ -762,7 +762,9 @@ int main(int argc, char ** argv) {
                 batch.pos[i]       = pos0 + (int32_t) off + i;
                 batch.n_seq_id[i]  = 1;
                 batch.seq_id[i][0] = 0;
-                batch.logits[i]    = (off + (size_t) i + 1 == tokens.size());
+                // every row an output: llama.cpp computes the last layer only for the output rows
+                // (inp_out_ids), so with one output the last layer's router saw one token
+                batch.logits[i]    = true;
             }
             if (llama_decode(ctx, batch) != 0) {
                 st.failure = "llama_decode failed";
