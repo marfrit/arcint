@@ -501,7 +501,7 @@ def run(cap, W, slots, depths, ranks, lr, block, limit=None, discount_shard=1,
             return
         first[d] = [int(i) for i in range(d)]
         src = targets - d
-        base = router_logits(X[:, src], W[src])        # (b, nt, ne) reuse logits
+        base = router_logits(X[:, src], W[targets])    # (b, nt, ne) reuse: the TARGET layer's router on the source input
         real = own[:, targets]                         # the target layer's own input
         ids_sel = ids[:, targets]                      # (b, nt, n_used)
         res_sel = resid[start:start + X.shape[0]][:, targets]
