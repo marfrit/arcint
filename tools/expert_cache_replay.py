@@ -1021,7 +1021,13 @@ class LearnedMap:
 
 def simulate(layers, steps, policy, adapt_every=6, max_swaps=96, budget=4, delay=2,
              min_usage=2.0, min_gain=1.5, decay=0.7, exact=False, provider=None,
-             blend_weight=0.0, blend_threshold=0.0, blend_margin=1.5):
+             blend_weight=0.0, blend_threshold=0.0, blend_margin=1.5, resid_log=None):
+    """`resid_log` (default None, no behaviour change) collects a copy of the
+    residency at each step, BEFORE that step's hits are counted and before its
+    plan lands, i.e. what the engine sees when it routes this step's experts:
+    a caller that scores a predictor over NOT-resident experts needs exactly
+    that view. Returns (hit rate, per-step hits and misses, slots a layer at the
+    end, swaps) as before; the log is the caller's list."""
     nl = len(layers); ne = layers[0]["n_expert"]
     res = np.zeros((nl, ne), bool)
     for i, L in enumerate(layers):
@@ -1038,6 +1044,8 @@ def simulate(layers, steps, policy, adapt_every=6, max_swaps=96, budget=4, delay
             else:
                 keep.append((land, flips))
         pending = keep
+        if resid_log is not None:
+            resid_log.append(res.copy())
         now += 1
         group = []
         h_step = m_step = 0

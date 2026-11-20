@@ -375,6 +375,18 @@ if(ARCINT_TESTS)
     add_executable(arcint-tokenize-cost tools/tokenize_cost.cpp)
     target_link_libraries(arcint-tokenize-cost PRIVATE arcint_core)
     target_compile_options(arcint-tokenize-cost PRIVATE -Wall -Wextra -Wpedantic)
+    # campaign expert-foresight's layer-ahead step 1: the router-input capture
+    # (tools/expert_router_capture.cpp), CPU only, reads the graph's
+    # ffn_moe_logits/ffn_moe_topk tensors through llama_context_params.cb_eval
+    # and self-checks the first decode token's ids against the ffn_gate_inp
+    # weight read from the run's own GGUF. Not a ctest case: it needs a GGUF and
+    # a prompt file; the device-free writer/reader round trip is
+    # expert-router-capture below. llama-ext.h (llama_model_n_expert) is in the
+    # pinned tree's src.
+    add_executable(arcint-expert-router-capture tools/expert_router_capture.cpp)
+    target_link_libraries(arcint-expert-router-capture PRIVATE arcint_core)
+    target_include_directories(arcint-expert-router-capture PRIVATE "${ARCINT_LLAMA_DIR}/src")
+    target_compile_options(arcint-expert-router-capture PRIVATE -Wall -Wextra -Wpedantic)
   endif()
   # test_props.cpp reads src/exec/backend_llama.cpp (the KV-precision tripwire:
   # the llama backend cannot be constructed without a card).
@@ -524,6 +536,16 @@ if(ARCINT_TESTS)
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fn_sweep_flags.py")
   set_tests_properties(fn-sweep-flags PROPERTIES LABELS unit)
+
+  # tools/expert_layer_ahead_replay.py (campaign expert-foresight, the queued
+  # layer-ahead replay): the arms on synthetic LAC1 captures, the hand-counted
+  # metrics, the online order and the cache's residency view. Standard library
+  # unittest (numpy needed for the arrays; gguf-py cells skip loudly without
+  # it), so a build host without them still runs the cells that can.
+  add_test(NAME expert-layer-ahead-replay
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_layer_ahead_replay.py")
+  set_tests_properties(expert-layer-ahead-replay PROPERTIES LABELS unit)
 
   # The release speed gate's decision function and parser (tests/acceptance/ab.py).
   # The Open Responses compliance gate (docs/campaigns/feyntalk.md Gate 3):
@@ -768,6 +790,16 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_profile_save.py")
     set_tests_properties(expert-profile-save PROPERTIES LABELS unit)
+    # the LAC1 writer/reader round trip of the router-input capture (campaign
+    # expert-foresight, the layer-ahead predictor's step 1): the Python mirror
+    # writer, the C++ writer compiled alone, byte equality, the torn-record and
+    # bad-header cells, and the two red mutants. No llama tree, no model: CXX is
+    # the build's own compiler, and the cell skips if it cannot compile.
+    add_test(NAME expert-router-capture
+             COMMAND "${CMAKE_COMMAND}" -E env "CXX=${CMAKE_CXX_COMPILER}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_router_capture.py")
+    set_tests_properties(expert-router-capture PROPERTIES LABELS unit)
     # patches 0088/0089's device-free cell: the int8 Q K^T's q8_0 block
     # offsets, its RNE Q quantizer and the S selftest against the f16 form, read
     # out of the kernel's own .inc (the text the backend prepends). The dispatch
