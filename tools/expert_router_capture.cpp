@@ -713,6 +713,7 @@ int main(int argc, char ** argv) {
     st.g.n_embd   = n_embd;
     st.g.n_expert = n_expert;
     st.g.n_used   = n_used;
+    st.layers.resize(n_layer);   // one slot a layer: capture_cb indexes it by the tensor's layer
     st.w = &w;
     cp.cb_eval = capture_cb;
     cp.cb_eval_user_data = &st;
