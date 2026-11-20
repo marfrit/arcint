@@ -787,7 +787,7 @@ int main(int argc, char ** argv) {
     }
     llama_sampler_free(smpl);
 
-    if (out.records == 0) {   // no graph ever wrote a token
+    if (out.records == 0 && !st.failed) {   // no graph ever wrote a token (an earlier failure keeps its own text)
         st.failure = "no token was captured";
         st.failed = true;
     }
