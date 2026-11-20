@@ -523,6 +523,16 @@ if(ARCINT_TESTS)
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fn_sweep_flags.py")
   set_tests_properties(fn-sweep-flags PROPERTIES LABELS unit)
 
+  # tools/expert_layer_ahead_replay.py (campaign expert-foresight, the queued
+  # layer-ahead replay): the arms on synthetic LAC1 captures, the hand-counted
+  # metrics, the online order and the cache's residency view. Standard library
+  # unittest (numpy needed for the arrays; gguf-py cells skip loudly without
+  # it), so a build host without them still runs the cells that can.
+  add_test(NAME expert-layer-ahead-replay
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_expert_layer_ahead_replay.py")
+  set_tests_properties(expert-layer-ahead-replay PROPERTIES LABELS unit)
+
   # The release speed gate's decision function and parser (tests/acceptance/ab.py).
   # The Open Responses compliance gate (docs/campaigns/feyntalk.md Gate 3):
   # the official vendored CLI, the seven 1.3.0 ids against a --stub server. NOT
