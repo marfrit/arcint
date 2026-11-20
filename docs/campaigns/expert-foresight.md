@@ -770,6 +770,23 @@ Plan, replay first, no engine build before the numbers:
 
 Queued after the card-pinning work, on the same delegate lanes.
 
+**Scope (operator, 2026-11-20): the prefetch, not the stand-ins.** HotRod pairs its
+look-ahead with *stand-in experts*: a routed expert that is not on the card is
+replaced by a resident one the router scored close to it (`router weight x
+logit gap <= budget`, ranks 3-9 at any distance by default). Its documentation
+judges that by task batteries (a 50-question maths and a 30-question coding
+test) and a guard that stops "where stand-ins start changing words"; it
+publishes no KL, and one tested rule gave a wrong maths answer (`paper`,
+docs/HOTROD-DETAILS.md:50-91, 135-154). Computing an expert the router did not
+pick changes the answer by construction, and arcint's bar is the answer-level
+one (mean KL at most 0.03 nats worse than the baseline arm, CLAUDE.md), so the
+stand-ins are out of this campaign. What is taken: predicting the router's own
+picks layers ahead and reading those experts early; the computation stays the
+router's. Two consequences for the replay: HotRod scores its predictor only on
+the ranks below its stand-in floor and skips what a stand-in would cover, so
+its hit rates are not ours; arcint's replay scores every routed rank
+(`recall_used` over all n_used), on the experts not resident at that token.
+
 ## Where it lives
 
 `contrib/llama.cpp/patches/0069-expert-route-trace.patch` (the trace),
