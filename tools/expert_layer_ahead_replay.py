@@ -46,8 +46,12 @@ NOT resident at that token:
                       the share whose prediction still lands inside top-K;
   recall_nonres_used  ids-weighted recall over the non-resident real ids.
 
-Slots, per layer, as the served unit runs them: default 5915 over the capture's
-48 layers, split flat (123 a layer, +1 on the first 11). `--profile STRP` uses
+Slots, per layer, as the served unit runs them: `--slots N` over the capture's
+layers, split flat (5,915 gives 123 a layer and +1 on the first 11; the served
+B70 unit now runs 6,639 at 13.05 GiB -- pass `--slots 6639 --profile
+expert-profile-strata.bin` for the production placement, and the JSON says
+`slot_mode: flat | profile`, so a flat run is never read as the unit's).
+`--profile STRP` uses
 tools/expert_cache_replay.py's read_profile/profile_slots walk instead (the
 production distribution, 93-155 a layer), the engine's own distribution rule.
 `--discount-shard K` divides the share by K, for the split-expert-file layout
@@ -221,6 +225,12 @@ class Capture:
 
 
 # ---------------------------------------------------------------- cache ----
+def slot_mode(profile):
+    """What the JSON says the slot placement is: a profile's engine walk, or a
+    flat split that is an assumption, never the served unit's."""
+    return "profile" if profile else "flat"
+
+
 def flat_slots(n_layer, n_expert, slots=5915, discount_shard=1):
     """The served unit's 5,915 slots over 48 layers, flat: 123 a layer and +1 on
     the first 11. `discount_shard` divides the share (the split-file layout).
@@ -608,7 +618,8 @@ def main(argv=None):
                     lr=a.lr, block=a.block, limit=a.limit, seed=a.seed,
                     loss="centred MSE on the real top-32 logits + hinge below the 32nd - 0.1",
                     order="test-then-train: predict, score, then update"),
-        cache=dict(hit_rate=cache["hits"], slots_per_layer=[int(x) for x in cache["slots_per_layer"]],
+        cache=dict(slot_mode=slot_mode(a.profile), slots=a.slots,
+                   hit_rate=cache["hits"], slots_per_layer=[int(x) for x in cache["slots_per_layer"]],
                    swaps=cache["swaps"]),
         depths=depth_report(stats, first, a.depths, a.ranks),
         online=dict(order="predict, score, then update (Correction.events pins it)",

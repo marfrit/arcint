@@ -42,7 +42,9 @@ predictor", step 2. Every cell was red first, with the mutation named:
    seen failing: the log appends after the hits count and after a plan lands --
    a swap that lands at step 1 shows up at step 1's own view and the cell fails.
 
-7. The slot split. The production 5,915 over 48 layers: 124 on the first 11,
+7. The slot mode and the slot split. A run without a profile names itself
+   `flat` in the JSON, a run with one `profile`. Red mutation seen failing:
+   slot_mode returns "flat" for a profile too. Then The production 5,915 over 48 layers: 124 on the first 11,
    123 on the rest, sum 5,915; a shard discount divides it. Red mutation seen
    failing: `base, extra = divmod(share, ...)` replaced by a flat base -- the
    sum is 5,904 and the cell fails.
@@ -281,6 +283,11 @@ class CacheView(unittest.TestCase):
         # step 0 plans the swap; it lands at step 0's end, so step 1 sees it
         self.assertEqual(log[0][0].tolist(), [True, True, False, False])
         self.assertEqual(log[1][0].tolist(), [False, False, True, True])
+
+    def test_slot_mode_is_named(self):
+        _skip_numpy()
+        self.assertEqual(replay.slot_mode(None), "flat")
+        self.assertEqual(replay.slot_mode("expert-profile-strata.bin"), "profile")
 
     def test_slot_split(self):
         _skip_numpy()
