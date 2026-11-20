@@ -796,3 +796,53 @@ its hit rates are not ours; arcint's replay scores every routed rank
 (the accept sidecar), `tests/python/test_expert_route_trace.py`,
 `tests/python/test_expert_profile_save.py`, and
 `tools/expert_route_trace_selftest.cpp` (the device-free cells).
+
+## The layer-ahead replay on Flash-Next (2026-11-20, `measured-here`)
+
+Capture: `tools/expert_router_capture.cpp` (CPU only, the router input of every
+MoE layer and the routed ids, read through llama.cpp's eval callback; a
+self-check recomputes the first decode token's top-2 from the captured input
+and the GGUF's router: exact on all 48 layers). Flash-Next IQ3_S, 6,774 prompt
+tokens of this repository's own text, 256 greedy decode tokens. Replay:
+`tools/expert_layer_ahead_replay.py`, the cache modelled as the unit runs it
+(its profile, 6,639 slots, strata adapt; 81.0 % of routed experts resident).
+The B70 runs under a 220 W power cap since 2026-11-20 (the card host's PSU);
+the capture is CPU only and unaffected.
+
+Router reuse (layer l+d's router on layer l's input), checked directly first:
+the true rank-0/1 experts within its top 4 at lead 0 100 %, lead 1 73.6 %,
+lead 4 53.4 % (HotRod reports 74.4 % and 55 % for the same predictor).
+
+Decode tokens, the predicted top-8 a layer (columns: the router's top expert
+caught; share of the 10 routed experts caught; the same share counted only over
+the experts NOT resident at that token, which is what a prefetch serves):
+
+| lead | arm | top expert | all routed | non-resident routed |
+|---|---|---|---|---|
+| 1 | reuse | 89.5 % | 57.6 % | 53.4 % |
+| 1 | learned (rank 8) | 92.2 % | 60.6 % | 42.4 % |
+| 2 | reuse | 82.0 % | 50.6 % | 46.3 % |
+| 2 | learned (rank 8) | 88.1 % | 56.0 % | 37.1 % |
+| 4 | reuse | 77.0 % | 45.3 % | 41.3 % |
+| 4 | learned (rank 8) | 84.9 % | 52.5 % | 34.3 % |
+| any | oracle | 100 % | 80.0 % | 74.8 % |
+
+With the top-16 a layer, reuse catches 77.5 / 68.0 / 61.0 % of the
+non-resident routed experts at lead 1 / 2 / 4.
+
+Reading:
+- Router reuse is the predictor to build on. The learned low-rank correction
+  (online, centred MSE on the top-32 plus a hinge, HotRod's loss) raises recall
+  over all routed experts by 3-8 points but LOWERS it on the non-resident ones
+  by 9-11 points: it learns the common experts, which are resident anyway.
+  HotRod's note says the same: train and score on the non-resident picks.
+- Price of the window (step 3, not yet measured on a served step): one expert
+  slot is ~2 MiB, and the B70's PCIe 4.0 x16 link refilled 6.20 GiB of slots in
+  0.274 s (the slot loan's log, ~22.6 GB/s), ~90 us a slot; a Flash-Next decode
+  step is ~19 ms at 4k (53.8 t/s, ~0.4 ms a layer). The misses are served by the
+  CPU today (`LLAMA_EXPERT_CACHE_CPU_MISSES=1`), so a prefetch turns a CPU-run
+  expert into a card-run one; its worth is the CPU miss time saved minus the
+  copies' contention, which needs the decode profile of the miss path.
+- Next: that profile (the CPU miss path's share of a decode step on the B70),
+  then a design that prefetches only the predicted non-resident experts at
+  lead 2, with the copies on the second queue.
