@@ -846,3 +846,17 @@ Reading:
 - Next: that profile (the CPU miss path's share of a decode step on the B70),
   then a design that prefetches only the predicted non-resident experts at
   lead 2, with the copies on the second queue.
+
+Step 3, the price of a miss on the B70 (2026-11-20, `measured-here`, under the
+220 W power cap; the unit's own arguments and package; one prompt, 256 greedy
+tokens, the warm second run, ~83 % of routed experts on the card):
+- misses computed on the CPU (as served, `LLAMA_EXPERT_CACHE_CPU_MISSES=1`):
+  59.2 t/s, 72 verifies at 55 ms;
+- misses copied to the card on demand (`=0`): 23.7 t/s, 146 ms a verify. About
+  300 misses a step cost ~91 ms more: ~290 us a synchronous copy, against
+  ~90 us at the link's bulk rate.
+So the copies must leave the critical path entirely: at the bulk rate the
+misses alone are ~28 ms of link time a step (half of it), and only reads issued
+a layer or more ahead, on the second queue, can pay; router reuse at lead 2
+catches ~46 % of the misses. The CPU's cost per miss today (what a hit saves)
+is the remaining price, measured next with a timeline of one step.
