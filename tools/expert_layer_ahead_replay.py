@@ -122,7 +122,9 @@ def _dequant(gguf, data, ttype):
     if ttype == 1:                     # F16
         return np.asarray(data, np.float32)
     if ttype == 30:                    # BF16: gguf-py hands it over as uint8 pairs
-        return np.asarray(data, np.float32)
+        # join each pair into the bf16 bit pattern, then place it in the high half of an f32
+        u16 = np.ascontiguousarray(data).view(np.uint16)
+        return (u16.astype(np.uint32) << 16).view(np.float32).reshape(u16.shape)
     from gguf import quants
     return np.asarray(quants.dequantize(data, ttype), np.float32)
 
