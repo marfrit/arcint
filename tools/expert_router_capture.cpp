@@ -303,7 +303,8 @@ struct weights {
             return false;
         }
         const ggml_type_traits * tr = ggml_get_type_traits(type);
-        if (tr == nullptr || tr->to_float == nullptr) {
+        // F32 and F16 have no to_float in ggml's traits (routers are often F32)
+        if (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && (tr == nullptr || tr->to_float == nullptr)) {
             detail = name + " has type " + ggml_type_name(type) + " with no to_float";
             return false;
         }
@@ -314,7 +315,10 @@ struct weights {
         std::vector<uint8_t> row(row_bytes);
         for (uint32_t j = 0; j < n_expert; ++j) {
             std::memcpy(row.data(), data + row_bytes * j, row_bytes);
-            tr->to_float(row.data(), w.data() + (size_t) j * n_embd, n_embd);
+            float * dst = w.data() + (size_t) j * n_embd;
+            if (type == GGML_TYPE_F32)      std::memcpy(dst, row.data(), sizeof(float) * n_embd);
+            else if (type == GGML_TYPE_F16) ggml_fp16_to_fp32_row((const ggml_fp16_t *) row.data(), dst, n_embd);
+            else                            tr->to_float(row.data(), dst, n_embd);
         }
         return true;
     }
