@@ -59,16 +59,15 @@ mkdir arcint && tar xzf arcint.tar.gz -C arcint --strip-components=1
 fetch llama.tar.gz "$LLAMA_URL"
 echo "$LLAMA_TARBALL_SHA256  llama.tar.gz" | sha256sum -c
 mkdir llama && tar xzf llama.tar.gz -C llama --strip-components=1
-for p in arcint/contrib/llama.cpp/patches/*.patch; do
-    (cd llama && git apply --whitespace=nowarn "$work/$p") || { echo "patch does not apply to the pin: $p" >&2; exit 1; }
-done
+# In byte order whatever the build host's locale (apply-series.sh; GitHub issue #6).
+bash arcint/contrib/llama.cpp/apply-series.sh "$work/llama"
 
 fetch whisper.tar.gz "$WHISPER_URL"
 echo "$WHISPER_TARBALL_SHA256  whisper.tar.gz" | sha256sum -c
 mkdir whisper && tar xzf whisper.tar.gz -C whisper --strip-components=1
 
-NPATCH=$(ls arcint/contrib/llama.cpp/patches/*.patch | wc -l)
-LAST=$(basename "$(ls arcint/contrib/llama.cpp/patches/*.patch | tail -1)" | cut -c1-4)
+NPATCH=$(bash arcint/contrib/llama.cpp/apply-series.sh --list | wc -l)
+LAST=$(basename "$(bash arcint/contrib/llama.cpp/apply-series.sh --list | tail -1)" | cut -c1-4)
 export ARCINT_BUILD="arcint-stt ${PKGVER}-${PKGREL}: whisper.cpp ${WHISPER_COMMIT:0:7} on llama.cpp ${LLAMA_COMMIT:0:7} + ${NPATCH} arcint patches (to ${LAST}), OpenCL"
 bash arcint/contrib/whisper/build-whisper.sh "$work/whisper" "$work/llama" "$work/build"
 

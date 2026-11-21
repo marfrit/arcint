@@ -82,10 +82,8 @@ echo "$LLAMA_TARBALL_SHA256  llama.tar.gz" | sha256sum -c
 tar xzf llama.tar.gz
 LLAMA_DIR="$work/llama/llama.cpp-${LLAMA_COMMIT}"
 cd "$LLAMA_DIR"
-for p in "$work/$SRC"/contrib/llama.cpp/patches/*.patch; do
-    [ -e "$p" ] || { echo "no contrib/llama.cpp/patches in the source tarball" >&2; exit 1; }
-    git apply --whitespace=nowarn "$p" || { echo "patch does not apply to the pin: $p" >&2; exit 1; }
-done
+# In byte order whatever the build host's locale (apply-series.sh; GitHub issue #6).
+bash "$work/$SRC/contrib/llama.cpp/apply-series.sh" "$LLAMA_DIR"
 # 0130l: a kernel source the host builds must survive the C preprocessor in every
 # define set it hands to the compiler. 0130k put directives inside backslash-continued
 # macro bodies, which fails the whole file and the production decode kernel with it.

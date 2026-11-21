@@ -72,11 +72,8 @@ if [ "${1:-}" = "--fresh" ]; then
     echo "$SHA  $TARBALL" | sha256sum -c --quiet || { echo "the llama tarball's sha256 differs from build-deb.sh's" >&2; exit 2; }
     tar xzf "$TARBALL" -C "$WORK"
     TREE="$WORK/llama.cpp-$COMMIT"
-    PATCHES=("$ARCINT"/contrib/llama.cpp/patches/*.patch)
-    [ -e "${PATCHES[0]}" ] || { echo "no contrib/llama.cpp/patches under $ARCINT" >&2; exit 2; }
-    ( cd "$TREE" && for p in "${PATCHES[@]}"; do
-          git apply --whitespace=nowarn "$p" || { echo "patch does not apply to the pin: $p" >&2; exit 2; }
-      done )
+    # In byte order whatever the locale (apply-series.sh; GitHub issue #6).
+    bash "$ARCINT/contrib/llama.cpp/apply-series.sh" "$TREE" || exit 2
 else
     TREE=${1:?usage: build-tools.sh <patched-llama-tree>  |  build-tools.sh --fresh <work-dir> [--arcint <arcint-tree>]}
 fi

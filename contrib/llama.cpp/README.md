@@ -4,10 +4,14 @@ The `--engine llama` executor (`src/exec/backend_llama.cpp`,
 `docs/llama-engine.md`) builds llama.cpp as a subproject from
 `ARCINT_LLAMA_DIR`. The pin is ggml-org/llama.cpp commit `3e4dfa8`
 (2026-10-15; until then `bed0a85` of 2026-10-02, see "Moving the pin"); the
-tree is that commit with the patches below applied in order:
+tree is that commit with the patches below applied one by one in byte order (the
+order `LC_ALL=C` sorts the names: `0129-` before `0129a-`, `0130b-` before
+`0130b1-`). `apply-series.sh` does that whatever the shell's locale; a plain
+`patches/*.patch` glob under en_US.UTF-8 puts `0129-` after `0129k-` and stops
+at `0129b` (GitHub issue #6):
 
     git -C <llama.cpp> checkout 3e4dfa8
-    git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch
+    <arcint>/contrib/llama.cpp/apply-series.sh <llama.cpp>
 
 A patch that does not apply cleanly to the pin is a bug in this directory, not
 a reason to move the pin. Since the fold of 0001-0096 (2026-11) the directory

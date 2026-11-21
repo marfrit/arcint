@@ -387,7 +387,7 @@ unit tests run against:
 A serving build needs a llama.cpp tree at the pinned commit (`3e4dfa8`) with
 `contrib/llama.cpp/patches` applied, and the OpenCL headers and ICD loader:
 
-    git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch
+    <arcint>/contrib/llama.cpp/apply-series.sh <llama.cpp>
     cmake -S . -B build-ll -DARCINT_LLAMA=ON -DARCINT_LLAMA_DIR=<llama.cpp> \
           -DCMAKE_BUILD_TYPE=Release -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
           -DARCINT_GIT_SHA=$(git rev-parse --short=12 HEAD)
