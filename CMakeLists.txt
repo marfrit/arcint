@@ -282,6 +282,7 @@ if(ARCINT_TESTS)
     tests/test_utf8.cpp
     tests/test_toolcall.cpp
     tests/test_sampler.cpp
+    tests/test_sampler_golden.cpp
     tests/test_sampling.cpp
     tests/test_stop.cpp
     tests/test_chat.cpp

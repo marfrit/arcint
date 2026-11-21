@@ -209,6 +209,17 @@ public:
 
     uint64_t seed() const { return seed_; }
 
+    // Tests: how many draws took the full-vocabulary sort (attempt-1 retry of a
+    // short probe, or a probe that could not settle). The no-truncation path
+    // (top_k 0 / top_p >= 1.0 / min_p 0) must never take one.
+    size_t full_sort_count() const { return full_sorts_; }
+    // Tests: override the candidate-probe size (default 2048). A probe forced
+    // below the vocabulary exercises the top_p < 1.0 path's probe-short walk.
+    void set_probe_size_for_test(size_t n) { probe_size_ = n; }
+    // Tests: make the untruncated draw's walk skip every k-th token (0 = off).
+    // A deliberately wrong draw for the chi-square negative control.
+    void set_untruncated_skip_every_for_test(size_t k) { skip_every_ = k; }
+
     // loop-guard: test hook for the zero-cost path -- how many ids the token
     // stretch's tracker has taken (1.2.5's speed gate measures the door-closed
     // and guard-off paths, where this must never rise). No response key.
@@ -295,6 +306,10 @@ private:
     void   build_think_id_table();
     void   observe_think_(std::string_view piece, int token);
     size_t collect_candidates(const float* logits, size_t vocab, bool full, int top_k);
+    // The no-truncation draw (top_k 0 / top_p >= 1.0 / min_p 0): one pass for
+    // max and min, one pass for per-token mass, then an id-order walk. No
+    // pair array, no partial sort, no renorm pass, no full sort.
+    int    draw_untruncated(const float* logits, size_t vocab, float temp);
 
     // Where the block is in the generation. undecided: the opening is not
     // settled yet and the lead is still examined; thinking: the block is open
@@ -318,6 +333,17 @@ private:
     bool answer_closer_now_ = false;   // the token that closed the block, once
 
     std::vector<std::pair<float, int>> scratch_;
+    // The untruncated draw's per-token mass, reused across draws.
+    std::vector<float> mass_;
+    // How many candidates the top_p < 1.0 probe pulls before falling back to a
+    // full sort. Softmax mass concentrates hard on a 248k vocabulary, so this
+    // covers top_p in practice while avoiding a quarter-million-element sort
+    // per token. Correctness does not depend on it: the probe's probabilities
+    // are normalised over the whole vocabulary, so a probe short of the top_p
+    // mass is seen and falls back.
+    size_t              probe_size_ = 2048;
+    size_t              full_sorts_ = 0;
+    size_t              skip_every_ = 0;
 
     // The mask's state (see ThinkState), plus the two text windows the states
     // examine. Both are bounded by the longest tag, so they cost nothing per

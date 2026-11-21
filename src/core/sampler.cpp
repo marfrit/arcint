@@ -14,12 +14,6 @@
 namespace lgc {
 namespace {
 
-// How many candidates to pull before falling back to a full sort. Softmax mass
-// concentrates hard on a 248k vocabulary, so this covers top_p in practice
-// while avoiding a quarter-million-element sort per token. Correctness does not
-// depend on it: the probe's probabilities are normalised over the whole
-// vocabulary, so a probe short of the top_p mass is seen and falls back.
-constexpr size_t kCandidateProbe = 2048;
 
 // LLAMA_SAMPLER_FAST_TOPK (default 0, off): take a row's top-k straight from
 // the logits instead of building the whole vocabulary's candidate array and
@@ -1136,7 +1130,7 @@ size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full,
     const size_t want = full ? vocab
                         : top_k > 0
                             ? std::min(static_cast<size_t>(top_k), vocab)
-                            : std::min(kCandidateProbe, vocab);
+                            : std::min(probe_size_, vocab);
 
 #ifdef ARCINT_LLAMA
     if (top_k > 0 && want < vocab && sampler_fast_topk()) {
@@ -1158,6 +1152,7 @@ size_t Sampler::collect_candidates(const float* logits, size_t vocab, bool full,
                           scratch_.end(), by_logit);
         scratch_.resize(want);
     } else {
+        if (full) ++full_sorts_;   // a full-vocabulary sort (the short-probe retry)
         std::sort(scratch_.begin(), scratch_.end(), by_logit);
     }
     return scratch_.size();
@@ -1290,6 +1285,54 @@ Sampler::EffectiveRow Sampler::effective_row() const {
     return r;
 }
 
+int Sampler::draw_untruncated(const float* logits, size_t vocab, float temp) {
+    // One pass for the row's max and min (the door floor), no allocation.
+    float max_logit = logits[0];
+    float min_logit = logits[0];
+    for (size_t i = 1; i < vocab; ++i) {
+        if (logits[i] > max_logit) max_logit = logits[i];
+        if (logits[i] < min_logit) min_logit = logits[i];
+    }
+    // One pass: per-token mass, float in the buffer, double sum accumulated.
+    // No branches in the body so the compiler can vectorise it. The candidate
+    // set is the whole row, so there is nothing to sort and no renorm pass:
+    // the draw is r = u * sum and the walk consumes mass in id order.
+    mass_.resize(vocab);
+    double sum = 0.0;
+    for (size_t i = 0; i < vocab; ++i) {
+        const float e = std::exp((logits[i] - max_logit) / temp);
+        mass_[i] = e;
+        sum += static_cast<double>(e);
+    }
+    if (!std::isfinite(sum) || sum <= 0.0) {
+        // Every logit -inf (a wholly masked row): the draw is the argmax, the
+        // same answer the empty-candidate path takes, with its counters.
+        const int best = argmax(logits, vocab);
+        count_door_masked_(logits[static_cast<size_t>(best)]);
+        count_door_eog_masked_(logits[static_cast<size_t>(best)]);
+        return best;
+    }
+
+    // The door counters take the floor of the candidate set; no truncation
+    // means the whole row, so the floor is the smallest logit.
+    if (!door_masked_logits_.empty()) count_door_masked_(min_logit);
+    if (!door_eog_masked_logits_.empty()) count_door_eog_masked_(min_logit);
+
+    std::uniform_real_distribution<double> dist(0.0, 1.0);
+    double                                 r = dist(rng_) * sum;
+    for (size_t i = 0; i < vocab; ++i) {
+        if (skip_every_ != 0 && i % skip_every_ == 0) continue;   // test only
+        r -= static_cast<double>(mass_[i]);
+        if (r <= 0.0) return static_cast<int>(i);
+    }
+    // Rounding fallback: the token with the largest id that still carries
+    // mass survives as the last candidate.
+    for (size_t i = vocab; i-- > 0;) {
+        if (mass_[i] > 0.0f) return static_cast<int>(i);
+    }
+    return static_cast<int>(argmax(logits, vocab));
+}
+
 int Sampler::draw(float* logits, size_t vocab) {
     // llava: one row per draw. The state cannot move inside sample(), so the
     // row decided here is the row this token is drawn with -- also in a verify
@@ -1303,8 +1346,17 @@ int Sampler::draw(float* logits, size_t vocab) {
         return best;
     }
 
+    // No truncation at all (top_k 0 / top_p >= 1.0 / min_p 0): the candidate
+    // set is the whole row, so there is no partial or full sort to take.
+    // Walk the row's float mass in id order. The distribution is the same
+    // softmax as the old full sort; the walk's relative order may differ,
+    // which is accepted.
+    if (row.top_k <= 0 && row.top_p >= 1.0f && row.min_p <= 0.0f) {
+        return draw_untruncated(logits, vocab, row.temperature > 0.0f ? row.temperature : 1.0f);
+    }
+
     for (int attempt = 0; attempt < 2; ++attempt) {
-        const bool   probing = attempt == 0 && row.top_k <= 0 && kCandidateProbe < vocab;
+        const bool   probing = attempt == 0 && row.top_k <= 0 && probe_size_ < vocab;
         const size_t n       = collect_candidates(logits, vocab, attempt > 0, row.top_k);
         if (n == 0) {
             // No candidate at all (every logit -inf, e.g. a whole row masked):

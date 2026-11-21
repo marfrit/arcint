@@ -2,7 +2,13 @@
 #include "core/sampler.h"
 #include "harness.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <map>
+#include <vector>
 
 using namespace lgc;
 
@@ -969,4 +975,174 @@ TEST(sampler_positional_ids_refuse_a_lossy_pairing) {
     // A zip by position would open the block paired with family 0's closer 5.
     // The guard refuses: the id does not open an unpaired block.
     CHECK(!s.think_block_open());
+}
+
+// ---------------------------------------------------------------------------
+// The no-truncation draw (top_k 0 / top_p >= 1.0 / min_p 0). No full sort.
+
+namespace {
+
+SamplerParams untruncated_params(float temp) {
+    SamplerParams p;
+    p.temperature        = temp;
+    p.top_k              = 0;
+    p.top_p              = 1.0f;
+    p.min_p              = 0.0f;
+    p.repetition_penalty = 1.0f;
+    return p;
+}
+
+std::vector<float> realistic_tail_row(size_t vocab) {
+    // A handful of logits near the max, a long deterministic tail: the shape a
+    // real 248k row has (mass concentrated in a few tokens, a long flat tail).
+    std::vector<float> l(vocab);
+    for (size_t i = 0; i < 8; ++i) l[i] = 2.9f - 0.01f * static_cast<float>(i);
+    for (size_t i = 8; i < vocab; ++i) {
+        uint32_t h = static_cast<uint32_t>(i) * 2654435761u;
+        h ^= h >> 13;
+        h *= 2246822519u;
+        h ^= h >> 16;
+        const float u = (h & 0xFFFFFF) / 16777216.0f;
+        l[i] = -12.0f + 2.0f * u;
+    }
+    return l;
+}
+
+}  // namespace
+
+TEST(sampler_untruncated_draw_never_takes_a_full_sort) {
+    // 1,000 draws on a 248,320-token row. On the old code every draw took the
+    // full 248k sort (the probe always came short); on the new path the answer
+    // is zero.
+    auto l = realistic_tail_row(248320);
+    Sampler s(untruncated_params(0.8f), 1234);
+    for (int i = 0; i < 1000; ++i) {
+        s.sample(l.data(), l.size());   // no penalties in the row: logits untouched
+    }
+    CHECK_EQ(s.full_sort_count(), 0u);
+}
+
+TEST(sampler_untruncated_draw_matches_analytic_softmax) {
+    // 200,000 draws at temperature 1.0 on a row whose mass is spread so that
+    // no token holds more than ~1/200 of it: 4,096 tokens, logits linearly
+    // decreasing from 0 to -4. Tokens grouped in id order into bins of roughly
+    // equal analytic mass; the chi-square statistic over bin counts (expected
+    // = N * bin_mass) must sit under the 0.999 quantile (~ 103.4 for 63 dof).
+    constexpr size_t vocab = 4096;
+    constexpr int n_draws = 200000;
+    std::vector<float> l(vocab);
+    for (size_t i = 0; i < vocab; ++i)
+        l[i] = -4.0f * static_cast<float>(i) / static_cast<float>(vocab - 1);
+
+    // Analytic softmax over the whole row.
+    float max_logit = l[0];
+    for (float v : l) max_logit = std::max(max_logit, v);
+    std::vector<double> exps(vocab);
+    double z = 0.0;
+    for (size_t i = 0; i < vocab; ++i) {
+        exps[i] = std::exp(static_cast<double>(l[i] - max_logit));
+        z += exps[i];
+    }
+
+    // Bins of roughly equal analytic mass, tokens kept in id order.
+    struct Bin {
+        size_t lo = 0;
+        size_t hi = 0;
+        double expected = 0.0;
+    };
+    std::vector<Bin> bins;
+    size_t bin_start = 0;
+    double bin_acc = 0.0;
+    for (size_t i = 0; i < vocab; ++i) {
+        bin_acc += exps[i] / z;
+        if (bin_acc >= 1.0 / 64.0) {
+            bins.push_back({bin_start, i + 1, bin_acc});
+            bin_start = i + 1;
+            bin_acc = 0.0;
+        }
+    }
+    if (bin_start < vocab) bins.push_back({bin_start, vocab, bin_acc});
+
+    // chi2 = sum over bins of (observed_count - expected_count)^2 / expected_count.
+    auto bin_chi2 = [&](const std::vector<double>& empirical_counts) {
+        double chi2 = 0.0;
+        for (const auto& bin : bins) {
+            double observed = 0.0;
+            for (size_t i = bin.lo; i < bin.hi; ++i) observed += empirical_counts[i];
+            const double expected = n_draws * bin.expected;
+            const double diff = observed - expected;
+            chi2 += diff * diff / expected;
+        }
+        return chi2;
+    };
+
+    std::vector<double> counts(vocab, 0.0);
+    {
+        Sampler s(untruncated_params(1.0f), 4711);
+        for (int i = 0; i < n_draws; ++i)
+            counts[static_cast<size_t>(s.sample(l.data(), l.size()))] += 1.0;
+    }
+
+    // The deep half of the row must be populated: the draw is not starved in
+    // the tail, so the check is not vacuous.
+    double tail_draws = 0.0;
+    for (size_t i = vocab / 2; i < vocab; ++i) tail_draws += counts[i];
+    CHECK(tail_draws > 1000.0);
+
+    const double chi2 = bin_chi2(counts);
+    std::printf("chi-square (%zu bins, %.0f draws): %.1f\n", bins.size(),
+                static_cast<double>(n_draws), chi2);
+    CHECK(chi2 < 103.4);
+
+    // The check must fail on a smaller deliberate error: the real sampler, but
+    // the walk skips every 16th token (its mass is never consumed, the token
+    // is never returned).
+    std::vector<double> wrong_counts(vocab, 0.0);
+    {
+        Sampler s(untruncated_params(1.0f), 4711);
+        s.set_untruncated_skip_every_for_test(16);
+        for (int i = 0; i < n_draws; ++i)
+            wrong_counts[static_cast<size_t>(s.sample(l.data(), l.size()))] += 1.0;
+    }
+    const double wrong_chi2 = bin_chi2(wrong_counts);
+    std::printf("wrong-walk chi-square (%zu bins): %.1f\n", bins.size(), wrong_chi2);
+    CHECK(wrong_chi2 > 103.4);
+}
+
+TEST(sampler_untruncated_draw_timing) {
+    // Printed, not asserted. Two configurations at vocabulary 248,320.
+    const size_t vocab = 248320;
+    auto l = realistic_tail_row(vocab);
+
+    const int n_draws = 300;
+
+    // top_k 0 / top_p 1.0 / temp 0.8: the no-truncation path.
+    {
+        Sampler s(untruncated_params(0.8f), 99);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n_draws; ++i) {
+            s.sample(l.data(), l.size());
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_draws;
+        std::printf("timing top_k 0 / top_p 1.0 / temp 0.8 (248,320): %.1f us per draw\n", us);
+    }
+
+    // top_k 20: the fast top-k path, as the baseline.
+    {
+        SamplerParams p;
+        p.temperature        = 0.8f;
+        p.top_k              = 20;
+        p.top_p              = 1.0f;
+        p.min_p              = 0.0f;
+        p.repetition_penalty = 1.0f;
+        Sampler s(p, 99);
+        auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < n_draws; ++i) {
+            s.sample(l.data(), l.size());
+        }
+        auto t1 = std::chrono::steady_clock::now();
+        const double us = std::chrono::duration<double, std::micro>(t1 - t0).count() / n_draws;
+        std::printf("timing top_k 20 / temp 0.8 (248,320):          %.1f us per draw\n", us);
+    }
 }
