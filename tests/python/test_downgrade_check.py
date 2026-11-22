@@ -44,10 +44,13 @@ class Compare(unittest.TestCase):
 
 
 class Table(unittest.TestCase):
-    def test_the_table_names_the_three_units(self):
+    def test_the_table_names_the_four_units(self):
         with open(os.path.join(HERE, "..", "acceptance", "expected-downgrades.json")) as f:
             t = json.load(f)
-        self.assertEqual(sorted(t), ["agent", "coder", "flashnext"])
+        self.assertEqual(sorted(t), ["agent", "coder", "flashnext", "inkling"])
+        # Inkling (1.8.0): the known generic paths (FA's declined row-block shape, the small f32
+        # loop-control products, the coda's Q8_0 MUL_MAT_ID), listed for the operator's acceptance
+        self.assertTrue(all("path=generic" in k or "path=declined" in k for k in t["inkling"]))
         # the operator accepted Flash-Next's keys; these two carry nothing
         self.assertEqual(t["coder"], [])
         self.assertEqual(t["agent"], [])
