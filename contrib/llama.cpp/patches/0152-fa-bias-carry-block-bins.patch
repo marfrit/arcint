@@ -1,0 +1,70 @@
+0152: the bias bins in the carried-softmax prompt builds are read at the absolute key (kv0 + key), as the mask is; a quantized pair's blocks past the first read the first block's bins.
+
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -198,6 +198,11 @@
+         : 0;
+ #ifdef FA_CARRY
+     if (mb != 0) mb += kv0;
++    // 0152: the bias bins are indexed by the absolute key, as the mask is (advanced by kv0
++    // above); a block past the first read the first block's bins before
++    const int bkv0 = kv0;
++#else
++    const int bkv0 = 0;
+ #endif
+ 
+     // the last key any row of the work-group sees: a row a work-item, its
+@@ -345,7 +350,7 @@
+                 if (bias_void != 0 && key < n_kv && q_sg + r < n_q) {
+                     const int qrow = batch * n_q + qr;
+                     const int bin = bix_void != 0
+-                        ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                        ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[bkv0 + key] : -1;
+                     if (bin >= 0 && bin < n_bins) {
+                         const float bv = ((global const float *)((global const char *) bias_void + bias_offset))[
+                             ((qrow * n_bins + bin) * n_head) + head];
+@@ -675,7 +680,7 @@
+                     if (bias_void != 0 && vis) {
+                         const int qrow = batch * n_q + q_sg + r;
+                         const int bin = bix_void != 0
+-                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[bkv0 + key] : -1;
+                         if (bin >= 0 && bin < n_bins) {
+                             const float bv = ((global const float *)((global const char *) bias_void + bias_offset))[
+                                 ((qrow * n_bins + bin) * n_head) + head];
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
+@@ -308,7 +308,7 @@
+                     if (bias_void != 0 && vis) {
+                         const int qrow = batch * n_q + q_sg + r;
+                         const int bin = bix_void != 0
+-                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[kv0 + key] : -1;   // 0152: absolute key
+                         if (bin >= 0 && bin < n_bins) {
+                             const float bv = ((global const float *)((global const char *) bias_void + bias_offset))[
+                                 ((qrow * n_bins + bin) * n_head) + head];
+@@ -332,7 +332,7 @@
+                         const int qr = min(q_sg + r, n_q - 1);
+                         const int qrow = batch * n_q + qr;
+                         const int bin = bix_void != 0
+-                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[kv0 + key] : -1;   // 0152: absolute key
+                         const half mh = ((global const half *)((global const char *) mb + qr * mask_nb1))[key];
+                         float mk = (float) mh;
+                         if (bin >= 0 && bin < n_bins) {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13495,6 +13495,10 @@
+     }
+     // prefill, and the flattened queries of 8 streams
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1025, 512, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
++    // 0152: the quantized pair's prompt path (K/V dequantized to f16 in blocks of 16384 keys, the
++    // softmax carried between them): one block, and two blocks, whose second reads its bins at kv0 + key
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1025, 512, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true, 1025));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 16448, 128, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true, 1025));
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 24, {1, 8}, 1024, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
+ 
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

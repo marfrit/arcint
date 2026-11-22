@@ -8789,3 +8789,27 @@ On the card (Arc Pro B60 at a 165 W cap, Inkling 2 Mini IQ4_NL, OpenCL, flash at
 98.175 %. test-backend-ops `-o SITU` on the card: 6 / 6 (the op's name is the GLU variant's; `-o GLU` selects
 nothing); the red case (sigmoid dropped in `kernel_situ_f32`) fails all 6 (ERR ~0.5) and moves the model's KL
 to 1.78; SWIGLU unchanged, 24 / 24.
+
+## 0152-fa-bias-carry-block-bins.patch
+
+A quantized K/V pair's prompt path dequantizes K and V to f16 in blocks of 16,384 keys
+(`GGML_OPENCL_FA_DPAS_F16KV_BLOCK`) and runs the f16 prompt kernel on each block with the softmax
+state carried between them (`FA_CARRY`, `kv0` the block's first key). The kernels advance the mask
+by `kv0`, but 0144 read the indexed bias's bins at `[key]`, the key within the block: every block
+after the first took the first block's relative-position bins. f16 K/V reads in place (`kv0 = 0`)
+and a mixed pair takes the f32_f16 kernel, so only q8_0/q8_0, q8_0/q4_0 and q4_0/q4_0 past 16,384
+keys were affected. The bins are now read at `kv0 + key` in `flash_attn_dpas.cl` (both kernels) and
+`flash_attn_dpas2.cl` (both lookups).
+
+`measured-here` (Arc Pro B70 at a 220 W cap, Inkling 2 Mini IQ4_NL, KL at 32,768 tokens against the
+CPU's f16 logits): q8_0/q8_0 0.037040, same top 94.586 % before; 0.005965 / 98.065 % after (f16
+0.005306, q8_0 K only 0.005412, q8_0 V only 0.005688, the CPU's own q8_0/q8_0 0.005908). Located by
+switch: `GGML_OPENCL_FA_DPAS_Q=0` (the quantized prompt kernels off) gave 0.005554, `FA_DPAS2=0` and
+`FA_GQA=0` left 0.037; at 2,048 tokens (one block) q8_0/q8_0 was 0.002351. With q8_0/q8_0 KV the
+needle at 64,000 and 120,000 tokens had been missed; with f16 KV it was found at 64,000.
+
+Two test-backend-ops cases run the quantized pair's prompt path with the bias, Inkling's shape
+(head 128, 24 query heads over 8, 1,025 bins), in one block (1,025 keys, 512 rows) and in two
+(16,448 keys, 128 rows). No case reached that path before: 0142's quantized bias cases have 4 rows
+(decode) and its prompt case is f16, so the whole FLASH_ATTN_EXT suite passed on 0150 even with
+64-key blocks forced (3,171 / 3,171). With the two cases: 3,173 / 3,173 on 0152 at both block sizes.
