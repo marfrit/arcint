@@ -136,6 +136,19 @@ private:
     std::vector<std::string> closers_;   // this dialect's closers, aligned with ids_
 
     Step lead_after_close_(std::string_view piece, int token_id);
+
+    // Inkling 2 Mini writes an assistant turn as framed blocks rather than one
+    // pre-opened think block: [header][content_thinking]reasoning[end],
+    // [header][content_text]answer[end], then one [header]name[tool-json]...
+    // [end] block per call. This path strips the framing as it streams, so the
+    // reasoning and answer callers see only their bytes; the call blocks stay
+    // whole in the content for parse_inkling_tool_calls.
+    Step ink_push(std::string_view piece, int token_id);
+    Step ink_flush();
+    std::string ink_buf_;
+    enum class InkStage : unsigned char { Lead, NeedKind, Thinking, AfterEnd, Answer, Tail };
+    InkStage ink_stage_ = InkStage::Lead;
+
 };
 
 // The non-streaming split driven by the same (piece, id) sequence the streamer

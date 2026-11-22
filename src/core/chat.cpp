@@ -399,11 +399,23 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
     // hands it to the template (Qwen3.8's reads reasoning_effort).
     if (body.contains("reasoning_effort") && !body["reasoning_effort"].is_null()) {
         const json& e = body["reasoning_effort"];
-        if (!e.is_string()) return "reasoning_effort must be a string";
-        const std::string level = e.get<std::string>();
-        req.has_enable_thinking = true;
-        req.enable_thinking     = level != "none" && level != "off";
-        req.reasoning_effort    = level;
+        // Inkling's template takes a number in [0, 0.99] as well as a name
+        // (chat_template.jinja, emit_thinking_effort): the number reaches the
+        // template through the passthrough object unchanged, which is what a
+        // chat_template_kwargs.reasoning_effort number does too.
+        if (e.is_number()) {
+            const double num = e.get<double>();
+            if (!(num >= 0.0 && num <= 0.99)) return "reasoning_effort must be in [0, 0.99]";
+            req.has_enable_thinking = true;
+            req.enable_thinking     = num > 0.0;
+            req.chat_template_kwargs["reasoning_effort"] = num;
+        } else {
+            if (!e.is_string()) return "reasoning_effort must be a string or a number in [0, 0.99]";
+            const std::string level = e.get<std::string>();
+            req.has_enable_thinking = true;
+            req.enable_thinking     = level != "none" && level != "off";
+            req.reasoning_effort    = level;
+        }
     }
     if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
         const json& kw = body["chat_template_kwargs"];
@@ -566,6 +578,15 @@ json tool_call_arguments_for_template(const std::string& arguments, bool templat
     return json(arguments);
 }
 
+bool is_inkling_template(std::string_view template_src) {
+    return template_src.find(markers::kInkMessageUser) != std::string_view::npos &&
+           template_src.find(markers::kInkContentImage) != std::string_view::npos;
+}
+
+ChatDialect dialect_from_template(std::string_view template_src, ChatDialect fallback) {
+    return is_inkling_template(template_src) ? ChatDialect(ChatDialect::Inkling) : fallback;
+}
+
 bool reserved_template_context_key(std::string_view key) {
     // The names minja's chat-template context sets before it merges
     // extra_context (third_party/minja/chat-template.hpp, ChatTemplate::apply):
@@ -620,6 +641,14 @@ bool reasoning_effort_level_known(std::string_view level) {
 
 std::string template_reasoning_effort(std::string_view level, std::string_view src) {
     if (src.find("reasoning_effort") == std::string_view::npos) return {};
+    if (is_inkling_template(src)) {
+        // Inkling's effort_map takes all seven names, minimal and max included,
+        // and each has its own value (0.1 vs 0.2): pass the name verbatim, no
+        // nearest-level rewrite. none is its 0.0, not an off switch.
+        for (const char* l : {"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+            if (level == l && template_quotes(src, l)) return std::string(l);
+        return {};
+    }
     const std::string_view l = level == "minimal" ? std::string_view("low") : level;
     if (l != "low" && l != "medium" && l != "high" && l != "xhigh") return {};
     if (template_quotes(src, l)) return std::string(l);
@@ -656,6 +685,11 @@ std::optional<std::string> load_chat_template_file(const std::string& path, std:
 std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src) {
     std::vector<std::string> out;
     if (template_src.find("reasoning_effort") == std::string_view::npos) return out;
+    if (is_inkling_template(template_src)) {
+        for (const char* l : {"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+            if (template_quotes(template_src, l)) out.emplace_back(l);
+        return out;
+    }
     for (const char* l : {"low", "medium", "high", "xhigh"})
         if (template_quotes(template_src, l)) out.emplace_back(l);
     return out;
@@ -810,10 +844,16 @@ std::optional<std::string> parse_template_kwarg_default(std::string_view kv, std
     if (k == "force_nonempty_content" && !v.is_boolean())
         return std::string("--chat-template-kwarg force_nonempty_content needs true or false "
                            "(the JSON booleans; 1, yes and True do not trigger it)");
-    if (k == "reasoning_effort" &&
-        !(v.is_string() && reasoning_effort_level_known(v.get<std::string>())))
-        return std::string("--chat-template-kwarg reasoning_effort needs one of none, off, minimal, "
-                           "low, medium, high, xhigh");
+    if (k == "reasoning_effort") {
+        if (v.is_number()) {
+            const double num = v.get<double>();
+            if (!(num >= 0.0 && num <= 0.99))
+                return std::string("--chat-template-kwarg reasoning_effort needs a number in [0, 0.99]");
+        } else if (!(v.is_string() && reasoning_effort_level_known(v.get<std::string>()))) {
+            return std::string("--chat-template-kwarg reasoning_effort needs one of none, off, minimal, "
+                               "low, medium, high, xhigh, or a number in [0, 0.99]");
+        }
+    }
     key   = k;
     value = std::move(v);
     return std::nullopt;

@@ -44,6 +44,9 @@ bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect
 }
 
 bool prompt_ends_after_think_block(std::string_view prompt, ChatDialect dialect) {
+    // Inkling ends every message block, the last user turn included, with the
+    // same closer; a prompt that ends there did not end after a think block.
+    if (dialect.inkling()) return false;
     // The layout after the closer is the template's, not part of the tag.
     while (!prompt.empty() && (prompt.back() == '\n' || prompt.back() == ' ')) prompt.remove_suffix(1);
     for (const auto& [open, close] : think_tag_pairs(dialect)) {

@@ -853,9 +853,9 @@ public:
         // Gemma 4 speaks its own reasoning channel and tool-call form. --tool-grammar
         // constrains the Qwen call form, so on this model it would constrain the
         // output to a syntax the model does not use: refused at start.
-        if (dialect_.gemma4() && cfg.tool_grammar)
-            throw std::runtime_error("--tool-grammar constrains the Qwen tool-call form; Gemma 4 calls tools in its own "
-                                     "form (parsed into tool_calls without it): start without --tool-grammar");
+        if ((dialect_.gemma4() || dialect_.inkling()) && cfg.tool_grammar)
+            throw std::runtime_error("--tool-grammar constrains the Qwen tool-call form; this model calls tools in its "
+                                     "own form (parsed into tool_calls without it): start without --tool-grammar");
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
         n_vocab_   = static_cast<size_t>(llama_vocab_n_tokens(vocab_));
         // loop-guard door: the multi-newline ids, scanned ONCE here where the
@@ -880,6 +880,7 @@ public:
         think_ids_qwen_  = build_think_ids(ChatDialect::Qwen);
         think_ids_ext_   = build_think_ids(ChatDialect::Extended);
         think_ids_gemma_ = build_think_ids(ChatDialect::Gemma4);
+        think_ids_inkling_ = build_think_ids(ChatDialect::Inkling);
         // One line, at load: what the id rule found, and where the text
         // fallback is in force. A served artifact whose tags the vocabulary
         // spells as text is then recognisable in the log, not only by its
@@ -1195,17 +1196,21 @@ public:
         const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
         const char* eos = llama_vocab_get_text(vocab_, llama_vocab_eos(vocab_));
         template_ = std::make_unique<minja::chat_template>(template_src_, bos ? bos : "", eos ? eos : "");
+        // The template decides the dialect's chat form (core/chat.cpp
+        // dialect_from_template): the admission table is the fallback for a model
+        // it does not name yet, the served template wins where it is Inkling's.
+        dialect_ = dialect_from_template(template_src_, dialect_);
         // W6 follow-up 2: the pre-flight, so /props is honest from the first
         // second, not only after the first GET. The canonical hash and the
         // served body's dump admit valid UTF-8 only; a vocabulary or template
         // whose text is not will never build the material. One pass over the
         // vocabulary's text at load; Qwen vocabularies pass it.
-        if (dialect_.gemma4()) {
+        if (dialect_.gemma4() || dialect_.inkling()) {
             // The gateway's renderer material carries the Qwen parser rows only
             // ("qwen3-coder/1"); advertising them for this model would be wrong.
             material_failed_.store(true, std::memory_order_relaxed);
             log::warn("load", "renderer material will not be built: the gateway parser knows the Qwen tool-call "
-                              "form only, not this model's (Gemma 4); token mode is off on this unit");
+                              "form only, not this model's; token mode is off on this unit");
         } else if (!cfg.tts) {
             const int  n_text  = static_cast<int>(llama_vocab_n_tokens(vocab_));
             const bool text_ok = renderer_text_utf8_ok(n_text, [&](int id) {
@@ -1578,6 +1583,7 @@ public:
         switch (dialect.kind) {
             case ChatDialect::Extended: return think_ids_ext_;
             case ChatDialect::Gemma4: return think_ids_gemma_;
+            case ChatDialect::Inkling: return think_ids_inkling_;
             default: return think_ids_qwen_;
         }
     }
@@ -2807,8 +2813,8 @@ private:
         if (!in.sampler.tool_grammar || in.tools.empty()) return nullptr;
         // the grammar is the Qwen call form (core/toolgrammar.cpp): on a Gemma 4 model
         // a request that asks for it is refused, not run against the wrong syntax
-        if (dialect_.gemma4())
-            throw InputError("tool_grammar constrains the Qwen tool-call form; this model (Gemma 4) calls tools in its own form");
+        if (dialect_.gemma4() || dialect_.inkling())
+            throw InputError("tool_grammar constrains the Qwen tool-call form; this model calls tools in its own form");
         const auto t0 = clock_type::now();
         auto       g  = std::make_unique<LlamaToolGrammar>(vocab_, in.tools, in.parallel_tool_calls);
         log::verbose("grammar", "tool-call grammar: %zu tools, %zu bytes of GBNF, triggered by %s, built in %.1f ms",
@@ -3159,6 +3165,7 @@ private:
     ThinkBlockIds                         think_ids_qwen_;   // the Qwen pair alone
     ThinkBlockIds                         think_ids_ext_;    // the full tag family
     ThinkBlockIds                         think_ids_gemma_;  // Gemma 4's channel
+    ThinkBlockIds                         think_ids_inkling_;  // Inkling's message framing
     ChatDialect                           dialect_;          // the admitted model's tags and call form
     bool llama2_7b_ = false;           // the GPU tables' model: no chat template
     std::unique_ptr<minja::chat_template> template_;
