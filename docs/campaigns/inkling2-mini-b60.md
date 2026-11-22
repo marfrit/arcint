@@ -70,10 +70,21 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
 
 ## Current state
 
-2026-11-22 02:30: the port to the pin in progress (four of seven commits: arch and hparams, the
-relative-position input and conv-state store, the text model and loader, the expert scales); arcint's
-chat side in progress; the FA design note written (`inkling2-fa-bias-design.md`); mainline's Vulkan build
-for the baseline arm built; weights downloaded (IQ4_NL complete). Nothing measured.
+2026-11-22 03:45 (`measured-here` unless marked):
+- **Baseline arm** (mainline `690b87d8`, Vulkan, B60 at 165 W, ggml-org IQ4_NL, llama-bench, 2 repetitions):
+  pp512 33.3 / 32.3 / 30.1 t/s and tg128 8.3 ± 4.1 / 10.1 / 10.2 t/s at depth 0 / 4,096 / 32,768. A Paris check
+  through mainline's server spent 600 tokens reasoning at the template's default effort (0.9) without an answer:
+  unchecked, not wrong.
+- **Port to the pin, CPU:** against mainline's CPU build on the IQ4_NL GGUF (English and code, 3 chunks of 2,048):
+  mean KL below print precision (< 5e-7 nats), max 0.000055, same top token 99.967 %, PPL 3.485480 against
+  3.485478; the red case (2 loop passes instead of 3) reads mean KL 0.499, same top 76.3 %. The q log-scaling on
+  the global layers is exactly 1 below position 8,191, so a red case on it needs a longer context. Experts are held
+  once per physical layer; the loop's cache slots alias them. ggml SCALE on row-strided views took mainline's loop
+  (red first: the pin's loop failed the view cases at NMSE 0.65-1.32).
+- **Chat:** an Inkling dialect in arcint (minja renders the shipped template; the golden render equals mainline's
+  byte for byte).
+- **Flash attention, step 1:** the indexed-bias op in arcint's own slots and its CPU reference; the FA suite
+  5,815 / 5,815 on CPU. The OpenCL kernels are next.
 
 ## Where it lives
 
