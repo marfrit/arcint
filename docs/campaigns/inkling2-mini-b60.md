@@ -81,6 +81,16 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   the global layers is exactly 1 below position 8,191, so a red case on it needs a longer context. Experts are held
   once per physical layer; the loop's cache slots alias them. ggml SCALE on row-strided views took mainline's loop
   (red first: the pin's loop failed the view cases at NMSE 0.65-1.32).
+- **The port on the card** (OpenCL, B60 at 165 W, patches 0133-0139 + 0145, no FA patches yet, 2026-11-22 05:00):
+  0 of the model's ops unsupported (the graph's 150 prefill / 144 decode shapes); 0145's SCALE on strided views,
+  LOG, ARANGE and the 2-5-wide SOFT_MAX pass on the card; a raw completion "The capital of France is Paris." at
+  18.2 t/s (llama-simple, 24 tokens; not comparable to llama-bench); KL against the CPU port's logits with FA on:
+  mean 0.00197 nats, max 0.070, same top 98.50 %, PPL 3.4847 against 3.4855 (FA off: 0.00205, same top 98.27 %).
+  Slow paths named by DOWNGRADE lines: MUL_MAT_ID on Q8_0 (the coda layers) and several f32 MUL_MATs on the
+  generic kernel; the prompt FA with sinks on the generic f32_f16 kernel.
+- **Flash attention, card run of the first kernels:** the bias cases were declined on OpenCL (never ran) and the
+  DPAS prompt kernels' new sink join broke 49 of 3,170 existing cases (sinks, f16, head 128, 32 / 75 rows): in
+  rework, nothing merged.
 - **Chat:** an Inkling dialect in arcint (minja renders the shipped template; the golden render equals mainline's
   byte for byte).
 - **Flash attention, step 1:** the indexed-bias op in arcint's own slots and its CPU reference; the FA suite
