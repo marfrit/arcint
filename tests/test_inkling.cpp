@@ -445,13 +445,10 @@ TEST(inkling_reasoning_effort_numeric_string_is_the_number) {
                                {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})},
                                {"reasoning_effort", bad}};
         ChatRequest req;
-        const auto err = parse_chat_request(body, req);
-        if (std::string(bad) == "1.5" || std::string(bad) == "-0.1") {
-            CHECK(err.has_value());                       // a number, out of range: refused at parse
-        } else {
-            CHECK(!err.has_value());                      // not a number: a name, the strict check decides
-            CHECK(check_strict_reasoning_effort(req, levels).has_value());
-        }
+        // kept as a string at parse (1.7.0's behaviour for every template); the strict check refuses
+        // an out-of-range number and a name the template does not take alike
+        CHECK(!parse_chat_request(body, req).has_value());
+        CHECK(check_strict_reasoning_effort(req, levels).has_value());
     }
     // a template without its own effort map keeps ignoring a level it does not name
     ChatRequest q = conversation("0.45");
@@ -466,4 +463,28 @@ TEST(inkling_reasoning_effort_numeric_string_is_the_number) {
 TEST(inkling_thinks_by_default) {
     CHECK(ChatDialect(ChatDialect::Inkling).thinks_by_default());
     CHECK(!ChatDialect(ChatDialect::Gemma4).thinks_by_default());
+}
+
+// 1.8.0 review S1: a typed numeric reasoning_effort survives a chat_template_kwargs object that
+// does not name it. Mutation: let the client's object replace the kwargs whole and the render
+// falls to the template default (0.9).
+TEST(inkling_numeric_effort_survives_other_kwargs) {
+    nlohmann::json body = {{"model", "inkling2-mini"},
+                           {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})},
+                           {"reasoning_effort", 0.7},
+                           {"chat_template_kwargs", {{"preserve_thinking", true}}}};
+    ChatRequest parsed;
+    CHECK(!parse_chat_request(body, parsed).has_value());
+    CHECK(parsed.chat_template_kwargs.contains("reasoning_effort"));
+    CHECK(parsed.chat_template_kwargs.contains("preserve_thinking"));
+    ChatRequest req = conversation(nullptr);
+    req.chat_template_kwargs = parsed.chat_template_kwargs;
+    req.chat_template_kwargs.erase("preserve_thinking");
+    CHECK(render(req) == render(conversation(nullptr, true)));   // 0.7, the numeric conversation
+    // the client's own reasoning_effort in the object wins over the typed field
+    nlohmann::json body2 = body;
+    body2["chat_template_kwargs"] = {{"reasoning_effort", "low"}};
+    ChatRequest p2;
+    CHECK(!parse_chat_request(body2, p2).has_value());
+    CHECK(p2.chat_template_kwargs["reasoning_effort"] == "low");
 }

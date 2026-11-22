@@ -432,14 +432,10 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
             req.has_enable_thinking = true;
             req.enable_thinking     = level != "none" && level != "off";
             req.reasoning_effort    = level;
-            // A number sent as a JSON string ("0.45": pi's thinkingLevelMap values are strings):
-            // the same range as a number, and thinking off at 0. The string is kept; a template
-            // that takes numbers (Inkling's) gets the number in template_context, another
-            // template ignores a level it does not name, as before.
-            if (double num = 0.0; effort_number(level, num)) {
-                if (!(num >= 0.0 && num <= 0.99)) return "reasoning_effort must be in [0, 0.99]";
-                req.enable_thinking = num > 0.0;
-            }
+            // A number sent as a JSON string ("0.45": pi's thinkingLevelMap values are strings) is
+            // kept as the string here, as in 1.7.0 for every template: a template with its own effort
+            // map (Inkling's) gets the number in template_context and its range is checked there
+            // (check_strict_reasoning_effort); another template ignores a level it does not name.
         }
     }
     if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
@@ -468,6 +464,11 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         json passthrough = json::object();
         for (auto it = kw.begin(); it != kw.end(); ++it)
             if (!it.value().is_null()) passthrough[it.key()] = it.value();
+        // a typed numeric reasoning_effort (above) already sits in the kwargs object: the client's
+        // own object replaces it only where it names reasoning_effort itself (1.8.0 review S1)
+        if (req.chat_template_kwargs.is_object() && req.chat_template_kwargs.contains("reasoning_effort") &&
+            !passthrough.contains("reasoning_effort"))
+            passthrough["reasoning_effort"] = req.chat_template_kwargs["reasoning_effort"];
         req.chat_template_kwargs = std::move(passthrough);
         // One construction, one reserved-key list: the keys minja's context
         // sets itself are refused by name (a client must not override the

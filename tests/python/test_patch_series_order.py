@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """The patch series applies in byte order, whatever the caller's locale (GitHub issue #6).
 
 contrib/llama.cpp/apply-series.sh lists and applies contrib/llama.cpp/patches/*.patch. Its

@@ -63,13 +63,7 @@ RUN set -eu; mkdir -p /src/llama && cd /src/llama; \
     echo "${LLAMA_TARBALL_SHA256}  llama.tar.gz" | sha256sum -c; \
     tar xzf llama.tar.gz; rm llama.tar.gz; \
     cd "llama.cpp-${LLAMA_COMMIT}"; \
-    shopt -s nullglob; \
-    for p in /src/arcint/contrib/llama.cpp/patches/*.patch; do \
-      [ -e "$p" ] || { echo "no contrib/llama.cpp/patches in the tree" >&2; exit 1; }; \
-      echo "applying $(basename "$p")"; \
-      git apply --whitespace=nowarn "$p" \
-        || { echo "patch does not apply to the pin: $p" >&2; exit 1; }; \
-    done; \
+    bash /src/arcint/contrib/llama.cpp/apply-series.sh . ; \
     echo "llama.cpp patched: $(ls /src/arcint/contrib/llama.cpp/patches/*.patch | wc -l) patches"
 
 # The gates are the product (build-deb.sh's words): the device-free unit

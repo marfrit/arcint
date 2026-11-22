@@ -533,6 +533,13 @@ if(ARCINT_TESTS)
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_downgrade_check.py")
   set_tests_properties(downgrade-check PROPERTIES LABELS unit)
 
+  # contrib/llama.cpp/apply-series.sh's byte order (GitHub issue #6), device-free; its locale case
+  # runs where en_US.UTF-8 is installed and is skipped (not failed) on a C-locale host
+  add_test(NAME patch-series-order
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_patch_series_order.py")
+  set_tests_properties(patch-series-order PROPERTIES LABELS unit)
+
   # tools/fn_sweep.py's flag tables and --no-mtp (the T1 leg), device-free.
   add_test(NAME fn-sweep-flags
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"

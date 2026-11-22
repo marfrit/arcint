@@ -111,7 +111,7 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   32k over the dense fold; against the Vulkan arm 5.5x prompt, 2.0-2.9x decode). The acceptance task, sampled
   (temperature 1.0, effort low), interleaved: dense fold 50/60 (one 0: the function declared `local`, the task
   asks for a global), indexed 60/60; a greedy run had flipped to the same `local` slip, which both builds show.
-- **Speed work** (Markus: performance first). Decode profile of one token (B60, the profiling build of the full stack):
+- **Speed work** (the operator: performance first). Decode profile of one token (B60, the profiling build of the full stack):
   33.2 ms of device time in 6,977 kernels (4.8 us each; wall ~42 ms): Q8_0 matvecs 6.6 ms, IQ4_NL experts 4.8 ms,
   CONCAT 5.7 ms in 356 launches and REPEAT 2.4 ms in 120 on 2304x1..5 tensors, small f32 products 2.7 ms, the
   per-pass elementwise ops ~4.7 ms, flash attention 0.48 ms. 0147 (one element a work item for small CONCAT /
