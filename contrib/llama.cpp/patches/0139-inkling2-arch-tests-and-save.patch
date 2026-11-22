@@ -1,18 +1,5 @@
-From 604d51dbabcbd038691e0631e60d580f305c8ff1 Mon Sep 17 00:00:00 2001
-From: Moe <moe@halzen.invalid>
-Date: Sun, 22 Nov 2026 02:29:29 +0100
-Subject: [PATCH 7/7] inkling2: cover the archs in the arch test and skip
- saving loops
+0139: cover inkling2 and inkling2_loop in test-llama-archs and keep the loop arch out of the model saver.
 
-The loop file holds 24 layers but runs 48 cache slots, so the saver is not
-supported for it.
----
- src/llama-model-saver.cpp  |  1 +
- tests/test-llama-archs.cpp | 51 +++++++++++++++++++++++++++++++++++---
- 2 files changed, 48 insertions(+), 4 deletions(-)
-
-diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
-index d824a29..e05d85f 100644
 --- a/src/llama-model-saver.cpp
 +++ b/src/llama-model-saver.cpp
 @@ -22,6 +22,7 @@ bool llama_model_saver_supports_arch(llm_arch arch) {
@@ -23,8 +10,6 @@ index d824a29..e05d85f 100644
          case LLM_ARCH_VLLM_DECISION2:
              return false;
          default:
-diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
-index 0eba951..b73a0d9 100644
 --- a/tests/test-llama-archs.cpp
 +++ b/tests/test-llama-archs.cpp
 @@ -180,6 +180,11 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
@@ -108,6 +93,3 @@ index 0eba951..b73a0d9 100644
              return true;
          default:
              return false;
--- 
-2.47.3
-

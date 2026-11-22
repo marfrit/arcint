@@ -1,19 +1,5 @@
-From 3d0d32b7570e03ba8f2f4c247d704b7665d10d03 Mon Sep 17 00:00:00 2001
-From: Moe <moe@halzen.invalid>
-Date: Sun, 22 Nov 2026 02:22:43 +0100
-Subject: [PATCH 6/7] inkling2_loop: share the cache slots' weights after the
- scale pass
+0138: run post_arch_tensors after the generic scale pass and share the physical weights across the loop's cache slots there, so each slot does not create duplicate scale tensors.
 
-The generic per-tensor scale pass runs over all cache slots; moving the
-aliasing after it means each slot does not create duplicate scale tensors.
----
- src/llama-model.cpp          | 3 +++
- src/models/inkling2-loop.cpp | 2 ++
- src/models/models.h          | 1 +
- 3 files changed, 6 insertions(+)
-
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 10d17e4..8442bd6 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1863,6 +1863,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -26,8 +12,6 @@ index 10d17e4..8442bd6 100644
      ml.done_getting_tensors();
  
      if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
-diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
-index 0de66ba..8366a11 100644
 --- a/src/models/inkling2-loop.cpp
 +++ b/src/models/inkling2-loop.cpp
 @@ -60,7 +60,9 @@ void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
@@ -40,8 +24,6 @@ index 0de66ba..8366a11 100644
      // share the physical weights, each cache slot keeps its own KV and conv state
      for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
          layers[il] = layers[layer_phys(il)];
-diff --git a/src/models/models.h b/src/models/models.h
-index 0830b5b..dc9c2b3 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -2340,6 +2340,7 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
@@ -52,6 +34,3 @@ index 0830b5b..dc9c2b3 100644
  
      int n_layer_phys() const override { return n_phys; }
      int layer_phys(int il) const;
--- 
-2.47.3
-

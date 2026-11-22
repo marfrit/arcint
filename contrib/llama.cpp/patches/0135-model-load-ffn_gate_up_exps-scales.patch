@@ -1,14 +1,5 @@
-From 8e5bba72ed215a673b9d5c451e23364c87ea8b10 Mon Sep 17 00:00:00 2001
-From: Moe <moe@halzen.invalid>
-Date: Sun, 22 Nov 2026 02:01:29 +0100
-Subject: [PATCH 3/7] model: load ffn_gate_up_exps scales
+0135: the generic per-tensor scale pass loads ffn_gate_up_exps.scale when a merged gate_up expert tensor exists, and rejects a file that carries both the split and the merged scale.
 
----
- src/llama-model.cpp | 6 ++++++
- 1 file changed, 6 insertions(+)
-
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 629618b..0424872 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -1755,6 +1755,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
@@ -24,6 +15,3 @@ index 629618b..0424872 100644
              }
  
              // recurrent / linear-attention weight scales (per-tensor, shape {1})
--- 
-2.47.3
-

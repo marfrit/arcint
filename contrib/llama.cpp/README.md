@@ -8482,9 +8482,17 @@ gate_up tensor exists, and rejects a file that carries both the split and the me
 ## 0136-ggml-scale-row-contiguous-input.patch
 
 Mainline's ggml change from the 953-commit gap between the pin and the model: SCALE takes a
-row-contiguous input, not only a contiguous one. The merged gate_up expert path passes one
-half of the matmul result (a view) to situ()'s linear-beta branch. Without it the CPU graph
-aborts on the first ubatch.
+row-contiguous input, not only a contiguous one, and its f32 and bf16 loops are mainline's
+(rows stepped by i1/i2/i3 over src0 and dst, the bias branch reading src0 with src0's own
+strides). The merged gate_up expert path passes one half of the matmul result (a view) to
+situ()'s linear-beta branch, so both matter.
+
+Red first: `test-backend-ops -b CPU -o '^SCALE'` on the pin's loop fails the four new view
+cases (half of a wider and taller base, bias 0 and 1.5, f32 and bf16: NMSE 0.65 to 1.32)
+against the use_ref CPU reference, and passes after the port. The use_ref branch is a
+per-element reference: without it the CPU test compares the same kernel with itself. The
+CPU KL gate on IQ4_NL after the change: mean 0.000000 nats, max 0.000055, same top p
+99.967 %, unchanged.
 
 ## 0137-inkling2-loop-cache-slots.patch
 

@@ -1,30 +1,5 @@
-From 6fa3d31066ee598a4f1f027988bd19fc4454e9df Mon Sep 17 00:00:00 2001
-From: Moe <moe@halzen.invalid>
-Date: Sun, 22 Nov 2026 01:49:26 +0100
-Subject: [PATCH 2/7] llama: relative-position attention input and conv state
- store
+0134: add the relative-position attention input (distances per cell, bias folded into the KQ mask) and the conv-state store, then the inkling2 text model loader and graph with relative bias, qk/rel clip, short convolutions, block attention residuals, situ MoE, the shortconv state and the unpadded logits view.
 
-inkling2: add the text model, loader and graph
-
-Adds the per-head relative-position bias, the recurrent short-conv state,
-the log-scaled positions, and the block attention residuals through the
-new relative-position attention input.
----
- src/llama-context.cpp     |   4 +-
- src/llama-graph.cpp       | 178 ++++++++++++++-
- src/llama-graph.h         |  62 ++++-
- src/llama-kv-cache.cpp    |  21 ++
- src/llama-kv-cache.h      |   2 +
- src/llama-model-saver.cpp |  14 +-
- src/llama-model.cpp       |   8 +-
- src/llama-quant.cpp       |   8 +
- src/models/inkling2.cpp   | 460 ++++++++++++++++++++++++++++++++++++++
- src/models/models.h       |  54 +++++
- 10 files changed, 802 insertions(+), 9 deletions(-)
- create mode 100644 src/models/inkling2.cpp
-
-diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index 153e028..e5d2179 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3637,7 +3637,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
@@ -45,8 +20,6 @@ index 153e028..e5d2179 100644
          /*.hparams     =*/ model.hparams,
          /*.cparams     =*/ cparams,
          /*.ubatch      =*/ ubatch,
-diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index aa0165d..f23c254 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1411,6 +1411,33 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
@@ -283,8 +256,6 @@ index aa0165d..f23c254 100644
  void llm_graph_context::build_dense_out(
      ggml_tensor * dense_2,
      ggml_tensor * dense_2_b,
-diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 57d5933..1f52bf5 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -791,6 +791,35 @@ public:
@@ -391,8 +362,6 @@ index 57d5933..1f52bf5 100644
      //
      // pooling
      //
-diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index 8fda148..dea7fca 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
 @@ -2191,6 +2191,23 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch
@@ -430,8 +399,6 @@ index 8fda148..dea7fca 100644
  void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
      kv->set_input_pos_bucket(dst, ubatch, sinfos.empty() ? 0 : sinfos[i_cur].kv_off);
  }
-diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 1658d3d..4546729 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
 @@ -278,6 +278,7 @@ public:
@@ -450,8 +417,6 @@ index 1658d3d..4546729 100644
  
      void set_input_k_rot(ggml_tensor * dst) const;
      void set_input_v_rot(ggml_tensor * dst) const;
-diff --git a/src/llama-model-saver.cpp b/src/llama-model-saver.cpp
-index 55dd45c..d824a29 100644
 --- a/src/llama-model-saver.cpp
 +++ b/src/llama-model-saver.cpp
 @@ -217,7 +217,10 @@ void llama_model_saver::add_kv_from_model() {
@@ -489,8 +454,6 @@ index 55dd45c..d824a29 100644
      add_tensor(model->nextn_proj_pre);
      add_tensor(model->nextn_proj_post);
      add_tensor(model->cls);
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index bcc7421..629618b 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -305,6 +305,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
@@ -522,8 +485,6 @@ index bcc7421..629618b 100644
          // the pairs of head values are offset by n_rot/2
          case LLM_ARCH_DORY:
          case LLM_ARCH_FALCON:
-diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
-index 20f0d63..deb0fbe 100644
 --- a/src/llama-quant.cpp
 +++ b/src/llama-quant.cpp
 @@ -328,6 +328,14 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
@@ -1007,8 +968,6 @@ index 0000000..38291ee
 +
 +    build_output(cur, blocks);
 +}
-diff --git a/src/models/models.h b/src/models/models.h
-index 85e65b1..d6dd88f 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -2280,6 +2280,60 @@ struct llama_model_falcon_h1 : public llama_model_base {
@@ -1072,6 +1031,3 @@ index 85e65b1..d6dd88f 100644
  
  struct llama_model_lfm2 : public llama_model_base {
      llama_model_lfm2(const struct llama_model_params & params) : llama_model_base(params) {}
--- 
-2.47.3
-

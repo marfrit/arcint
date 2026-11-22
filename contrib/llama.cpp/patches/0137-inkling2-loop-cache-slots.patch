@@ -1,24 +1,5 @@
-From b952d0007c82a04c9ae93f59bb416130ae76c169 Mon Sep 17 00:00:00 2001
-From: Moe <moe@halzen.invalid>
-Date: Sun, 22 Nov 2026 02:20:33 +0100
-Subject: [PATCH 5/7] inkling2_loop: repeat the core layers through cache slots
+0137: add the inkling2_loop arch, its loop kv and tensor names and the cache-slot expansion, and the graph that repeats the core block loop.count times with the previous pass's block bank.
 
-The Mini keeps 24 physical layers in the file and runs the core 3 times.
-Each pass owns its KV rows and its conv state.
----
- src/llama-arch.cpp           |  50 ++++++++++++++++
- src/llama-arch.h             |  19 ++++++
- src/llama-context.cpp        |   3 +-
- src/llama-model.cpp          |   5 +-
- src/llama-model.h            |   2 +
- src/llama-quant.cpp          |   5 +-
- src/models/inkling2-loop.cpp | 113 +++++++++++++++++++++++++++++++++++
- src/models/models.h          |  30 ++++++++++
- 8 files changed, 223 insertions(+), 4 deletions(-)
- create mode 100644 src/models/inkling2-loop.cpp
-
-diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 36f048d..0dcec14 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -166,6 +166,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -134,8 +115,6 @@ index 36f048d..0dcec14 100644
          case LLM_ARCH_OLMO2:
          case LLM_ARCH_OLMOE:
          case LLM_ARCH_DEEPSEEK2:
-diff --git a/src/llama-arch.h b/src/llama-arch.h
-index 6f7ad00..75e38da 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
 @@ -171,6 +171,7 @@ enum llm_arch {
@@ -178,8 +157,6 @@ index 6f7ad00..75e38da 100644
      LLM_TENSOR_ATTN_Q_NORM,
      LLM_TENSOR_ATTN_K_NORM,
      LLM_TENSOR_LAYER_OUT_NORM,
-diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index e5d2179..563eee7 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -3638,7 +3638,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
@@ -192,8 +169,6 @@ index e5d2179..563eee7 100644
          res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
      } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
          // DFlash2's convolutions and selector are shape work rather than matmuls,
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 0424872..10d17e4 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -307,6 +307,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
@@ -222,8 +197,6 @@ index 0424872..10d17e4 100644
              return LLAMA_ROPE_TYPE_NONE;
  
          // the pairs of head values are offset by n_rot/2
-diff --git a/src/llama-model.h b/src/llama-model.h
-index bfa22c4..e3251be 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -924,6 +924,8 @@ struct llama_model {
@@ -235,8 +208,6 @@ index bfa22c4..e3251be 100644
      virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
  
  protected:
-diff --git a/src/llama-quant.cpp b/src/llama-quant.cpp
-index deb0fbe..d2ca875 100644
 --- a/src/llama-quant.cpp
 +++ b/src/llama-quant.cpp
 @@ -328,12 +328,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
@@ -374,8 +345,6 @@ index 0000000..0de66ba
 +    }
 +    build_output(cur, blocks);
 +}
-diff --git a/src/models/models.h b/src/models/models.h
-index d6dd88f..0830b5b 100644
 --- a/src/models/models.h
 +++ b/src/models/models.h
 @@ -2335,6 +2335,36 @@ struct llama_model_inkling2 : public llama_model_base {
@@ -415,6 +384,3 @@ index d6dd88f..0830b5b 100644
  struct llama_model_lfm2 : public llama_model_base {
      llama_model_lfm2(const struct llama_model_params & params) : llama_model_base(params) {}
      void load_arch_hparams(llama_model_loader & ml) override;
--- 
-2.47.3
-

@@ -1,19 +1,5 @@
-From e9e521c2f1e668276c9d8c657fe2085649292118 Mon Sep 17 00:00:00 2001
-From: Moe <moe@halzen.invalid>
-Date: Sun, 22 Nov 2026 01:41:53 +0100
-Subject: [PATCH 1/7] inkling2: add arch, kv/tensor names and hparams
+0133: add the inkling2 arch, its kv and tensor names, the relative-position, qk-clip, log-scale, unpadded-vocabulary and conv-state hparams, and the inkling2 tokenizer pre (text only).
 
----
- src/llama-arch.cpp    | 32 ++++++++++++++++++++++++++++++++
- src/llama-arch.h      | 25 +++++++++++++++++++++++++
- src/llama-hparams.cpp |  5 +++++
- src/llama-hparams.h   | 13 +++++++++++++
- src/llama-model.h     | 19 +++++++++++++++++++
- src/llama-vocab.cpp   |  5 +++++
- 6 files changed, 99 insertions(+)
-
-diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index f6d8342..36f048d 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -165,6 +165,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -132,8 +118,6 @@ index f6d8342..36f048d 100644
          case LLM_ARCH_OLMO2:
          case LLM_ARCH_OLMOE:
          case LLM_ARCH_DEEPSEEK2:
-diff --git a/src/llama-arch.h b/src/llama-arch.h
-index 84d19c3..6f7ad00 100644
 --- a/src/llama-arch.h
 +++ b/src/llama-arch.h
 @@ -170,6 +170,7 @@ enum llm_arch {
@@ -203,8 +187,6 @@ index 84d19c3..6f7ad00 100644
      LLM_TENSOR_ATTN_Q_NORM,
      LLM_TENSOR_ATTN_K_NORM,
      LLM_TENSOR_LAYER_OUT_NORM,
-diff --git a/src/llama-hparams.cpp b/src/llama-hparams.cpp
-index b83f45b..9dd6f60 100644
 --- a/src/llama-hparams.cpp
 +++ b/src/llama-hparams.cpp
 @@ -211,6 +211,11 @@ uint32_t llama_hparams::n_embd_r() const {
@@ -219,8 +201,6 @@ index b83f45b..9dd6f60 100644
      if (n_shortconv_l_cache != 0) {
          // for LFM2 models
          return n_embd * (n_shortconv_l_cache - 1);
-diff --git a/src/llama-hparams.h b/src/llama-hparams.h
-index 922164a..d8b3e0a 100644
 --- a/src/llama-hparams.h
 +++ b/src/llama-hparams.h
 @@ -104,6 +104,7 @@ struct llama_hparams {
@@ -257,8 +237,6 @@ index 922164a..d8b3e0a 100644
      bool ssm_dt_b_c_rms = false;
  
      float f_clamp_kqv      = 0.0f;
-diff --git a/src/llama-model.h b/src/llama-model.h
-index bb4b002..bfa22c4 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
 @@ -615,6 +615,24 @@ struct llama_layer {
@@ -294,8 +272,6 @@ index bb4b002..bfa22c4 100644
      struct ggml_tensor * output_norm_b   = nullptr;
      struct ggml_tensor * output          = nullptr;
      struct ggml_tensor * output_b        = nullptr;
-diff --git a/src/llama-vocab.cpp b/src/llama-vocab.cpp
-index 9b5cc2e..04451d2 100644
 --- a/src/llama-vocab.cpp
 +++ b/src/llama-vocab.cpp
 @@ -2475,6 +2475,11 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
@@ -310,6 +286,3 @@ index 9b5cc2e..04451d2 100644
              } else if (
                  tokenizer_pre == "granite-embed-multi-97m") {
                  pre_type = LLAMA_VOCAB_PRE_TYPE_GRANITE_EMB_MULTI;
--- 
-2.47.3
-
