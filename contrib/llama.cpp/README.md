@@ -8749,3 +8749,36 @@ test-backend-ops `-o SIGMOID`: the two strided f32 cases (`v=1`, [128,2,2,2] and
 "not supported" before, pass; the red case (`exp(+x)` in the new kernel) fails exactly those two
 (ERR 2.05 and 1.94). The contiguous bf16 [128,2,2,2] case is borderline at the test's 1e-7 NMSE
 threshold with random inputs in both builds: 6 of 50 runs fail on 0148, 2 of 50 on 0149.
+
+## 0150-ggml-glu-situ-fused.patch
+
+Inkling 2 Mini's expert activation (SITU) ran as a chain of nine small ops per MoE visit on the
+gate and up halves of the merged gate_up result, two strided views: scale(gate, 1/beta), tanh,
+scale(beta), sigmoid(gate), mul, then the up branch scale(up, 1/lb), tanh, scale(lb) and the
+final mul. 48 visits a decode token.
+
+The patch adds a GLU variant: `GGML_GLU_OP_SITU` with op params beta and linear_beta (the way
+`GGML_GLU_OP_SWIGLU_OAI` carries alpha and limit), `ggml_situ` and `ggml_situ_split`, and
+`build_moe_ffn` runs `LLM_FFN_SITU` as that one op on the gate and up views.
+
+The CPU implementation is the reference and keeps the chain's formula and order:
+`beta*tanh(gate*(1/beta)) * (1/(1+exp(-gate))) * (linear_beta > 0 ? linear_beta*tanh(up*(1/linear_beta)) : up)`.
+`kernel_situ_f32` in `glu.cl` takes both halves by their strides, so the merged gate_up tensor
+and the split two-tensor form share it; f32 only, and `supports_op` admits exactly that case.
+
+`measured-here`, CPU tree (`test-export-graph-ops` at `-c 2048`) and the CPU KL gate on the
+IQ4_NL file, base 547c468 vs this patch:
+
+| | base | patch |
+|---|---|---|
+| decode graph nodes (`tg`) | 11,243 | 10,859 |
+| prefill graph nodes (`pp`) | 11,363 | 10,979 |
+| mean KL vs the base logits, same top | - | 0.000000, 99.967 % |
+
+The unmeasured card expectation is 8 kernel launches fewer per MoE visit, 384 a decode token,
+against about 6,778 before.
+
+test-backend-ops `-o SITU` (correctness, merged and split, [2304,8,1,1], [2304,512,1,1], an odd
+small shape, plus the split [1152,...] forms): six cases, pass on the CPU. On a card the same
+six compare the OpenCL kernel against the CPU reference. The KL red case, dropping the sigmoid
+in the CPU op, gives mean KL 1.787650 and same top 56.044 %.
