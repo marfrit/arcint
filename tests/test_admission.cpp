@@ -15,6 +15,8 @@ ModelGeometry mistral24b() { return {40, 5120, 32, 8, 128, 131072}; }
 ModelGeometry llama2_7b() { return {32, 4096, 32, 32, 0, 32000}; }
 // Dory1.0-4B: the PHYSICAL block count (72), not the 112 or 192 libllama executes at 2 or 4 loops
 ModelGeometry dory_4b() { return {72, 2560, 16, 4, 256, 131072}; }
+// Inkling 2 Mini: the PHYSICAL block count (24), not the cache slots its three loop passes execute
+ModelGeometry inkling2_mini() { return {24, 2304, 24, 8, 128, 200058}; }
 
 }  // namespace
 
@@ -79,6 +81,27 @@ TEST(admission_dory_refuses_every_near_miss_and_the_executed_layer_counts) {
         g.n_layer = executed;
         CHECK(admit_model("dory", g, false) == AdmittedModel::None);
     }
+}
+
+TEST(admission_inkling2_mini_at_its_physical_geometry) {
+    CHECK(admit_model("inkling2_loop", inkling2_mini(), false) == AdmittedModel::Inkling2Mini);
+    CHECK(dialect_of(AdmittedModel::Inkling2Mini) == ChatDialect::Inkling);
+}
+
+TEST(admission_inkling2_refuses_every_near_miss_and_the_executed_layer_count) {
+    for (int field = 0; field < 6; ++field) {
+        ModelGeometry g = inkling2_mini();
+        switch (field) {
+            case 0: g.n_layer = 48; break;      // the executed visits (6 + 12 x 3 + 6), not the blocks
+            case 1: g.n_embd = 2048; break;
+            case 2: g.n_head = 16; break;
+            case 3: g.n_head_kv = 4; break;
+            case 4: g.head_dim = 64; break;
+            default: g.n_vocab = 201024; break;   // the padded embedding rows
+        }
+        CHECK(admit_model("inkling2_loop", g, false) == AdmittedModel::None);
+    }
+    CHECK(admit_model("inkling2", inkling2_mini(), false) == AdmittedModel::None);   // the loop-less arch
 }
 
 TEST(admission_a_geometry_is_not_admitted_under_another_architecture) {
@@ -152,6 +175,7 @@ TEST(admission_refusal_names_the_admitted_sizes) {
     CHECK(msg.find("Llama 2 7B") != std::string::npos);
     CHECK(msg.find("Dory1.0-4B") != std::string::npos);
     CHECK(msg.find("72 blocks") != std::string::npos);
+    CHECK(msg.find("Inkling 2 Mini") != std::string::npos);
 }
 
 TEST(checkpoints_the_flag_is_refused_where_nothing_can_be_snapshotted) {

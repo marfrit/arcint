@@ -31,6 +31,7 @@ enum class AdmittedModel {
     Gemma4E4B,        // 'gemma4', 42 x 2560, 8/2 heads, key length 512
     Granite8B,        // 'granite', see admission.cpp
     Dory1_0_4B,       // 'dory', 72 physical blocks x 2560, 16/4 heads, key length 256 (core/dory.h)
+    Inkling2Mini,     // 'inkling2_loop', 24 physical blocks x 2304, 24/8 heads, key length 128
     Qwen3Tts,         // only under --tts
 };
 

@@ -787,7 +787,8 @@ public:
         // a looped model's llama_model_n_layer is the executed count (112 at 2 loops, 192 at 4):
         // admission matches the physical blocks, the file's block_count (contrib/llama.cpp 0108)
 #ifdef ARCINT_LLAMA_DORY
-        geometry.n_layer   = a == "dory" ? llama_model_n_layer_physical(model_) : llama_model_n_layer(model_);
+        geometry.n_layer   = (a == "dory" || a == "inkling2_loop") ? llama_model_n_layer_physical(model_)
+                                                                 : llama_model_n_layer(model_);
 #else
         geometry.n_layer   = llama_model_n_layer(model_);
 #endif
