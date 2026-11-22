@@ -8519,3 +8519,27 @@ the saver (the file holds 24 layers and the load expands them to 48 cache slots)
 
 Gate: `test-llama-archs` all pass. Red case on the same base logits: 2 loop passes instead
 of 3 gives mean KL 0.498889 nats, maximum 11.487644, same top p 76.279 %.
+
+## 0145-opencl-scale-view-log-arange.patch
+
+The looped model's graph on the OpenCL backend, at decode and at a 512-token prefill: 4,062 view
+nodes skipped, 11,826 nodes, 150 unique op shapes on the prefill and 144 on the decode, 27 op
+types. Every type is accepted by the pin's `ggml_opencl_supports_op` except three: SCALE on a
+row-contiguous view (the merged gate_up half that situ() scales, per MoE layer visit), LOG (the
+log-scaled positions, one node a graph) and ARANGE (the short-conv store's rollback slot order,
+only with recurrent rollback). This patch adds them: a stride-addressed `kernel_scale_f32_nc`
+(supports_op now takes `ggml_is_contiguous_rows`, the kernels picked by `ggml_is_contiguous`),
+`kernel_log_f32`/`_4` and `kernel_arange_f32`, each with its own creation and dispatch.
+
+The rest stays as the pin had it. Named slow paths: FLASH_ATTN_EXT with sinks (the model passes
+a zero sink logit for the depth bias's +exp(0) denominator) skips Intel's DPAS prefill kernels,
+whose condition refuses sinks, and takes the f32/f16 prompt kernels that support per-head f16
+masks and sinks - correct, slower. The per-head mask's mask_ne2 is read by the kernels. IQ4_NL
+and Q8_0 MUL_MAT_ID go through the K-quant q8_1 id path (IQ4_NL k-unit 32, weights contiguous);
+a device that refuses those id kernels declines every expert product to the CPU, so the card
+scan must show no `op=MUL_MAT_ID ... kernels-missing` DOWNGRADE. SOFT_MAX over the mix's 2-5
+keys is a width below the Intel kernel's required sub-group; three test cases now cover it.
+
+Gate on the card: `test-export-graph-ops` writes the graph's 294 unique op shapes, and
+`test-backend-ops -b OpenCL --test-file` replays them against the CPU reference; the SCALE view,
+LOG, ARANGE and small SOFT_MAX cases are in the suite directly. No FA kernel is touched.

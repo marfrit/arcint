@@ -1,0 +1,312 @@
+0145: OpenCL takes SCALE on a row-contiguous view through a stride-addressed kernel and gains LOG and ARANGE kernels, so the merged gate_up half, the log-scaled positions and the short-conv rollback slot order stay on the device; test-backend-ops gets 2-5-wide SOFT_MAX cases.
+
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -288,6 +288,7 @@ set(GGML_OPENCL_KERNELS
+     repeat
+     mul_mat_f16_f32
+     mul_mm_f16_f32_kq_kqv
++    arange
+     conv2d
+     conv2d_f16_f32
+     conv3d
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1055,7 +1055,9 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_sub, kernel_sub_row, kernel_sub_f16, kernel_sub_row_f16;
+     cl_kernel kernel_add_id;
+     cl_kernel kernel_add_id_add_id_swiglu_oai;
+-    cl_kernel kernel_scale_f32, kernel_scale_f32_4;
++    cl_kernel kernel_scale_f32, kernel_scale_f32_4, kernel_scale_f32_nc;
++    cl_kernel kernel_log_f32, kernel_log_f32_4;            // 0146
++    cl_kernel kernel_arange_f32 = nullptr;                 // 0147
+     cl_kernel kernel_sqr_cont_f32, kernel_sqr_cont_f32_4, kernel_sqr_cont_f16, kernel_sqr_cont_f16_4;
+     cl_kernel kernel_sqrt_cont_f32, kernel_sqrt_cont_f32_4, kernel_sqrt_cont_f16, kernel_sqrt_cont_f16_4;
+     cl_kernel kernel_mean_f32, kernel_mean_f32_4;
+@@ -4360,8 +4362,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         cl_program prog =
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+ 
+-        CL_CHECK((backend_ctx->kernel_scale_f32   = clCreateKernel(prog, "kernel_scale_f32", &err), err));
+-        CL_CHECK((backend_ctx->kernel_scale_f32_4 = clCreateKernel(prog, "kernel_scale_f32_4", &err), err));
++        CL_CHECK((backend_ctx->kernel_scale_f32    = clCreateKernel(prog, "kernel_scale_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_scale_f32_4  = clCreateKernel(prog, "kernel_scale_f32_4", &err), err));
++        CL_CHECK((backend_ctx->kernel_scale_f32_nc = clCreateKernel(prog, "kernel_scale_f32_nc", &err), err));
++        CL_CHECK(clReleaseProgram(prog));
++        GGML_LOG_CONT(".");
++    }
++
++    // arange (0147)
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "arange.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("arange.cl");
++#endif
++        cl_program prog =
++            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++        CL_CHECK((backend_ctx->kernel_arange_f32 = clCreateKernel(prog, "kernel_arange_f32", &err), err));
+         CL_CHECK(clReleaseProgram(prog));
+         GGML_LOG_CONT(".");
+     }
+@@ -4791,6 +4810,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         CL_UNARY_EXT_K(round)
+         CL_UNARY_EXT_K(trunc)
+ #undef CL_UNARY_EXT_K
++        CL_CHECK((backend_ctx->kernel_log_f32   = clCreateKernel(prog, "kernel_log_f32",   &err), err));
++        CL_CHECK((backend_ctx->kernel_log_f32_4 = clCreateKernel(prog, "kernel_log_f32_4", &err), err));
+         CL_CHECK(clReleaseProgram(prog));
+         GGML_LOG_CONT(".");
+     }
+@@ -12837,7 +12858,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                     op->type == op->src[1]->type;
+         }
+         case GGML_OP_SCALE:
+-            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
++            // 0145: a row-contiguous view (the merged gate_up path's one half) takes
++            // the stride-addressed kernel; the dense one keeps the vec4 kernels
++            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
++                   ggml_is_contiguous_rows(op);
+         case GGML_OP_ADD:
+             if (op->type == GGML_TYPE_F16) {
+                 const bool src0_ok = op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32;
+@@ -12854,6 +12878,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                    (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+         case GGML_OP_ADD_ID:
+             return op->src[0]->type == GGML_TYPE_F32;
++        case GGML_OP_LOG:
++            // 0146: natural log, f32, the log-scaled positions' single node
++            return op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]);
++        case GGML_OP_ARANGE:
++            // 0147: a 1-D f32 ramp (the short-conv store's rollback slot order)
++            return op->type == GGML_TYPE_F32 && ggml_is_contiguous(op);
+         case GGML_OP_SQR:
+         case GGML_OP_SQRT:
+             return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+@@ -20296,6 +20326,76 @@ static void ggml_cl_sqrt(ggml_backend_t backend, const ggml_tensor * src0, const
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++static void ggml_cl_arange(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++    UNUSED(src0);
++    UNUSED(src1);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    float start = 0.0f, stop = 0.0f, step = 0.0f;
++    memcpy(&start, (const float *) dst->op_params + 0, sizeof(float));
++    memcpy(&stop,  (const float *) dst->op_params + 1, sizeof(float));
++    memcpy(&step,  (const float *) dst->op_params + 2, sizeof(float));
++    GGML_UNUSED(stop);
++
++    const int n = (int) ggml_nelements(dst);
++
++    cl_kernel kernel = backend_ctx->kernel_arange_f32;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(float),    &start));
++    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(float),    &step));
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &n));
++
++    size_t global_work_size[] = {(size_t)n, 1, 1};
++    size_t local_work_size[]  = {64, 1, 1};
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
++static void ggml_cl_log(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++    UNUSED(src1);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    cl_kernel kernel;
++
++    int n = ggml_nelements(dst);
++    if (n % 4 == 0) {
++        kernel = backend_ctx->kernel_log_f32_4;
++        n /= 4;
++    } else {
++        kernel = backend_ctx->kernel_log_f32;
++    }
++
++    CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel, 2, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 3, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, 4, sizeof(int),      &n));
++
++    size_t global_work_size[] = {(size_t)n, 1, 1};
++    size_t local_work_size[]  = {64, 1, 1};
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
+ static void ggml_cl_mean(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -38892,7 +38992,8 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
+     GGML_ASSERT(dst->extra);
+     GGML_UNUSED(src1);
+ 
+-    GGML_ASSERT(ggml_is_contiguous(src0));
++    GGML_ASSERT(ggml_is_contiguous_rows(src0));
++    GGML_ASSERT(ggml_is_contiguous_rows(dst));
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
+@@ -38909,6 +39010,39 @@ static void ggml_cl_scale(ggml_backend_t backend, const ggml_tensor * src0, cons
+ 
+     cl_kernel kernel;
+ 
++    if (!ggml_is_contiguous(src0)) {
++        // 0145: a view that is not contiguous, e.g. one half of the merged gate_up
++        // matmul result: walk the rows with their own strides on both sides
++        kernel = backend_ctx->kernel_scale_f32_nc;
++
++        const int     ne00 = src0->ne[0], ne01 = src0->ne[1], ne02 = src0->ne[2], ne03 = src0->ne[3];
++        const cl_ulong nb00 = src0->nb[0], nb01 = src0->nb[1], nb02 = src0->nb[2], nb03 = src0->nb[3];
++        const cl_ulong nb0 = dst->nb[0], nb1 = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
++
++        CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
++        CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
++        CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &offsetd));
++        CL_CHECK(clSetKernelArg(kernel,  4, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &nb00));
++        CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &nb01));
++        CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb02));
++        CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nb03));
++        CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nb0));
++        CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &nb1));
++        CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb2));
++        CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb3));
++        CL_CHECK(clSetKernelArg(kernel, 13, sizeof(float),    &scale));
++        CL_CHECK(clSetKernelArg(kernel, 14, sizeof(float),    &bias));
++
++        const int nth = 64;
++        size_t global_work_size[] = {(size_t)ne01*nth, (size_t)ne02, (size_t)ne03};
++        size_t local_work_size[]  = {(size_t)nth, 1, 1};
++
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++        return;
++    }
++
+     int n = ggml_nelements(dst);
+ 
+     if (n % 4 == 0) {
+@@ -40739,6 +40873,18 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_sqrt;
+             break;
++        case GGML_OP_LOG:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_log;
++            break;
++        case GGML_OP_ARANGE:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_arange;
++            break;
+         case GGML_OP_MEAN:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/arange.cl b/ggml/src/ggml-opencl/kernels/arange.cl
+new file mode 100644
+index 0000000..aae30ba
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/arange.cl
+@@ -0,0 +1,8 @@
++// 0147: GGML_OP_ARANGE, the rollback slot order of the short-conv state store
++kernel void kernel_arange_f32(
++        global float * dst, ulong offsetd,
++        float start, float step, int n) {
++    if ((int) get_global_id(0) >= n) { return; }
++    dst = (global float*)((global char*)dst + offsetd);
++    dst[get_global_id(0)] = start + step * (float) get_global_id(0);
++}
+--- a/ggml/src/ggml-opencl/kernels/scale.cl
++++ b/ggml/src/ggml-opencl/kernels/scale.cl
+@@ -37,3 +37,21 @@ kernel void kernel_scale_f32_4(
+     dst = (global float4*)((global char*)dst + offsetd);
+     dst[get_global_id(0)] = src0[get_global_id(0)] * scale + bias;
+ }
++
++// stride-addressed scale for a row-contiguous but not contiguous input (a view):
++// the same walk as unary_ext's _nc kernels, with the scale and bias
++kernel void kernel_scale_f32_nc(
++        global const char * src0, ulong offset0,
++        global       char * dst,  ulong offsetd,
++        int ne00, ulong nb00, ulong nb01, ulong nb02, ulong nb03,
++        ulong nb0, ulong nb1, ulong nb2, ulong nb3,
++        float scale, float bias) {
++    src0 = src0 + offset0; dst = dst + offsetd;
++    const int i3 = get_group_id(2);
++    const int i2 = get_group_id(1);
++    const int i1 = get_group_id(0);
++    for (int i0 = get_local_id(0); i0 < ne00; i0 += get_local_size(0)) {
++        float x = *(global const float *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
++        *(global float *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = x * scale + bias;
++    }
++}
+--- a/ggml/src/ggml-opencl/kernels/unary_ext.cl
++++ b/ggml/src/ggml-opencl/kernels/unary_ext.cl
+@@ -87,3 +87,23 @@ UNARY_EXT(floor,        floor(x),                                          floor
+ UNARY_EXT(ceil,         ceil(x),                                           ceil(x))
+ UNARY_EXT(round,        round(x),                                          round(x))
+ UNARY_EXT(trunc,        trunc(x),                                          trunc(x))
++
++// 0146: GGML_OP_LOG (natural log) for the log-scaled positions of the model
++kernel void kernel_log_f32(
++        global const float * src0, ulong offset0,
++        global       float * dst,  ulong offsetd, int n) {
++    if ((int) get_global_id(0) >= n) { return; }
++    src0 = (global float*)((global char*)src0 + offset0);
++    dst  = (global float*)((global char*)dst  + offsetd);
++    dst[get_global_id(0)] = log(src0[get_global_id(0)]);
++}
++
++kernel void kernel_log_f32_4(
++        global const float4 * src0, ulong offset0,
++        global       float4 * dst,  ulong offsetd, int n) {
++    if ((int) get_global_id(0) >= n) { return; }
++    src0 = (global float4*)((global char*)src0 + offset0);
++    dst  = (global float4*)((global char*)dst  + offsetd);
++    float4 x = src0[get_global_id(0)];
++    dst[get_global_id(0)] = (float4)(log(x.x), log(x.y), log(x.z), log(x.w));
++}
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -14183,6 +14183,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         }
+     }
+ 
++    // 0145: the depth-attention mix of the looped model: softmax over 2 to 5 keys,
++    // a width below the Intel kernel's required sub-group
++    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {2, 1, 24, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
++    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {3, 1, 24, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
++    test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {5, 3, 24, 1}, false, false, GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
++
+     for (int col : {8192, 16384, 32768, 65536, 131072, 262144, 524288}) {
+         for (int rows : {1, 4, 16}){
+             test_cases.emplace_back(new test_soft_max(GGML_TYPE_F32, {col, rows, 1, 1}, false,  false,  GGML_TYPE_F32, {1, 1}, 1.0f, 0.0f));
