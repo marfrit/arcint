@@ -66,7 +66,7 @@ its design and record are at the tag
 
 ## arcint measured the llama-bench way
 
-The A770 rows in this section and the next are historical (hardware sold,
+The A770 rows in this section and the next are historical (card retired,
 last measured with release 1.7.0); the B60 rows are current.
 
 llama.cpp's community GPU tables ([Vulkan](https://github.com/ggml-org/llama.cpp/discussions/10879),
@@ -77,7 +77,7 @@ gives arcint the same run, and it refuses a file with another sha256.
 
 | Card | Engine | Flash attention | pp512 t/s | tg128 t/s |
 |---|---|---|---|---|
-| Arc A770 16 GB (sold, 1.7.0) | **arcint's series, llama-bench** | on | **2816.12 ± 2.12** | **70.60 ± 0.03** |
+| Arc A770 16 GB (retired, 1.7.0) | **arcint's series, llama-bench** | on | **2816.12 ± 2.12** | **70.60 ± 0.03** |
 | | **arcint, served** | on | **2611.39 ± 1.09** | **70.45 ± 0.03** |
 | | SYCL fp16, here | on | 1457.24 ± 4.00 | 73.66 ± 0.02 |
 | | SYCL fp16, here | off | 1876.79 ± 10.29 | 68.72 ± 0.02 |
@@ -122,13 +122,13 @@ small depth: one sub-group walked 128 keys a split at any depth, and patch 0097 
 
 | Card | pp512 start -> 0096 | tg128 start -> 0096 -> 0097 |
 |---|---|---|
-| Arc A770 (sold, 1.7.0) | 362.73 -> 1956.15 (5.4x) | 39.48 -> 63.56 -> 70.22 (+78 %) |
+| Arc A770 (retired, 1.7.0) | 362.73 -> 1956.15 (5.4x) | 39.48 -> 63.56 -> 70.22 (+78 %) |
 | Arc Pro B60 | 425.57 -> 2332.94 (5.5x) | 76.24 -> 75.77 -> 80.70 (+6 %) |
 
 0097 reaches served models too: the production KV (q8_0:q4_0) on Llama 2 goes 54.89 -> 66.06 on the A770 (historical) and 68.63 -> 78.87 on the B60, and the coder's numbers are under "Numbers by release".
 The answers held: on both cards the mean KL against a CPU reference over 16 x 512 tokens is 0.00043 nats with each patch on and off, and all 8 fact questions come back right in every arm.
 
-**The coder's own file on the A770** (historical, the card is sold; `measured-here`, llama-bench shape, f16 KV, MTP off, 3 repetitions, before 0097; flash attention on, off in brackets):
+**The coder's own file on the A770** (historical, the card is retired; `measured-here`, llama-bench shape, f16 KV, MTP off, 3 repetitions, before 0097; flash attention on, off in brackets):
 
 | Engine | pp512 t/s | tg128 t/s |
 |---|---|---|
@@ -225,7 +225,7 @@ needed in the whole round. The same set without the door needed the slap 4
 times.
 
 **How it was tested** (`measured-here`, October 2026). The coder (Qwen3.6-27B-A3B,
-then on the A770, now sold) was given 30 competitive-programming tasks published after its
+then on the A770, now retired) was given 30 competitive-programming tasks published after its
 training cutoff, AtCoder Beginner Contest 475 to 480, problems A to E. Each
 answer was compiled and judged in a sandbox without network against an
 independent reference solution plus brute-force and generated tests. The
@@ -278,7 +278,7 @@ request; llama.cpp's issue for a line-based detector went stale.
 | service | model | served file | card | context |
 |---|---|---|---|---|
 | agent | Qwen3.8-27B (`qwen35`, dense, 64 layers, MTP layer) | Q4_K_M GGUF | Arc Pro B60 | 245,760 tokens, q8_0:q4_0 KV, MTP 5 |
-| coder (historical) | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770, sold; last run with 1.7.0 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
+| coder (historical) | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770, retired; last run with 1.7.0 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
 | Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_S GGUF since 2026-10-20 (IQ3_XXS and IQ2_XS as the faster options) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
 | Inkling | Inkling 2 Mini (26.4B total / 3.4B active MoE) | IQ4_NL GGUF from ggml-org's conversion | Arc Pro B60 | see "Inkling 2 Mini" below |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
@@ -334,7 +334,7 @@ ignores `enable_thinking`.
 
 ## Numbers by release
 
-The A770 and coder figures below are historical (hardware sold, last measured with 1.7.0 or earlier); the B60 figures were measured on the B60.
+The A770 and coder figures below are historical (card retired, last measured with 1.7.0 or earlier); the B60 figures were measured on the B60.
 
 Patch 0097 against the deployed build (2026-11-05, `measured-here`, one window): the coder (A770, historical) on its deployed flags, MTP on, 12 answers a run, 74.65 -> 82.78 t/s (+10.9 %), a verify step
 26.2 -> 24.1 ms, draft acceptance 72.9 -> 71.9 %; the release A/B's decode 53.70 / 51.50 / 47.40 -> 58.70 / 59.65 / 55.90; the task at 10/10 three times. The agent is equal, 47.71 -> 47.76 t/s, because its verify rows take another
@@ -384,7 +384,7 @@ point per case, at temperature 0.
 | service | card | prefill | decode | answers |
 |---|---|---|---|---|
 | agent | B60 | 708.7 t/s at 54,895 tokens, 498.5 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm at 212,992 ctx) | the needle at 138k; task 10/10 |
-| coder | A770 (sold, historical) | 724.3 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
+| coder | A770 (retired, historical) | 724.3 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
 | Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 617.2 t/s at 20,045 tokens (asked right after the capital) | 35.2-35.4 t/s | the needle |
 | images, Z-Image Turbo | B60 | | 1024x1024, 8 steps: 2.14 s a step, the VAE 6.12 s, ~23.4 s a request (1.1.1-1 package, 2026-10-23); was 6.3 s / ~23.5 s on 2026-10-18; 512x512: 0.48 s a step | the image gate against a CPU reference: 42.6 dB |
 | Flash-Next, IQ2_XS option | B60 + 20.3 GiB host bank | 665.6 t/s, the same protocol | 42.3 t/s | the needle |
@@ -597,11 +597,12 @@ service's production flags, Flash-Next's expert cache included
 ## Scope
 
 - **Models**: the table above. Other architectures are refused at load.
-- **Cards**: the Intel Arc Pro B60 (24 GB, Xe2), under the xe kernel driver.
+- **Cards**: the Intel Arc Pro B70 (32 GB, Xe2, BMG-G31) and B60 (24 GB, Xe2, BMG-G21), under the xe
+  kernel driver; `--device B70` / `--device B60` pick a card by name.
   One card per process, or two by layers for one model
   (`--llama-layer-split`, DESIGN §3.10). The Arc A770 (16 GiB, Xe-HPG,
-  Alchemist) is **Hardware Sold**: it was gated through 1.7.0, the card is
-  no longer available to the project, and nothing runs on it. Its paths
+  Alchemist) is **retired** (hardware no longer available): it was gated through 1.7.0, and nothing
+  runs on it now. Its paths
   stay in the series untested; its numbers are historical, last measured
   with 1.7.0 ([docs/a770-reference.md](docs/a770-reference.md)).
 - **Images**: text-to-image and editing through `arcint-imggen` (sd.cpp's
