@@ -103,6 +103,14 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   20.1 / 18.4 t/s at depth 0 / 4,096 / 32,768 (FA off 174.0 / 144.4 / 97.1 and 23.6 / 21.4 / 19.5), against Vulkan's
   33.3 / 32.3 / 30.1 and 8.3 / 10.1 / 10.2: prompt 5.2x / 4.3x / 3.5x, decode 2.8x / 2.0x / 1.8x. The graph still
   folds the bias into the dense mask (the wiring onto the indexed op, 0146, is open).
+- **The bias through the indexed FA op** (0146, the full stack aa9eb32d = the pin + 113 patches, 2026-11-22 07:35):
+  CPU gate both arms (indexed, and the dense fold with the op forced declined) mean KL 0 against mainline, same top
+  99.967 %; red (the table read dropped in the CPU reference) 4.01 nats on the indexed arm only. On the B60: KL
+  against the CPU base 0.00199, same top 98.53 % (the dense fold: 0.00197 / 98.50 %); llama-bench pp512 183.9 /
+  177.5 / 164.1 and tg128 24.0 / 22.6 / 20.8 t/s at depth 0 / 4,096 / 32,768 (+54 % prompt and +13 % decode at
+  32k over the dense fold; against the Vulkan arm 5.5x prompt, 2.0-2.9x decode). The acceptance task, sampled
+  (temperature 1.0, effort low), interleaved: dense fold 50/60 (one 0: the function declared `local`, the task
+  asks for a global), indexed 60/60; a greedy run had flipped to the same `local` slip, which both builds show.
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
