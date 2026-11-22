@@ -122,6 +122,15 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   The output head (Q8_0, 0.49 GB a token) requantized from BF16: Q6_K mean KL 0.000115, same top 99.19 %, -23 %
   bytes; Q4_K KL 0.00116, same top 98.37 %, -47 % (CPU, against the Q8_0 head's logits): inside the bar, worth
   ~0.25-0.5 ms a token; it goes with the weight-format decision.
+  0148 (the depth-mix states as one stack, a row per block, read by a view): CONCAT 548 -> 288 and REPEAT
+  120 -> 0 per decode graph; card tg128 29.09 -> 29.50 (+1.4 %), KL identical. Profile after it: 25.9 ms device
+  in 6,730 kernels, wall 33.9 ms. The gap was the host (`measured-here`, unitrace: ~6,730 enqueues a token at
+  ~3.6 us host each, 49 blocking reads, ~154 waits), and gdb plus `GGML_SCHED_DEBUG=2` named the cause: SITU's
+  `sigmoid` of the gate half of gate_up (a strided view) was not admitted by OpenCL and ran on the CPU, a graph
+  split per MoE visit (48 a token). Graph rebuild was not it (CPU: 14 of 15 decode graphs reused). 0149 (a
+  strided f32 sigmoid kernel): CPU splits 49 -> 1 a graph; pp512 185.0 -> 417.9 t/s (+126 %) at depth 0 and
+  178.4 -> 387.8 at 4,096; tg128 29.50 -> 34.86 (+18 %) and 27.62 -> 32.25; KL 0.001931 (0148: 0.001986).
+  Inkling decode on the B60 since the start of the speed work: 24.0 -> 34.9 t/s at depth 0, prefill 184 -> 418.
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
