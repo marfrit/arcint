@@ -131,6 +131,11 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   strided f32 sigmoid kernel): CPU splits 49 -> 1 a graph; pp512 185.0 -> 417.9 t/s (+126 %) at depth 0 and
   178.4 -> 387.8 at 4,096; tg128 29.50 -> 34.86 (+18 %) and 27.62 -> 32.25; KL 0.001931 (0148: 0.001986).
   Inkling decode on the B60 since the start of the speed work: 24.0 -> 34.9 t/s at depth 0, prefill 184 -> 418.
+  The same class of gap elsewhere (`measured-here`, `GGML_SCHED_DEBUG=2`, the decode graph of each production model on
+  the full series tree, flash attention on, q8_0:q4_0 KV): the dense 27B, the iwo4 coder file and Dory on the B60
+  have one CPU split, the token embedding; Flash-Next on the B70 with its experts put on the CPU on purpose
+  (`-ot exps=CPU`) has only the expert blocks and the embedding there (the CPU-only lightning indexer is switched
+  off by `resolve_fused_ops`, as intended). arcint's MTP draft graphs were not in this check.
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
