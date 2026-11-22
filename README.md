@@ -319,8 +319,8 @@ generated tokens, measured at a context depth of 0, 4,096 and 32,768 tokens.
 
 | Engine | pp512 t/s at depth 0 / 4,096 / 32,768 | tg128 t/s at depth 0 / 4,096 / 32,768 |
 |---|---|---|
-| arcint 1.8.0 (OpenCL), flash attention on, B60 | 417.9 / 387.8 / 331.3 | 34.9 / 32.3 / 28.8 |
-| arcint 1.8.0 (OpenCL), flash attention on, B70 (220 W cap) | 658.2 / 627.2 / 550.6 | 40.1 / 39.2 / 37.5 |
+| arcint 1.8.0 (OpenCL), flash attention on, B60 | 429.1 / 397.4 / 337.5 | 36.6 / 33.7 / 29.9 |
+| arcint 1.8.0 before 0150 (OpenCL), flash attention on, B70 (220 W cap) | 658.2 / 627.2 / 550.6 | 40.1 / 39.2 / 37.5 |
 | arcint at first light (the port and the flash-attention bias, before the speed work) | 183.9 / 177.5 / 164.1 | 24.0 / 22.6 / 20.8 |
 | mainline llama.cpp, Vulkan backend, same tool and card | 33.3 / 32.3 / 30.1 | 8.3 / 10.1 / 10.2 |
 
@@ -328,11 +328,14 @@ The B70 gives the same answers (mean KL against the CPU reference identical to t
 acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 15-30 % on generation:
 Inkling's decode is bound by the number of small kernel launches more than by memory bandwidth.
 
-Against Vulkan on the B60, arcint is 11-12.5x faster on the prompt and
-2.8-4.2x on generation. The speed work after first light: small copy kernels
+Against Vulkan on the B60, arcint is 11-13x faster on the prompt and
+2.9-4.4x on generation. The speed work after first light: small copy kernels
 for the model's tiny concatenations (0147), the depth mix as one stack (0148),
-and the strided sigmoid (0149) that keeps the expert activation on the card
-instead of one CPU round trip per expert layer.
+the strided sigmoid (0149) that keeps the expert activation on the card
+instead of one CPU round trip per expert layer, and the expert activation as one
+fused op (0150). With q8_0 KV the needle is found at 64,000 and 120,000 tokens
+(the B70 at 131,072 cells); the mean KL against the CPU reference at 32,768
+tokens is 0.006.
 
 Answers: the acceptance task (a Lua CSV parser to RFC 4180, scored by
 executing the candidate code) passes 10/10 at reasoning effort low and at
@@ -635,7 +638,7 @@ service's production flags, Flash-Next's expert cache included
   segfaults in every SYCL program with the distribution's Level Zero loader (`libze1`
   1.20.6), and loader 1.34 fixes it (`measured-here`).
 - **Vulkan** depends on the card. On the A770 (historical) and the B60 it trails SYCL and the series here (the table above, Mesa 25.0.7, and on the B60
-  126 / 7.8 t/s on the dense 27B at 1k against SYCL's 249 / 14.2, 2026-09-07, `measured-here`); a B70 reports 4570.29 / 112.89. On Inkling 2 Mini, arcint is 11-12.5x faster than Vulkan on the prompt and 2.8-4.2x on generation, same card (see "Inkling 2 Mini").
+  126 / 7.8 t/s on the dense 27B at 1k against SYCL's 249 / 14.2, 2026-09-07, `measured-here`); a B70 reports 4570.29 / 112.89. On Inkling 2 Mini, arcint is 11-13x faster than Vulkan on the prompt and 2.9-4.4x on generation, same card (see "Inkling 2 Mini").
 - **OpenVINO**: arcint's first engine (0.1-0.7.12). Its GPU plugin emits good
   Xe code, but the services needed an IR export per model and a GPU-plugin
   patch series on a pinned nightly, and the libllama engine overtook it on
