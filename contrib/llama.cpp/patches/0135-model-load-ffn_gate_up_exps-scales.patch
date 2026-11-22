@@ -1,0 +1,29 @@
+From 8e5bba72ed215a673b9d5c451e23364c87ea8b10 Mon Sep 17 00:00:00 2001
+From: Moe <moe@halzen.invalid>
+Date: Sun, 22 Nov 2026 02:01:29 +0100
+Subject: [PATCH 3/7] model: load ffn_gate_up_exps scales
+
+---
+ src/llama-model.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 629618b..0424872 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1755,6 +1755,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+             }
+             if (!layer.ffn_up_exps_s && layer.ffn_up_exps) {
+                 layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
++                if (layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
++                    throw std::runtime_error(format("ffn_up_exps.scale and ffn_gate_up_exps.weight both exist for layer %d", i));
++                }
++            }
++            if (!layer.ffn_up_exps_s && layer.ffn_gate_up_exps) {
++                layer.ffn_up_exps_s = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "scale", i), {n_expert}, TENSOR_NOT_REQUIRED);
+             }
+ 
+             // recurrent / linear-attention weight scales (per-tensor, shape {1})
+-- 
+2.47.3
+

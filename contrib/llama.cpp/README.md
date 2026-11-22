@@ -8449,3 +8449,65 @@ logged for all three types, none with the switch at 0 (the red case); MUL_MAT 29
 was not run: its id takes the unchanged branch (`code`). The real gap (the fp16 Q5_K and
 Q6_K GEMMs at bandwidth) needs a structural change, an int8 path for those types,
 not a tile.
+
+## 0133-inkling2-arch-and-hparams.patch
+
+Ports the arch, kv and tensor names and the hparams of mainline #32217 (5c008e0), text half
+only: the `inkling2` arch, the relative-position and log-scaling keys, the short-conv and
+block-residual hparams, `vocab_size_unpadded`, the recurrent conv state width, and the
+`inkling2` tokenizer pre. Vision/mmproj, conversion and CUDA stay out.
+
+Gate: builds with `test-llama-archs`.
+
+## 0134-inkling2-relative-position-input-and-model.patch
+
+Ports the text model of #32217 and the mask fixes of #32429 (8af68d4) on the pin's shape:
+the pin has dense KQ input masks and no `kv_rows`, so the relative-position input holds the
+per-cell distances and the bias is folded into the mask (cast to F32, added, F16 for flash
+attention) with a zero sink logit; the pin's iswa `build_attn` takes the mask as a parameter.
+Also ports `build_conv_state_store` (rollback slots included) and `set_input_relative_pos`
+with the pin's cell-window offset, and adds the model loader and graph: per-head relative
+bias, q/k L2 clip, input and post convolutions, block attention residuals, MoE with sigmoid
+gating and situ, final logit softcap, unpadded vocabulary.
+
+Gate: on the IQ4_NL GGUF, "What is the capital of France?" answers Paris. KL against mainline
+690b87d8's CPU base logits (2048 tokens of English and code, -c 2048, 3 chunks): mean
+0.000000 nats, maximum 0.000055, same top p 99.967 %.
+
+## 0135-model-load-ffn_gate_up_exps-scales.patch
+
+Ports #32657: the generic `.scale` pass loads `ffn_gate_up_exps.scale` when the merged
+gate_up tensor exists, and rejects a file that carries both the split and the merged scale.
+
+## 0136-ggml-scale-row-contiguous-input.patch
+
+Mainline's ggml change from the 953-commit gap between the pin and the model: SCALE takes a
+row-contiguous input, not only a contiguous one. The merged gate_up expert path passes one
+half of the matmul result (a view) to situ()'s linear-beta branch. Without it the CPU graph
+aborts on the first ubatch.
+
+## 0137-inkling2-loop-cache-slots.patch
+
+Ports the Mini's loop of #32694: the `inkling2_loop` arch, the loop kv and tensor names, the
+cache-slot expansion (`n_layer_all = n_phys + (passes - 1) * core`), the per-slot layer
+arrays, the weight placement through the pin's `n_layer_physical`/`layer_physical`, the
+message controllers, and the graph that runs the core `loop.count` times with the previous
+pass's block bank.
+
+Gate: the same Paris answer and the same KL numbers above.
+
+## 0138-inkling2-loop-slots-after-scale.patch
+
+Ports #32704: `post_arch_tensors()` runs after the generic scale pass, and the loop's cache
+slots alias the physical layers there. Each cache slot would otherwise create its own copy
+of the per-tensor and per-expert scale tensors, and the aliasing happens after the pass, so
+the slots share the physical layer's tensors (including the expert weights, so the experts
+live once per physical layer and the expert cache keys on those pointers).
+
+## 0139-inkling2-arch-tests-and-save.patch
+
+Covers `inkling2` and `inkling2_loop` in `test-llama-archs`, and keeps the loop arch out of
+the saver (the file holds 24 layers and the load expands them to 48 cache slots).
+
+Gate: `test-llama-archs` all pass. Red case on the same base logits: 2 loop passes instead
+of 3 gives mean KL 0.498889 nats, maximum 11.487644, same top p 76.279 %.

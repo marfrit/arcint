@@ -1,0 +1,54 @@
+From 444f184343b22be99e11b1e594e8d23da15815cd Mon Sep 17 00:00:00 2001
+From: Moe <moe@halzen.invalid>
+Date: Sun, 22 Nov 2026 02:20:27 +0100
+Subject: [PATCH 4/7] ggml: let scale take a row-contiguous input
+
+The merged gate_up expert path passes a view of one half of the matmul
+result to situ(), which is row-contiguous but not contiguous.
+---
+ ggml/src/ggml-cpu/ops.cpp | 8 ++++----
+ ggml/src/ggml.c           | 2 +-
+ 2 files changed, 5 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index cf768de..7b11367 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -4955,8 +4955,8 @@ static void ggml_compute_forward_scale_f32(
+ 
+     const ggml_tensor * src0 = dst->src[0];
+ 
+-    GGML_ASSERT(ggml_is_contiguous(src0));
+-    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(ggml_is_contiguous_rows(src0));
++    GGML_ASSERT(ggml_is_contiguous_rows(dst));
+     GGML_ASSERT(ggml_are_same_shape(src0, dst));
+ 
+     float s; // scale factor
+@@ -5007,8 +5007,8 @@ static void ggml_compute_forward_scale_bf16(
+ 
+     const ggml_tensor * src0 = dst->src[0];
+ 
+-    GGML_ASSERT(ggml_is_contiguous(src0));
+-    GGML_ASSERT(ggml_is_contiguous(dst));
++    GGML_ASSERT(ggml_is_contiguous_rows(src0));
++    GGML_ASSERT(ggml_is_contiguous_rows(dst));
+     GGML_ASSERT(ggml_are_same_shape(src0, dst));
+ 
+     float s; // scale factor
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 63ee87d..a7829c9 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -3476,7 +3476,7 @@ static struct ggml_tensor * ggml_scale_impl(
+         float                 s,
+         float                 b,
+         bool                  inplace) {
+-    GGML_ASSERT(ggml_is_padded_1d(a));
++    GGML_ASSERT(ggml_is_contiguous_rows(a));
+ 
+     struct ggml_tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
+ 
+-- 
+2.47.3
+
