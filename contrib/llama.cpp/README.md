@@ -8712,9 +8712,40 @@ Gate, CPU build, the pinned IQ4_NL weights, base logits from the same weights:
 holds: mean KL divergence 0.000000, same top p 99.967 %. Red case, the visit writing the
 previous slot instead of the last row: mean KL 10.334091, same top 1.369 %.
 
-Card commands owed, 0147 vs 0147+0148:
-
-    llama-bench -m <pinned IQ4_NL>.gguf -fa 1 -p 512 -n 128 -d 0,4096 -r 2
+On the card (Arc Pro B60 at a 165 W cap, OpenCL, flash attention on, `measured-here`), 0147 vs
+0147+0148: mean KL against the CPU base logits identical (0.001986, same top 98.534 %); llama-bench
+tg128 29.09 -> 29.50 t/s at depth 0 and 27.28 -> 27.56 at 4,096; pp512 +0.6 %.
 
     llama-perplexity -m <pinned IQ4_NL>.gguf -f /tmp/ink/gate.txt -c 2048 --chunks 3 -fa on \
         --kl-divergence --kl-divergence-base /tmp/ink/base.logits
+
+## 0149-opencl-sigmoid-strided-f32.patch
+
+Inkling 2 Mini's expert activation (SITU) takes `sigmoid` of the gate half of the fused gate_up
+result, a strided view. The OpenCL backend accepted SIGMOID only on contiguous input, so the
+scheduler ran that node on the CPU: per decode token 48 graph splits, each a blocking read of the
+gate to the host and about three queue synchronizations (`measured-here`: gdb backtraces of
+`clEnqueueReadBuffer` and `clWaitForEvents`, all from `ggml_backend_sched_graph_compute_async`
+and `sched_copy_input`; `GGML_SCHED_DEBUG=2`: 49 CPU splits per graph, the token embedding and 48
+SIGMOID nodes). The host could not run ahead of the card, so decode was bound by kernel enqueue
+(about 6,700 launches a token at about 3.6 us host each, unitrace).
+
+`kernel_sigmoid_f32_nc` takes the input by its strides, one work group per row, the layout of
+`kernel_tanh_f32_nc`, and the formula of `kernel_sigmoid_f32` (the same rounding);
+`ggml_cl_sigmoid` uses it for a non-contiguous f32 input, and `supports_op` admits that case. The
+contiguous paths and the f16 and bf16 paths are unchanged.
+
+Card (Arc Pro B60 at a 165 W cap, Inkling 2 Mini IQ4_NL, OpenCL, flash attention on,
+`measured-here`), 0148 vs 0148+0149:
+
+| | 0148 | 0149 |
+|---|---|---|
+| CPU splits per graph | 49 | 1 |
+| pp512 depth 0 / 4,096 (t/s) | 185.0 / 178.4 | 417.9 / 387.8 |
+| tg128 depth 0 / 4,096 (t/s) | 29.50 / 27.62 | 34.86 / 32.25 |
+| mean KL vs the CPU base, same top | 0.001986, 98.534 % | 0.001931, 98.501 % |
+
+test-backend-ops `-o SIGMOID`: the two strided f32 cases (`v=1`, [128,2,2,2] and [5,7,11,13]),
+"not supported" before, pass; the red case (`exp(+x)` in the new kernel) fails exactly those two
+(ERR 2.05 and 1.94). The contiguous bf16 [128,2,2,2] case is borderline at the test's 1e-7 NMSE
+threshold with random inputs in both builds: 6 of 50 runs fail on 0148, 2 of 50 on 0149.
