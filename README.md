@@ -313,17 +313,22 @@ from ggml-org's conversion; IQ4_NL weights are used here. It runs on the Arc
 Pro B60 with flash attention that carries the model's relative bias and
 sinks inside the OpenCL kernels.
 
-`measured-here`, one Arc Pro B60 at a 165 W power cap, IQ4_NL weights,
+`measured-here`, one Arc Pro B60 at a 165 W power cap (the B70 row: one Arc Pro B70 at 220 W), IQ4_NL weights,
 llama-bench, two repetitions. pp512 is a prompt of 512 tokens, tg128 is 128
 generated tokens, measured at a context depth of 0, 4,096 and 32,768 tokens.
 
 | Engine | pp512 t/s at depth 0 / 4,096 / 32,768 | tg128 t/s at depth 0 / 4,096 / 32,768 |
 |---|---|---|
-| arcint 1.8.0 (OpenCL), flash attention on | 417.9 / 387.8 / 331.3 | 34.9 / 32.3 / 28.8 |
+| arcint 1.8.0 (OpenCL), flash attention on, B60 | 417.9 / 387.8 / 331.3 | 34.9 / 32.3 / 28.8 |
+| arcint 1.8.0 (OpenCL), flash attention on, B70 (220 W cap) | 658.2 / 627.2 / 550.6 | 40.1 / 39.2 / 37.5 |
 | arcint at first light (the port and the flash-attention bias, before the speed work) | 183.9 / 177.5 / 164.1 | 24.0 / 22.6 / 20.8 |
 | mainline llama.cpp, Vulkan backend, same tool and card | 33.3 / 32.3 / 30.1 | 8.3 / 10.1 / 10.2 |
 
-Against Vulkan on the same card, arcint is 11-12.5x faster on the prompt and
+The B70 gives the same answers (mean KL against the CPU reference identical to the B60's, the
+acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 15-30 % on generation:
+Inkling's decode is bound by the number of small kernel launches more than by memory bandwidth.
+
+Against Vulkan on the B60, arcint is 11-12.5x faster on the prompt and
 2.8-4.2x on generation. The speed work after first light: small copy kernels
 for the model's tiny concatenations (0147), the depth mix as one stack (0148),
 and the strided sigmoid (0149) that keeps the expert activation on the card

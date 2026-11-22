@@ -136,6 +136,12 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   have one CPU split, the token embedding; Flash-Next on the B70 with its experts put on the CPU on purpose
   (`-ot exps=CPU`) has only the expert blocks and the embedding there (the CPU-only lightning indexer is switched
   off by `resolve_fused_ops`, as intended). arcint's MTP draft graphs were not in this check.
+- **The B70** (ib1, `measured-here`, one Arc Pro B70 at 220 W, `ZE_AFFINITY_MASK=1`, the same 0149 build, IQ4_NL):
+  pp512 658.2 / 627.2 / 550.6 t/s and tg128 40.12 / 39.22 / 37.47 at depth 0 / 4,096 / 32,768 (B60: 417.9 / 387.8 /
+  331.3 and 34.86 / 32.25 / 28.79); mean KL 0.001931, same top 98.501 %, as on the B60; one CPU split (the
+  embedding); arcint 42e8525b served: Paris, the acceptance task 10/10 at effort low (served decode 40.2 t/s). The
+  same kernels run on both cards (Xe2). Decode gains 15-30 % on a card with +33 % dense decode bandwidth: Inkling's
+  decode is bound by its ~6,800 launches a token, not by bytes.
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
