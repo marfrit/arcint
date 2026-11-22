@@ -98,6 +98,11 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   A 4,697-token prompt: prefill 127.7 t/s, decode 17.8 t/s; against the Vulkan arm at depth 4,096 (pp512 32.3,
   tg128 10.1 t/s) about 4x and 1.8x, but from different tools (arcint's server lines against llama-bench):
   indicative until the same tool measures both.
+- **Same tool against the baseline arm** (llama-bench, pp512 / tg128, -r 2, B60 at 165 W, IQ4_NL; the integration
+  series = the pin + 112 patches, OpenCL; 2026-11-22 07:00): FA on pp512 172.7 / 139.1 / 106.5 t/s and tg128 23.0 /
+  20.1 / 18.4 t/s at depth 0 / 4,096 / 32,768 (FA off 174.0 / 144.4 / 97.1 and 23.6 / 21.4 / 19.5), against Vulkan's
+  33.3 / 32.3 / 30.1 and 8.3 / 10.1 / 10.2: prompt 5.2x / 4.3x / 3.5x, decode 2.8x / 2.0x / 1.8x. The graph still
+  folds the bias into the dense mask (the wiring onto the indexed op, 0146, is open).
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
