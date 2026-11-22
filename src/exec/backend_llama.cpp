@@ -1649,6 +1649,10 @@ public:
                     // quotes), from the scan the render maps a client's level with;
                     // empty for a template that does not read the variable.
                     {"reasoning_effort_levels", template_reasoning_effort_levels(template_src_)},
+                    // A template with its own effort map that raises on an unknown name
+                    // (Inkling's): the request's level is checked against the list above
+                    // and refused with a 400 naming it, before the render.
+                    {"reasoning_effort_strict", is_inkling_template(template_src_)},
                     // The vocab's BOS rule: the generation prepends BOS when the
                     // rendered template did not write it, and /tokenize's count
                     // applies the same rule. A proxy reads it here.

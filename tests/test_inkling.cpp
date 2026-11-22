@@ -372,3 +372,60 @@ TEST(inkling_reasoning_effort_number_and_names) {
     ChatRequest req;
     CHECK(parse_chat_request(bad, req).has_value());
 }
+
+// reasoning_effort robustness for a template with its own effort map (1.8.0).
+// Mutation: drop both the "off" -> "none" line in template_reasoning_effort and
+// the enable_thinking=false fallback in template_context (either alone still
+// yields none: the parser turns "off" into enable_thinking=false) and the "off"
+// render falls to the template's default 0.9, as it did before 1.8.0.
+TEST(inkling_reasoning_effort_off_is_none) {
+    const std::string off  = render(conversation("off"));
+    const std::string none = render(conversation("none"));
+    const std::string dflt = render(conversation(nullptr));
+    CHECK(off == none);
+    CHECK(off != dflt);
+}
+
+// Mutation: drop the enable_thinking=false fallback in template_context and the
+// render is the template default's (0.9), not none's.
+TEST(inkling_enable_thinking_false_without_effort_is_none) {
+    ChatRequest req = conversation(nullptr);
+    nlohmann::json body = {{"model", "inkling2-mini"},
+                           {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})},
+                           {"chat_template_kwargs", {{"enable_thinking", false}}}};
+    ChatRequest parsed;
+    CHECK(!parse_chat_request(body, parsed).has_value());
+    CHECK(parsed.has_enable_thinking && !parsed.enable_thinking);
+    req.has_enable_thinking = parsed.has_enable_thinking;
+    req.enable_thinking     = parsed.enable_thinking;
+    req.chat_template_kwargs = parsed.chat_template_kwargs;
+    CHECK(render(req) == render(conversation("none")));
+    // thinking left on and no level: the template's own default stays
+    ChatRequest on = conversation(nullptr);
+    on.has_enable_thinking = true;
+    on.enable_thinking     = true;
+    CHECK(render(on) == render(conversation(nullptr)));
+}
+
+// Mutation: make `known` accept every name and "turbo" passes; drop the range
+// check and 1.5 passes.
+TEST(inkling_strict_effort_refuses_unknown_names_with_the_list) {
+    const std::vector<std::string> levels = template_reasoning_effort_levels(kInklingTemplate);
+    CHECK(levels.size() == 7);
+    for (const char* ok : {"none", "minimal", "low", "medium", "high", "xhigh", "max", "off"})
+        CHECK(!check_strict_reasoning_effort(conversation(ok), levels).has_value());
+    CHECK(!check_strict_reasoning_effort(conversation(nullptr), levels).has_value());
+    CHECK(!check_strict_reasoning_effort(conversation(nullptr, true), levels).has_value());   // 0.7
+    const auto bad = check_strict_reasoning_effort(conversation("turbo"), levels);
+    CHECK(bad.has_value());
+    CHECK(bad->find("\"turbo\"") != std::string::npos);
+    CHECK(bad->find("\"none\", \"minimal\", \"low\", \"medium\", \"high\", \"xhigh\", \"max\"") != std::string::npos);
+    ChatRequest kw = conversation(nullptr);
+    kw.chat_template_kwargs = {{"reasoning_effort", 1.5}};
+    CHECK(check_strict_reasoning_effort(kw, levels).has_value());
+    kw.chat_template_kwargs = {{"reasoning_effort", "fast"}};
+    CHECK(check_strict_reasoning_effort(kw, levels).has_value());
+    kw.chat_template_kwargs = {{"reasoning_effort", "off"}};
+    CHECK(!check_strict_reasoning_effort(kw, levels).has_value());
+    CHECK(render(kw) == render(conversation("none")));   // the kwarg's "off" is mapped too
+}

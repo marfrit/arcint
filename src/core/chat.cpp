@@ -1,5 +1,6 @@
 #include "core/chat.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -647,6 +648,9 @@ std::string template_reasoning_effort(std::string_view level, std::string_view s
         // nearest-level rewrite. none is its 0.0, not an off switch.
         for (const char* l : {"none", "minimal", "low", "medium", "high", "xhigh", "max"})
             if (level == l && template_quotes(src, l)) return std::string(l);
+        // "off" is the switch other clients send for no reasoning: Inkling's
+        // name for it is none (0.0); without this it fell to the default 0.9
+        if (level == "off" && template_quotes(src, "none")) return "none";
         return {};
     }
     const std::string_view l = level == "minimal" ? std::string_view("low") : level;
@@ -695,6 +699,36 @@ std::vector<std::string> template_reasoning_effort_levels(std::string_view templ
     return out;
 }
 
+std::optional<std::string> check_strict_reasoning_effort(const ChatRequest& req,
+                                                         const std::vector<std::string>& levels) {
+    const auto has = [&](std::string_view l) {
+        return std::find(levels.begin(), levels.end(), l) != levels.end();
+    };
+    const auto known = [&](const std::string& v) { return v == "off" ? has("none") : has(v); };
+    const auto refuse = [&](const std::string& v) {
+        std::string allowed;
+        for (const std::string& l : levels) allowed += (allowed.empty() ? "\"" : ", \"") + l + "\"";
+        return "reasoning_effort \"" + v + "\" is not one this model takes: one of " + allowed +
+               (has("none") ? ", \"off\" (= \"none\")" : "") + ", or a number in [0, 0.99]";
+    };
+    if (req.chat_template_kwargs.is_object()) {
+        const auto it = req.chat_template_kwargs.find("reasoning_effort");
+        if (it != req.chat_template_kwargs.end() && !it->is_null()) {   // the explicit kwarg wins
+            if (it->is_number()) {
+                const double n = it->get<double>();
+                if (!(n >= 0.0 && n <= 0.99)) return std::string("reasoning_effort must be in [0, 0.99]");
+                return std::nullopt;
+            }
+            if (!it->is_string()) return std::string("reasoning_effort must be a string or a number in [0, 0.99]");
+            const std::string v = it->get<std::string>();
+            if (!known(v)) return refuse(v);
+            return std::nullopt;
+        }
+    }
+    if (!req.reasoning_effort.empty() && !known(req.reasoning_effort)) return refuse(req.reasoning_effort);
+    return std::nullopt;
+}
+
 EffectiveEffort effective_reasoning_effort(const ChatRequest& req) {
     EffectiveEffort e;
     if (req.chat_template_kwargs.is_object()) {
@@ -730,6 +764,9 @@ nlohmann::json template_context(const ChatRequest& req, std::string& error,
             extra[it.key()] = it.value();
         }
     }
+    const bool inkling = is_inkling_template(template_src);
+    if (inkling && extra.contains("reasoning_effort") && extra["reasoning_effort"] == "off")
+        extra["reasoning_effort"] = "none";
     if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
     if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
     // The explicit kwarg wins (it is already in extra), as enable_thinking does:
@@ -743,6 +780,12 @@ nlohmann::json template_context(const ChatRequest& req, std::string& error,
             extra["reasoning_effort"] = level;
         }
     }
+    // Inkling's template ignores enable_thinking and reads only reasoning_effort,
+    // with 0.9 for an absent one: a client that switched thinking off and named
+    // no level gets none (0.0), the template's own off. The card's caveat holds:
+    // none is the template's lowest setting, not a guarantee of no reasoning.
+    if (inkling && !extra.contains("reasoning_effort") && req.has_enable_thinking && !req.enable_thinking)
+        extra["reasoning_effort"] = "none";
     return extra;
 }
 

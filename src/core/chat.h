@@ -260,6 +260,14 @@ bool promote_reasoning_to_content(const nlohmann::json& chat_template_kwargs,
 // reads the variable at all (empty otherwise). /props publishes them.
 std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src);
 
+// For a template with its own effort map (Inkling's raises on a name it does not
+// know, and ignores enable_thinking): the request's reasoning_effort, typed or as
+// chat_template_kwargs.reasoning_effort, must be one of `levels`, "off" (taken as
+// "none"), a number in [0, 0.99], or absent. The refusal names the allowed set;
+// the caller answers it with a 400 instead of the template's raise_exception.
+std::optional<std::string> check_strict_reasoning_effort(const ChatRequest& req,
+                                                         const std::vector<std::string>& levels);
+
 // M0 stub prompt rendering.
 //
 // This is NOT the model's chat template. DESIGN.md §3.7 makes the artifact the

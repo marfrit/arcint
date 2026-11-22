@@ -878,6 +878,18 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         return HttpResult{400, invalid_request("this unit serves speech (--tts): POST /v1/audio/speech; "
                                                "chat completions are not served here")};
     }
+    // A template with its own effort map (Inkling's) raises on a level it does
+    // not know: answer that with a 400 naming the allowed set, before the render.
+    {
+        const json caps = ctx.backend->template_caps();
+        if (caps.value("reasoning_effort_strict", false)) {
+            const std::vector<std::string> levels =
+                caps.value("reasoning_effort_levels", std::vector<std::string>{});
+            if (auto err = check_strict_reasoning_effort(req, levels)) {
+                return HttpResult{400, invalid_request(*err)};
+            }
+        }
+    }
 
     PreparedChat prep;
     // The id the route lambda put on the struct before calling prepare: the
