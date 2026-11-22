@@ -1,0 +1,445 @@
+0142: test-backend-ops flash-attention cases gain bias, n_bins and sinks_zeros, at the model shape (head 128, 24 query heads over 8 K/V heads, 1025 bins, kv 1024/1025/1088, nb 1/4/8/512, four K/V type pairs, a zero sink, 8 streams); tests/test-flash-attn-indexed-bias.cpp checks the contract by hand-computed expectation, a constant bin against a dense mask, and the F16 rounding.
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 30a8e01..9320206 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -393,6 +393,8 @@ endif()
+ 
+ llama_build(test-backend-ops.cpp LINK ggml)
+ 
++llama_build_and_test(test-flash-attn-indexed-bias.cpp LINK ggml)
++
+ llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
+ llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
+ llama_build_and_test(test-autorelease.cpp       LABEL "model")
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 2d0ec4d..f024ffd 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -465,6 +465,9 @@ static std::string var_to_str(ggml_scale_mode mode) {
+ #define VARS_TO_STR15(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o) VAR_TO_STR(a) + "," + VARS_TO_STR14(b, c, d, e, f, g, h, i, j, k, l, m, n, o)
+ #define VARS_TO_STR16(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p) VAR_TO_STR(a) + "," + VARS_TO_STR15(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p)
+ #define VARS_TO_STR17(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q) VAR_TO_STR(a) + "," + VARS_TO_STR16(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q)
++#define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
++#define VARS_TO_STR19(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VAR_TO_STR(a) + "," + VARS_TO_STR18(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
++#define VARS_TO_STR20(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t) VAR_TO_STR(a) + "," + VARS_TO_STR19(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)
+ 
+ // accept FLT_MAX as infinity
+ static bool isinf_or_max(float f) {
+@@ -9154,8 +9157,12 @@ struct test_flash_attn_ext : public test_case {
+     const bool v_is_view_of_k;
+     const int64_t n_kv_max;
+ 
++    const bool bias; // indexed relative-position bias (0140): table[head, indices[key, query], query]
++    const int64_t n_bins; // table->ne[1]; 0 when bias is off
++    const bool sinks_zeros; // fill the sinks with zeros, as the model with a folded-in sink logit does
++
+     std::string vars() override {
+-        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max);
++        return VARS_TO_STR20(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, bias, n_bins, sinks_zeros);
+     }
+ 
+     double max_nmse_err() override {
+@@ -9172,9 +9179,11 @@ struct test_flash_attn_ext : public test_case {
+     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
+                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
+                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+-                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0)
++                        bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
++                        bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false)
+         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+-          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max) {}
++          type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
++          bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
+@@ -9232,9 +9241,20 @@ struct test_flash_attn_ext : public test_case {
+             ggml_set_name(s, "s");
+         }
+ 
++        ggml_tensor * bt = nullptr;
++        ggml_tensor * bi = nullptr;
++        if (bias) {
++            // one row of bins per head, one query (a row of all streams, flattened in stream order) per column
++            bt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[2], n_bins, q->ne[1]*q->ne[3]);
++            ggml_set_name(bt, "bt");
++            bi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, q->ne[1]*q->ne[3]);
++            ggml_set_name(bi, "bi");
++        }
++
+         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+         ggml_flash_attn_ext_add_sinks(out, s);
+         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
++        ggml_flash_attn_ext_add_indexed_bias(out, bt, bi);
+         ggml_prec_set_acc(out, prec);
+         ggml_set_name(out, "out");
+ 
+@@ -9244,8 +9264,26 @@ struct test_flash_attn_ext : public test_case {
+     void initialize_tensors(ggml_context * ctx) override {
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+             if (strcmp(t->name, "s") == 0) {
+-                // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
+-                init_tensor_uniform(t, -10.0f, 10.0f);
++                if (sinks_zeros) {
++                    std::vector<float> z(ggml_nelements(t), 0.0f);
++                    ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
++                } else {
++                    // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
++                    init_tensor_uniform(t, -10.0f, 10.0f);
++                }
++            } else if (strcmp(t->name, "bt") == 0) {
++                // large enough to move the argmax
++                init_tensor_uniform(t, -4.0f, 4.0f);
++            } else if (strcmp(t->name, "bi") == 0) {
++                // one-sided distance-like bins: every index lands in a bin, and every 997th one is out of
++                // range on purpose so that the bin < n_bins guard reads it as no bias (CPU and the kernels)
++                std::vector<int32_t> data(ggml_nelements(t));
++                for (size_t i = 0; i < data.size(); ++i) {
++                    const int64_t key = i % t->ne[0];
++                    const int64_t row = i / t->ne[0];
++                    data[i] = (i % 997 == 996) ? (int32_t) n_bins : (int32_t) ((key + 5*row) % n_bins);
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+             } else if (strcmp(t->name, "m") == 0) {
+                 if (n_kv_max > 0) {
+                     init_tensor_kq_mask_sparse(t, n_kv_max);
+@@ -13375,6 +13413,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+                                                         GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     }
+ 
++    // 0140's indexed bias at Inkling 2 Mini's shape: head 128, 24 query heads over 8 K/V heads,
++    // 1025 bins (a 1024-token window plus the pad bin), a zero sink beside the random ones
++    for (int kv : {1024, 1025, 1088}) {
++        for (int nb : {1, 4, 8}) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
++        }
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025, true));
++    }
++    for (auto [tk, tv] : std::vector<std::pair<ggml_type, ggml_type>> {{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, {GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}}) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1025, 4, true, true, 0, 0, GGML_PREC_F32, tk, tv, {0, 1, 2, 3}, true, false, 0, true, 1025));
++    }
++    // prefill, and the flattened queries of 8 streams
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1025, 512, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 24, {1, 8}, 1024, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
++
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+diff --git a/tests/test-flash-attn-indexed-bias.cpp b/tests/test-flash-attn-indexed-bias.cpp
+new file mode 100644
+index 0000000..675e083
+--- /dev/null
++++ b/tests/test-flash-attn-indexed-bias.cpp
+@@ -0,0 +1,311 @@
++// GGML_OP_FLASH_ATTN_EXT indexed bias (0140, the contract of the compact-bias PR): the bias is
++// table[head, indices[key, query], query], added to the mask value before its F16 rounding. The
++// expectations below are computed by hand, not against the CPU backend, so a CPU that rounds twice
++// or not at all fails them.
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <vector>
++
++static void test_indexed_bias(ggml_backend_t backend, int width, int n_query, int cells = 768) {
++    constexpr int heads = 6, kv_heads = 2, streams = 2, bins = 17;
++    const int cols = cells;
++
++    ggml_context * ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
++    auto * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, n_query, heads, streams);
++    auto * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, width, cells, kv_heads, streams);
++    auto * v = ggml_dup_tensor(ctx, k);
++    auto * mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cols, n_query, 1, streams);
++    auto * table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, heads, bins, n_query*streams);
++    auto * indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cols, n_query*streams);
++    auto * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
++    auto * out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf(width), 0, 0);
++    ggml_flash_attn_ext_add_sinks(out, sinks);
++    const bool supports_plain = ggml_backend_supports_op(backend, out);
++    ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
++    GGML_ASSERT(ggml_flash_attn_ext_has_indexed_bias(out));
++    ggml_flash_attn_ext_add_indexed_bias(out, nullptr, nullptr);
++    GGML_ASSERT(!ggml_flash_attn_ext_has_indexed_bias(out) && !out->src[12] && !out->src[13]);
++    GGML_ASSERT(ggml_backend_supports_op(backend, out) == supports_plain);
++    ggml_flash_attn_ext_add_indexed_bias(out, table, indices);
++    ggml_prec_set_acc(out, GGML_PREC_F32);
++
++    if (!ggml_backend_supports_op(backend, out)) {
++        ggml_free(ctx);
++        return;
++    }
++
++    auto * graph = ggml_new_graph(ctx);
++    ggml_build_forward_expand(graph, out);
++    auto * buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    GGML_ASSERT(buf);
++    ggml_backend_buffer_clear(buf, 0);
++
++    std::vector<int32_t> idx(ggml_nelements(indices));
++    std::vector<ggml_fp16_t> visibility(idx.size()), values(ggml_nelements(v));
++    std::vector<ggml_fp16_t> keys(ggml_nelements(k));
++    std::vector<float> queries(ggml_nelements(q));
++    float sink_logits[heads];
++    for (int h = 0; h < heads; ++h) {
++        sink_logits[h] = float(2*h - 3);
++    }
++    for (size_t i = 0; i < queries.size(); i += width) {
++        queries[i] = 4.0f;
++    }
++    std::vector<float> biases(ggml_nelements(table)), expected(n_query*streams*heads), output(ggml_nelements(out));
++    for (int s = 0; s < v->ne[3]; ++s) {
++        for (int h = 0; h < kv_heads; ++h) {
++            for (int c = 0; c < cells; ++c) {
++                const float x = float((c + 3*h + 5*s) % 23 - 11)/16;
++                const int offset = ((s*kv_heads + h)*cells + c)*width;
++                std::fill_n(values.data() + offset, width, ggml_fp32_to_fp16(x));
++                keys[offset] = ggml_fp32_to_fp16(float((7*c + 2*h + 3*s) % 29 - 14)/4);
++            }
++        }
++    }
++    for (int s = 0; s < streams; ++s) {
++        for (int j = 0; j < n_query; ++j) {
++            const int query = s*n_query + j;
++            for (int h = 0; h < heads; ++h) {
++                for (int b = 0; b < bins; ++b) {
++                    biases[(query*bins + b)*heads + h] = float((b*(3 + h) + query) % 13 - 6)/2.9f;
++                }
++                double sum = exp(double(sink_logits[h])), weighted = 0.0;
++                for (int c = 0; c < cols; ++c) {
++                    const int i = query*cols + c;
++                    idx[i] = (c + 3*query) % bins;
++                    const bool visible = (s != 1 || j != 0) && (c + j) % 7 != 0;
++                    visibility[i] = ggml_fp32_to_fp16(visible ? 0.25f : -INFINITY);
++                    if (visible) {
++                        const int vk = s*kv_heads + h/(heads/kv_heads);
++                        const double qk = 4.0*ggml_fp16_to_fp32(keys[(vk*cells + c)*width])/sqrt(width);
++                        const float m = 0.25f + biases[(query*bins + idx[i])*heads + h];
++                        const double weight = exp(qk + ggml_fp16_to_fp32(ggml_fp32_to_fp16(m)));
++                        weighted += weight*ggml_fp16_to_fp32(values[(vk*cells + c)*width]);
++                        sum += weight;
++                    }
++                }
++                expected[query*heads + h] = weighted/sum;
++            }
++        }
++    }
++    ggml_backend_tensor_set(q, queries.data(), 0, ggml_nbytes(q));
++    ggml_backend_tensor_set(k, keys.data(), 0, ggml_nbytes(k));
++    ggml_backend_tensor_set(v, values.data(), 0, ggml_nbytes(v));
++    ggml_backend_tensor_set(mask, visibility.data(), 0, ggml_nbytes(mask));
++    ggml_backend_tensor_set(table, biases.data(), 0, ggml_nbytes(table));
++    ggml_backend_tensor_set(sinks, sink_logits, 0, sizeof(sink_logits));
++    ggml_backend_tensor_set(indices, idx.data(), 0, ggml_nbytes(indices));
++    GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
++    ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
++    float max_error = 0.0f;
++    for (size_t i = 0; i < output.size(); ++i) {
++        GGML_ASSERT(std::isfinite(output[i]));
++        max_error = std::max(max_error, fabsf(output[i] - expected[i/width]));
++    }
++    printf("%s: width=%d, queries=%d, cells=%d, max error=%g\n", ggml_backend_name(backend), width, n_query, cells, max_error);
++    GGML_ASSERT(max_error < 0.001f);
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
++// a small indexed-bias case whose data the caller fills in, computed twice if wanted: with the bias
++// (table + indices) and without it (a dense mask). Runs the same K/V, Q and sink data both times.
++struct bias_case {
++    int width = 128;
++    int heads = 4;
++    int kv_heads = 2;
++    int n_query = 3;
++    int cells = 96;
++    int bins = 8;
++
++    ggml_context * ctx = nullptr;
++    ggml_tensor * q, * k, * v, * mask, * table, * indices, * sinks, * out;
++
++    bias_case(bool with_bias, int heads_ = 4, int kv_heads_ = 2) : heads(heads_), kv_heads(kv_heads_) {
++        ctx = ggml_init({32*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true});
++        q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, width, n_query, heads, 1);
++        k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, width, cells, kv_heads, 1);
++        v = ggml_dup_tensor(ctx, k);
++        mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, cells, n_query, 1, 1);
++        table = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, heads, bins, n_query);
++        indices = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, cells, n_query);
++        sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, heads);
++        out = ggml_flash_attn_ext(ctx, q, k, v, mask, 1.0f/sqrtf(width), 0, 0);
++        ggml_flash_attn_ext_add_sinks(out, sinks);
++        ggml_flash_attn_ext_add_indexed_bias(out, with_bias ? table : nullptr, with_bias ? indices : nullptr);
++        ggml_prec_set_acc(out, GGML_PREC_F32);
++    }
++    ~bias_case() { ggml_free(ctx); }
++
++    // graph buffers of a case: allocated for the whole context, so table and indices are allocated
++    // even when the bias is off (they are simply not sources then)
++    std::vector<float> run(ggml_backend_t backend, const std::vector<float> & qv, const std::vector<ggml_fp16_t> & kv,
++            const std::vector<ggml_fp16_t> & vm, const std::vector<ggml_fp16_t> & mv, const std::vector<float> & tv,
++            const std::vector<int32_t> & iv, const std::vector<float> & sv) {
++        auto * graph = ggml_new_graph(ctx);
++        ggml_build_forward_expand(graph, out);
++        auto * buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++        GGML_ASSERT(buf);
++        ggml_backend_buffer_clear(buf, 0);
++        ggml_backend_tensor_set(q, qv.data(), 0, ggml_nbytes(q));
++        ggml_backend_tensor_set(k, kv.data(), 0, ggml_nbytes(k));
++        ggml_backend_tensor_set(v, vm.data(), 0, ggml_nbytes(v));
++        ggml_backend_tensor_set(mask, mv.data(), 0, ggml_nbytes(mask));
++        ggml_backend_tensor_set(table, tv.data(), 0, ggml_nbytes(table));
++        ggml_backend_tensor_set(indices, iv.data(), 0, ggml_nbytes(indices));
++        ggml_backend_tensor_set(sinks, sv.data(), 0, ggml_nbytes(sinks));
++        GGML_ASSERT(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS);
++        std::vector<float> r(ggml_nelements(out));
++        ggml_backend_tensor_get(out, r.data(), 0, ggml_nbytes(out));
++        ggml_backend_buffer_free(buf);
++        return r;
++    }
++};
++
++static void fill_case_data(const bias_case & c, int bin, float mask_vis,
++        std::vector<float> & qv, std::vector<ggml_fp16_t> & kv, std::vector<ggml_fp16_t> & vm,
++        std::vector<float> & tv, std::vector<int32_t> & iv, std::vector<float> & sv) {
++    // every head shares one table column per bin, so a constant bin is a constant dense-mask value
++    for (int query = 0; query < c.n_query; ++query) {
++        for (int h = 0; h < c.heads; ++h) {
++            for (int b = 0; b < c.bins; ++b) {
++                tv[(query*c.bins + b)*c.heads + h] = (b == bin) ? 1.5f : float(b)/8;
++            }
++            sv[h] = 0.0f; // the model's zero sink
++        }
++        for (int key = 0; key < c.cells; ++key) {
++            iv[query*c.cells + key] = bin;
++        }
++    }
++    qv.assign(c.width*c.n_query*c.heads, 1.0f);
++    kv.assign(c.width*c.cells*c.kv_heads, ggml_fp32_to_fp16(0.5f));
++    vm.assign(c.width*c.cells*c.kv_heads, 0.0f);
++    GGML_UNUSED(mask_vis);
++}
++
++// red case 3: a constant bin's indices must give the answer of a dense mask holding that bin's value,
++// which a backend that ignores the table and reads the mask alone cannot reproduce
++static void test_constant_bin(ggml_backend_t backend) {
++    bias_case cb(true), nb(false);
++
++    std::vector<float> qv; std::vector<ggml_fp16_t> kv, vm;
++    std::vector<float> tv(ggml_nelements(cb.table)), sv(cb.heads);
++    std::vector<int32_t> iv(ggml_nelements(cb.indices));
++    fill_case_data(cb, 5, 0.25f, qv, kv, vm, tv, iv, sv);
++
++    std::vector<ggml_fp16_t> m_bias(ggml_nelements(cb.mask)), m_dense(ggml_nelements(nb.mask));
++    for (size_t i = 0; i < m_bias.size(); ++i) {
++        const int query = i / cb.cells;
++        const bool visible = i % cb.cells % 10 != 9; // whole blocks of invisible cells too
++        const float m = visible ? 0.25f : -INFINITY;
++        m_bias[i] = ggml_fp32_to_fp16(m);
++        // the same mask with the constant bin's value folded in, rounded to f16 like the kernels do
++        m_dense[i] = ggml_fp32_to_fp16(visible ? m + tv[query*cb.bins*cb.heads + 5*cb.heads] : m);
++    }
++
++    if (!ggml_backend_supports_op(backend, cb.out)) {
++        ggml_free(cb.ctx);
++        return;
++    }
++
++    std::vector<float> r_bias  = cb.run(backend, qv, kv, vm, m_bias, tv, iv, sv);
++    std::vector<float> r_dense = nb.run(backend, qv, kv, vm, m_dense, tv, iv, sv);
++    float max_diff = 0.0f;
++    for (size_t i = 0; i < r_bias.size(); ++i) {
++        max_diff = std::max(max_diff, fabsf(r_bias[i] - r_dense[i]));
++    }
++    printf("%s: constant bin 5 vs dense mask, max difference=%g\n", ggml_backend_name(backend), max_diff);
++    GGML_ASSERT(max_diff < 1e-6f);
++}
++
++// red case 6: the bias is added to the mask value before the sum's single F16 rounding. Two bins of
++// a different bias phase over a mask of 100.0 land on different sides of the F16 grid at magnitude
++// 100, so the rounded scores differ where the unrounded ones do; V follows the bins, so the answer
++// moves by ~0.015 with the rounding and an implementation that keeps the sum in f32 misses it.
++static void test_bias_rounding(ggml_backend_t backend) {
++    bias_case cb(true, 1, 1);
++
++    std::vector<float> qv; std::vector<ggml_fp16_t> kv, vm;
++    std::vector<float> tv(ggml_nelements(cb.table)), sv(cb.heads);
++    std::vector<int32_t> iv(ggml_nelements(cb.indices));
++    fill_case_data(cb, 0, 0.25f, qv, kv, vm, tv, iv, sv);
++
++    for (size_t i = 0; i < tv.size(); ++i) {
++        tv[i] = 0.0f;
++    }
++    tv[1] = 0.03f; // bin 1: 100.0 + 0.03 rounds down to 100.0, bin 0 stays 100.0
++
++    std::vector<ggml_fp16_t> m(ggml_nelements(cb.mask));
++    for (size_t i = 0; i < m.size(); ++i) {
++        m[i] = ggml_fp32_to_fp16(100.0f);
++    }
++    for (int query = 0; query < cb.n_query; ++query) {
++        for (int key = 0; key < cb.cells; ++key) {
++            iv[query*cb.cells + key] = key % 2;
++            vm[key*cb.width] = ggml_fp32_to_fp16(key % 2 == 0 ? 1.0f : -1.0f);
++        }
++    }
++
++    if (!ggml_backend_supports_op(backend, cb.out)) {
++        ggml_free(cb.ctx);
++        return;
++    }
++
++    std::vector<float> r = cb.run(backend, qv, kv, vm, m, tv, iv, sv);
++
++    // hand-computed: exp(qk + f16(mask + bias)) with the rounded sum, and the same with the raw sum
++    const auto expect = [&](bool rounded) {
++        std::vector<float> e(cb.heads);
++        for (int h = 0; h < cb.heads; ++h) {
++            const float qk = ggml_fp16_to_fp32(kv[0])/sqrtf(float(cb.width));
++            double sum = exp(double(sv[h])), weighted = 0.0;
++            for (int c = 0; c < cb.cells; ++c) {
++                const float m16 = ggml_fp16_to_fp32(m[c]);
++                const float s = m16 + tv[c % 2];
++                const float ms = rounded ? ggml_fp16_to_fp32(ggml_fp32_to_fp16(s)) : s;
++                const double w = exp(qk + ms);
++                weighted += w*ggml_fp16_to_fp32(vm[c*cb.width]);
++                sum += w;
++            }
++            e[h] = float(weighted/sum);
++        }
++        return e;
++    };
++    const std::vector<float> e_round = expect(true), e_raw = expect(false);
++    float discrimination = 0.0f;
++    for (size_t i = 0; i < e_round.size(); ++i) {
++        discrimination = std::max(discrimination, fabsf(e_round[i] - e_raw[i]));
++    }
++    GGML_ASSERT(discrimination > 1e-2f); // else the case would pass either way
++
++    float max_error = 0.0f;
++    for (size_t i = 0; i < r.size(); ++i) {
++        max_error = std::max(max_error, fabsf(r[i] - e_round[i/cb.width]));
++    }
++    printf("%s: f16 rounding of mask+bias, max error=%g, rounded vs unrounded expectation=%g\n",
++           ggml_backend_name(backend), max_error, discrimination);
++    GGML_ASSERT(max_error < 1e-3f);
++}
++
++int main() {
++    ggml_backend_load_all();
++    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++        auto dev = ggml_backend_dev_get(i);
++        auto backend = ggml_backend_dev_init(dev, nullptr);
++        GGML_ASSERT(backend);
++        for (int width : {64, 128}) {
++            test_indexed_bias(backend, width, 7, 16);
++            for (int n_query : {1, 7, 65}) {
++                test_indexed_bias(backend, width, n_query);
++            }
++        }
++        test_constant_bin(backend);
++        test_bias_rounding(backend);
++        ggml_backend_free(backend);
++    }
++}

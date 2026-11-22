@@ -1,0 +1,75 @@
+0141: the CPU flash-attention reference adds the indexed bias to the mask in both score loops (one chunk and the tiled path), rounds mask+bias to F16 once, applies the ALiBi slope after it, reads a bin past n_bins as no bias and keeps a -INFINITY mask entry -INFINITY.
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index cf768de..1627111 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8960,6 +8960,23 @@ void ggml_compute_forward_top_k(
+     }
+ }
+ 
++// the indexed bias of a GGML_OP_FLASH_ATTN_EXT: table[head, indices[key, query], query], 0.0f when there is none
++static inline float ggml_flash_attn_ext_get_indexed_bias(const ggml_tensor * dst, int64_t query, int64_t head, int64_t key) {
++    const ggml_tensor * table   = dst->src[GGML_FA_SRC_BIAS_TABLE];
++    const ggml_tensor * indices = dst->src[GGML_FA_SRC_BIAS_IDX];
++
++    if (!table) {
++        return 0.0f;
++    }
++
++    const int32_t bin = ((const int32_t *) indices->data)[query*indices->ne[0] + key];
++    if ((uint32_t) bin >= (uint32_t) table->ne[1]) {
++        return 0.0f;
++    }
++
++    return ((const float *) table->data)[(query*table->ne[1] + bin)*table->ne[0] + head];
++}
++
+ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         const ggml_compute_params * params,
+         ggml_tensor * dst,
+@@ -9068,6 +9085,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         }
+ 
+         const ggml_fp16_t * mp = mask ? (ggml_fp16_t *)((char *) mask->data + iq1*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]) : NULL;
++        const int64_t query = iq3*neq1 + iq1;
++        const bool has_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+ 
+         // k indices
+         const int ik3 = iq3 / rk3;
+@@ -9085,10 +9104,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+         // ref: https://arxiv.org/pdf/2112.05682.pdf
+ 
+         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
++            float mv = mp ? GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+             if (mv == -INFINITY) {
+                 continue;
+             }
++            if (has_bias && mp) {
++                // the bias is added to the mask value before its F16 rounding; a -INFINITY mask entry stays -INFINITY
++                mv = GGML_CPU_FP16_TO_FP32(GGML_FP32_TO_FP16(mv + ggml_flash_attn_ext_get_indexed_bias(dst, query, h, ic)));
++            }
++            mv *= slope;
+ 
+             float s; // KQ value
+ 
+@@ -9346,11 +9370,18 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+ 
+             // skip the tile entirely if all the masks are -inf
+             if (mask) {
++                const bool has_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
+                 bool can_skip = true;
+                 for (int tq = 0; tq < tile_rows; tq++) {
+                     const ggml_fp16_t * mp_row = (const ggml_fp16_t *)((const char *) mask->data + (iq1 + tq)*mask->nb[1] + (iq2%mask->ne[2])*mask->nb[2] + (iq3%mask->ne[3])*mask->nb[3]);
++                    const int64_t query = iq3*neq1 + iq1 + tq;
+                     for (int tk = 0; tk < kv_tile; tk++) {
+-                        mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
++                        float mv = GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
++                        if (has_bias && mv != -INFINITY) {
++                            // the bias is added to the mask value before its F16 rounding
++                            mv = GGML_CPU_FP16_TO_FP32(GGML_FP32_TO_FP16(mv + ggml_flash_attn_ext_get_indexed_bias(dst, query, h, ic + tk)));
++                        }
++                        mask32[tq * KV_TILE_SZ + tk] = slope * mv;
+                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
+                             can_skip = false;
+                         }

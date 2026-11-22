@@ -8520,6 +8520,51 @@ the saver (the file holds 24 layers and the load expands them to 48 cache slots)
 Gate: `test-llama-archs` all pass. Red case on the same base logits: 2 loop passes instead
 of 3 gives mean KL 0.498889 nats, maximum 11.487644, same top p 76.279 %.
 
+## 0140-fa-indexed-bias-op-slots.patch
+
+`ggml_flash_attn_ext_add_indexed_bias(fa, table, indices)` takes the contract of
+upstream PR 32740 and lays it in arcint's slots, because that PR's `src[6]`/`src[7]`
+and `op_params` 5 are the paged attention's `ring_k`/`ring_v` and page size here. The
+table is `src[12]`, the indices `src[13]`, the flag `op_params` i32 15 (the last word
+of the 64-byte block), `GGML_MAX_SRC` 14, and the `static_assert`s beside the paged
+ones keep the constants in step. The semantics are the PR's: `table[head,
+indices[key, query], query]` is added to the mask value before its F16 rounding, and
+queries of all streams are flattened in stream order. The setter holds the shapes
+(`table` F32 contiguous `[n_head, n_bins, n_q*streams]`, `indices` I32 contiguous
+`[n_kv, n_q*streams]`, a mask covering every attended column). Every backend that
+accepts FA and does not implement the mechanism declines the op in `supports_op`
+(cuda, cann, et, hexagon, metal, openvino, rpc, sycl, virtgpu, vulkan, webgpu, zdnn),
+so the scheduler never runs a kernel that would ignore the flag. Declines do not
+carry to ARM or the SVE path: CPU implements it.
+
+## 0141-fa-indexed-bias-cpu-reference.patch
+
+The CPU reference is what test-backend-ops compares against, so it must own the same
+arithmetic as the kernels. This tree has two score loops (the one-chunk loop, and the
+tiled path `0129`-era work added): both read `bin = indices[query*n_kv + key]`, add
+`table[(query*n_bins + bin)*n_head + head]` to the mask in F32, round the sum to F16
+once and multiply the ALiBi slope after it. A bin past `n_bins` reads no bias (the
+PR's CUDA guard), and a `-INFINITY` mask entry stays `-INFINITY`, tested on the mask,
+not on the sum.
+
+## 0142-fa-indexed-bias-tests.patch
+
+`test-backend-ops`' `test_flash_attn_ext` gains `bias`, `n_bins` and `sinks_zeros`,
+and the indices a sparse out-of-range value (every 997th), so the `bin < n_bins`
+guard is a compared case rather than a comment. Cases at the model's shape: head
+128, 24 query heads over 8 K/V heads (`nh=8`, `nr23={3,1}`), `n_bins` 1025, kv
+1024/1025/1088 (the window edge and the pad bin), nb 1/4/8 (decode and the verify
+rows) and 512 (prefill), the four K/V type pairs f16, q8_0/q8_0, q8_0/q4_0,
+q4_0/q4_0, sinks on including the all-zero one the model passes and nr23 `{1,8}` for
+the flattened 8-stream queries. `tests/test-flash-attn-indexed-bias.cpp` is the PR's
+standalone expectation test without the row list, plus two red cases: a constant bin
+against a dense mask holding that bin's value (bit-equal on CPU, and a backend that
+reads the mask alone cannot reproduce it), and a hand-computed F16 rounding case at
+magnitude 100 where a sum kept in F32 misses by 0.015 of the answer. CPU is both the
+reference and the backend under test on this machine, so the F16 contract is proved
+by the standalone test only: with the CPU bias switched off, that assert fails and
+test-backend-ops still passes both sides.
+
 ## 0145-opencl-scale-view-log-arange.patch
 
 The looped model's graph on the OpenCL backend, at decode and at a 512-token prefill: 4,062 view
