@@ -1194,8 +1194,13 @@ public:
             template_source_ = "chatml-fallback";
         }
         template_src_ = tmpl;
-        const char* bos = llama_vocab_get_text(vocab_, llama_vocab_bos(vocab_));
-        const char* eos = llama_vocab_get_text(vocab_, llama_vocab_eos(vocab_));
+        // A model without a BOS (or EOS) token reports LLAMA_TOKEN_NULL (-1), and
+        // llama_vocab_get_text(-1) throws a range error (Inkling 2 Mini has no BOS):
+        // the template then sees an empty string, as for a token without text.
+        const llama_token bos_id = llama_vocab_bos(vocab_);
+        const llama_token eos_id = llama_vocab_eos(vocab_);
+        const char* bos = bos_id >= 0 ? llama_vocab_get_text(vocab_, bos_id) : nullptr;
+        const char* eos = eos_id >= 0 ? llama_vocab_get_text(vocab_, eos_id) : nullptr;
         template_ = std::make_unique<minja::chat_template>(template_src_, bos ? bos : "", eos ? eos : "");
         // The template decides the dialect's chat form (core/chat.cpp
         // dialect_from_template): the admission table is the fallback for a model
