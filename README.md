@@ -1,12 +1,19 @@
 # arcint
 
 An inference server for Intel Arc: OpenAI-compatible endpoints for a short
-list of models on the Arc Pro B60 and, through 1.7.0, the Arc A770, from the dense
-Qwen3.8-27B to the 512-expert Qwen3.8-Flash-Next on one card plus host RAM,
-since 1.1.0 text-to-image: Z-Image Turbo, Qwen-Image (lettering, German
-included), FLUX.2 klein with image editing, and an ESRGAN upscaler; and since
-1.2.0 voice and vision: image input to the chat endpoint, speech to text, and
-German text to speech that clones enrolled voices.
+list of models on the Arc Pro B60, from the dense Qwen3.8-27B to the
+512-expert Qwen3.8-Flash-Next on one card plus host RAM, and since 1.8.0
+Thinking Machines' Inkling 2 Mini. Since 1.1.0 it also does text-to-image:
+Z-Image Turbo, Qwen-Image (lettering, German included), FLUX.2 klein with
+image editing, and an ESRGAN upscaler; since 1.2.0 voice and vision: image
+input to the chat endpoint, speech to text, and German text to speech that
+clones enrolled voices.
+
+**Hardware Sold: the Arc A770.** The Arc A770 was supported and gated through
+release 1.7.0. Its hardware has been sold and the card is no longer available
+to the project, so no release gate runs on it any more. Every A770 number in
+this file is historical, last measured with release 1.7.0, and is marked as
+such. Its last recorded state: [docs/a770-reference.md](docs/a770-reference.md).
 
 arcint runs GGUF files through libllama (llama.cpp at a pinned commit) with
 ggml's OpenCL backend and a published series of Intel kernels
@@ -53,15 +60,17 @@ Arc inference by mechanism, with the measured effect, the code location and what
 was tried and not adopted.
 
 **History.** Until 0.7.12 arcint also had an OpenVINO engine, on a patched
-OpenVINO runtime. It began there partly because its first design wrote SYCL off
-as broken under the xe driver. That came from a note about runtimes older than
-the xe transition, no test of a current runtime backed it, and it was wrong
-(see "Why not just use …" below). The OpenVINO engine was retired in 0.8.0; its
-design and record are at the tag
+OpenVINO runtime. Its first design wrote SYCL off as broken under the xe
+driver; that came from a note about runtimes older than the xe transition and
+was wrong (see "Why not just use ..." below). The engine was retired in 0.8.0;
+its design and record are at the tag
 [`openvino-history`](https://github.com/marfrit/arcint/tree/openvino-history)
 ([docs/history.md](docs/history.md)).
 
 ## arcint measured the llama-bench way
+
+The A770 rows in this section and the next are historical (hardware sold,
+last measured with release 1.7.0); the B60 rows are current.
 
 llama.cpp's community GPU tables ([Vulkan](https://github.com/ggml-org/llama.cpp/discussions/10879),
 [SYCL](https://github.com/ggml-org/llama.cpp/discussions/23313)) compare cards on one
@@ -71,7 +80,7 @@ gives arcint the same run, and it refuses a file with another sha256.
 
 | Card | Engine | Flash attention | pp512 t/s | tg128 t/s |
 |---|---|---|---|---|
-| Arc A770 16 GB | **arcint's series, llama-bench** | on | **2816.12 ± 2.12** | **70.60 ± 0.03** |
+| Arc A770 16 GB (sold, 1.7.0) | **arcint's series, llama-bench** | on | **2816.12 ± 2.12** | **70.60 ± 0.03** |
 | | **arcint, served** | on | **2611.39 ± 1.09** | **70.45 ± 0.03** |
 | | SYCL fp16, here | on | 1457.24 ± 4.00 | 73.66 ± 0.02 |
 | | SYCL fp16, here | off | 1876.79 ± 10.29 | 68.72 ± 0.02 |
@@ -88,15 +97,15 @@ gives arcint the same run, and it refuses a file with another sha256.
 | | Vulkan, here | on | 726.81 ± 0.38 | 68.06 ± 0.01 |
 | | Vulkan, here | off | 729.87 ± 0.70 | 65.25 ± 0.01 |
 
-The arcint rows are `measured-here` on 1.5.3 (2026-11-06, e6c9d107, f16 KV, MTP off, the A770's GT clock pinned at 2000 MHz): llama-bench itself built on
+The arcint rows are `measured-here` on 1.5.3 (2026-11-06, f16 KV, MTP off, the A770's GT clock pinned at 2000 MHz): llama-bench itself built on
 arcint's llama.cpp series, and arcint's own server through the tool above. The rows marked "here" are `measured-here` too: stock llama-bench at the same
-llama.cpp pin (3e4dfa8, no arcint patches), oneAPI 2026.1.1, Level Zero V2, the same card, host and clock. The Vulkan rows are stock llama.cpp at master 45b6604b2 on Mesa 25.0.7 (the pin within 0.5 %); the A770's decode is below the 53 t/s reported in the Vulkan thread on another host, and its clock here is held at 2000 MHz.
+llama.cpp pin (3e4dfa8, no arcint patches), oneAPI 2026.1.1, Level Zero V2, the same card, host and clock. The Vulkan rows are stock llama.cpp at master 45b6604b2 on Mesa 25.0.7 (the pin within 0.5 %); the A770's Vulkan decode is below the 53 t/s reported in the Vulkan thread on another host, and its clock here was held at 2000 MHz.
 
-The series' prefill rows are int8 DPAS on this weight type, patch 0099: a mean KL of 0.00105 nats against the CPU reference over whole chunks, 0.00043 one token a ubatch, 8 fact questions right. Against stock SYCL's best prefill (fp16 without flash attention), the series leads by 50 % on the A770 and 133 % on the B60. Against its best decode (fp16 with flash attention), it trails
-by 4.2 % and 2.9 %. SYCL's legacy Level Zero adapter is a little faster at decode on the B60 (85.96 t/s, a 5.0 % gap) and slower on the A770 (58.93 t/s). Other cards are in the
-threads: an Arc Pro B70 under Vulkan reports 4570.29 / 112.89, and there is no B70 here.
+The series' prefill rows are int8 DPAS on this weight type, patch 0099: a mean KL of 0.00105 nats against the CPU reference over whole chunks, 0.00043 one token a ubatch, 8 fact questions right. Against stock SYCL's best prefill (fp16 without flash attention), the series leads by 50 % on the A770 (historical) and 133 % on the B60. Against its best decode (fp16 with flash attention), it trails
+by 4.2 % and 2.9 %. SYCL's legacy Level Zero adapter is a little faster at decode on the B60 (85.96 t/s, a 5.0 % gap) and slower on the A770 (58.93 t/s, historical). Other cards are in the
+threads: an Arc Pro B70 under Vulkan reports 4570.29 / 112.89, and no B70 row is measured here.
 
-**IPEX-LLM**, Intel's fork, reports higher rows in the same threads, so it was run here too (`measured-here`, the newest published wheel, 2.7.0b20260110, in a container on the same host, xe). Its prefill: 2825.67 on the B60 and 2603.55 on the A770, at a mean KL of 0.016 nats against the CPU reference, inside the answer-level bar; it led the series' 1.5.2 rows, and pricing that lead found patch 0099. Its decode, on this host: the B60 without flash attention decodes at 80.54 with right answers, while with flash attention (B60) or on the A770 at all, one-token decode came out wrong: KL 6.7 nats or infinite, wrong or gibberish answers, whatever the t/s says. Other builds and machines may differ. It also refuses the hybrid models arcint serves (`unknown model architecture`). What was learned from it: [research-concept-mining/ipex-llm](docs/campaigns/research-concept-mining/ipex-llm/README.md) (on the `qfndev` branch).
+**IPEX-LLM**, Intel's fork, reports higher rows in the same threads, so it was run here too (`measured-here`, the newest published wheel, 2.7.0b20260110, in a container on the same host, xe). Its prefill: 2825.67 on the B60 and 2603.55 on the A770 (historical), at a mean KL of 0.016 nats against the CPU reference, inside the answer-level bar; it led the series' 1.5.2 rows, and pricing that lead found patch 0099. Its decode, on this host: the B60 without flash attention decodes at 80.54 with right answers, while with flash attention (B60) or on the A770 at all, one-token decode came out wrong: KL 6.7 nats or infinite, wrong or gibberish answers, whatever the t/s says. Other builds and machines may differ. It also refuses the hybrid models arcint serves (`unknown model architecture`). What was learned from it: [research-concept-mining/ipex-llm](docs/campaigns/research-concept-mining/ipex-llm/README.md) (on the `qfndev` branch).
 
 **The same run, not the same program.** arcint serves the rows through its own path (HTTP,
 slot, sampler), which is what a client gets. A warm-up prefill and generation go uncounted.
@@ -108,8 +117,7 @@ uses prompt + generation, 640 here; arcint's row is the same at both (1952.47 / 
 Serving costs a flat 14-17 ms a request against llama-bench on the same series (at 512, 1,024 and 4,096 tokens, both files below), and decode nothing.
 
     python3 tools/llama_scoreboard.py --arcint /usr/bin/arcint \
-        --model llama-2-7b.Q4_0.gguf --card "Arc A770=16 GB=GPU.1" \
-        --card "Arc Pro B60=24 GB=GPU.0"
+        --model llama-2-7b.Q4_0.gguf --card "Arc Pro B60=24 GB=GPU.0"
 
 **What moved the rows.** Two patches. Dense Q4_0 is a type none of the served models use, and it ran on upstream's float kernels:
 patch 0096 puts it on the Intel integer-dot matvec and the XMX GEMM. Decode attention then cost more than the dense product it replaces at
@@ -117,13 +125,13 @@ small depth: one sub-group walked 128 keys a split at any depth, and patch 0097 
 
 | Card | pp512 start -> 0096 | tg128 start -> 0096 -> 0097 |
 |---|---|---|
-| Arc A770 | 362.73 -> 1956.15 (5.4x) | 39.48 -> 63.56 -> 70.22 (+78 %) |
+| Arc A770 (sold, 1.7.0) | 362.73 -> 1956.15 (5.4x) | 39.48 -> 63.56 -> 70.22 (+78 %) |
 | Arc Pro B60 | 425.57 -> 2332.94 (5.5x) | 76.24 -> 75.77 -> 80.70 (+6 %) |
 
-0097 reaches served models too: the production KV (q8_0:q4_0) on Llama 2 goes 54.89 -> 66.06 on the A770 and 68.63 -> 78.87 on the B60, and the coder's numbers are under "Current numbers".
+0097 reaches served models too: the production KV (q8_0:q4_0) on Llama 2 goes 54.89 -> 66.06 on the A770 (historical) and 68.63 -> 78.87 on the B60, and the coder's numbers are under "Numbers by release".
 The answers held: on both cards the mean KL against a CPU reference over 16 x 512 tokens is 0.00043 nats with each patch on and off, and all 8 fact questions come back right in every arm.
 
-**The coder's own file on the A770** (`measured-here`, llama-bench shape, f16 KV, MTP off, 3 repetitions, before 0097; flash attention on, off in brackets):
+**The coder's own file on the A770** (historical, the card is sold; `measured-here`, llama-bench shape, f16 KV, MTP off, 3 repetitions, before 0097; flash attention on, off in brackets):
 
 | Engine | pp512 t/s | tg128 t/s |
 |---|---|---|
@@ -146,7 +154,7 @@ follow-up resume instead of re-reading: 66-76 ms each, one or two a prompt, on h
 Each row is the same file on the same card (3 repetitions). arcint leads the 35B on both numbers and the 27B on prefill, and trails the 27B's decode by 4.4 %. The services run faster than this on decode:
 MTP is off here, and on 1.5.1 the agent decodes 48.4 t/s with it (CHANGELOG).
 
-## New: loop guard for small models
+## Loop guard for small models
 
 Small and mixture-of-experts coder models sometimes think themselves into a
 loop: the same line, or the same check with one number changed, comes back
@@ -182,7 +190,7 @@ its position and the drafts behind it are dropped. The response carries a `loop_
 object (detections, nudges, slaps, aborts) when the ladder moved, and the
 decode line in the log counts the same.
 
-**New in 1.2.4: the door rung.** Before the nudge, a model that has decided
+**The door rung (1.2.4).** Before the nudge, a model that has decided
 but cannot stop can close the block itself. At detection the sampler masks the
 vocabulary's multi-newline tokens: every id whose decoded piece consists only
 of newline characters and has two or more of them, while the think block is
@@ -220,7 +228,7 @@ needed in the whole round. The same set without the door needed the slap 4
 times.
 
 **How it was tested** (`measured-here`, October 2026). The coder (Qwen3.6-27B-A3B,
-the A770) was given 30 competitive-programming tasks published after its
+then on the A770, now sold) was given 30 competitive-programming tasks published after its
 training cutoff, AtCoder Beginner Contest 475 to 480, problems A to E. Each
 answer was compiled and judged in a sandbox without network against an
 independent reference solution plus brute-force and generated tests. The
@@ -273,8 +281,9 @@ request; llama.cpp's issue for a line-based detector went stale.
 | service | model | served file | card | context |
 |---|---|---|---|---|
 | agent | Qwen3.8-27B (`qwen35`, dense, 64 layers, MTP layer) | Q4_K_M GGUF | Arc Pro B60 | 245,760 tokens, q8_0:q4_0 KV, MTP 5 |
-| coder | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
+| coder (historical) | Qwen3.6-27B-A3B-Coder (`qwen35moe`, 184 experts, MTP layer) | a searched per-layer quant mix (14.6 GB) | Arc A770, sold; last run with 1.7.0 | 98,304 tokens, q8_0:q4_0 KV, MTP 4 |
 | Flash-Next | Qwen3.8-Flash-Next (`qwen4exp`, 125B-A6B, 512 experts, n-gram table) | ISTA-DASLab's IQ3_S GGUF since 2026-10-20 (IQ3_XXS and IQ2_XS as the faster options) through an expert cache: the hot experts in VRAM, the rest in host RAM, read over the link or computed on the CPU; its MTP layer from the checkpoint | Arc Pro B60 + host RAM, on demand | 131,072 tokens, q8_0 KV, MTP 3 |
+| Inkling | Inkling 2 Mini (26.4B total / 3.4B active MoE) | IQ4_NL GGUF from ggml-org's conversion | Arc Pro B60 | see "Inkling 2 Mini" below |
 | writer | Cydonia 24B v4.3 (Mistral Small 3.2, `llama`) | imatrix Q4_K_M | Arc Pro B60, on demand | 98,304 tokens, q8_0 KV |
 | images | Z-Image Turbo (6B DiT) with the Qwen3-4B-Instruct-2507 encoder and the FLUX autoencoder | Q8_0 GGUFs, `ae.safetensors` | Arc Pro B60, on demand | 1024x1024, 8 steps |
 | images, lettering | Qwen-Image (20B MMDiT) with the Qwen2.5-VL-7B encoder and the Wan VAE | Q4_K_M GGUFs | Arc Pro B60, on demand | 1024x1024, 20 steps |
@@ -283,7 +292,7 @@ request; llama.cpp's issue for a line-based detector went stale.
 | speech out | Qwen3-TTS-12Hz-1.7B-Base (`qwen3tts`) with its audio-generation projector (speaker encoder, code predictor, acoustic decoder) | Q8_0 GGUF + Q8_0 mmproj with the code head and embedding at f16 | backbone on the Arc Pro B60, the projector on the CPU; on demand | German; enrolled voices only |
 | speech in | Whisper large-v3-turbo (whisper.cpp) | whisper.cpp's `.bin` | Arc Pro B60, on demand | German first; `/v1/audio/transcriptions` |
 
-The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`,
+The engine admits these architectures (Inkling 2 Mini, `qwen35`, `qwen35moe`, `qwen4exp`,
 `llama` at the Mistral Small 24B and Llama 2 7B geometries, `qwen2vl` for vision, `gemma4` at
 the E4B geometry, `granite` at the 8B geometry, `dory` at the 1.0-4B geometry, and under `--tts`
 `qwen3tts`) and refuses others
@@ -296,9 +305,40 @@ Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
 faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has
 the RAM for its bank (DESIGN §7.2).
 
-## Current numbers
+## Inkling 2 Mini (1.8.0)
 
-Patch 0097 against the deployed build (2026-11-05, `measured-here`, one window): the coder on its deployed flags, MTP on, 12 answers a run, 74.65 -> 82.78 t/s (+10.9 %), a verify step
+Thinking Machines' Inkling 2 Mini is a
+mixture-of-experts model with 26.4B parameters in total and 3.4B active per
+token. Its core is 12 blocks run three times, attention carries a
+relative-position bias, and the context is 1M tokens. arcint serves the GGUF
+from ggml-org's conversion; IQ4_NL weights are used here. It runs on the Arc
+Pro B60 with flash attention that carries the model's relative bias and
+sinks inside the OpenCL kernels.
+
+`measured-here`, one Arc Pro B60 at a 165 W power cap, IQ4_NL weights,
+llama-bench, two repetitions. pp512 is a prompt of 512 tokens, tg128 is 128
+generated tokens, measured at a context depth of 0, 4,096 and 32,768 tokens.
+
+| Engine | pp512 t/s at depth 0 / 4,096 / 32,768 | tg128 t/s at depth 0 / 4,096 / 32,768 |
+|---|---|---|
+| arcint (OpenCL), flash attention on | 183.9 / 177.5 / 164.1 | 24.0 / 22.6 / 20.8 |
+| arcint with the small-copy kernel fix (also in 1.8.0) | unchanged | 28.5 / 26.8 / not measured |
+| mainline llama.cpp, Vulkan backend, same tool and card | 33.3 / 32.3 / 30.1 | 8.3 / 10.1 / 10.2 |
+
+Against Vulkan on the same card, arcint is about 5.5x faster on the prompt
+and 2-3x on generation.
+
+Answers: the acceptance task (a Lua CSV parser to RFC 4180, scored by
+executing the candidate code) passes 10/10 at reasoning effort low and at
+medium; the capital of France comes back as Paris; tool calls work. The
+model's reasoning depth is set with `reasoning_effort`; its chat template
+ignores `enable_thinking`.
+
+## Numbers by release
+
+The A770 and coder figures below are historical (hardware sold, last measured with 1.7.0 or earlier); the B60 figures were measured on the B60.
+
+Patch 0097 against the deployed build (2026-11-05, `measured-here`, one window): the coder (A770, historical) on its deployed flags, MTP on, 12 answers a run, 74.65 -> 82.78 t/s (+10.9 %), a verify step
 26.2 -> 24.1 ms, draft acceptance 72.9 -> 71.9 %; the release A/B's decode 53.70 / 51.50 / 47.40 -> 58.70 / 59.65 / 55.90; the task at 10/10 three times. The agent is equal, 47.71 -> 47.76 t/s, because its verify rows take another
 kernel; the needle right at 254,970 tokens in 725 s, peak 24,190 of 24,480 MiB; prefill, the writer and the vision service unchanged, with the same answers. Flash-Next's A/B is red on its variance rule, accepted (operator, 2026-11-05): 32.97 -> 33.33 t/s with a spread of 10.8 % against 5.5 %: its answers
 differ in every run, and draft acceptance moved between 64 and 74 % with them.
@@ -306,7 +346,7 @@ differ in every run, and draft acceptance moved between 64 and 74 % with them.
 The night ladder of 2026-11-05 (`measured-here`, the build 31e021e4, 1.5.0 + patches 0095 and 0096 +
 the reasoning-effort rework, alternated with 1.5.0's binary in one window): the agent's prefill +1.6 % at
 55k (707.2 t/s) and +1.1 % at 138k (500.0), same answers; the needle right at 254,970 tokens in 725 s, peak 24,133
-of 24,480 MiB; Flash-Next passes at 537.7 t/s prefill and 32.67 t/s decode; the coder 783.9 t/s at 41k (+0.8 %) and the
+of 24,480 MiB; Flash-Next passes at 537.7 t/s prefill and 32.67 t/s decode; the coder (A770, historical) 783.9 t/s at 41k (+0.8 %) and the
 task at 10/10 three times; the writer's decode +4.9 %, the vision service's +7.4 %.
 
 One cell of that ladder is red and accepted (operator, 2026-11-05): the coder's `decode-b`, 53.75 -> 51.50 t/s. Patch
@@ -316,14 +356,11 @@ it and drew fewer accepted drafts (39.2 -> 33.7 %) while its verify step got fas
 (+4.0 %), acceptance 72.30 -> 72.35 %; the agent 46.3 -> 47.5 t/s (+2.7 %), acceptance 47.1 -> 46.7 %. KL
 against a CPU reference stays inside the answer-level bar: 0.0049 -> 0.0041 nats in prefill, 0.00686 -> 0.00687 in decode.
 
-1.2.3 (2026-10-24, `measured-here`, the pre-tag package): coder and agent
-equal to 1.2.2 in the same-window A/B with the switches off; the coder with
-its 1.2.3 flags (loop guard, non-thinking row) 5/5 at 10/10 greedy and 30/30
-at 10/10 at temperature 0.7.
-
-1.2.2 (2026-10-23, `measured-here`, the build of this release): coder, agent and
-Flash-Next equal to 1.2.1 in the same-window A/B; the acceptance task 5/5 at
-10/10 greedy on the coder and the agent; the two new guards are off by default.
+1.2.2 and 1.2.3 (2026-10-23/24, `measured-here`, the pre-tag packages): coder,
+agent and Flash-Next equal to the previous release in the same-window A/B with
+the new switches off; the acceptance task 5/5 at 10/10 greedy on the coder and
+the agent, and the coder with its 1.2.3 flags (loop guard, non-thinking row)
+30/30 at 10/10 at temperature 0.7.
 
 1.2.1 (2026-10-20, `measured-here`, the pre-tag package, the B60): Flash-Next
 IQ3_XXS decodes 38.1 t/s on six answers (1.2.0: 33.9), prefill 622 t/s at
@@ -332,7 +369,7 @@ IQ3_XXS decodes 38.1 t/s on six answers (1.2.0: 33.9), prefill 622 t/s at
 1.2.0's release check (2026-10-19, `measured-here`, the pre-tag packages,
 `docs/milestone-1.2.0.md` §9.11): the agent and the coder alternated with
 1.1.1's binary are equal to it (709.4 / 498.9 t/s at 55k / 138k on the B60;
-51.1 / 47.6 / 44.1 t/s decode and 725 t/s at 41k on the A770), with the same
+51.1 / 47.6 / 44.1 t/s decode and 725 t/s at 41k on the A770, historical), with the same
 answers byte for byte and the task at 10/10 and 9/10. The new services on the
 B60: vision 9/9 on the content check; speech out at 1.12× real time (182.96
 s of audio in 163.84 s) with a round-trip word error rate of 0.026 on 46
@@ -349,7 +386,7 @@ point per case, at temperature 0.
 | service | card | prefill | decode | answers |
 |---|---|---|---|---|
 | agent | B60 | 708.7 t/s at 54,895 tokens, 498.5 at 138,028 | not in this check (38.9 / 25.6 / 16.6 / 13.5 t/s at 4k / 55k / 130k / 200k, 2026-10-16, the DFlash2 campaign's MTP 5 arm at 212,992 ctx) | the needle at 138k; task 10/10 |
-| coder | A770 | 724.3 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
+| coder | A770 (sold, historical) | 724.3 t/s at 40,841 tokens | 51.1 / 47.5 / 44.0 t/s on three 300-token answers | the needle; task 9/10 |
 | Flash-Next, IQ3_XXS | B60 + 28.7 GiB host bank | 617.2 t/s at 20,045 tokens (asked right after the capital) | 35.2-35.4 t/s | the needle |
 | images, Z-Image Turbo | B60 | | 1024x1024, 8 steps: 2.14 s a step, the VAE 6.12 s, ~23.4 s a request (1.1.1-1 package, 2026-10-23); was 6.3 s / ~23.5 s on 2026-10-18; 512x512: 0.48 s a step | the image gate against a CPU reference: 42.6 dB |
 | Flash-Next, IQ2_XS option | B60 + 20.3 GiB host bank | 665.6 t/s, the same protocol | 42.3 t/s | the needle |
@@ -367,7 +404,7 @@ needle and 37.8 t/s decode on its own request, where arcint decodes
 43.8-44.0 (`measured-here`, 2026-10-14/15).
 
 Quality: KL against a Q8_0 or CPU reference, 16 x 512 tokens. The agent's
-q8_0:q4_0 KV 0.0057 nats; the coder's searched quant 0.0237, inside the
+q8_0:q4_0 KV 0.0057 nats; the coder's searched quant (A770, historical) 0.0237, inside the
 answer-level bar against its Q4_K_M; Flash-Next IQ3_XXS 0.218 nats, top-1
 89.7 % (IQ2_XS 0.294, 87.1 %), an accepted shortfall (UD-Q3_K_XL: 0.100, 93.3 %).
 
@@ -535,6 +572,13 @@ service's production flags, Flash-Next's expert cache included
   `chat_template_caps` reports `supports_preserve_reasoning` (the template
   renders reasoning_content at all) and `supports_preserve_thinking` (it reads
   the switch).
+- `--chat-template-file PATH` replaces the GGUF's embedded chat template with
+  the jinja text of PATH, as llama.cpp's flag of the same name: the rendering,
+  the capability scan (`/props` `chat_template_caps`) and the renderer material
+  all read the file. It is read and parsed at start; a missing, empty or
+  unparsable file stops the start, and there is no fallback to the embedded
+  template. `chat_template_caps.template_source` is `gguf`, `file` or
+  `chatml-fallback`. Not with `--stub`.
 - `POST /tokenize` and `POST /detokenize` are llama-server-compatible:
   `/tokenize` takes `{content, add_special?, with_pieces?, model?}` and
   returns `{tokens}` (or `{id, piece}` objects with `with_pieces`; a piece
@@ -554,20 +598,14 @@ service's production flags, Flash-Next's expert cache included
 
 ## Scope
 
-- `--chat-template-file PATH` replaces the GGUF's embedded chat template with
-  the jinja text of PATH, as llama.cpp's flag of the same name: the rendering,
-  the capability scan (`/props` `chat_template_caps`) and the renderer material
-  all read the file. It is read and parsed at start; a missing, empty or
-  unparsable file stops the start, and there is no fallback to the embedded
-  template. `chat_template_caps.template_source` is `gguf`, `file` or
-  `chatml-fallback`. Not with `--stub`.
 - **Models**: the table above. Other architectures are refused at load.
 - **Cards**: the Intel Arc Pro B60 (24 GB, Xe2), under the xe kernel driver.
   One card per process, or two by layers for one model
   (`--llama-layer-split`, DESIGN §3.10). The Arc A770 (16 GiB, Xe-HPG,
-  Alchemist) was gated through 1.7.0 and is **untested** from the next
-  release on: its paths stay in the series, no gate runs them; its last
-  measured state is [docs/a770-reference.md](docs/a770-reference.md).
+  Alchemist) is **Hardware Sold**: it was gated through 1.7.0, the card is
+  no longer available to the project, and nothing runs on it. Its paths
+  stay in the series untested; its numbers are historical, last measured
+  with 1.7.0 ([docs/a770-reference.md](docs/a770-reference.md)).
 - **Images**: text-to-image and editing through `arcint-imggen` (sd.cpp's
   `sd-server`, a separate binary and process): Z-Image Turbo, Qwen-Image and
   FLUX.2 klein, one unit each, one at a time on the card
@@ -583,14 +621,14 @@ service's production flags, Flash-Next's expert cache included
   builds on: it carries its kernels as patches against upstream and keeps
   llama.cpp's model code, its KV and its checkpoint mechanism.
 - **SYCL** works under the xe driver on both cards, and llama.cpp's SYCL backend is under active development
-  upstream. It is a real alternative: on Llama 2 it decodes 4-5 % faster than arcint's series on both cards, and it decodes the 27B 4.4 % faster on the B60, while the series leads
-  prefill on both (10.5 % and 31 %) and prefills the coder's file at 2.1x (the tables above). `measured-here` (2026-11-05): on the A770, USM `memcpy`
+  upstream. It is a real alternative: on Llama 2 it decodes 4-5 % faster than arcint's series on both cards (the A770 figure historical), and it decodes the 27B 4.4 % faster on the B60, while the series leads
+  prefill on both (10.5 % and 31 %) and prefills the coder's file at 2.1x (the tables above). `measured-here` (2026-11-05, A770 historical): on the A770, USM `memcpy`
   verified up to 3 GiB and a kernel, through Level Zero V2, legacy Level Zero and OpenCL; on both cards, llama-bench on V2 and the legacy adapter; the answers right (KL 0.00043 nats against the
-  CPU reference, the 8 fact questions); no wedge. Strata's SYCL engine ran through Level Zero on the B60 too (2026-10-06), the numbers under "Current numbers". One trap on Debian trixie: oneAPI 2026.1
+  CPU reference, the 8 fact questions); no wedge. Strata's SYCL engine ran through Level Zero on the B60 too (2026-10-06), the numbers under "Numbers by release". One trap on Debian trixie: oneAPI 2026.1
   segfaults in every SYCL program with the distribution's Level Zero loader (`libze1`
   1.20.6), and loader 1.34 fixes it (`measured-here`).
-- **Vulkan** depends on the card. On the A770 and the B60 it trails SYCL and the series here (the table above, Mesa 25.0.7, and on the B60
-  126 / 7.8 t/s on the dense 27B at 1k against SYCL's 249 / 14.2, 2026-09-07, `measured-here`); a B70 reports 4570.29 / 112.89.
+- **Vulkan** depends on the card. On the A770 (historical) and the B60 it trails SYCL and the series here (the table above, Mesa 25.0.7, and on the B60
+  126 / 7.8 t/s on the dense 27B at 1k against SYCL's 249 / 14.2, 2026-09-07, `measured-here`); a B70 reports 4570.29 / 112.89. On Inkling 2 Mini, arcint is about 5.5x faster than Vulkan on the prompt and 2-3x on generation, same card (see "Inkling 2 Mini").
 - **OpenVINO**: arcint's first engine (0.1-0.7.12). Its GPU plugin emits good
   Xe code, but the services needed an IR export per model and a GPU-plugin
   patch series on a pinned nightly, and the libllama engine overtook it on
