@@ -92,8 +92,12 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   the chat dialect, the admission entry and the null-BOS fix; IQ4_NL, q8_0 KV, 32,768 context): Paris at reasoning
   effort low, unset and sampled (the reasoning split into its own field, 169-187 characters), a correct tool call;
   decode 18.8-19.8 t/s (19.0 over a 4,000-token answer), prefill 53-128 t/s on short prompts. The acceptance task
-  reasoned to the 4,000-token cap at the template's default effort (0.9) without code: the harness's
-  enable_thinking=false means nothing to this template; it needs reasoning_effort or a larger cap.
+  (the harness's own request at reasoning_effort, greedy, 12,000-token cap): **10/10 four times**, at low (2,111
+  tokens, 19.4 / 20.9 t/s) and at medium (4,270 tokens, 18.7 / 18.8 t/s); at the template's default effort 0.9 with
+  a 4,000-token cap it reasoned to the cap (the harness's enable_thinking=false means nothing to this template).
+  A 4,697-token prompt: prefill 127.7 t/s, decode 17.8 t/s; against the Vulkan arm at depth 4,096 (pp512 32.3,
+  tg128 10.1 t/s) about 4x and 1.8x, but from different tools (arcint's server lines against llama-bench):
+  indicative until the same tool measures both.
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
