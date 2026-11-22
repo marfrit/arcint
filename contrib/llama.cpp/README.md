@@ -8684,3 +8684,37 @@ Gate on the card, owed, both builds:
     test-backend-ops -b GPUOpenCL -o REPEAT
     test-backend-ops perf -b GPUOpenCL -o CONCAT
     test-backend-ops perf -b GPUOpenCL -o REPEAT
+
+## 0148-inkling2-depth-mix-stack.patch
+
+The depth mix rebuilt `states` with one CONCAT per earlier block at every layer that starts a
+block, and broadcast the query with REPEAT at every visit: 260 CONCAT and 120 REPEAT launches
+for a decode token (16-20 us each before 0147). Now a block start writes its residual into a row
+of one F32 stack, a visit writes cur into the last row and takes one view over the rows it needs,
+and a decode passes the query unrepeated because `mul_mat` takes src1 ne2=1. A second stack holds
+the previous pass's bank. The values and their order are unchanged: the rows hold the blocks
+newest first, as the old concat chain built them, and the copy is byte-identical.
+
+The stack is read only through views. The scheduler leaves such a tensor without a backend, and
+ggml-alloc aborts on `buffer_id >= 0`, so each stack gets one direct consumer: a SUM_ROWS whose
+result is unused. A decode token runs 3 of them (one res stack, two bank stacks), one per stack
+and not per visit, each reading the stack once (18 KiB a token). A cheaper anchor would need a
+backend handle for the stack; the scheduler exposes none that a model graph can reach.
+
+Graph counts for a decode step (test-export-graph-ops, CPU, -c 2048): nodes 11490 -> 11243,
+CONCAT 548 -> 288, REPEAT 120 -> 0, SUM_ROWS 192 -> 195; the prompt graph goes 11490 -> 11363.
+
+Gate, CPU build, the pinned IQ4_NL weights, base logits from the same weights:
+
+    llama-perplexity -m <pinned IQ4_NL>.gguf -f /tmp/ink/gate.txt -c 2048 --chunks 3 -fa on \
+        --kl-divergence --kl-divergence-base /tmp/ink/base.logits
+
+holds: mean KL divergence 0.000000, same top p 99.967 %. Red case, the visit writing the
+previous slot instead of the last row: mean KL 10.334091, same top 1.369 %.
+
+Card commands owed, 0147 vs 0147+0148:
+
+    llama-bench -m <pinned IQ4_NL>.gguf -fa 1 -p 512 -n 128 -d 0,4096 -r 2
+
+    llama-perplexity -m <pinned IQ4_NL>.gguf -f /tmp/ink/gate.txt -c 2048 --chunks 3 -fa on \
+        --kl-divergence --kl-divergence-base /tmp/ink/base.logits

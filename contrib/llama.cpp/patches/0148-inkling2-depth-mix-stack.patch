@@ -1,0 +1,139 @@
+0148: the Inkling depth mix writes each block residual into one stack row and reads a view, instead of rebuilding the states with a CONCAT per block at every block start.
+
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+index 8366a11..83f12d3 100644
+--- a/src/models/inkling2-loop.cpp
++++ b/src/models/inkling2-loop.cpp
+@@ -90,12 +90,25 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
+     for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
+         // the bank of the previous pass: its blocks after the first core block, and its output
+         std::vector<ggml_tensor *> bank;
+-        ggml_tensor * bank_out = nullptr;
++        ggml_tensor * bank_out   = nullptr;
++        ggml_tensor * bank_stack = nullptr;
+         if (pass > 0) {
+             bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
+             bank_out = cur;
+             cur = prelude;
+             blocks = prelude_blocks;
++
++            // the bank keeps its own stack, otherwise the current pass overwrites its rows
++            const int64_t n_embd = m.hparams.n_embd;
++            const int64_t n_slot = (int64_t) bank.size();
++            bank_stack = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, n_slot + 1, n_tokens);
++            ggml_build_forward_expand(gf, ggml_sum_rows(ctx0, bank_stack));
++            for (int64_t j = 0; j < n_slot; ++j) {
++                ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++                    ggml_reshape_2d(ctx0, bank[j], n_embd, n_tokens),
++                    ggml_view_3d(ctx0, bank_stack, n_embd, 1, n_tokens,
++                        bank_stack->nb[1], bank_stack->nb[2], (n_slot - 1 - j)*bank_stack->nb[1])));
++            }
+         }
+         for (int ip = start; ip < end; ++ip) {
+             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
+@@ -104,7 +117,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
+                 continue;
+             }
+             const auto & loop = m.loop_layers[ip - start];
+-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
++            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query, bank_stack), &loop);
+         }
+     }
+ 
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 1d797a6..d163849 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -174,15 +174,53 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
+     return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
+ }
+ 
++ggml_tensor * llama_model_inkling2::graph::res_stack_tensor() {
++    if (!res_stack) {
++        const int64_t block  = hparams.attn_res_block_size;
++        const int64_t n_slot = (model.n_layer_physical() + block - 1) / block + 1;
++        res_stack = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, n_slot, n_tokens);
++        // the stack is only read through views; a direct consumer anchors it on the backend
++        ggml_build_forward_expand(gf, ggml_sum_rows(ctx0, res_stack));
++    }
++    return res_stack;
++}
++
++// the stack rows hold the block residuals newest first, the last row holds the current input
++void llama_model_inkling2::graph::write_res_block(ggml_tensor * block, int j) {
++    ggml_tensor * stack  = res_stack_tensor();
++    const int64_t n_slot = stack->ne[1] - 1;
++    GGML_ASSERT(j < n_slot);
++
++    ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++        ggml_reshape_2d(ctx0, block, n_embd, n_tokens),
++        ggml_view_3d(ctx0, stack, n_embd, 1, n_tokens, stack->nb[1], stack->nb[2], (n_slot - 1 - j)*stack->nb[1])));
++}
++
+ // attention over the depth: mix the earlier block outputs and cur with learned queries
+-ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+-    ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
+-    for (ggml_tensor * block : blocks) {
+-        states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
++ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
++        ggml_tensor * stack) {
++    if (!stack) {
++        stack = res_stack_tensor();
+     }
++
++    const int64_t n_slot  = stack->ne[1] - 1;
++    const int64_t n_block = (int64_t) blocks.size();
++    GGML_ASSERT(n_block + 1 <= stack->ne[1]);
++
++    // cur goes to the last row, the blocks are already in their rows from the block starts
++    ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++        ggml_reshape_2d(ctx0, cur, n_embd, n_tokens),
++        ggml_view_3d(ctx0, stack, n_embd, 1, n_tokens, stack->nb[1], stack->nb[2], n_slot*stack->nb[1])));
++
++    ggml_tensor * states = ggml_view_3d(ctx0, stack, n_embd, n_block + 1, n_tokens,
++            stack->nb[1], stack->nb[2], (n_slot - n_block)*stack->nb[1]);
+     states = ggml_rms_norm(ctx0, states, 1e-6f);
+ 
+-    ggml_tensor * queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
++    // decode broadcasts the query over the single token, mul_mat allows src1 ne2=1
++    ggml_tensor * queries = query;
++    if (n_tokens > 1) {
++        queries = ggml_repeat(ctx0, query, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, n_embd, query->ne[1], n_tokens));
++    }
+ 
+     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+@@ -380,6 +418,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+     // the first layer of each block starts a new residual stream, the earlier one joins the mixed blocks
+     if (ip % hparams.attn_res_block_size == 0) {
++        write_res_block(inpSA, (int) blocks.size());
+         blocks.push_back(inpSA);
+     } else {
+         cur = ggml_add(ctx0, inpSA, cur);
+diff --git a/src/models/models.h b/src/models/models.h
+index dc9c2b3..86397b1 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2300,7 +2300,8 @@ struct llama_model_inkling2 : public llama_model_base {
+ 
+     struct graph : public llm_graph_context {
+         graph(const llm_graph_params & params);
+-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
++        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
++                ggml_tensor * stack = nullptr);
+         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+         ggml_tensor * convolve(
+                 ggml_tensor * cur,
+@@ -2330,6 +2331,11 @@ struct llama_model_inkling2 : public llama_model_base {
+ 
+         ggml_tensor * inp_out_ids = nullptr;
+         ggml_tensor * tau         = nullptr; // log-scaled positions
++
++        // one tensor per residual stack: a block start writes its residual into a row
++        ggml_tensor * res_stack = nullptr;
++        ggml_tensor * res_stack_tensor();
++        void write_res_block(ggml_tensor * block, int j);
+     };
+ 
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
