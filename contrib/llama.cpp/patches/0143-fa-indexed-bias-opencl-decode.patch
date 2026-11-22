@@ -1,0 +1,357 @@
+0143: the indexed bias in the OpenCL decode kernels (flash_attn_gqa_dpas.cl, the flash_attn_*q1_split_intel family) as build-time variants -DFA_BIAS_TABLE=<n_bins>, compiled on first use and bound behind the plain arguments; supports_op declines only the shapes no variant covers and names the reason on a DOWNGRADE line.
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1498,6 +1498,9 @@ struct ggml_backend_opencl_context {
+     // 1-3 row form; only the q8_0 K pairs have one
+     cl_kernel kernel_fa_gqa_st_dk[2][4] = {};
+     int       fa_gqa_sides = 2;                   // sub-groups per 8 rows the kernels were built for
++    // 0143: the indexed-bias variants, key {kind, dk, dv, kvq, n_bins}: kind 0 the GQA
++    // kernel, 1 the f16 intel split, 2 its quantized pair; built on first use
++    std::map<std::array<int, 5>, cl_kernel> fa_bias_kernels;
+     int       fa_gqa_tiles = 8;                   // 8-row tiles a work-group holds (64 rows; 0124's wide cap)
+     int       fa_dpas_bq = 0, fa_dpas_nthr = 0;   // query rows and work-items a work-group
+     cl_kernel kernel_gdn_intel_pp = nullptr;
+@@ -8680,7 +8683,72 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
+     return true;
+ }
+ 
+-// Compile a quant FA split kernel with a hand-picked (BLOCK_M, N_SPLIT) that
++// 0143: a decode kernel compiled for an indexed relative-position bias
++// (ggml_flash_attn_ext_add_indexed_bias): -DFA_BIAS_TABLE=<n_bins> over the plain
++// variant's options, built on first use and memoised. kind 0 the GQA kernel (kvq
++// the kernel slot 0-3, as the plain build indexes it), 1 the f16 intel split, 2 its
++// quantized pair (kvq 0 q8q8, 1 q8q4, 2 q4q4). NULL = not built.
++static cl_kernel ggml_opencl_fa_bias_kernel(ggml_backend_opencl_context * backend_ctx,
++                                            int kind, int dk, int dv, int kvq, int n_bins) {
++    const std::array<int, 5> key = {kind, dk, dv, kvq, n_bins};
++    const auto it = backend_ctx->fa_bias_kernels.find(key);
++    if (it != backend_ctx->fa_bias_kernels.end()) {
++        return it->second;
++    }
++    const ggml_opencl_fa_dim * cfg = nullptr;
++    for (const auto & d : g_opencl_fa_dims) {
++        if (d.dk == dk && d.dv == dv) { cfg = &d; break; }
++    }
++    cl_kernel k = nullptr;
++    if (cfg != nullptr && n_bins > 0 && backend_ctx->gpu_family == INTEL) {
++        const int kvq_gqa = kvq;
++        const int gkv[4][2] = { {0, 0}, {1, 1}, {1, 2}, {2, 2} };
++        std::string src, opts, name;
++        const std::string bias_opt = " -DFA_BIAS_TABLE=" + std::to_string(n_bins);
++        if (kind == 0 && kvq_gqa >= 0 && kvq_gqa < 4 &&
++            backend_ctx->kernel_fa_gqa_dk[dk == 256 ? 0 : 1][kvq_gqa] != nullptr) {
++            cl_int err;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++            const std::string gqa_src {
++                #include "flash_attn_gqa_dpas.cl.h"
++            };
++#else
++            const std::string gqa_src = read_file("flash_attn_gqa_dpas.cl");
++#endif
++            src = gqa_src;
++            opts = backend_ctx->kernel_compile_opts + " -cl-intel-256-GRF-per-thread -DDK=" + std::to_string(dk) +
++                   " -DGQA_SIDES=" + std::to_string(backend_ctx->fa_gqa_sides) +
++                   " -DKT=" + std::to_string(gkv[kvq_gqa][0]) + " -DVT=" + std::to_string(gkv[kvq_gqa][1]);
++            if (const char * gopt = getenv("GGML_OPENCL_FA_GQA_OPTS")) { opts += std::string(" ") + gopt; }
++            name = "flash_attn_gqa_dpas";
++            cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
++                src.c_str(), opts + bias_opt, /*fatal=*/false, "fa gqa bias", backend_ctx->queue);
++            if (prog != nullptr) {
++                k = clCreateKernel(prog, name.c_str(), &err);
++                if (err != CL_SUCCESS) { k = nullptr; }
++                CL_CHECK(clReleaseProgram(prog));
++            }
++        } else if (kind == 1 || (kind == 2 && kvq >= 0 && kvq < 3 && dk % 32 == 0)) {
++            const char * qn[3] = { "flash_attn_q8q8_q1_split_intel", "flash_attn_q8q4_q1_split_intel",
++                                   "flash_attn_q4q4_q1_split_intel" };
++            name = kind == 1 ? "flash_attn_f32_f16_q1_split_intel" : qn[kvq];
++            src  = ggml_opencl_fa_kernel_src(FA_VARIANT_F32_F16);
++            opts = ggml_opencl_fa_compile_opts(backend_ctx, cfg, FA_VARIANT_F32_F16);
++            cl_program prog = src.empty() ? nullptr : build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
++                src.c_str(), opts + bias_opt, /*fatal=*/false, kind == 1 ? "fa f32_f16 split intel bias" : "fa quant split intel bias",
++                backend_ctx->queue);
++            if (prog != nullptr) {
++                cl_int err;
++                k = clCreateKernel(prog, name.c_str(), &err);
++                if (err != CL_SUCCESS) { k = nullptr; }
++                CL_CHECK(clReleaseProgram(prog));
++            }
++        }
++    }
++    backend_ctx->fa_bias_kernels[key] = k;   // memoise, a failure included
++    return k;
++}
++
+ // overrides the default fa_dims tuning, for the DK values where the default
+ // N_SPLIT is degenerate for quant prefill:
+ //   DK=256: default N_SPLIT=16 leaves DK/32=8 blocks -> 0 blocks/split.
+@@ -13246,9 +13314,50 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+         case GGML_OP_MEAN:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT: {
+-            // 0140: the indexed bias (table/indices at src 12/13) is not in any kernel yet
++            // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
++            // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
++            // the prompt kernels have no bias yet, so those shapes go to ggml
+             if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+-                return false;
++                const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
++                const ggml_tensor * mask = op->src[3];
++                const ggml_tensor * bt = op->src[GGML_FA_SRC_BIAS_TABLE];
++                const ggml_tensor * bi = op->src[GGML_FA_SRC_BIAS_IDX];
++                const bool f16kv = q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16;
++                const int  kvq   = q->type != GGML_TYPE_F32 ? -1 :
++                                   k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0 ? 0 :
++                                   k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 ? 1 :
++                                   k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 ? 2 : -1;
++                static const char * fdi_env = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
++                const char * why = nullptr;
++                if (fdi_env != nullptr && atoi(fdi_env) == 0) {
++                    why = "switched-off";
++                } else if (op->src[GGML_FA_SRC_PAGES] || op->src[GGML_FA_SRC_PLAN] || op->src[GGML_FA_SRC_TAG]) {
++                    why = "paged";
++                } else if (backend_ctx->gpu_family != INTEL) {
++                    why = "device";
++                } else if (q->type != GGML_TYPE_F32 || (!f16kv && kvq < 0)) {
++                    why = "kv-type";
++                } else if (mask == nullptr || mask->type != GGML_TYPE_F16 || q->ne[1] > 8 ||
++                           k->ne[3] != q->ne[3] || q->ne[0] != v->ne[0]) {
++                    why = "shape";
++                } else if (bt == nullptr || bi == nullptr || bt->ne[1] <= 0 || bi->type != GGML_TYPE_I32 ||
++                           bi->ne[0] < k->ne[1]) {
++                    why = "bias-tensors";
++                } else {
++                    load_cl_kernels(backend_ctx);
++                    const int n_bins = (int) bt->ne[1];
++                    const std::pair<int, int> key = { q->ne[0], v->ne[0] };
++                    if (backend_ctx->fa.f32_merge.count(key) == 0) {
++                        why = "no-merge";
++                    } else if (ggml_opencl_fa_bias_kernel(backend_ctx, f16kv ? 1 : 2, q->ne[0], v->ne[0], f16kv ? -1 : kvq,
++                                                         n_bins) == nullptr) {
++                        why = "no-bias-kernel";
++                    }
++                }
++                if (why != nullptr) {
++                    ggml_cl_downgrade("op=FLASH_ATTN indexed-bias path=declined reason=%s", why);
++                    return false;
++                }
+             }
+             // 0119's paged K/V: 0122 teaches the GQA decode kernel (0016, with 0088's int8
+             // Q K^T and 0089's staged 1-3 row form) to resolve every K/V row through the
+@@ -26565,6 +26674,28 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     if (kv_pages && !use_fd_gqa) {
+         GGML_ABORT("ggml_opencl: a paged decode FLASH_ATTN_EXT reached a kernel without a page table");
+     }
++    // 0143: an indexed bias runs only on a variant built for it, -DFA_BIAS_TABLE=<n_bins>:
++    // the GQA kernel when the rows took it, else the intel split kernel or its
++    // quantized pair. supports_op accepted only shapes landing here
++    const bool fa_bias = ggml_flash_attn_ext_has_indexed_bias(dst);
++    int fa_bias_bins = 0;
++    if (fa_bias) {
++        const ggml_tensor * bt = dst->src[GGML_FA_SRC_BIAS_TABLE];
++        fa_bias_bins = bt != nullptr ? (int) bt->ne[1] : 0;
++        GGML_ASSERT(!kv_pages && "a paged FLASH_ATTN_EXT cannot take an indexed bias");
++        fd_k_split = use_fd_gqa ? ggml_opencl_fa_bias_kernel(backend_ctx, 0, d_head_q, d_head_v,
++                                                            is_mixed ? 0 : kvq + 1, fa_bias_bins)
++                   : is_mixed   ? ggml_opencl_fa_bias_kernel(backend_ctx, 1, d_head_q, d_head_v, -1, fa_bias_bins)
++                   : kvq >= 0   ? ggml_opencl_fa_bias_kernel(backend_ctx, 2, d_head_q, d_head_v, kvq, fa_bias_bins)
++                   : nullptr;
++        if (fd_k_split == nullptr) {
++            GGML_ABORT("ggml_opencl: an indexed-bias FLASH_ATTN_EXT reached the dispatcher without a kernel");
++        }
++        use_fd_mq = false;
++        use_fd_mq_decode = false;
++        use_fa_k_img = false;
++        use_fd_intel = true;
++    }
+     if (fd_k_split == NULL &&
+         n_q >= 1 && n_q <= fd_max_n_q && n_kv >= FD_MIN_N_KV && !is_causal &&
+         d_head_q <= FD_MAX_DK &&
+@@ -26921,6 +27052,24 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rv_nb2));
+             CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &rv_nb3));
+         }
++        if (fa_bias) {
++            // 0143: the table [n_head][n_bins][n_tokens] and the bins [n_kv][n_tokens]
++            const ggml_tensor * bt = dst->src[GGML_FA_SRC_BIAS_TABLE];
++            const ggml_tensor * bi = dst->src[GGML_FA_SRC_BIAS_IDX];
++            ggml_tensor_extra_cl * eb = bt ? (ggml_tensor_extra_cl *) bt->extra : NULL;
++            ggml_tensor_extra_cl * ei = bi ? (ggml_tensor_extra_cl *) bi->extra : NULL;
++            cl_mem   bt_buffer = eb ? eb->data_device : NULL;
++            cl_mem   bi_buffer = ei ? ei->data_device : NULL;
++            const cl_ulong offset_bt = eb ? eb->offset + bt->view_offs : 0;
++            const cl_ulong offset_bi = ei ? ei->offset + bi->view_offs : 0;
++            const cl_ulong bi_nb1 = bi ? bi->nb[1] : 0;
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &bt_buffer));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_bt));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(int),      &fa_bias_bins));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_mem),   &bi_buffer));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &offset_bi));
++            CL_CHECK(clSetKernelArg(k_split, argi++, sizeof(cl_ulong), &bi_nb1));
++        }
+ 
+         // MQ split kernel uses MQ_NSG_SPLIT subgroups and one WG per (kv_head, batch, split)
+         // matches Q1_WG_SIZE * NSG (MQ_GQA=4 -> 256; MQ_GQA=8 -> 192)
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_f32_f16.cl
+@@ -1,5 +1,11 @@
+ #pragma OPENCL EXTENSION cl_khr_fp16 : enable
+ 
++// > 0: the host built this variant for an indexed relative-position bias of
++// that many bins (ggml_flash_attn_ext_add_indexed_bias)
++#ifndef FA_BIAS_TABLE
++#define FA_BIAS_TABLE 0
++#endif
++
+ #ifdef cl_intel_subgroups
+ #pragma OPENCL EXTENSION cl_intel_subgroups : enable
+ #else
+@@ -2826,9 +2832,16 @@ static inline void fdi_load(const int t, const global char * p, float * out) {
+         }
+     }
+ }
++#if FA_BIAS_TABLE > 0
++#define FDI_BIAS_PARAMS , const global void * bias_void, ulong bias_offset, const int n_bins, const global void * bix_void, ulong bix_offset, ulong bix_nb1
++#define FDI_BIAS_PASS , bias_void, bias_offset, n_bins, bix_void, bix_offset, bix_nb1
++#else
++#define FDI_BIAS_PARAMS
++#define FDI_BIAS_PASS
++#endif
+ #define FDI_PARAMS const global void * q_void, ulong q_offset, const global void * k_void, ulong k_offset, const global void * v_void, ulong v_offset, const float scale, const int n_q, const int n_kv, const int n_head, const ulong q_nb1, const ulong q_nb2, const ulong q_nb3, const ulong k_nb1, const ulong k_nb2, const ulong k_nb3, const ulong v_nb1, const ulong v_nb2, const ulong v_nb3, const float max_bias, const float m0, const float m1, const int n_head_log2, const float logit_softcap, const int n_head_kv, const global void * mask_void, const ulong mask_offset, const ulong mask_nb1, const ulong mask_nb2, const ulong mask_nb3, const int mask_ne2, const int mask_ne3, global float * partial_void, const int n_splits, const int kv_per_split
+ #define FDI_PASS q_void, q_offset, k_void, k_offset, v_void, v_offset, scale, n_q, n_kv, n_head, q_nb1, q_nb2, q_nb3, k_nb1, k_nb2, k_nb3, v_nb1, v_nb2, v_nb3, max_bias, m0, m1, n_head_log2, logit_softcap, n_head_kv, mask_void, mask_offset, mask_nb1, mask_nb2, mask_nb3, mask_ne2, mask_ne3, partial_void, n_splits, kv_per_split
+-static inline void fdi_split_body(FDI_PARAMS, const int KT, const int VT) {
++static inline void fdi_split_body(FDI_PARAMS FDI_BIAS_PARAMS, const int KT, const int VT) {
+     const int lane           = get_sub_group_local_id();
+     const int head_batch_idx = get_group_id(1);
+     const int split_q_idx    = get_group_id(2);
+@@ -2883,7 +2896,26 @@ static inline void fdi_split_body(FDI_PARAMS, const int KT, const int VT) {
+                 // softcap, then the mask (ggml-cpu's order); clamped so that
+                 // exp() never sees -inf under -cl-finite-math-only
+                 if (logit_softcap > 0.0f) s[j] = logit_softcap * tanh(s[j] / logit_softcap);
+-                if (mask_ptr != NULL) s[j] += slope * vload_half(min(k0 + j, kv_end - 1), mask_ptr);
++                const int key = min(k0 + j, kv_end - 1);
++#if FA_BIAS_TABLE > 0
++                // indexed bias: mask + bias in f32, rounded to f16 once, the slope after
++                float mv = mask_ptr != NULL ? (float) vload_half(key, mask_ptr) : 0.0f;
++                if (bias_void != NULL) {
++                    // one row per (batch, query): the table holds all of them
++                    const int qrow = batch_idx * n_q + q_idx;
++                    const int bin = bix_void != NULL
++                        ? ((const global int *) ((const global char *) bix_void + bix_offset +
++                           (ulong) qrow * bix_nb1))[key] : -1;
++                    if (bin >= 0 && bin < n_bins) {
++                        const float bv = ((const global float *) ((const global char *) bias_void + bias_offset))[
++                            ((qrow * n_bins + bin) * n_head) + head_idx];
++                        mv = (float) (half) (mv + bv);
++                    }
++                }
++                s[j] += slope * mv;
++#else
++                if (mask_ptr != NULL) s[j] += slope * vload_half(key, mask_ptr);
++#endif
+                 s[j] = fmax(s[j], FA_M_INIT);
+                 if (k0 + j < kv_end) m_new = fmax(m_new, s[j]);
+             }
+@@ -2940,6 +2972,7 @@ __kernel void flash_attn_f32_f16_q1_split_intel(
+     global float * partial_void,
+     const int n_splits,
+     const int kv_per_split
++    FDI_BIAS_PARAMS
+ ) {
+     const int lane           = get_sub_group_local_id();
+     const int head_batch_idx = get_group_id(1);
+@@ -2995,7 +3028,26 @@ __kernel void flash_attn_f32_f16_q1_split_intel(
+                 // softcap, then the mask (ggml-cpu's order); clamped so that
+                 // exp() never sees -inf under -cl-finite-math-only
+                 if (logit_softcap > 0.0f) s[j] = logit_softcap * tanh(s[j] / logit_softcap);
+-                if (mask_ptr != NULL) s[j] += slope * vload_half(min(k0 + j, kv_end - 1), mask_ptr);
++                const int key = min(k0 + j, kv_end - 1);
++#if FA_BIAS_TABLE > 0
++                // indexed bias: mask + bias in f32, rounded to f16 once, the slope after
++                float mv = mask_ptr != NULL ? (float) vload_half(key, mask_ptr) : 0.0f;
++                if (bias_void != NULL) {
++                    // one row per (batch, query): the table holds all of them
++                    const int qrow = batch_idx * n_q + q_idx;
++                    const int bin = bix_void != NULL
++                        ? ((const global int *) ((const global char *) bix_void + bix_offset +
++                           (ulong) qrow * bix_nb1))[key] : -1;
++                    if (bin >= 0 && bin < n_bins) {
++                        const float bv = ((const global float *) ((const global char *) bias_void + bias_offset))[
++                            ((qrow * n_bins + bin) * n_head) + head_idx];
++                        mv = (float) (half) (mv + bv);
++                    }
++                }
++                s[j] += slope * mv;
++#else
++                if (mask_ptr != NULL) s[j] += slope * vload_half(key, mask_ptr);
++#endif
+                 s[j] = fmax(s[j], FA_M_INIT);
+                 if (k0 + j < kv_end) m_new = fmax(m_new, s[j]);
+             }
+@@ -3025,11 +3077,11 @@ __kernel void flash_attn_f32_f16_q1_split_intel(
+ #if FDI_SG == 16 && DK % 32 == 0
+ // the same with quantized K / V: 8:8, 8:4, 4:4
+ __attribute__((intel_reqd_sub_group_size(FDI_SG)))
+-__kernel void flash_attn_q8q8_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 1, 1); }
++__kernel void flash_attn_q8q8_q1_split_intel(FDI_PARAMS FDI_BIAS_PARAMS) { fdi_split_body(FDI_PASS FDI_BIAS_PASS, 1, 1); }
+ __attribute__((intel_reqd_sub_group_size(FDI_SG)))
+-__kernel void flash_attn_q8q4_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 1, 2); }
++__kernel void flash_attn_q8q4_q1_split_intel(FDI_PARAMS FDI_BIAS_PARAMS) { fdi_split_body(FDI_PASS FDI_BIAS_PASS, 1, 2); }
+ __attribute__((intel_reqd_sub_group_size(FDI_SG)))
+-__kernel void flash_attn_q4q4_q1_split_intel(FDI_PARAMS) { fdi_split_body(FDI_PASS, 2, 2); }
++__kernel void flash_attn_q4q4_q1_split_intel(FDI_PARAMS FDI_BIAS_PARAMS) { fdi_split_body(FDI_PASS FDI_BIAS_PASS, 2, 2); }
+ #endif
+ #endif
+ 
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -46,6 +46,10 @@
+ #endif
+ #define DV DK
+ #define KC (DK / 16)            // k chunks of the Q K^T product
++// > 0: the host built this variant for an indexed bias of that many bins
++#ifndef FA_BIAS_TABLE
++#define FA_BIAS_TABLE 0
++#endif
+ #ifndef GQA_SIDES
+ #define GQA_SIDES 2             // sub-groups sharing 8 rows, each a column range
+ #endif
+@@ -211,6 +215,13 @@ kernel void flash_attn_gqa_dpas(
+     const global void * table_void, const ulong table_off, const int page_size,
+     const global void * rk_void, ulong rk_offset, ulong rk_nb1, ulong rk_nb2, ulong rk_nb3,
+     const global void * rv_void, ulong rv_offset, ulong rv_nb1, ulong rv_nb2, ulong rv_nb3
++#if FA_BIAS_TABLE > 0
++    // indexed relative-position bias (ggml_flash_attn_ext_add_indexed_bias):
++    // bias[idx[query][key]] added to the mask before its f16 rounding, table
++    // [n_head][n_bins][n_tokens] head fastest, indices [n_kv][n_tokens]
++    , const global void * bias_void, ulong bias_offset, const int n_bins,
++    const global void * bix_void, ulong bix_offset, ulong bix_nb1
++#endif
+ ) {
+ #if defined(GQA_K_STAGED) && !(GQA_I8 && KT == 1)
+     local half ks[BK * DK];     // [key][DK]
+@@ -704,8 +715,21 @@ kernel void flash_attn_gqa_dpas(
+             FA_UNROLL
+ #endif
+             for (int r = 0; r < 8; ++r) {
+-                if (kvis && rv[r]) mk[r] = mrow[r] != 0 ? (float) mrow[r][key] : 0.f;
+-                else mk[r] = M_INIT;
++                if (!(kvis && rv[r])) { mk[r] = M_INIT; continue; }
++                float mv = mrow[r] != 0 ? (float) mrow[r][key] : 0.f;
++#if FA_BIAS_TABLE > 0
++                // one rounding: the sum is made in f32 and taken to f16 once, as
++                // the CPU reference does; a bin out of range adds nothing
++                const int qrow_b = batch * n_q + rt[r];
++                const int bin = bix_void != 0
++                    ? ((const global int *) ((const global char *) bix_void + bix_offset + qrow_b * bix_nb1))[key] : -1;
++                if (bias_void != 0 && bin >= 0 && bin < n_bins) {
++                    const float bv = ((const global float *) ((const global char *) bias_void + bias_offset))[
++                        ((qrow_b * n_bins + bin) * n_head) + rh[r]];
++                    mv = (float) (half) (mv + bv);
++                }
++#endif
++                mk[r] = mv;
+             }
+             // -inf (masked) gives s + -inf = -inf, clamped below to M_INIT; no
+             // per-element -inf test needed

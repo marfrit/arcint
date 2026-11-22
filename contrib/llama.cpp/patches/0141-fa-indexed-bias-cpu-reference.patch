@@ -1,6 +1,5 @@
 0141: the CPU flash-attention reference adds the indexed bias to the mask in both score loops (one chunk and the tiled path), rounds mask+bias to F16 once, applies the ALiBi slope after it, reads a bin past n_bins as no bias and keeps a -INFINITY mask entry -INFINITY.
-diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index cf768de..1627111 100644
+
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -8960,6 +8960,23 @@ void ggml_compute_forward_top_k(

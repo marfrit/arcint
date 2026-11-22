@@ -8565,6 +8565,55 @@ reference and the backend under test on this machine, so the F16 contract is pro
 by the standalone test only: with the CPU bias switched off, that assert fails and
 test-backend-ops still passes both sides.
 
+## 0143-fa-indexed-bias-opencl-decode.patch
+
+The decode and verify kernels read the bias where they fold the mask:
+`flash_attn_gqa_dpas.cl` (a row's mask pair, `rh[r]`/`rt[r]` as head and query)
+and the `flash_attn_*_q1_split_intel` family, the f16 body and the shared
+`fdi_split_body` the quantized pairs call. Both are build-time variants,
+`-DFA_BIAS_TABLE=<n_bins>`, off by default, so the plain kernels compile and run
+as before. The host compiles a variant on first use, keyed by kind, head size,
+kernel slot and `n_bins`, binds the table, the bins and `n_bins` behind the plain
+arguments, and `supports_op` declines a bias call only when no variant covers its
+shape, naming the reason on a `DOWNGRADE` line (`switched-off`, `device`,
+`kv-type`, `shape`, `paged`, `bias-tensors`, `bias-table`, `bias-indices`,
+`no-merge`, `no-bias-kernel`, `row-blocks`).
+The split's merge kernel belongs to the `f32_f16` variant, which is built on
+first use, so `supports_op` and the dispatch ask for it before they read the
+merge map: without that the variants never existed at support time and every
+decode bias shape declined. The bias tensors are checked in the layout the
+setter asserts - the table one row a (stream, query) in dim 2, dim 3 one, the
+indices `[kv, rows]` - so a verify of 4-8 rows and a call over several streams
+are accepted as the kernels handle them; a table read as dim 3 accepted only
+the single-row shapes. `GGML_OPENCL_FA_INTEL_SPLIT=0` keeps ggml's kernels. Sinks need no kernel change:
+`flash_attn_f32_merge` joins them across splits (the merge launch already passes
+`offset_sinks`).
+
+## 0144-fa-indexed-bias-sinks-opencl-prefill.patch
+
+The XMX prompt kernels add the bias inside their mask epilogues -
+`flash_attn_dpas.cl` sub-group 16 and 8, `flash_attn_dpas2.cl`'s classed branch
+and its bounds branch - with the same F16 single rounding. Sinks enter `m` and
+`l` once after the key loop; `flash_attn_split_combine` joins a split's state
+first (`m_final = max(max(m, sink))`, `l = Σ l·e^(m-m_final) + e^(sink-m_final)`),
+and the single-call epilogues do the same for their own rows. The carry store
+path keeps state only, so the final block's division adds the sink once.
+
+These kernels take the sink and bias arguments unconditionally, NULL and 0 when
+a call has none: the prompt mask epilogue already branches per row, so one
+pointer test per row is cheaper than a second variant map. `fa_dpas_ok` no
+longer declines sinks or a bias, it checks the tensors' shapes (`fa_sinks_ok`,
+`fa_bias_ok`) and skips the mask class map for a bias call - a bias tile is
+never all-zero, and classing it would skip the tiles the mask alone lets out.
+`o` and `l` follow `m` when the sink raises it, and each sink term is added to
+the sub-group-reduced `l` rather than to every lane's partial: with the term in
+each lane, a 16-lane subgroup counted a call's sink 16 times, and the failing
+cases were exactly the sink prompts above 8 rows.
+`supports_op` hands a bias call of more than 8 rows to those kernels: it asks for
+a prompt kernel covering the head size, no ALiBi or softcap, the mask and the
+tensor layouts, and declines the 9-64-row single-batch shapes whose row blocks
+re-enter the dispatcher with sliced rows but whole-batch indices.
+
 ## 0145-opencl-scale-view-log-arange.patch
 
 The looped model's graph on the OpenCL backend, at decode and at a 512-token prefill: 4,062 view
