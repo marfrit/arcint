@@ -111,6 +111,14 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   32k over the dense fold; against the Vulkan arm 5.5x prompt, 2.0-2.9x decode). The acceptance task, sampled
   (temperature 1.0, effort low), interleaved: dense fold 50/60 (one 0: the function declared `local`, the task
   asks for a global), indexed 60/60; a greedy run had flipped to the same `local` slip, which both builds show.
+- **Speed work** (Markus: performance first). Decode profile of one token (B60, the profiling build of the full stack):
+  33.2 ms of device time in 6,977 kernels (4.8 us each; wall ~42 ms): Q8_0 matvecs 6.6 ms, IQ4_NL experts 4.8 ms,
+  CONCAT 5.7 ms in 356 launches and REPEAT 2.4 ms in 120 on 2304x1..5 tensors, small f32 products 2.7 ms, the
+  per-pass elementwise ops ~4.7 ms, flash attention 0.48 ms. 0147 (one element a work item for small CONCAT /
+  REPEAT; the generic kernels walked a 2,304-element row serially): tg128 23.40 -> 28.48 t/s (+21.7 %) at depth 0,
+  22.60 -> 26.75 (+18.4 %) at 4,096, prefill level. Measured and dropped (CPU): a loop self-draft (1 pass: same top
+  70.4 %, 2 passes 76.3 %: no gain at a draft cost of 0.5-0.75 forward a token); expert reuse across passes
+  (consecutive passes share 58 % of the experts; the model is resident, nothing to prefetch).
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
