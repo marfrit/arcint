@@ -429,3 +429,33 @@ TEST(inkling_strict_effort_refuses_unknown_names_with_the_list) {
     CHECK(!check_strict_reasoning_effort(kw, levels).has_value());
     CHECK(render(kw) == render(conversation("none")));   // the kwarg's "off" is mapped too
 }
+
+// pi sends its thinkingLevelMap values as JSON strings: "0.7" is the number 0.7.
+// Mutation: drop the numeric-string branch in template_context and "0.7" renders
+// as the template default (0.9), not as 0.7; drop it in the strict check and
+// "0.45" is refused.
+TEST(inkling_reasoning_effort_numeric_string_is_the_number) {
+    CHECK(render(conversation("0.7")) == render(conversation(nullptr, true)));   // 0.7 as a number
+    CHECK(render(conversation("0.7")) != render(conversation(nullptr)));
+    const std::vector<std::string> levels = template_reasoning_effort_levels(kInklingTemplate);
+    CHECK(!check_strict_reasoning_effort(conversation("0.45"), levels).has_value());
+    CHECK(!check_strict_reasoning_effort(conversation("0"), levels).has_value());
+    for (const char* bad : {"1.5", "-0.1", "0x1p-2", "nan", "0.5abc"}) {
+        nlohmann::json body = {{"model", "inkling2-mini"},
+                               {"messages", nlohmann::json::array({{{"role", "user"}, {"content", "hi"}}})},
+                               {"reasoning_effort", bad}};
+        ChatRequest req;
+        const auto err = parse_chat_request(body, req);
+        if (std::string(bad) == "1.5" || std::string(bad) == "-0.1") {
+            CHECK(err.has_value());                       // a number, out of range: refused at parse
+        } else {
+            CHECK(!err.has_value());                      // not a number: a name, the strict check decides
+            CHECK(check_strict_reasoning_effort(req, levels).has_value());
+        }
+    }
+    // a template without its own effort map keeps ignoring a level it does not name
+    ChatRequest q = conversation("0.45");
+    std::string e;
+    const nlohmann::json ctx = template_context(q, e, "{%- if reasoning_effort == 'low' -%}l{%- endif -%}");
+    CHECK(!ctx.contains("reasoning_effort"));
+}
