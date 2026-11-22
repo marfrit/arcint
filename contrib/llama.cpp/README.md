@@ -4,10 +4,14 @@ The `--engine llama` executor (`src/exec/backend_llama.cpp`,
 `docs/llama-engine.md`) builds llama.cpp as a subproject from
 `ARCINT_LLAMA_DIR`. The pin is ggml-org/llama.cpp commit `3e4dfa8`
 (2026-10-15; until then `bed0a85` of 2026-10-02, see "Moving the pin"); the
-tree is that commit with the patches below applied in order:
+tree is that commit with the patches below applied one by one in byte order (the
+order `LC_ALL=C` sorts the names: `0129-` before `0129a-`, `0130b-` before
+`0130b1-`). `apply-series.sh` does that whatever the shell's locale; a plain
+`patches/*.patch` glob under en_US.UTF-8 puts `0129-` after `0129k-` and stops
+at `0129b` (GitHub issue #6):
 
     git -C <llama.cpp> checkout 3e4dfa8
-    git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch
+    <arcint>/contrib/llama.cpp/apply-series.sh <llama.cpp>
 
 A patch that does not apply cleanly to the pin is a bug in this directory, not
 a reason to move the pin. Since the fold of 0001-0096 (2026-11) the directory
@@ -8417,3 +8421,395 @@ candidate without either fix with `VERIFY=1`: node 0's ring row 0 wrong in all 8
 (md5 5f932b72915b, c1da3368f9af against 98d05d0226bc), and equals it under `VERIFY=1`, whose host
 waits close the race. Decode at 30k 92.5 ms a step with the overlap against 127.0; at 120k 170.6
 against 292.6.
+
+## 0132-opencl-g31-kq2d-tiles.patch
+
+The Arc Pro B70 (BMG-G31: 32 Xe2 cores, 608 GB/s) runs the same kernels as the
+B60 (BMG-G21: 20 cores, 456 GB/s). On the dense 27B its prompt is +51 % at 4,096
+tokens, not the cores' +60 %. Its device profile (unitrace, `measured-here`,
+2026-11-19) puts the shortfall in the 2D K-quant GEMMs: Q4_K int8 1.52x, Q6_K
+1.39x, Q5_K 1.30x of the B60's time. The fp16-path GEMMs scale like the
+bandwidth (1.33x), not the cores.
+
+`tools/kq_tune/kqga_e2e.py` searched their tiles on the B70: two seeds of about
+100 evaluations, llama-bench pp512 against the default re-measured every 8. Both
+seeds found the default within the drift (best 0.9926 and 0.9956), and both bests
+share Q4_K's int8 kernel on 8 sub-groups (WG 8, against 16). Interleaved against
+the default, 4 pairs: pp512 +0.14 % (3 ahead, 1 equal), pp4096 with q8_0:q4_0 KV
++0.31 % (4 of 4). The change moves no arithmetic: MUL_MAT 2941/2941 both ways, and
+the mean KL of the 27B against its CPU reference at ubatch 512 is 0.011867 in both
+arms and both repeats (top-1 96.044 %).
+
+The patch reads the Intel device id (`CL_DEVICE_ID_INTEL`, as 0079 does) and,
+on 0xe223 only, builds each type's program with those tiles when no
+`GGML_OPENCL_KQ_2D_T<i>` is set, logging the tiles it took.
+`GGML_OPENCL_KQ_2D_DEVICE=0` keeps the defaults. On the built patch (B70, the release tree's tools with 0132, 4 interleaved
+pairs against `GGML_OPENCL_KQ_2D_DEVICE=0`): pp512 +0.36 % (3 of 4 ahead), pp4096 q8_0:q4_0 +0.66 % (4 of 4); the tile line
+logged for all three types, none with the switch at 0 (the red case); MUL_MAT 2941/2941; the 27B's KL 0.011867 twice. The B60
+was not run: its id takes the unchanged branch (`code`). The real gap (the fp16 Q5_K and
+Q6_K GEMMs at bandwidth) needs a structural change, an int8 path for those types,
+not a tile.
+
+## 0133-inkling2-arch-and-hparams.patch
+
+Ports the arch, kv and tensor names and the hparams of mainline #32217 (5c008e0), text half
+only: the `inkling2` arch, the relative-position and log-scaling keys, the short-conv and
+block-residual hparams, `vocab_size_unpadded`, the recurrent conv state width, and the
+`inkling2` tokenizer pre. Vision/mmproj, conversion and CUDA stay out.
+
+Gate: builds with `test-llama-archs`.
+
+## 0134-inkling2-relative-position-input-and-model.patch
+
+Ports the text model of #32217 and the mask fixes of #32429 (8af68d4) on the pin's shape:
+the pin has dense KQ input masks and no `kv_rows`, so the relative-position input holds the
+per-cell distances and the bias is folded into the mask (cast to F32, added, F16 for flash
+attention) with a zero sink logit; the pin's iswa `build_attn` takes the mask as a parameter.
+Also ports `build_conv_state_store` (rollback slots included) and `set_input_relative_pos`
+with the pin's cell-window offset, and adds the model loader and graph: per-head relative
+bias, q/k L2 clip, input and post convolutions, block attention residuals, MoE with sigmoid
+gating and situ, final logit softcap, unpadded vocabulary.
+
+Gate: on the IQ4_NL GGUF, "What is the capital of France?" answers Paris. KL against mainline
+690b87d8's CPU base logits (2048 tokens of English and code, -c 2048, 3 chunks): mean
+0.000000 nats, maximum 0.000055, same top p 99.967 %.
+
+## 0135-model-load-ffn_gate_up_exps-scales.patch
+
+Ports #32657: the generic `.scale` pass loads `ffn_gate_up_exps.scale` when the merged
+gate_up tensor exists, and rejects a file that carries both the split and the merged scale.
+
+## 0136-ggml-scale-row-contiguous-input.patch
+
+Mainline's ggml change from the 953-commit gap between the pin and the model: SCALE takes a
+row-contiguous input, not only a contiguous one, and its f32 and bf16 loops are mainline's
+(rows stepped by i1/i2/i3 over src0 and dst, the bias branch reading src0 with src0's own
+strides). The merged gate_up expert path passes one half of the matmul result (a view) to
+situ()'s linear-beta branch, so both matter.
+
+Red first: `test-backend-ops -b CPU -o '^SCALE'` on the pin's loop fails the four new view
+cases (half of a wider and taller base, bias 0 and 1.5, f32 and bf16: NMSE 0.65 to 1.32)
+against the use_ref CPU reference, and passes after the port. The use_ref branch is a
+per-element reference: without it the CPU test compares the same kernel with itself. The
+CPU KL gate on IQ4_NL after the change: mean 0.000000 nats, max 0.000055, same top p
+99.967 %, unchanged.
+
+## 0137-inkling2-loop-cache-slots.patch
+
+Ports the Mini's loop of #32694: the `inkling2_loop` arch, the loop kv and tensor names, the
+cache-slot expansion (`n_layer_all = n_phys + (passes - 1) * core`), the per-slot layer
+arrays, the weight placement through the pin's `n_layer_physical`/`layer_physical`, the
+message controllers, and the graph that runs the core `loop.count` times with the previous
+pass's block bank.
+
+Gate: the same Paris answer and the same KL numbers above.
+
+## 0138-inkling2-loop-slots-after-scale.patch
+
+Ports #32704: `post_arch_tensors()` runs after the generic scale pass, and the loop's cache
+slots alias the physical layers there. Each cache slot would otherwise create its own copy
+of the per-tensor and per-expert scale tensors, and the aliasing happens after the pass, so
+the slots share the physical layer's tensors (including the expert weights, so the experts
+live once per physical layer and the expert cache keys on those pointers).
+
+## 0139-inkling2-arch-tests-and-save.patch
+
+Covers `inkling2` and `inkling2_loop` in `test-llama-archs`, and keeps the loop arch out of
+the saver (the file holds 24 layers and the load expands them to 48 cache slots).
+
+Gate: `test-llama-archs` all pass. Red case on the same base logits: 2 loop passes instead
+of 3 gives mean KL 0.498889 nats, maximum 11.487644, same top p 76.279 %.
+
+## 0140-fa-indexed-bias-op-slots.patch
+
+`ggml_flash_attn_ext_add_indexed_bias(fa, table, indices)` takes the contract of
+upstream PR 32740 and lays it in arcint's slots, because that PR's `src[6]`/`src[7]`
+and `op_params` 5 are the paged attention's `ring_k`/`ring_v` and page size here. The
+table is `src[12]`, the indices `src[13]`, the flag `op_params` i32 15 (the last word
+of the 64-byte block), `GGML_MAX_SRC` 14, and the `static_assert`s beside the paged
+ones keep the constants in step. The semantics are the PR's: `table[head,
+indices[key, query], query]` is added to the mask value before its F16 rounding, and
+queries of all streams are flattened in stream order. The setter holds the shapes
+(`table` F32 contiguous `[n_head, n_bins, n_q*streams]`, `indices` I32 contiguous
+`[n_kv, n_q*streams]`, a mask covering every attended column). Every backend that
+accepts FA and does not implement the mechanism declines the op in `supports_op`
+(cuda, cann, et, hexagon, metal, openvino, rpc, sycl, virtgpu, vulkan, webgpu, zdnn),
+so the scheduler never runs a kernel that would ignore the flag. Declines do not
+carry to ARM or the SVE path: CPU implements it.
+
+## 0141-fa-indexed-bias-cpu-reference.patch
+
+The CPU reference is what test-backend-ops compares against, so it must own the same
+arithmetic as the kernels. This tree has two score loops (the one-chunk loop, and the
+tiled path `0129`-era work added): both read `bin = indices[query*n_kv + key]`, add
+`table[(query*n_bins + bin)*n_head + head]` to the mask in F32, round the sum to F16
+once and multiply the ALiBi slope after it. A bin past `n_bins` reads no bias (the
+PR's CUDA guard), and a `-INFINITY` mask entry stays `-INFINITY`, tested on the mask,
+not on the sum.
+
+## 0142-fa-indexed-bias-tests.patch
+
+`test-backend-ops`' `test_flash_attn_ext` gains `bias`, `n_bins` and `sinks_zeros`,
+and the indices a sparse out-of-range value (every 997th), so the `bin < n_bins`
+guard is a compared case rather than a comment. Cases at the model's shape: head
+128, 24 query heads over 8 K/V heads (`nh=8`, `nr23={3,1}`), `n_bins` 1025, kv
+1024/1025/1088 (the window edge and the pad bin), nb 1/4/8 (decode and the verify
+rows) and 512 (prefill), the four K/V type pairs f16, q8_0/q8_0, q8_0/q4_0,
+q4_0/q4_0, sinks on including the all-zero one the model passes and nr23 `{1,8}` for
+the flattened 8-stream queries. `tests/test-flash-attn-indexed-bias.cpp` is the PR's
+standalone expectation test without the row list, plus two red cases: a constant bin
+against a dense mask holding that bin's value (bit-equal on CPU, and a backend that
+reads the mask alone cannot reproduce it), and a hand-computed F16 rounding case at
+magnitude 100 where a sum kept in F32 misses by 0.015 of the answer. CPU is both the
+reference and the backend under test on this machine, so the F16 contract is proved
+by the standalone test only: with the CPU bias switched off, that assert fails and
+test-backend-ops still passes both sides.
+
+## 0143-fa-indexed-bias-opencl-decode.patch
+
+The decode and verify kernels read the bias where they fold the mask:
+`flash_attn_gqa_dpas.cl` (a row's mask pair, `rh[r]`/`rt[r]` as head and query)
+and the `flash_attn_*_q1_split_intel` family, the f16 body and the shared
+`fdi_split_body` the quantized pairs call. Both are build-time variants,
+`-DFA_BIAS_TABLE=<n_bins>`, off by default, so the plain kernels compile and run
+as before. The host compiles a variant on first use, keyed by kind, head size,
+kernel slot and `n_bins`, binds the table, the bins and `n_bins` behind the plain
+arguments, and `supports_op` declines a bias call only when no variant covers its
+shape, naming the reason on a `DOWNGRADE` line (`switched-off`, `device`,
+`kv-type`, `shape`, `paged`, `bias-tensors`, `bias-table`, `bias-indices`,
+`no-merge`, `no-bias-kernel`, `row-blocks`).
+The split's merge kernel belongs to the `f32_f16` variant, which is built on
+first use, so `supports_op` and the dispatch ask for it before they read the
+merge map: without that the variants never existed at support time and every
+decode bias shape declined. The bias tensors are checked in the layout the
+setter asserts - the table one row a (stream, query) in dim 2, dim 3 one, the
+indices `[kv, rows]` - so a verify of 4-8 rows and a call over several streams
+are accepted as the kernels handle them; a table read as dim 3 accepted only
+the single-row shapes. `GGML_OPENCL_FA_INTEL_SPLIT=0` keeps ggml's kernels. Sinks need no kernel change:
+`flash_attn_f32_merge` joins them across splits (the merge launch already passes
+`offset_sinks`).
+
+## 0144-fa-indexed-bias-sinks-opencl-prefill.patch
+
+The XMX prompt kernels add the bias inside their mask epilogues -
+`flash_attn_dpas.cl` sub-group 16 and 8, `flash_attn_dpas2.cl`'s classed branch
+and its bounds branch - with the same F16 single rounding. Sinks enter `m` and
+`l` once after the key loop; `flash_attn_split_combine` joins a split's state
+first (`m_final = max(max(m, sink))`, `l = Σ l·e^(m-m_final) + e^(sink-m_final)`),
+and the single-call epilogues do the same for their own rows. The carry store
+path keeps state only, so the final block's division adds the sink once.
+
+These kernels take the sink and bias arguments unconditionally, NULL and 0 when
+a call has none: the prompt mask epilogue already branches per row, so one
+pointer test per row is cheaper than a second variant map. `fa_dpas_ok` no
+longer declines sinks or a bias, it checks the tensors' shapes (`fa_sinks_ok`,
+`fa_bias_ok`) and skips the mask class map for a bias call - a bias tile is
+never all-zero, and classing it would skip the tiles the mask alone lets out.
+`o` and `l` follow `m` when the sink raises it, and each sink term is added to
+the sub-group-reduced `l` rather than to every lane's partial: with the term in
+each lane, a 16-lane subgroup counted a call's sink 16 times, and the failing
+cases were exactly the sink prompts above 8 rows.
+`supports_op` hands a bias call of more than 8 rows to those kernels: it asks for
+a prompt kernel covering the head size, no ALiBi or softcap, the mask and the
+tensor layouts, and declines the 9-64-row single-batch shapes whose row blocks
+re-enter the dispatcher with sliced rows but whole-batch indices.
+
+## 0145-opencl-scale-view-log-arange.patch
+
+The looped model's graph on the OpenCL backend, at decode and at a 512-token prefill: 4,062 view
+nodes skipped, 11,826 nodes, 150 unique op shapes on the prefill and 144 on the decode, 27 op
+types. Every type is accepted by the pin's `ggml_opencl_supports_op` except three: SCALE on a
+row-contiguous view (the merged gate_up half that situ() scales, per MoE layer visit), LOG (the
+log-scaled positions, one node a graph) and ARANGE (the short-conv store's rollback slot order,
+only with recurrent rollback). This patch adds them: a stride-addressed `kernel_scale_f32_nc`
+(supports_op now takes `ggml_is_contiguous_rows`, the kernels picked by `ggml_is_contiguous`),
+`kernel_log_f32`/`_4` and `kernel_arange_f32`, each with its own creation and dispatch.
+
+The rest stays as the pin had it. Named slow paths: FLASH_ATTN_EXT with sinks (the model passes
+a zero sink logit for the depth bias's +exp(0) denominator) skips Intel's DPAS prefill kernels,
+whose condition refuses sinks, and takes the f32/f16 prompt kernels that support per-head f16
+masks and sinks - correct, slower. The per-head mask's mask_ne2 is read by the kernels. IQ4_NL
+and Q8_0 MUL_MAT_ID go through the K-quant q8_1 id path (IQ4_NL k-unit 32, weights contiguous);
+a device that refuses those id kernels declines every expert product to the CPU, so the card
+scan must show no `op=MUL_MAT_ID ... kernels-missing` DOWNGRADE. SOFT_MAX over the mix's 2-5
+keys is a width below the Intel kernel's required sub-group; three test cases now cover it.
+
+Gate on the card: `test-export-graph-ops` writes the graph's 294 unique op shapes, and
+`test-backend-ops -b OpenCL --test-file` replays them against the CPU reference; the SCALE view,
+LOG, ARANGE and small SOFT_MAX cases are in the suite directly. No FA kernel is touched.
+
+## 0146-inkling2-rel-bias-indexed-flash-attention.patch
+
+Wires the Inkling 2 Mini rel attention to the indexed bias op of 0140-0142. With flash attention
+on, `build_attn_mha` builds the FLASH_ATTN_EXT node, attaches the compact table (F32
+`[n_head, n_bins, n_tokens]`) and the distance indices (I32 `[n_kv, n_tokens]`), and asks the
+layer's backend through `ggml_backend_supports_op` on that node. A backend that supports it reads
+the bias in its kernel; the CPU does. A backend that declines it - OpenCL until 0143-0144 land,
+CUDA, and the rest that 0140 makes decline - gets the dense fallback: the bias is gathered from
+the table by the indices and added to the mask in F32 before the one F16 rounding, exactly what
+the model used to build itself. With flash attention off the model's existing dense fold is
+untouched. The sink logit already rides inside the table (minus the per-head sink), so the FA
+sink argument stays the zero vector.
+
+Gate, CPU, IQ4_NL, `-c 2048`, three chunks, against the FA-on mainline base logits: the indexed
+arm at `-fa on` has mean KL 0.000000 and same top 99.967 %, the dense arm with the indexed op
+forced declined has mean KL 0.000000 and the same top. Red case: dropping the table read in the
+CPU reference gives mean KL 4.011524 and same top 27.208 % on the indexed arm, while the dense
+arm is unchanged (0.001894 against that base, because a FA-on base cannot be matched with flash
+attention off; the mainline build's own `-fa off` is 0.001954 against the same base).
+
+The card run is owed: the OpenCL kernels are 0143-0144 of the other branch; until they are in
+the series, an Inkling run on OpenCL declines the indexed bias and takes the dense fallback.
+
+## 0147-opencl-small-concat-repeat.patch
+
+The OpenCL CONCAT and REPEAT kernels gave one work item a whole output row and walked
+it in a strided loop, so a few kilobytes cost a full serial chain: `kernel_concat_b4`
+at 2304x2 to 2304x5 and `kernel_repeat_f32` at 2304x1, 2304x3 and 2304x4 took 16 and
+20 us per launch. Both now have a small variant that copies one element per work item,
+rows flattened over dims 0 and 1, local size 256, and it runs only when the output holds
+at most 16384 elements (64 KiB of F32): large copies keep the old geometry. Only 4-byte
+elements take the small variant, and the copy stays byte-identical.
+
+`test-backend-ops` gains the decode shapes: CONCAT along dim 1 of [2304,1] pieces
+(2304x2 to 2304x5), the dim 0 2304+2304 split (4608x1), narrow 4x2304 and 4x1024 rows,
+and REPEAT of [2304,1] to itself, to 3 and to 4 rows. The same entries are in the perf
+list, so `perf -o CONCAT` and `perf -o REPEAT` time exactly these shapes.
+
+Gate, CPU build: `test-backend-ops -b CPU -o CONCAT` 205/205, `-o REPEAT` 21/21.
+
+Gate on the card, owed, both builds:
+
+    test-backend-ops -b GPUOpenCL -o CONCAT
+    test-backend-ops -b GPUOpenCL -o REPEAT
+    test-backend-ops perf -b GPUOpenCL -o CONCAT
+    test-backend-ops perf -b GPUOpenCL -o REPEAT
+
+## 0148-inkling2-depth-mix-stack.patch
+
+The depth mix rebuilt `states` with one CONCAT per earlier block at every layer that starts a
+block, and broadcast the query with REPEAT at every visit: 260 CONCAT and 120 REPEAT launches
+for a decode token (16-20 us each before 0147). Now a block start writes its residual into a row
+of one F32 stack, a visit writes cur into the last row and takes one view over the rows it needs,
+and a decode passes the query unrepeated because `mul_mat` takes src1 ne2=1. A second stack holds
+the previous pass's bank. The values and their order are unchanged: the rows hold the blocks
+newest first, as the old concat chain built them, and the copy is byte-identical.
+
+The stack is read only through views. The scheduler leaves such a tensor without a backend, and
+ggml-alloc aborts on `buffer_id >= 0`, so each stack gets one direct consumer: a SUM_ROWS whose
+result is unused. A decode token runs 3 of them (one res stack, two bank stacks), one per stack
+and not per visit, each reading the stack once (18 KiB a token). A cheaper anchor would need a
+backend handle for the stack; the scheduler exposes none that a model graph can reach.
+
+Graph counts for a decode step (test-export-graph-ops, CPU, -c 2048): nodes 11490 -> 11243,
+CONCAT 548 -> 288, REPEAT 120 -> 0, SUM_ROWS 192 -> 195; the prompt graph goes 11490 -> 11363.
+
+Gate, CPU build, the pinned IQ4_NL weights, base logits from the same weights:
+
+    llama-perplexity -m <pinned IQ4_NL>.gguf -f /tmp/ink/gate.txt -c 2048 --chunks 3 -fa on \
+        --kl-divergence --kl-divergence-base /tmp/ink/base.logits
+
+holds: mean KL divergence 0.000000, same top p 99.967 %. Red case, the visit writing the
+previous slot instead of the last row: mean KL 10.334091, same top 1.369 %.
+
+On the card (Arc Pro B60 at a 165 W cap, OpenCL, flash attention on, `measured-here`), 0147 vs
+0147+0148: mean KL against the CPU base logits identical (0.001986, same top 98.534 %); llama-bench
+tg128 29.09 -> 29.50 t/s at depth 0 and 27.28 -> 27.56 at 4,096; pp512 +0.6 %.
+
+    llama-perplexity -m <pinned IQ4_NL>.gguf -f /tmp/ink/gate.txt -c 2048 --chunks 3 -fa on \
+        --kl-divergence --kl-divergence-base /tmp/ink/base.logits
+
+## 0149-opencl-sigmoid-strided-f32.patch
+
+Inkling 2 Mini's expert activation (SITU) takes `sigmoid` of the gate half of the fused gate_up
+result, a strided view. The OpenCL backend accepted SIGMOID only on contiguous input, so the
+scheduler ran that node on the CPU: per decode token 48 graph splits, each a blocking read of the
+gate to the host and about three queue synchronizations (`measured-here`: gdb backtraces of
+`clEnqueueReadBuffer` and `clWaitForEvents`, all from `ggml_backend_sched_graph_compute_async`
+and `sched_copy_input`; `GGML_SCHED_DEBUG=2`: 49 CPU splits per graph, the token embedding and 48
+SIGMOID nodes). The host could not run ahead of the card, so decode was bound by kernel enqueue
+(about 6,700 launches a token at about 3.6 us host each, unitrace).
+
+`kernel_sigmoid_f32_nc` takes the input by its strides, one work group per row, the layout of
+`kernel_tanh_f32_nc`, and the formula of `kernel_sigmoid_f32` (the same rounding);
+`ggml_cl_sigmoid` uses it for a non-contiguous f32 input, and `supports_op` admits that case. The
+contiguous paths and the f16 and bf16 paths are unchanged.
+
+Card (Arc Pro B60 at a 165 W cap, Inkling 2 Mini IQ4_NL, OpenCL, flash attention on,
+`measured-here`), 0148 vs 0148+0149:
+
+| | 0148 | 0149 |
+|---|---|---|
+| CPU splits per graph | 49 | 1 |
+| pp512 depth 0 / 4,096 (t/s) | 185.0 / 178.4 | 417.9 / 387.8 |
+| tg128 depth 0 / 4,096 (t/s) | 29.50 / 27.62 | 34.86 / 32.25 |
+| mean KL vs the CPU base, same top | 0.001986, 98.534 % | 0.001931, 98.501 % |
+
+test-backend-ops `-o SIGMOID`: the two strided f32 cases (`v=1`, [128,2,2,2] and [5,7,11,13]),
+"not supported" before, pass; the red case (`exp(+x)` in the new kernel) fails exactly those two
+(ERR 2.05 and 1.94). The contiguous bf16 [128,2,2,2] case is borderline at the test's 1e-7 NMSE
+threshold with random inputs in both builds: 6 of 50 runs fail on 0148, 2 of 50 on 0149.
+
+## 0150-ggml-glu-situ-fused.patch
+
+Inkling 2 Mini's expert activation (SITU) ran as a chain of nine small ops per MoE visit on the
+gate and up halves of the merged gate_up result, two strided views: scale(gate, 1/beta), tanh,
+scale(beta), sigmoid(gate), mul, then the up branch scale(up, 1/lb), tanh, scale(lb) and the
+final mul. 48 visits a decode token.
+
+The patch adds a GLU variant: `GGML_GLU_OP_SITU` with op params beta and linear_beta (the way
+`GGML_GLU_OP_SWIGLU_OAI` carries alpha and limit), `ggml_situ` and `ggml_situ_split`, and
+`build_moe_ffn` runs `LLM_FFN_SITU` as that one op on the gate and up views.
+
+The CPU implementation is the reference and keeps the chain's formula and order:
+`beta*tanh(gate*(1/beta)) * (1/(1+exp(-gate))) * (linear_beta > 0 ? linear_beta*tanh(up*(1/linear_beta)) : up)`.
+`kernel_situ_f32` in `glu.cl` takes both halves by their strides, so the merged gate_up tensor
+and the split two-tensor form share it; f32 only, and `supports_op` admits exactly that case.
+
+`measured-here`, CPU tree (`test-export-graph-ops` at `-c 2048`) and the CPU KL gate on the
+IQ4_NL file, base 547c468 vs this patch:
+
+| | base | patch |
+|---|---|---|
+| decode graph nodes (`tg`) | 11,243 | 10,859 |
+| prefill graph nodes (`pp`) | 11,363 | 10,979 |
+| mean KL vs the base logits, same top | - | 0.000000, 99.967 % |
+
+The unmeasured card expectation is 8 kernel launches fewer per MoE visit, 384 a decode token,
+against about 6,778 before.
+
+test-backend-ops `-o SITU` (correctness, merged and split, [2304,8,1,1], [2304,512,1,1], an odd
+small shape, plus the split [1152,...] forms): six cases, pass on the CPU. On a card the same
+six compare the OpenCL kernel against the CPU reference. The KL red case, dropping the sigmoid
+in the CPU op, gives mean KL 1.787650 and same top 56.044 %.
+
+On the card (Arc Pro B60 at a 165 W cap, Inkling 2 Mini IQ4_NL, OpenCL, flash attention on, `measured-here`),
+0149 vs 0149+0150: tg128 34.88 -> 36.60 t/s at depth 0 (+4.9 %), 32.23 -> 33.74 at 4,096, 28.78 -> 29.93 at
+32,768; pp512 +2.7 % (417.9 -> 429.1). Mean KL against the CPU base 0.001931 -> 0.001947, same top 98.501 ->
+98.175 %. test-backend-ops `-o SITU` on the card: 6 / 6 (the op's name is the GLU variant's; `-o GLU` selects
+nothing); the red case (sigmoid dropped in `kernel_situ_f32`) fails all 6 (ERR ~0.5) and moves the model's KL
+to 1.78; SWIGLU unchanged, 24 / 24.
+
+## 0152-fa-bias-carry-block-bins.patch
+
+A quantized K/V pair's prompt path dequantizes K and V to f16 in blocks of 16,384 keys
+(`GGML_OPENCL_FA_DPAS_F16KV_BLOCK`) and runs the f16 prompt kernel on each block with the softmax
+state carried between them (`FA_CARRY`, `kv0` the block's first key). The kernels advance the mask
+by `kv0`, but 0144 read the indexed bias's bins at `[key]`, the key within the block: every block
+after the first took the first block's relative-position bins. f16 K/V reads in place (`kv0 = 0`)
+and a mixed pair takes the f32_f16 kernel, so only q8_0/q8_0, q8_0/q4_0 and q4_0/q4_0 past 16,384
+keys were affected. The bins are now read at `kv0 + key` in `flash_attn_dpas.cl` (both kernels) and
+`flash_attn_dpas2.cl` (both lookups).
+
+`measured-here` (Arc Pro B70 at a 220 W cap, Inkling 2 Mini IQ4_NL, KL at 32,768 tokens against the
+CPU's f16 logits): q8_0/q8_0 0.037040, same top 94.586 % before; 0.005965 / 98.065 % after (f16
+0.005306, q8_0 K only 0.005412, q8_0 V only 0.005688, the CPU's own q8_0/q8_0 0.005908). Located by
+switch: `GGML_OPENCL_FA_DPAS_Q=0` (the quantized prompt kernels off) gave 0.005554, `FA_DPAS2=0` and
+`FA_GQA=0` left 0.037; at 2,048 tokens (one block) q8_0/q8_0 was 0.002351. With q8_0/q8_0 KV the
+needle at 64,000 and 120,000 tokens had been missed; with f16 KV it was found at 64,000.
+
+Two test-backend-ops cases run the quantized pair's prompt path with the bias, Inkling's shape
+(head 128, 24 query heads over 8, 1,025 bins), in one block (1,025 keys, 512 rows) and in two
+(16,448 keys, 128 rows). No case reached that path before: 0142's quantized bias cases have 4 rows
+(decode) and its prompt case is f16, so the whole FLASH_ATTN_EXT suite passed on 0150 even with
+64-key blocks forced (3,171 / 3,171). With the two cases: 3,173 / 3,173 on 0152 at both block sizes.

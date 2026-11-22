@@ -41,6 +41,15 @@ bool is_dory_4b(std::string_view arch, const ModelGeometry& g) {
            g.head_dim == 256 && g.n_vocab == 131072;
 }
 
+// Inkling 2 Mini (Thinking Machines, `inkling2_loop`): 24 PHYSICAL blocks, 2304 wide, 24 query heads
+// over 8 KV heads, key length 128, 200,058 tokens (`code`: the GGUF's metadata; the vocabulary is the
+// unpadded count llama_vocab_n_tokens reports, the file pads its embedding rows to 201,024). The core
+// blocks 6-17 run three times through cache slots, so, as for Dory, the backend passes the physical count.
+bool is_inkling2_mini(std::string_view arch, const ModelGeometry& g) {
+    return arch == "inkling2_loop" && g.n_layer == 24 && g.n_embd == 2304 && g.n_head == 24 && g.n_head_kv == 8 &&
+           g.head_dim == 128 && g.n_vocab == 200058;
+}
+
 }  // namespace
 
 std::string checkpoints_refusal(bool asked, bool can_snapshot, std::string_view arch) {
@@ -59,6 +68,7 @@ AdmittedModel admit_model(std::string_view arch, const ModelGeometry& g, bool tt
     if (is_gemma4_e4b(arch, g)) return AdmittedModel::Gemma4E4B;
     if (is_granite_8b(arch, g)) return AdmittedModel::Granite8B;
     if (is_dory_4b(arch, g)) return AdmittedModel::Dory1_0_4B;
+    if (is_inkling2_mini(arch, g)) return AdmittedModel::Inkling2Mini;
     if (tts && arch == "qwen3tts") return AdmittedModel::Qwen3Tts;
     return AdmittedModel::None;
 }
@@ -71,6 +81,8 @@ ChatDialect dialect_of(AdmittedModel m) {
         // block when thinking is on, the template's default) and the Qwen coder's function/parameter
         // call form (`code`: the GGUF's template text; tests/test_chat_render.cpp, test_toolcall.cpp)
         case AdmittedModel::Dory1_0_4B: return ChatDialect::Qwen;
+        // Inkling 2 Mini: its own message-block framing and JSON calls (core/dialect.h)
+        case AdmittedModel::Inkling2Mini: return ChatDialect::Inkling;
         default: return ChatDialect::Qwen;
     }
 }
@@ -81,7 +93,8 @@ std::string admission_refusal(const std::string& gguf_path, std::string_view arc
            "qwen2vl (vision, with --mmproj), Mistral Small 3.2 24B ('llama', 40 x 5120, 32/8 heads), "
            "Llama 2 7B ('llama', 32 x 4096, 32/32 heads), Gemma 4 E4B ('gemma4', 42 x 2560, 8/2 heads, "
            "key length 512), Granite 4.2 8B ('granite', 40 x 4096, 32/8 heads), Dory1.0-4B ('dory', 72 blocks x 2560, "
-           "16/4 heads, key length 256) and, under --tts, qwen3tts";
+           "16/4 heads, key length 256), Inkling 2 Mini ('inkling2_loop', 24 blocks x 2304, 24/8 heads, key length 128) "
+           "and, under --tts, qwen3tts";
 }
 
 }  // namespace lgc

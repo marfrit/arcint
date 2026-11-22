@@ -312,12 +312,106 @@ ToolCallParse parse_gemma_tool_calls(std::string_view text, const ToolSchemas* s
     return result;
 }
 
+
+// ---- Inkling 2 Mini's call form -------------------------------------------
+// One block per call, as mainline's common/parsers/inkling.cpp builds it:
+//   <|message_model|>NAME<|content_invoke_tool_json|>
+//   {"name":"NAME","args":{...}}<|end_message|>
+// (0003-chat-implement-inkling-parser-32381.patch, common/parsers/inkling.cpp:
+// `open` and `tool_choice`). The header name and the JSON name must agree; the
+// arguments are one JSON object, whose strings may contain the block closer.
+
+ToolCallParse parse_inkling_tool_calls(std::string_view text) {
+    ToolCallParse result;
+    size_t cursor = 0;
+    while (cursor <= text.size()) {
+        const size_t tj = text.find(markers::kInkContentToolJson, cursor);
+        if (tj == std::string_view::npos) {
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        const size_t h = text.rfind(markers::kInkMessageModel, tj);
+        if (h == std::string_view::npos || h < cursor) {
+            // A call marker outside a header block: not this parser's form.
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        const size_t name_start = h + markers::kInkMessageModel.size();
+        // The header must be this block's: a closer between it and the tool
+        // marker means the header introduced an earlier block, not the call.
+        if (text.find(markers::kInkEndMessage, name_start) < tj) {
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        const std::string name(text::trim(text.substr(name_start, tj - name_start)));
+        const size_t json_start = tj + markers::kInkContentToolJson.size();
+        size_t       json_end   = json_start;
+        if (json_start >= text.size() || text[json_start] != '{') {
+            result.truncated = true;
+            result.content.append(text.substr(h));
+            break;
+        }
+        int  depth = 0;
+        bool in_str = false, escaped = false;
+        for (; json_end < text.size(); ++json_end) {
+            const char c = text[json_end];
+            if (in_str) {
+                if (escaped) escaped = false;
+                else if (c == '\\') escaped = true;
+                else if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '"') in_str = true;
+            else if (c == '{') ++depth;
+            else if (c == '}' && --depth == 0) {
+                ++json_end;   // past the closing brace
+                break;
+            }
+        }
+        if (depth != 0 || in_str) {
+            result.truncated = true;
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        json parsed;
+        try {
+            parsed = json::parse(text.substr(json_start, json_end - json_start));
+        } catch (const json::exception&) {
+            result.truncated = true;
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        const bool named = parsed.is_object() && parsed.contains("name") &&
+                           parsed["name"].is_string() && parsed["name"].get<std::string>() == name &&
+                           parsed.contains("args") && parsed["args"].is_object();
+        const size_t end = text.substr(json_end, markers::kInkEndMessage.size()) ==
+                                   markers::kInkEndMessage
+                               ? json_end + markers::kInkEndMessage.size()
+                               : std::string_view::npos;
+        if (!named || end == std::string_view::npos) {
+            result.truncated = true;
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        ToolCall call;
+        call.id        = log::format("call_%zu", result.calls.size());
+        call.name      = name;
+        call.arguments = parsed["args"].dump();
+        result.content.append(text.substr(cursor, h - cursor));
+        result.calls.push_back(std::move(call));
+        cursor = end;
+    }
+    return result;
+}
+
 }  // namespace
 
 std::string_view tool_call_open(ChatDialect dialect) {
+    if (dialect.inkling()) return markers::kInkMessageModel;
     return dialect.gemma4() ? markers::kGemmaToolOpen : kOpen;
 }
 std::string_view tool_call_close(ChatDialect dialect) {
+    if (dialect.inkling()) return markers::kInkEndMessage;
     return dialect.gemma4() ? markers::kGemmaToolClose : kClose;
 }
 
@@ -375,6 +469,7 @@ ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* sc
 }
 
 ToolCallParse parse_tool_calls(std::string_view text, ChatDialect dialect, const ToolSchemas* schemas) {
+    if (dialect.inkling()) return parse_inkling_tool_calls(text);
     return dialect.gemma4() ? parse_gemma_tool_calls(text, schemas) : parse_qwen_tool_calls(text, schemas);
 }
 

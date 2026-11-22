@@ -1,0 +1,69 @@
+0132: the 2D K-quant GEMMs take the B70's (BMG-G31, device id 0xe223) searched tiles when no GGML_OPENCL_KQ_2D_T<i> is set: Q4_K's int8 kernel on 8 sub-groups a work-group, Q5_K and Q6_K with a barrier every 8 blocks; GGML_OPENCL_KQ_2D_DEVICE=0 keeps the defaults.
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -876,6 +876,8 @@ struct ggml_backend_opencl_context {
+     // 0079: LEO mode and the DG2 family, for the image1d_buffer weight bound
+     bool    leo_mode = false;
+     bool    dg2 = false;
++    // 0132: the Intel device id (CL_DEVICE_ID_INTEL), 0 when the runtime does not expose it
++    cl_uint intel_device_id = 0;
+     size_t  image2d_max_height;
+ 
+     cl_device_svm_capabilities svm_caps;
+@@ -3245,6 +3247,20 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         const std::string en = "GGML_OPENCL_KQ_2D_T" + std::to_string(i);
+                         const char * tv = getenv(en.c_str());
+                         int a = 0, b = 0, c = 0, d = 0;
++                        if (tv == nullptr) {
++                            // 0132: a card's own tiles where they were searched and gated (tools/kq_tune,
++                            // kqga_e2e.py). The B70 (BMG-G31, 0xe223): Q4_K's int8 kernel on 8 sub-groups
++                            // a work-group, Q5_K and Q6_K with a barrier every 8 blocks; the dense 27B's
++                            // prefill +0.31 % at 4,096 tokens, the same logits to the last digit, MUL_MAT
++                            // 2941/2941 (measured-here). GGML_OPENCL_KQ_2D_DEVICE=0 keeps every card on
++                            // the defaults above.
++                            static const char * dv_env = getenv("GGML_OPENCL_KQ_2D_DEVICE");
++                            static const char * const g31[3] = { "64,8,32,32", "64,16,32,8", "64,16,32,8" };
++                            if ((dv_env == nullptr || atoi(dv_env) != 0) && backend_ctx->intel_device_id == 0xe223u) {
++                                tv = g31[i];
++                                GGML_LOG_INFO("ggml_opencl: %s=%s (the B70's searched tiles; GGML_OPENCL_KQ_2D_DEVICE=0: off)\n", en.c_str(), tv);
++                            }
++                        }
+                         if (tv == nullptr) continue;
+                         if (sscanf(tv, "%d,%d,%d,%d", &a, &b, &c, &d) != 4 || a <= 0 || b <= 0 || d <= 0 || (c != 8 && c != 32) || a % c != 0) {
+                             GGML_LOG_WARN("ggml_opencl: %s=%s ignored\n", en.c_str(), tv);
+@@ -9212,6 +9228,26 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
+     return true;
+ }
+ 
++// 0132: the Intel device id through cl_intel_device_attribute_query, 0 when the
++// runtime does not expose it (the Arc Pro B70, BMG-G31, is 0xe223 and the Arc Pro
++// B60, BMG-G21, 0xe211: measured-here).
++static cl_uint ggml_opencl_intel_device_id(cl_device_id device) {
++    size_t ext_size = 0;
++    if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, 0, nullptr, &ext_size) != CL_SUCCESS || ext_size == 0) {
++        return 0;
++    }
++    std::unique_ptr<char[]> ext(new char[ext_size]);
++    if (clGetDeviceInfo(device, CL_DEVICE_EXTENSIONS, ext_size, ext.get(), nullptr) != CL_SUCCESS ||
++        strstr(ext.get(), "cl_intel_device_attribute_query") == nullptr) {
++        return 0;
++    }
++    cl_uint id = 0;
++    if (clGetDeviceInfo(device, CL_DEVICE_ID_INTEL, sizeof(id), &id, nullptr) != CL_SUCCESS) {
++        return 0;
++    }
++    return id;
++}
++
+ // 0079: the device is a DG2 (Intel Arc A-series / Pro A-series).  The model
+ // names carry it; when the runtime exposes cl_intel_device_attribute_query the
+ // device id is the authoritative form (the A770 is 0x56a0, measured-here; the
+@@ -9384,6 +9420,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
+     // the false branch and create the same images as before.
+     backend_ctx->leo_mode = ggml_cl_version_is_leo(dev_ctx->device_version.c_str()) != 0;
+     backend_ctx->dg2      = ggml_opencl_device_is_dg2(device);
++    backend_ctx->intel_device_id = ggml_opencl_intel_device_id(device);
+     if (backend_ctx->leo_mode && backend_ctx->dg2) {
+         GGML_LOG_INFO("ggml_opencl: LEO on DG2: weight images above %zu texels are skipped\n",
+                       GGML_CL_DG2_LEO_MAX_IMAGE_TEXELS);

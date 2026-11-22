@@ -44,6 +44,9 @@ bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect
 }
 
 bool prompt_ends_after_think_block(std::string_view prompt, ChatDialect dialect) {
+    // Inkling ends every message block, the last user turn included, with the
+    // same closer; a prompt that ends there did not end after a think block.
+    if (dialect.inkling()) return false;
     // The layout after the closer is the template's, not part of the tag.
     while (!prompt.empty() && (prompt.back() == '\n' || prompt.back() == ' ')) prompt.remove_suffix(1);
     for (const auto& [open, close] : think_tag_pairs(dialect)) {
@@ -874,6 +877,18 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     if (st.tts) {
         return HttpResult{400, invalid_request("this unit serves speech (--tts): POST /v1/audio/speech; "
                                                "chat completions are not served here")};
+    }
+    // A template with its own effort map (Inkling's) raises on a level it does
+    // not know: answer that with a 400 naming the allowed set, before the render.
+    {
+        const json caps = ctx.backend->template_caps();
+        if (caps.value("reasoning_effort_strict", false)) {
+            const std::vector<std::string> levels =
+                caps.value("reasoning_effort_levels", std::vector<std::string>{});
+            if (auto err = check_strict_reasoning_effort(req, levels)) {
+                return HttpResult{400, invalid_request(*err)};
+            }
+        }
     }
 
     PreparedChat prep;

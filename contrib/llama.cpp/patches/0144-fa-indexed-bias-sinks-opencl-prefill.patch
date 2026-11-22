@@ -1,0 +1,456 @@
+0144: the indexed bias and the sinks in the XMX prompt kernels (flash_attn_dpas.cl sub-group 16 and 8, flash_attn_dpas2.cl and its split combine), taken as unconditional trailing arguments; fa_dpas_ok checks their shapes instead of declining them.
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13329,6 +13329,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                                    k->type == GGML_TYPE_Q4_0 && v->type == GGML_TYPE_Q4_0 ? 2 : -1;
+                 static const char * fdi_env = getenv("GGML_OPENCL_FA_INTEL_SPLIT");
+                 const char * why = nullptr;
++                const bool decode_rows = q->ne[1] <= 8;
+                 if (fdi_env != nullptr && atoi(fdi_env) == 0) {
+                     why = "switched-off";
+                 } else if (op->src[GGML_FA_SRC_PAGES] || op->src[GGML_FA_SRC_PLAN] || op->src[GGML_FA_SRC_TAG]) {
+@@ -13337,21 +13338,57 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                     why = "device";
+                 } else if (q->type != GGML_TYPE_F32 || (!f16kv && kvq < 0)) {
+                     why = "kv-type";
+-                } else if (mask == nullptr || mask->type != GGML_TYPE_F16 || q->ne[1] > 8 ||
++                } else if (mask == nullptr || mask->type != GGML_TYPE_F16 ||
+                            k->ne[3] != q->ne[3] || q->ne[0] != v->ne[0]) {
+                     why = "shape";
+-                } else if (bt == nullptr || bi == nullptr || bt->ne[1] <= 0 || bi->type != GGML_TYPE_I32 ||
+-                           bi->ne[0] < k->ne[1]) {
+-                    why = "bias-tensors";
+                 } else {
+-                    load_cl_kernels(backend_ctx);
+-                    const int n_bins = (int) bt->ne[1];
+-                    const std::pair<int, int> key = { q->ne[0], v->ne[0] };
+-                    if (backend_ctx->fa.f32_merge.count(key) == 0) {
+-                        why = "no-merge";
+-                    } else if (ggml_opencl_fa_bias_kernel(backend_ctx, f16kv ? 1 : 2, q->ne[0], v->ne[0], f16kv ? -1 : kvq,
+-                                                         n_bins) == nullptr) {
+-                        why = "no-bias-kernel";
++                    float max_bias = 0.0f, softcap = 0.0f;
++                    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
++                    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
++                    // the table holds one row per (stream, query), flattened stream first in
++                    // dim 2 - the setter asserts that layout; dim 3 is 1. The kernels read
++                    // table[(row*n_bins + bin)*n_head + head] and idx[row, key]
++                    const int64_t rows = q->ne[1] * q->ne[3];
++                    if (bt == nullptr || bi == nullptr) {
++                        why = "bias-tensors";
++                    } else if (bt->type != GGML_TYPE_F32 || !ggml_is_contiguous(bt) || bt->ne[0] != q->ne[2] ||
++                               bt->ne[1] <= 0 || bt->ne[2] < rows || bt->ne[3] != 1) {
++                        why = "bias-table";
++                    } else if (bi->type != GGML_TYPE_I32 || !ggml_is_contiguous(bi) || !ggml_is_matrix(bi) ||
++                               bi->ne[0] < k->ne[1] || bi->ne[1] < rows) {
++                        why = "bias-indices";
++                    } else if (!decode_rows) {
++                        // the prompt kernels read the bias: the ordinary dpas branch, whose
++                        // mask, layout and kernel conditions are the ones fa_dpas_ok keeps.
++                        // The 9-64-row blocks re-enter this function with sliced rows but
++                        // whole-batch indices, so those shapes are declined here
++                        load_cl_kernels(backend_ctx);
++                        const int dk = (int) q->ne[0], dv = (int) v->ne[0];
++                        const int fa_dki = dk == 256 && dv == 256 ? 0 : dk == 128 && dv == 128 ? 1 : -1;
++                        const bool dpas = fa_dki >= 0 && (f16kv ? backend_ctx->kernel_fa_dpas_dk[fa_dki] != nullptr
++                                                               : backend_ctx->kernel_fa_dpas_q_dk[fa_dki][kvq] != nullptr);
++                        if (q->ne[1] <= 64 && q->ne[3] == 1) {
++                            why = "row-blocks";
++                        } else if (!dpas || max_bias != 0.0f || softcap != 0.0f ||
++                                   q->nb[0] != sizeof(float) || k->nb[0] != ggml_type_size(k->type) ||
++                                   v->nb[0] != ggml_type_size(v->type) ||
++                                   mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1]) {
++                            why = "shape";
++                        }
++                    } else {
++                        load_cl_kernels(backend_ctx);
++                        // the merge and the split kernels come from the f32_f16 variant, built
++                        // on demand (the dk512 path does the same): a support query can land
++                        // before any allocation
++                        ggml_opencl_ensure_fa_variant(backend_ctx, q->ne[0], v->ne[0], FA_VARIANT_F32_F16);
++                        const int n_bins = (int) bt->ne[1];
++                        const std::pair<int, int> key = { q->ne[0], v->ne[0] };
++                        if (backend_ctx->fa.f32_merge.count(key) == 0) {
++                            why = "no-merge";
++                        } else if (ggml_opencl_fa_bias_kernel(backend_ctx, f16kv ? 1 : 2, q->ne[0], v->ne[0],
++                                                             f16kv ? -1 : kvq, n_bins) == nullptr) {
++                            why = "no-bias-kernel";
++                        }
+                     }
+                 }
+                 if (why != nullptr) {
+@@ -25899,8 +25936,21 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     // Xe2 at head size 512 has flash_attn_dpas2.cl only: f16 K/V in place, or
+     // any pair through its carry path's f16 blocks
+     const bool fa_v2_512 = fa_pi == 2 && kd_sel == nullptr && ggml_opencl_fa_dpas512_ready(backend_ctx, is_mixed, kvq);
+-    const bool fa_dpas_ok = (kd_sel != nullptr || fa_v2_512) && n_q > 8 && !gqa_wide &&
+-        sinks == nullptr && max_bias == 0.0f && logit_softcap == 0.0f &&
++    // 0144: sinks and the indexed bias are read by the prompt kernels themselves
++    // (one sink logit a head, the bias folded into the mask); both need the tensors
++    // in the shape the kernels index, so a call missing them is still declined
++    const bool fa_bias_pre = ggml_flash_attn_ext_has_indexed_bias(dst);
++    const ggml_tensor * fb_table = fa_bias_pre ? dst->src[GGML_FA_SRC_BIAS_TABLE] : nullptr;
++    const ggml_tensor * fb_idx   = fa_bias_pre ? dst->src[GGML_FA_SRC_BIAS_IDX]   : nullptr;
++    const bool fa_bias_ok = !fa_bias_pre || (fb_table != nullptr && fb_idx != nullptr && mask != nullptr &&
++        fb_table->type == GGML_TYPE_F32 && ggml_is_contiguous(fb_table) && fb_table->ne[0] == n_head &&
++        fb_table->ne[1] > 0 && fb_table->ne[2] >= (int64_t) n_q * n_batch && fb_table->ne[3] == 1 &&
++        fb_idx->type == GGML_TYPE_I32 && ggml_is_contiguous(fb_idx) && fb_idx->ne[0] >= (int64_t) n_kv &&
++        fb_idx->ne[1] >= (int64_t) n_q * n_batch);
++    const bool fa_sinks_ok = sinks == nullptr || (sinks->type == GGML_TYPE_F32 && ggml_is_contiguous(sinks) &&
++        sinks->ne[0] >= (int64_t) n_head);
++    const bool fa_dpas_ok = (kd_sel != nullptr || fa_v2_512) && n_q > 8 && !gqa_wide && fa_bias_ok && fa_sinks_ok &&
++        max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
+     if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok && !gqa_wide) {
+@@ -25952,7 +26002,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         cl_int   mcls_tiles = 0;
+         auto prep_mcls = [&]() {
+             cl_kernel km = backend_ctx->kernel_fa_mask_cls;
+-            if (km == nullptr || mask_buffer == nullptr || (mcls_env != nullptr && atoi(mcls_env) == 0)) {
++            // 0144: with a bias every tile reads it (`all-zero` would skip the tiles
++            // the mask alone lets out), so the class map is not built
++            if (km == nullptr || mask_buffer == nullptr || fa_bias_pre || (mcls_env != nullptr && atoi(mcls_env) == 0)) {
+                 return;
+             }
+             mcls_tiles = CEIL_DIV(n_kv, 32);
+@@ -26025,6 +26077,33 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                     CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),    &sl));
+                 }
+             }
++            // 0144: the sink logits and the indexed-bias table and bins, last in the
++            // kernel signature; NULL and 0 when the call has none
++            const int   n_bins = fb_table != nullptr ? (int) fb_table->ne[1] : 0;
++            cl_mem sink_buffer = nullptr;
++            cl_ulong sink_off = 0;
++            if (sinks != nullptr) {
++                ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *) sinks->extra;
++                sink_buffer = es->data_device;
++                sink_off = es->offset + sinks->view_offs;
++            }
++            cl_mem   bt_buffer = nullptr, bi_buffer = nullptr;
++            cl_ulong bt_off = 0, bi_off = 0, bi_nb1 = 0;
++            if (fb_table != nullptr && fb_idx != nullptr) {
++                ggml_tensor_extra_cl * eb = (ggml_tensor_extra_cl *) fb_table->extra;
++                ggml_tensor_extra_cl * ei = (ggml_tensor_extra_cl *) fb_idx->extra;
++                bt_buffer = eb->data_device; bt_off = eb->offset + fb_table->view_offs;
++                bi_buffer = ei->data_device; bi_off = ei->offset + fb_idx->view_offs;
++                bi_nb1 = fb_idx->nb[1];
++            }
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   sink_buffer ? &sink_buffer : &nomask));
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &sink_off));
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   bt_buffer ? &bt_buffer : &nomask));
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &bt_off));
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(int),      &n_bins));
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_mem),   bi_buffer ? &bi_buffer : &nomask));
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &bi_off));
++            CL_CHECK(clSetKernelArg(kd, a++, sizeof(cl_ulong), &bi_nb1));
+             const size_t bq   = (size_t) (v2 ? backend_ctx->fa_dpas2_bq   : backend_ctx->fa_dpas_bq);
+             const size_t nthr = (size_t) (v2 ? backend_ctx->fa_dpas2_nthr : backend_ctx->fa_dpas_nthr);
+             size_t gws[3] = { (size_t) CEIL_DIV(n_q, (int) bq) * nthr * (size_t) n_split, (size_t) n_head * fa_nvh, (size_t) n_batch };
+@@ -26086,6 +26165,16 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+             CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(int),      &n_head));
+             CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(int),      &n_batch));
+             CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(int),      &carry_out));
++            // 0144: the sink, joined after the merge (m_final, l_final)
++            cl_mem sink_buffer = nullptr;
++            cl_ulong sink_off = 0;
++            if (sinks != nullptr) {
++                ggml_tensor_extra_cl * es = (ggml_tensor_extra_cl *) sinks->extra;
++                sink_buffer = es->data_device;
++                sink_off = es->offset + sinks->view_offs;
++            }
++            CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(cl_mem),   sink_buffer ? &sink_buffer : &nomask));
++            CL_CHECK(clSetKernelArg(kcomb, a++, sizeof(cl_ulong), &sink_off));
+             const size_t n_g = (size_t) CEIL_DIV(n_q, backend_ctx->fa_dpas2_bq) * backend_ctx->fa_dpas2_bq / 8;
+             size_t gws[3] = { n_g * 16, (size_t) n_head * fa_nvh, (size_t) n_batch };
+             size_t lws[3] = { 16, 1, 1 };
+@@ -26682,6 +26771,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     if (fa_bias) {
+         const ggml_tensor * bt = dst->src[GGML_FA_SRC_BIAS_TABLE];
+         fa_bias_bins = bt != nullptr ? (int) bt->ne[1] : 0;
++        // the split's merge kernel comes from the f32_f16 variant; a call whose
++        // supports_op ran earlier already has it, one that did not gets it here
++        ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16);
+         GGML_ASSERT(!kv_pages && "a paged FLASH_ATTN_EXT cannot take an indexed bias");
+         fd_k_split = use_fd_gqa ? ggml_opencl_fa_bias_kernel(backend_ctx, 0, d_head_q, d_head_v,
+                                                             is_mixed ? 0 : kvq + 1, fa_bias_bins)
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas.cl
+@@ -176,6 +176,12 @@ kernel void flash_attn_f32_f16_dpas(
+         // `carry` from the previous block (carry_in) to the next (carry_out)
+         , global float * carry, int kv0, int carry_in, int carry_out
+ #endif
++        // 0144: the attention sink (a per-head logit with no V row) and an indexed
++        // relative-position bias (bin = idx[query][key], table [(query*n_bins + bin)*n_head + head]
++        // added to the mask in f32 and rounded to f16 once); NULL when the call has none
++        , global const void * sink_void, ulong sink_offset
++        , global const void * bias_void, ulong bias_offset, int n_bins
++        , global const void * bix_void, ulong bix_offset, ulong bix_nb1
+         ) {
+     local half kv[BK * DK];     // one buffer (16 KB at DK 256): K, then rewritten as V
+ 
+@@ -334,8 +340,18 @@ kernel void flash_attn_f32_f16_dpas(
+                 const int qr = min(q_sg + r, n_q - 1);
+                 half mh = 0.0h;
+                 if (mb != 0 && key < n_kv) mh = ((global const half *)((global const char *) mb + qr * mask_nb1))[key];
+-                const float mk  = (float) mh;
++                float mk  = (float) mh;
+                 const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;   // -inf: masked
++                if (bias_void != 0 && key < n_kv && q_sg + r < n_q) {
++                    const int qrow = batch * n_q + qr;
++                    const int bin = bix_void != 0
++                        ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                    if (bin >= 0 && bin < n_bins) {
++                        const float bv = ((global const float *)((global const char *) bias_void + bias_offset))[
++                            ((qrow * n_bins + bin) * n_head) + head];
++                        mk = (float)(half)(mk + bv);
++                    }
++                }
+                 sv[r] = vis ? sv[r] + mk : M_INIT;
+             }
+             s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
+@@ -418,8 +434,31 @@ kernel void flash_attn_f32_f16_dpas(
+         return;
+     }
+ #endif
++    // 0144: the sink enters m and l once, after the key loop: one logit a head,
++    // no V row. m is the same in every lane, l a lane's partial sum, so the term
++    // is added to the reduced sum, once - not to every lane's l
++    float skterm[8];
++    for (int r = 0; r < 8; ++r) skterm[r] = 0.f;
++    if (sink_void != 0) {
++        const float sk = ((global const float *)((global const char *) sink_void + sink_offset))[head];
++        float cs[8];
++        for (int r = 0; r < 8; ++r) {
++            cs[r] = 1.f;
++            if (q_sg + r < n_q) {
++                const float nm = fmax(m[r], sk);
++                if (nm > m[r]) {
++                    cs[r] = native_exp(m[r] - nm);   // o and l follow the new max
++                    l[r] *= cs[r];
++                }
++                m[r] = nm;
++                skterm[r] = native_exp(sk - nm);
++            }
++        }
++        const float8 cv = (float8)(cs[0], cs[1], cs[2], cs[3], cs[4], cs[5], cs[6], cs[7]);
++        for (int c = 0; c < NDC; ++c) o[c] *= cv;
++    }
+     float lv[8];
+-    for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]);
++    for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]) + skterm[r];
+     for (int c = 0; c < NDC; ++c) {
+         const float ov[8] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
+         for (int r = 0; r < 8; ++r) {
+@@ -491,7 +530,14 @@ kernel void flash_attn_f32_f16_dpas(
+         ulong v_nb1, ulong v_nb2, ulong v_nb3,
+         ulong o_nb1, ulong o_nb2, ulong o_nb3,
+         ulong mask_nb1, ulong mask_nb2, ulong mask_nb3, int mask_ne2, int mask_ne3,
+-        int n_batch, int k_ne3, int v_ne3) {
++        int n_batch, int k_ne3, int v_ne3
++        // 0144: the attention sink (a per-head logit with no V row) and an indexed
++        // relative-position bias (bin = idx[query][key], table [(query*n_bins + bin)*n_head + head]
++        // added to the mask in f32 and rounded to f16 once); NULL when the call has none
++        , global const void * sink_void, ulong sink_offset
++        , global const void * bias_void, ulong bias_offset, int n_bins
++        , global const void * bix_void, ulong bix_offset, ulong bix_nb1
++        ) {
+ #ifndef FA_QG
+     local half qs[BQ * DK];
+ #endif
+@@ -624,8 +670,18 @@ kernel void flash_attn_f32_f16_dpas(
+                 float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
+                 for (int r = 0; r < 8; ++r) {
+                     half mh = ((global const half *)((global const char *) mb + qroff[r]))[min(key, n_kv - 1)];
+-                    const float mk  = (float) mh;
++                    float mk  = (float) mh;
+                     const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;   // -inf: masked
++                    if (bias_void != 0 && vis) {
++                        const int qrow = batch * n_q + q_sg + r;
++                        const int bin = bix_void != 0
++                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                        if (bin >= 0 && bin < n_bins) {
++                            const float bv = ((global const float *)((global const char *) bias_void + bias_offset))[
++                                ((qrow * n_bins + bin) * n_head) + head];
++                            mk = (float)(half)(mk + bv);
++                        }
++                    }
+                     sv[r] = vis ? sv[r] + mk : M_INIT;
+                 }
+                 s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
+@@ -723,8 +779,31 @@ kernel void flash_attn_f32_f16_dpas(
+         }
+     }
+ 
++    // 0144: the sink enters m and l once, after the key loop: one logit a head,
++    // no V row. m is the same in every lane, l a lane's partial sum, so the term
++    // is added to the reduced sum, once - not to every lane's l
++    float skterm[8];
++    for (int r = 0; r < 8; ++r) skterm[r] = 0.f;
++    if (sink_void != 0) {
++        const float sk = ((global const float *)((global const char *) sink_void + sink_offset))[head];
++        float cs[8];
++        for (int r = 0; r < 8; ++r) {
++            cs[r] = 1.f;
++            if (q_sg + r < n_q) {
++                const float nm = fmax(m[r], sk);
++                if (nm > m[r]) {
++                    cs[r] = native_exp(m[r] - nm);   // o and l follow the new max
++                    l[r] *= cs[r];
++                }
++                m[r] = nm;
++                skterm[r] = native_exp(sk - nm);
++            }
++        }
++        const float8 cv = (float8)(cs[0], cs[1], cs[2], cs[3], cs[4], cs[5], cs[6], cs[7]);
++        for (int c = 0; c < NDC; ++c) o[c] *= cv;
++    }
+     float lv[8], linv[8];
+-    for (int r = 0; r < 8; ++r) { lv[r] = sub_group_reduce_add(l[r]); linv[r] = lv[r] > 0.f ? 1.f / lv[r] : 0.f; }
++    for (int r = 0; r < 8; ++r) { lv[r] = sub_group_reduce_add(l[r]) + skterm[r]; linv[r] = lv[r] > 0.f ? 1.f / lv[r] : 0.f; }
+     for (int c = 0; c < NDC; ++c) {
+         const float ov[8] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
+         for (int r = 0; r < 8; ++r) {
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dpas2.cl
+@@ -151,6 +151,12 @@ kernel void flash_attn_f32_f16_dpas2(
+         , global float * carry, int kv0, int carry_in, int carry_out
+         , global float * parts, int n_split, int split_len
+ #endif
++        // 0144: the attention sink (a per-head logit with no V row) and an indexed
++        // relative-position bias (bin = idx[query][key], table [(query*n_bins + bin)*n_head + head]
++        // added to the mask in f32 and rounded to f16 once); NULL when the call has none
++        , global const void * sink_void, ulong sink_offset
++        , global const void * bias_void, ulong bias_offset, int n_bins
++        , global const void * bix_void, ulong bix_offset, ulong bix_nb1
+         ) {
+     const int lane = get_sub_group_local_id(), sg = get_sub_group_id(), lid = get_local_id(0);
+     // dimension 1: a head slot, the head times NVH plus this work-group's half of V
+@@ -297,8 +303,18 @@ kernel void flash_attn_f32_f16_dpas2(
+                     const int qr = min(q_sg + r, n_q - 1);
+                     half mh = 0.0h;
+                     if (mb != 0 && key < n_kv) mh = ((global const half *)((global const char *) mb + qr * mask_nb1))[key];
+-                    const float mk  = (float) mh;
++                    float mk  = (float) mh;
+                     const bool  vis = key < n_kv && q_sg + r < n_q && as_ushort(mh) != 0xFC00;
++                    if (bias_void != 0 && vis) {
++                        const int qrow = batch * n_q + q_sg + r;
++                        const int bin = bix_void != 0
++                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                        if (bin >= 0 && bin < n_bins) {
++                            const float bv = ((global const float *)((global const char *) bias_void + bias_offset))[
++                                ((qrow * n_bins + bin) * n_head) + head];
++                            mk = (float)(half)(mk + bv);
++                        }
++                    }
+                     sv[r] = vis ? sv[r] + mk : M_INIT;
+                 }
+                 s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
+@@ -310,7 +326,25 @@ kernel void flash_attn_f32_f16_dpas2(
+                 const int key = t0 + g * 16 + lane;
+                 float sv[8] = { s[g].s0, s[g].s1, s[g].s2, s[g].s3, s[g].s4, s[g].s5, s[g].s6, s[g].s7 };
+                 _Pragma("unroll")
+-                for (int r = 0; r < 8; ++r) sv[r] = key < n_kv && q_sg + r < n_q ? sv[r] : M_INIT;
++                for (int r = 0; r < 8; ++r) {
++                    const bool vis = key < n_kv && q_sg + r < n_q;
++                    if (vis && bias_void != 0 && mb != 0) {
++                        const int qr = min(q_sg + r, n_q - 1);
++                        const int qrow = batch * n_q + qr;
++                        const int bin = bix_void != 0
++                            ? ((global const int *)((global const char *) bix_void + bix_offset + qrow * bix_nb1))[key] : -1;
++                        const half mh = ((global const half *)((global const char *) mb + qr * mask_nb1))[key];
++                        float mk = (float) mh;
++                        if (bin >= 0 && bin < n_bins) {
++                            const float bv = ((global const float *)((global const char *) bias_void + bias_offset))[
++                                ((qrow * n_bins + bin) * n_head) + head];
++                            mk = (float)(half)(mk + bv);
++                        }
++                        sv[r] = as_ushort(mh) != 0xFC00 ? sv[r] + mk : M_INIT;
++                    } else {
++                        sv[r] = vis ? sv[r] : M_INIT;
++                    }
++                }
+                 s[g] = (float8)(sv[0], sv[1], sv[2], sv[3], sv[4], sv[5], sv[6], sv[7]);
+             }
+         }
+@@ -381,9 +415,35 @@ kernel void flash_attn_f32_f16_dpas2(
+         return;
+     }
+ #endif
++    // 0144: the sink enters m and l once after the key loop: one logit a head, no
++    // V row. m is the same in every lane, l a lane's partial sum, so the term is
++    // added to the reduced sum, once - not to every lane's l
++    float skterm[8];
++    _Pragma("unroll")
++    for (int r = 0; r < 8; ++r) skterm[r] = 0.f;
++    if (sink_void != 0) {
++        const float sk = ((global const float *)((global const char *) sink_void + sink_offset))[head];
++        float cs[8];
++        _Pragma("unroll")
++        for (int r = 0; r < 8; ++r) {
++            cs[r] = 1.f;
++            if (q_sg + r < n_q) {
++                const float nm = fmax(m[r], sk);
++                if (nm > m[r]) {
++                    cs[r] = native_exp(m[r] - nm);   // o and l follow the new max
++                    l[r] *= cs[r];
++                }
++                m[r] = nm;
++                skterm[r] = native_exp(sk - nm);
++            }
++        }
++        const float8 cv = (float8)(cs[0], cs[1], cs[2], cs[3], cs[4], cs[5], cs[6], cs[7]);
++        _Pragma("unroll")
++        for (int c = 0; c < NDC; ++c) o[c] *= cv;
++    }
+     float lv[8];
+     _Pragma("unroll")
+-    for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]);
++    for (int r = 0; r < 8; ++r) lv[r] = sub_group_reduce_add(l[r]) + skterm[r];
+     _Pragma("unroll")
+     for (int c = 0; c < NDC; ++c) {
+         const float ov[8] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
+@@ -409,7 +469,8 @@ __attribute__((intel_reqd_sub_group_size(SG)))
+ __attribute__((reqd_work_group_size(SG, 1, 1)))
+ kernel void flash_attn_split_combine(global float * carry, global const float * parts, int n_split,
+                                      global char * o_void, ulong o_offset, ulong o_nb1, ulong o_nb2, ulong o_nb3,
+-                                     int n_q, int n_head, int n_batch, int carry_out) {
++                                     int n_q, int n_head, int n_batch, int carry_out,
++                                     global const void * sink_void, ulong sink_offset) {
+     const int lane = get_sub_group_local_id();
+     const int grp = get_group_id(0), hs = get_group_id(1), batch = get_group_id(2);
+     const int head = hs / NVH, vh = hs % NVH;
+@@ -443,8 +504,29 @@ kernel void flash_attn_split_combine(global float * carry, global const float *
+         vstore8(l,  0, cb + (NDC + 1) * 128);
+         return;
+     }
+-    const float lv[8] = { sub_group_reduce_add(l.s0), sub_group_reduce_add(l.s1), sub_group_reduce_add(l.s2), sub_group_reduce_add(l.s3),
+-                          sub_group_reduce_add(l.s4), sub_group_reduce_add(l.s5), sub_group_reduce_add(l.s6), sub_group_reduce_add(l.s7) };
++    // 0144: the sink joins the merged state: m is the same in every lane, l and
++    // o a lane's partial sums, so the term is added to the reduced l, once
++    float skterm[8];
++    for (int r = 0; r < 8; ++r) skterm[r] = 0.f;
++    if (sink_void != 0) {
++        const float sk = ((global const float *)((global const char *) sink_void + sink_offset))[head];
++        const float mv[8] = { mx.s0, mx.s1, mx.s2, mx.s3, mx.s4, mx.s5, mx.s6, mx.s7 };
++        float nm[8], cs[8];
++        for (int r = 0; r < 8; ++r) {
++            nm[r] = fmax(mv[r], sk);
++            cs[r] = nm[r] > mv[r] ? native_exp(mv[r] - nm[r]) : 1.f;   // o and l follow the new max
++            skterm[r] = native_exp(sk - nm[r]);
++        }
++        mx = (float8)(nm[0], nm[1], nm[2], nm[3], nm[4], nm[5], nm[6], nm[7]);
++        const float8 cv = (float8)(cs[0], cs[1], cs[2], cs[3], cs[4], cs[5], cs[6], cs[7]);
++        l *= cv;
++        _Pragma("unroll")
++        for (int c = 0; c < NDC; ++c) o[c] *= cv;
++    }
++    const float lv[8] = { sub_group_reduce_add(l.s0) + skterm[0], sub_group_reduce_add(l.s1) + skterm[1],
++                          sub_group_reduce_add(l.s2) + skterm[2], sub_group_reduce_add(l.s3) + skterm[3],
++                          sub_group_reduce_add(l.s4) + skterm[4], sub_group_reduce_add(l.s5) + skterm[5],
++                          sub_group_reduce_add(l.s6) + skterm[6], sub_group_reduce_add(l.s7) + skterm[7] };
+     _Pragma("unroll")
+     for (int c = 0; c < NDC; ++c) {
+         const float ov[8] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };

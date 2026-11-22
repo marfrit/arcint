@@ -1,0 +1,275 @@
+0147: the OpenCL CONCAT and REPEAT kernels copy one element per work item for outputs up to 16384 elements, so the small decode shapes stop walking a row in a strided loop per work item while large copies keep the old geometry.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 4ee80ae..bcc49a3 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1430,7 +1430,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_argsort_f32_i32;
+     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
+     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
+-    cl_kernel kernel_repeat_f32;
++    cl_kernel kernel_repeat_f32, kernel_repeat_f32_small;
+     cl_kernel kernel_repeat_f16 = nullptr;
+     cl_kernel kernel_pad;
+     cl_kernel kernel_tanh_f32, kernel_tanh_f32_4, kernel_tanh_f32_nc;
+@@ -1457,7 +1457,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_softplus_f16, kernel_softplus_f16_4, kernel_softplus_f16_nc;
+     cl_kernel kernel_upscale;
+     cl_kernel kernel_upscale_bilinear;
+-    cl_kernel kernel_concat_b1, kernel_concat_b2, kernel_concat_b4, kernel_concat_b8, kernel_concat_b4_pack;
++    cl_kernel kernel_concat_b1, kernel_concat_b2, kernel_concat_b4, kernel_concat_b8, kernel_concat_b4_pack, kernel_concat_b4_small;
+     cl_kernel kernel_conv_2d_f16;
+     cl_kernel kernel_conv_2d_f32;
+     cl_kernel kernel_conv_2d_f16_f32;
+@@ -4652,6 +4652,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+         CL_CHECK((backend_ctx->kernel_repeat_f32 = clCreateKernel(prog, "kernel_repeat_f32", &err), err));
+         CL_CHECK((backend_ctx->kernel_repeat_f16 = clCreateKernel(prog, "kernel_repeat_f16", &err), err));
++        CL_CHECK((backend_ctx->kernel_repeat_f32_small = clCreateKernel(prog, "kernel_repeat_f32_small", &err), err));
+         CL_CHECK(clReleaseProgram(prog));
+         GGML_LOG_CONT(".");
+     }
+@@ -4909,6 +4910,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         CL_CHECK((backend_ctx->kernel_concat_b4 = clCreateKernel(prog, "kernel_concat_b4", &err), err));
+         CL_CHECK((backend_ctx->kernel_concat_b8 = clCreateKernel(prog, "kernel_concat_b8", &err), err));
+         CL_CHECK((backend_ctx->kernel_concat_b4_pack = clCreateKernel(prog, "kernel_concat_b4_pack", &err), err));
++        CL_CHECK((backend_ctx->kernel_concat_b4_small = clCreateKernel(prog, "kernel_concat_b4_small", &err), err));
+         CL_CHECK(clReleaseProgram(prog));
+         GGML_LOG_CONT(".");
+     }
+@@ -22280,7 +22282,17 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
+     const cl_ulong nb2 = dst->nb[2];
+     const cl_ulong nb3 = dst->nb[3];
+ 
+-    cl_kernel kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_repeat_f16 : backend_ctx->kernel_repeat_f32;
++    // small copies: one work item per element. The generic kernel walks ne0 in a
++    // strided loop per work item, which is latency bound at a few kilobytes.
++    const bool repeat_small = dst->type == GGML_TYPE_F32 &&
++        (size_t)ne0*ne1*ne2*ne3 <= 16384;
++
++    cl_kernel kernel;
++    if (repeat_small) {
++        kernel = backend_ctx->kernel_repeat_f32_small;
++    } else {
++        kernel = dst->type == GGML_TYPE_F16 ? backend_ctx->kernel_repeat_f16 : backend_ctx->kernel_repeat_f32;
++    }
+ 
+     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+@@ -22300,6 +22312,16 @@ static void ggml_cl_repeat(ggml_backend_t backend, const ggml_tensor * src0, con
+     CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &nb2));
+     CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &nb3));
+ 
++    if (repeat_small) {
++        CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int), &ne1));
++
++        const int lsz = (int)MIN((size_t)256, backend_ctx->max_workgroup_size);
++        size_t global_work_size[] = {(size_t)ne0*ne1, (size_t)ne2, (size_t)ne3};
++        size_t local_work_size[] = {(size_t)lsz, 1, 1};
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++        return;
++    }
++
+     int nth = 64;
+ 
+     size_t global_work_size[] = {(size_t)ne1*nth, (size_t)ne2, (size_t)ne3};
+@@ -22560,9 +22582,14 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
+     const size_t ts = ggml_type_size(dst->type);
+     // the pack kernel copies 4-byte elements, so it is only valid for those.
+     const bool concat_pack = (dim == 0 && ne0 < 32 && ts == 4);
++    // small copies: one work item per element. The generic kernel walks ne0 in a
++    // strided loop per work item, which is latency bound at a few kilobytes.
++    const bool concat_small = (ts == 4 && (size_t)ne0*ne1*ne2*ne3 <= 16384);
+     cl_kernel kernel;
+     if (concat_pack) {
+         kernel = backend_ctx->kernel_concat_b4_pack;
++    } else if (concat_small) {
++        kernel = backend_ctx->kernel_concat_b4_small;
+     } else {
+         switch (ts) {
+             case 1:  kernel = backend_ctx->kernel_concat_b1; break;
+@@ -22614,6 +22641,14 @@ static void ggml_cl_concat(ggml_backend_t backend, const ggml_tensor * src0, con
+         size_t global_work_size[] = {(size_t)nwg*lsz, 1, 1};
+         size_t local_work_size[]  = {(size_t)lsz, 1, 1};
+         backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
++    } else if (concat_small) {
++        // ne1 of the output; the kernel uses it to drop the rounded tail.
++        CL_CHECK(clSetKernelArg(kernel, 24, sizeof(int), &ne1));
++
++        const int lsz = (int)MIN((size_t)256, backend_ctx->max_workgroup_size);
++        size_t global_work_size[] = {(size_t)ne0*ne1, (size_t)ne2, (size_t)ne3};
++        size_t local_work_size[] = {(size_t)lsz, 1, 1};
++        backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     } else {
+         size_t global_work_size[] = {(size_t)ne1*nth, (size_t)ne2, (size_t)ne3};
+         size_t local_work_size[] = {(size_t)nth, 1, 1};
+diff --git a/ggml/src/ggml-opencl/kernels/concat.cl b/ggml/src/ggml-opencl/kernels/concat.cl
+index 8ecf746..7d65878 100644
+--- a/ggml/src/ggml-opencl/kernels/concat.cl
++++ b/ggml/src/ggml-opencl/kernels/concat.cl
+@@ -126,3 +126,62 @@ kernel void kernel_concat_b4_pack(
+         *y = *x;
+     }
+ }
++
++// small shapes: one work item copies one element, rows flattened over dim 0 and 1.
++// The generic kernel above walks ne0 with a strided step in one work item, which is
++// latency bound when ne0 is a few thousand and the whole copy is a few kilobytes.
++kernel void kernel_concat_b4_small(
++    global  const char * src0,
++    ulong                offset0,
++    global  const char * src1,
++    ulong                offset1,
++    global        char * dst,
++    ulong                offsetd,
++    int             ne00,
++    int             ne01,
++    int             ne02,
++    int             ne03,
++    ulong           nb00,
++    ulong           nb01,
++    ulong           nb02,
++    ulong           nb03,
++    ulong           nb10,
++    ulong           nb11,
++    ulong           nb12,
++    ulong           nb13,
++    int             ne0,
++    ulong           nb0,
++    ulong           nb1,
++    ulong           nb2,
++    ulong           nb3,
++    int             dim,
++    int             ne1
++) {
++    src0 = src0 + offset0;
++    src1 = src1 + offset1;
++    dst  = dst  + offsetd;
++
++    int g = get_global_id(0);
++    if (g >= ne0*ne1) {
++        return;
++    }
++
++    const int i0 = g % ne0;
++    const int i1 = g / ne0;
++    const int i2 = get_global_id(1);
++    const int i3 = get_global_id(2);
++
++    int o[4] = {0, 0, 0, 0};
++    o[dim] = dim == 0 ? ne00 : (dim == 1 ? ne01 : (dim == 2 ? ne02 : ne03));
++
++    global const int * x;
++    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
++        x = (global const int *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
++    } else {
++        x = (global const int *)(src1 + (i3 - o[3])*nb13 + (i2 - o[2])*nb12 + (i1 - o[1])*nb11 + (i0 - o[0])*nb10);
++    }
++
++    global int * y = (global int *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0);
++
++    *y = *x;
++}
+diff --git a/ggml/src/ggml-opencl/kernels/repeat.cl b/ggml/src/ggml-opencl/kernels/repeat.cl
+index 53d9673..ba3e8d9 100644
+--- a/ggml/src/ggml-opencl/kernels/repeat.cl
++++ b/ggml/src/ggml-opencl/kernels/repeat.cl
+@@ -75,3 +75,45 @@ kernel void kernel_repeat_f16(
+         *((global ushort *)(dst_ptr + i0*nb0)) = *((global const ushort *)(src0_ptr + i00*nb00));
+     }
+ }
++
++// small shapes: one work item copies one element of the whole output.
++// The generic kernel above walks ne0 with a strided step in one work item, which is
++// latency bound for a few kilobytes.
++kernel void kernel_repeat_f32_small(
++        global const char * src0,
++        ulong               offset0,
++        global       char * dst,
++        ulong               offsetd,
++        int     ne00,
++        int     ne01,
++        int     ne02,
++        int     ne03,
++        ulong   nb00,
++        ulong   nb01,
++        ulong   nb02,
++        ulong   nb03,
++        int     ne0,
++        ulong   nb0,
++        ulong   nb1,
++        ulong   nb2,
++        ulong   nb3,
++        int     ne1
++) {
++    src0 = src0 + offset0;
++    dst  = dst  + offsetd;
++
++    int g = get_global_id(0);
++    if (g >= ne0*ne1) {
++        return;
++    }
++
++    const int i0 = g % ne0;
++    const int i1 = g / ne0;
++    const int i2 = get_global_id(1);
++    const int i3 = get_global_id(2);
++
++    global const char * src0_ptr = src0 + (i3%ne03)*nb03 + (i2%ne02)*nb02 + (i1%ne01)*nb01;
++    global       char * dst_ptr  = dst  +  i3*nb3  +  i2*nb2  +  i1*nb1;
++
++    *((global float *)(dst_ptr + i0*nb0)) = *((global const float *)(src0_ptr + (i0%ne00)*nb00));
++}
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b9f2c7a..c7fac6b 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11387,6 +11387,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_repeat(GGML_TYPE_BF16, {10, 5, 4, ne3}, {2, 1, 1, 1}));
+     }
+ 
++    // small copies at the Inkling 2 Mini decode shapes: a broadcast row, repeated
++    // 1, 3 and 4 times, a few kilobytes each. Golden is the byte-identical copy.
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2304, 1, 1, 1}, {1, 1, 1, 1}));
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2304, 1, 1, 1}, {1, 3, 1, 1}));
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2304, 1, 1, 1}, {1, 4, 1, 1}));
++
+     for (bool view : {false, true}) {
+         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {1, 1, 1, 1}, view));
+         test_cases.emplace_back(new test_repeat_back(GGML_TYPE_F32, {8, 6, 4, 2}, {2, 1, 1, 1}, view));
+@@ -12849,6 +12855,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_concat(GGML_TYPE_Q8_0, {8192, 2, 1, 1}, dim == 0 ? 4096 : 1, dim, 0));
+     }
+ 
++    // small copies at the Inkling 2 Mini decode shapes: dim 1 pieces of a 2304-wide
++    // row, the dim 0 2304+2304 split, and narrow 4-wide rows.
++    for (int64_t nb : {1, 2, 3, 4}) {
++        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2304, 1, 1, 1}, nb, 1, 0));
++    }
++    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2304, 1, 1, 1}, 2304, 0, 0));
++    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4, 1, 1, 1}, 2303, 1, 0));
++    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4, 1, 1, 1}, 1023, 1, 0));
++
+     for (ggml_sort_order order : {GGML_SORT_ORDER_ASC, GGML_SORT_ORDER_DESC}) {
+         for (uint32_t i = 4; i <= 1024*1024; i *= 2) {
+             test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {i-1, 1, 1, 1}));
+@@ -14430,6 +14445,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
+     }
+ 
++    // the small CONCAT and REPEAT copies of the Inkling 2 Mini decode token
++    // (356 and 120 launches per token, a few kilobytes each)
++    for (int64_t nb : {1, 2, 3, 4}) {
++        test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2304, 1, 1, 1}, nb, 1, 0));
++    }
++    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {2304, 1, 1, 1}, 2304, 0, 0));
++    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4, 1, 1, 1}, 2303, 1, 0));
++    test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {4, 1, 1, 1}, 1023, 1, 0));
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2304, 1, 1, 1}, {1, 1, 1, 1}));
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2304, 1, 1, 1}, {1, 3, 1, 1}));
++    test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {2304, 1, 1, 1}, {1, 4, 1, 1}));
++
+ 
+     return test_cases;
+ }

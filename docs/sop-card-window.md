@@ -39,16 +39,23 @@ enumeration) on the dev hardware:**
 
 | DRM node | PCI id | card | arcint device (OpenCL platform:device) |
 |---|---|---|---|
-| `card0` | `8086:56a0` | Arc A770, 16 GiB | **GPU.1** (`GGML_OPENCL_DEVICES=1:0`) |
-| `card1` | `8086:e211` | Arc Pro B60, 24 GiB | **GPU.0** (`0:0`) |
+| `card0` | `8086:e211` | Arc Pro B60, 24 GiB | **GPU.0** / `B60` (`0:0`) |
+| `card1` | `8086:e223` | Arc Pro B70, 32 GiB | **GPU.1** / `B70` (`0:1`) |
+
+(Since 2026-11-19; before, `card0` was the A770 at `1:0` and `card1` the B60.)
 
 Anything read per `/sys/class/drm/cardN` or per-card `fdinfo` and reported as
 "GPU.N" is attributed to the **wrong card** unless mapped through
 `/sys/class/drm/cardN/device/{vendor,device}` first. Confirm the OpenCL
 side from the process, not from memory: arcint's load log names the device
 (`ggml_opencl: device: 'Intel(R) Arc(TM) Pro B60 Graphics'`), and `clinfo -l`
-lists the platforms. The two generations are two OpenCL platforms: the A770
-is platform 1, device 0 (`1:0`), not `0:1`.
+lists the platforms. The two Battlemage cards share OpenCL platform 0 (the
+B60 `0:0`, the B70 `0:1`); the A770 had a platform of its own (`1:0`).
+`--device` takes a name word (`B60`, `B70`) or `GPU.N`, the N-th GPU over all
+platforms, and arcint hands libllama exactly that card. A build before the
+card-selection fix needs `ZE_AFFINITY_MASK` (NEO's device filter) to keep a
+process on one card of a shared platform: without it libllama spread the
+agent over both cards.
 
 **`act_freq` is not a contention signal on every node.** The A770's node
 returns a constant `act_freq=8517` with `cur_freq` and `max_freq` EMPTY (an

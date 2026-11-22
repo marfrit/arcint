@@ -1,0 +1,258 @@
+0140: FLASH_ATTN_EXT takes an indexed relative-position bias (table at src 12, indices at src 13, flag in op_params 15, GGML_MAX_SRC 14, static asserts beside the paged ones); the bias is table[head, indices[key, query], query] added to the mask before its F16 rounding, and every backend without the mechanism declines it.
+
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -228,7 +228,8 @@
+ // first FLASH_ATTN_EXT case asserted host_k && host_v && ring_k && ring_v). A
+ // source index beyond the array is undefined behaviour; the static_assert in
+ // ggml-impl.h keeps the two constants in step.
+-#define GGML_MAX_SRC            12
++// 0140: 14, so the indexed bias table/indices at 12/13 fit beside the paged sources.
++#define GGML_MAX_SRC            14
+ #define GGML_MAX_N_THREADS      512
+ #define GGML_MAX_OP_PARAMS      64
+ 
+@@ -2538,6 +2539,15 @@ extern "C" {
+             struct ggml_tensor * a,
+             struct ggml_tensor * sinks);
+ 
++    GGML_API bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a);
++
++    // Add table[head, indices[key, query], query] to the mask before its F16 rounding.
++    // Queries from all streams are flattened in stream order. Indices must be in [0, table->ne[1]).
++    GGML_API void ggml_flash_attn_ext_add_indexed_bias(
++            struct ggml_tensor * a,
++            struct ggml_tensor * table,
++            struct ggml_tensor * indices);
++
+     // Paged K/V: k and v hold a pool of pages of page_size rows ([n_embd, n_pool_rows, n_head_kv, 1]), and the attended
+     // sequence is pages->ne[0]*page_size rows long (the mask's ne[0]). pages (I32 [n_pages, n_tables]) holds page tables,
+     // of which row `table` is used (e.g. one table per layer in one input). In it, entry i >= 0 is the pool page that
+--- a/ggml/src/ggml-cann/ggml-cann.cpp
++++ b/ggml/src/ggml-cann/ggml-cann.cpp
+@@ -2405,6 +2405,9 @@ static enum ggml_status ggml_backend_cann_graph_compute(ggml_backend_t backend,
+  *              otherwise false.
+  */
+ static bool ggml_backend_cann_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     switch (op->op) {
+         case GGML_OP_UNARY:
+             switch (ggml_get_unary_op(op)) {
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5417,6 +5417,9 @@ static ggml_backend_buffer_type_t ggml_backend_cuda_device_get_host_buffer_type(
+ 
+ // TODO: move these functions here
+ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+ 
+     // check if all the sources are allocated on this device
+--- a/ggml/src/ggml-et/ggml-et.cpp
++++ b/ggml/src/ggml-et/ggml-et.cpp
+@@ -863,6 +863,9 @@ static bool et_ggml_is_row_contiguous(const ggml_tensor * t) {
+ }
+ 
+ static bool ggml_backend_et_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     GGML_UNUSED(dev);
+ 
+     bool supported = false;
+--- a/ggml/src/ggml-hexagon/ggml-hexagon.cpp
++++ b/ggml/src/ggml-hexagon/ggml-hexagon.cpp
+@@ -9379,6 +9379,9 @@ static bool ggml_hexagon_supported_roll(const struct ggml_hexagon_session * sess
+ }
+ 
+ static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
+     auto sess    = dev_ctx->session();
+ 
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -197,11 +197,25 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
+ #define GGML_FA_SRC_HOST_K      9   // the host store of this attention layer: [n_embd, page_size, n_pages]
+ #define GGML_FA_SRC_HOST_V      10
+ #define GGML_FA_SRC_PLAN        11  // I32 [n_pages]: the ring row of each streamed page, -1 for a resident one
++
++// GGML_OP_FLASH_ATTN_EXT indexed bias (ggml_flash_attn_ext_add_indexed_bias): the bias is
++//   table[head, indices[key, query], query], added to the f16 mask before its rounding
++#define GGML_FA_PARAM_BIAS_FLAG  15  // i32: 0 = no indexed bias, 1 = table and indices are set
++#define GGML_FA_SRC_BIAS_TABLE   12  // F32 contiguous [n_head, n_bins, n_query*n_streams]
++#define GGML_FA_SRC_BIAS_IDX     13  // I32 contiguous [n_kv, n_query*n_streams], values in [0, n_bins)
+ // the sources live in ggml_tensor::src[GGML_MAX_SRC]; an index past it is UB (window 266)
+ #ifdef __cplusplus
+ static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
++static_assert(GGML_FA_SRC_BIAS_IDX < GGML_MAX_SRC, "GGML_MAX_SRC must hold the indexed bias sources");
++static_assert(GGML_FA_SRC_PLAN < GGML_FA_SRC_BIAS_TABLE, "an indexed bias source must not overwrite a paged FA source");
++static_assert(GGML_FA_PARAM_BIAS_FLAG < GGML_MAX_OP_PARAMS/sizeof(int32_t), "op_params must hold the indexed bias flag");
++static_assert(GGML_FA_PARAM_PAGES_ROW < GGML_FA_PARAM_BIAS_FLAG, "the indexed bias flag must not overwrite a paged FA param");
+ #else
+ _Static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
++_Static_assert(GGML_FA_SRC_BIAS_IDX < GGML_MAX_SRC, "GGML_MAX_SRC must hold the indexed bias sources");
++_Static_assert(GGML_FA_SRC_PLAN < GGML_FA_SRC_BIAS_TABLE, "an indexed bias source must not overwrite a paged FA source");
++_Static_assert(GGML_FA_PARAM_BIAS_FLAG < GGML_MAX_OP_PARAMS/sizeof(int32_t), "op_params must hold the indexed bias flag");
++_Static_assert(GGML_FA_PARAM_PAGES_ROW < GGML_FA_PARAM_BIAS_FLAG, "the indexed bias flag must not overwrite a paged FA param");
+ #endif
+ 
+ static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
+--- a/ggml/src/ggml-metal/ggml-metal.cpp
++++ b/ggml/src/ggml-metal/ggml-metal.cpp
+@@ -751,6 +751,9 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
+ }
+ 
+ static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+ 
+     return ggml_metal_device_supports_op(ctx_dev, op);
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13246,6 +13246,10 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+         case GGML_OP_MEAN:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_FLASH_ATTN_EXT: {
++            // 0140: the indexed bias (table/indices at src 12/13) is not in any kernel yet
++            if (ggml_flash_attn_ext_has_indexed_bias(op)) {
++                return false;
++            }
+             // 0119's paged K/V: 0122 teaches the GQA decode kernel (0016, with 0088's int8
+             // Q K^T and 0089's staged 1-3 row form) to resolve every K/V row through the
+             // page table. Accepted only for exactly the shapes that kernel handles; every
+--- a/ggml/src/ggml-openvino/ggml-openvino.cpp
++++ b/ggml/src/ggml-openvino/ggml-openvino.cpp
+@@ -1890,6 +1890,9 @@ static ggml_openvino_op_support ggml_backend_openvino_device_supports_op_impl(gg
+ }
+ 
+ static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     auto res = ggml_backend_openvino_device_supports_op_impl(dev, op);
+     if (!res.is_supported) {
+         static const bool log_unsupported = ggml_openvino_getenv_int("GGML_OPENVINO_LOG_UNSUPPORTED_OPS") != 0;
+--- a/ggml/src/ggml-rpc/ggml-rpc.cpp
++++ b/ggml/src/ggml-rpc/ggml-rpc.cpp
+@@ -2886,6 +2886,9 @@ static ggml_backend_buffer_type_t ggml_backend_rpc_device_get_buffer_type(ggml_b
+ }
+ 
+ static bool ggml_backend_rpc_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     GGML_UNUSED(dev);
+     GGML_UNUSED(op);
+     //TODO: call the remote backend and cache the results
+--- a/ggml/src/ggml-sycl/ggml-sycl.cpp
++++ b/ggml/src/ggml-sycl/ggml-sycl.cpp
+@@ -6762,6 +6762,9 @@ static ggml_backend_buffer_t ggml_backend_sycl_device_buffer_from_host_ptr(ggml_
+ }
+ 
+ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     ggml_backend_sycl_device_context *sycl_ctx =
+         (ggml_backend_sycl_device_context *)dev->context;
+     int device = sycl_ctx->device;
+--- a/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
++++ b/ggml/src/ggml-virtgpu/ggml-backend-device.cpp
+@@ -30,6 +30,9 @@ static void ggml_backend_remoting_device_get_memory(ggml_backend_dev_t dev, size
+ }
+ 
+ static bool ggml_backend_remoting_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+ #if USE_ALWAYS_TRUE_SUPPORTS_OP == 1
+     /* ggml-rpc cheats it like this */
+     /* with the current implementation of serialize_tensor, the src/view aren't properly passed */
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -15410,6 +15410,9 @@ static ggml_backend_t ggml_backend_vk_device_init(ggml_backend_dev_t dev, const
+ }
+ 
+ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+     const vk_device& device = ggml_vk_get_device(ctx->device);
+ 
+--- a/ggml/src/ggml-webgpu/ggml-webgpu.cpp
++++ b/ggml/src/ggml-webgpu/ggml-webgpu.cpp
+@@ -4423,6 +4423,9 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
+ }
+ 
+ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     ggml_backend_webgpu_device_context * ctx = static_cast<ggml_backend_webgpu_device_context *>(dev->context);
+ 
+     ggml_tensor * src0 = op->src[0];
+--- a/ggml/src/ggml-zdnn/ggml-zdnn.cpp
++++ b/ggml/src/ggml-zdnn/ggml-zdnn.cpp
+@@ -576,6 +576,9 @@ static ggml_backend_buffer_type_t ggml_backend_zdnn_device_get_buffer_type(ggml_
+ }
+ 
+ static bool ggml_backend_zdnn_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
++    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
++        return false;
++    }
+     ggml_backend_zdnn_device_context * ctx_dev = (ggml_backend_zdnn_device_context *) dev->context;
+ 
+     return ggml_zdnn_supports_op(ctx_dev, op);
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5629,6 +5629,40 @@ void ggml_flash_attn_ext_add_sinks(
+     a->src[4] = sinks;
+ }
+ 
++bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++
++    return ggml_get_op_params_i32(a, GGML_FA_PARAM_BIAS_FLAG) != 0;
++}
++
++void ggml_flash_attn_ext_add_indexed_bias(
++        struct ggml_tensor * a,
++        struct ggml_tensor * table,
++        struct ggml_tensor * indices) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT((table == NULL) == (indices == NULL));
++
++    a->src[GGML_FA_SRC_BIAS_TABLE] = table;
++    a->src[GGML_FA_SRC_BIAS_IDX]   = indices;
++    ggml_set_op_params_i32(a, GGML_FA_PARAM_BIAS_FLAG, table != NULL);
++
++    if (!table) {
++        return;
++    }
++
++    const struct ggml_tensor * q    = a->src[0];
++    const struct ggml_tensor * mask = a->src[3];
++
++    // the bias is added to the mask, so the mask must cover every attended column
++    GGML_ASSERT(mask && mask->ne[0] == ggml_flash_attn_ext_n_kv(a));
++    GGML_ASSERT(mask->ne[1] == q->ne[1]);
++    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
++    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
++    GGML_ASSERT(table->ne[0] == q->ne[2] && table->ne[1] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
++    GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices));
++    GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
++}
++
+ void ggml_flash_attn_ext_set_pages(
+         struct ggml_tensor * a,
+         struct ggml_tensor * pages,

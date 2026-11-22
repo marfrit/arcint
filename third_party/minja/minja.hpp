@@ -95,7 +95,13 @@ private:
     }
     out << string_quote;
   }
-  void dump(std::ostringstream & out, int indent = -1, int level = 0, bool to_json = false) const {
+  void dump(std::ostringstream & out, int indent = -1, int level = 0, bool to_json = false,
+            std::string_view item_sep = {}, std::string_view key_sep = {}) const {
+    // The separators `tojson(separators=(item, key))` asks for; empty means
+    // minja's own formatting, which depends on indent (Python json.dumps's
+    // defaults). Nested values inherit them.
+    const std::string_view item = item_sep.empty() ? (indent < 0 ? std::string_view(", ") : std::string_view(",")) : item_sep;
+    const std::string_view key = key_sep.empty() ? std::string_view(": ") : key_sep;
     auto print_indent = [&](int level) {
       if (indent > 0) {
           out << "\n";
@@ -103,9 +109,8 @@ private:
       }
     };
     auto print_sub_sep = [&]() {
-      out << ',';
-      if (indent < 0) out << ' ';
-      else print_indent(level + 1);
+      out << item;
+      if (indent >= 0 && item == ",") print_indent(level + 1);
     };
 
     auto string_quote = to_json ? '"' : '\'';
@@ -116,7 +121,7 @@ private:
       print_indent(level + 1);
       for (size_t i = 0; i < array_->size(); ++i) {
         if (i) print_sub_sep();
-        (*array_)[i].dump(out, indent, level + 1, to_json);
+        (*array_)[i].dump(out, indent, level + 1, to_json, item, key);
       }
       print_indent(level);
       out << "]";
@@ -130,8 +135,8 @@ private:
         } else {
           out << string_quote << it->first.dump() << string_quote;
         }
-        out << ": ";
-        it->second.dump(out, indent, level + 1, to_json);
+        out << key;
+        it->second.dump(out, indent, level + 1, to_json, item, key);
       }
       print_indent(level);
       out << "}";
@@ -445,9 +450,10 @@ public:
     throw std::runtime_error("get<T> not defined for this value type: " + dump());
   }
 
-  std::string dump(int indent=-1, bool to_json=false) const {
+  std::string dump(int indent=-1, bool to_json=false,
+                   std::string_view item_sep = {}, std::string_view key_sep = {}) const {
     std::ostringstream out;
-    dump(out, indent, 0, to_json);
+    dump(out, indent, 0, to_json, item_sep, key_sep);
     return out.str();
   }
 
@@ -2328,6 +2334,11 @@ private:
 
         while (it != end) {
             if (!consumeToken(",").empty()) {
+                // Local patch: Jinja allows a trailing comma before the closing
+                // brace; Inkling 2 Mini's template ends every tool spec with one.
+                if (!consumeToken("}").empty()) {
+                    return std::make_shared<DictExpr>(get_location(), std::move(elements));
+                }
                 parseKeyValuePair();
             } else if (!consumeToken("}").empty()) {
                 return std::make_shared<DictExpr>(get_location(), std::move(elements));
@@ -2734,8 +2745,42 @@ inline std::shared_ptr<Context> Context::builtins() {
   }));
   // `ensure_ascii` is accepted and ignored: Value::dump already writes non-ASCII text as it is, which is
   // what the templates that pass ensure_ascii=False (Granite 4.2) ask for. See PATCHES.md.
-  globals.set("tojson", simple_function("tojson", { "value", "indent", "ensure_ascii" }, [](const std::shared_ptr<Context> &, Value & args) {
-    return Value(args.at("value").dump(args.get<int64_t>("indent", -1), /* to_json= */ true));
+  // `sort_keys` / `separators`: Inkling 2 Mini passes both. Compact separators are already `dump`'s
+  // behaviour at indent -1; sort_keys is honoured recursively, as Python's json.dumps does.
+  globals.set("tojson", simple_function("tojson", { "value", "indent", "ensure_ascii", "sort_keys", "separators" }, [](const std::shared_ptr<Context> &, Value & args) {
+    auto sort_recursive = std::make_shared<std::function<Value(const Value &)>>();
+    *sort_recursive = [sort_recursive](const Value & value) -> Value {
+      if (value.is_object()) {
+        auto copy = value;
+        auto keys = copy.keys();
+        std::sort(keys.begin(), keys.end(), [](const Value & a, const Value & b) {
+          return a.to_str() < b.to_str();
+        });
+        auto sorted = Value::object();
+        for (const auto & key : keys) sorted.set(key, (*sort_recursive)(value.at(key)));
+        return sorted;
+      }
+      if (value.is_array()) {
+        auto sorted = Value::array();
+        for (size_t i = 0, n = value.size(); i < n; ++i) sorted.push_back((*sort_recursive)(value.at(i)));
+        return sorted;
+      }
+      return value;
+    };
+    auto value = args.at("value");
+    if (args.get<bool>("sort_keys", false)) value = (*sort_recursive)(value);
+    const int64_t indent = args.get<int64_t>("indent", -1);
+    // `separators=(item, key)` as Python's json.dumps: both are strings, the
+    // first between items, the second between a key and its value. Absent, the
+    // defaults are Python's ((", ", ": ") compact, (",", ": ") indented).
+    std::string item_sep = indent < 0 ? ", " : ",";
+    std::string key_sep  = ": ";
+    if (args.contains("separators") && args.at("separators").is_array()) {
+      const Value & seps = args.at("separators");
+      if (seps.size() > 0) item_sep = seps.at(0).get<std::string>();
+      if (seps.size() > 1) key_sep  = seps.at(1).get<std::string>();
+    }
+    return Value(value.dump(indent, /* to_json= */ true, item_sep, key_sep));
   }));
   globals.set("items", simple_function("items", { "object" }, [](const std::shared_ptr<Context> &, Value & args) {
     auto items = Value::array();
@@ -2807,8 +2852,8 @@ inline std::shared_ptr<Context> Context::builtins() {
   globals.set("count", simple_function("count", { "items" }, [](const std::shared_ptr<Context> &, Value & args) {
     return Value((int64_t) args.at("items").size());
   }));
-  globals.set("dictsort", simple_function("dictsort", { "value" }, [](const std::shared_ptr<Context> &, Value & args) {
-    if (args.size() != 1) throw std::runtime_error("dictsort expects exactly 1 argument (TODO: fix implementation)");
+  globals.set("dictsort", simple_function("dictsort", { "value", "case_sensitive" }, [](const std::shared_ptr<Context> &, Value & args) {
+    // `case_sensitive` accepted (Inkling 2 Mini passes it); keys sort as strings either way.
     auto & value = args.at("value");
     auto keys = value.keys();
     std::sort(keys.begin(), keys.end());
@@ -2867,6 +2912,19 @@ inline std::shared_ptr<Context> Context::builtins() {
   }));
   globals.set("int", simple_function("int", { "value" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
       return args.at("value").to_int();
+  }));
+  // Local patch: Jinja's float filter. Inkling 2 Mini's template converts a
+  // numeric reasoning_effort with `eff | float`; without it every render throws
+  // `Value is not callable: null`. See PATCHES.md.
+  globals.set("float", simple_function("float", { "value" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
+      auto & value = args.at("value");
+      if (value.is_null()) return Value(0.0);
+      if (value.is_number()) return Value(value.get<double>());
+      try {
+          return Value(std::stod(value.to_str()));
+      } catch (const std::exception &) {
+          return Value(0.0);
+      }
   }));
   globals.set("list", simple_function("list", { "items" }, [](const std::shared_ptr<Context> &, Value & args) -> Value {
       auto & items = args.at("items");

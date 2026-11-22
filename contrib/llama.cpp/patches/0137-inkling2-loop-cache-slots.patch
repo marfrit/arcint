@@ -1,0 +1,386 @@
+0137: add the inkling2_loop arch, its loop kv and tensor names and the cache-slot expansion, and the graph that repeats the core block loop.count times with the previous pass's block bank.
+
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -166,6 +166,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_POCKETTTS,        "pockettts"        },
+     { LLM_ARCH_K2_HORIZON,       "k2-horizon"       },
+     { LLM_ARCH_INKLING2,         "inkling2"         },
++    { LLM_ARCH_INKLING2_LOOP,    "inkling2_loop"    },
+     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
+ };
+ 
+@@ -329,6 +330,11 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
+     { LLM_KV_ATTENTION_RELATIVE_CLIP,                "%s.attention.relative_clip"                },
+     { LLM_KV_ATTENTION_LOG_SCALE_FLOOR,              "%s.attention.log_scale_floor"              },
+     { LLM_KV_ATTENTION_LOG_SCALE_ALPHA,              "%s.attention.log_scale_alpha"              },
++    { LLM_KV_LOOP_START,                             "%s.loop.start"                            },
++    { LLM_KV_LOOP_END,                               "%s.loop.end"                              },
++    { LLM_KV_LOOP_COUNT,                             "%s.loop.count"                            },
++    { LLM_KV_LOOP_GATE_RANK,                         "%s.loop.gate_rank"                        },
++    { LLM_KV_LOOP_VARYING,                           "%s.loop.varying"                          },
+ 
+     { LLM_KV_HYPER_CONNECTION_COUNT,                 "%s.hyper_connection.count"                 },
+     { LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,   "%s.hyper_connection.sinkhorn_iterations"   },
+@@ -526,6 +532,20 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_ATTN_Q_NORM,                            "blk.%d.attn_q_norm" },
+     { LLM_TENSOR_ATTN_K_NORM,                            "blk.%d.attn_k_norm" },
+     { LLM_TENSOR_ATTN_GATE,                              "blk.%d.attn_gate" },
++    { LLM_TENSOR_ATTN_REL,                     "blk.%d.attn_rel" },
++    { LLM_TENSOR_ATTN_REL_BIAS,                "blk.%d.attn_rel_bias" },
++    { LLM_TENSOR_ATTN_Q_CLIP,                  "blk.%d.attn_q_clip" },
++    { LLM_TENSOR_ATTN_REL_CLIP,                "blk.%d.attn_rel_clip" },
++    { LLM_TENSOR_ATTN_SINK_PROJ,               "blk.%d.attn_sink_proj" },
++    { LLM_TENSOR_ATTN_Q_INP_NORM,              "blk.%d.attn_q_inp_norm" },
++    { LLM_TENSOR_ATTN_K_INP_NORM,              "blk.%d.attn_k_inp_norm" },
++    { LLM_TENSOR_ATTN_V_INP_NORM,              "blk.%d.attn_v_inp_norm" },
++    { LLM_TENSOR_ATTN_K_CONV,                  "blk.%d.attn_k_conv" },
++    { LLM_TENSOR_ATTN_V_CONV,                  "blk.%d.attn_v_conv" },
++    { LLM_TENSOR_ATTN_K_CONV_PROJ,             "blk.%d.attn_k_conv_proj" },
++    { LLM_TENSOR_ATTN_V_CONV_PROJ,             "blk.%d.attn_v_conv_proj" },
++    { LLM_TENSOR_ATTN_POST_CONV,               "blk.%d.attn_post_conv" },
++    { LLM_TENSOR_ATTN_RES_QUERY,               "blk.%d.attn_res_query" },
+     { LLM_TENSOR_FFN_POST_NORM,                          "blk.%d.post_ffw_norm" },
+     { LLM_TENSOR_FFN_POST_NORM_1,                        "blk.%d.post_ffw_norm_1" },
+     { LLM_TENSOR_FFN_POST_NORM_2,                        "blk.%d.post_ffw_norm_2" },
+@@ -539,6 +559,19 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_FFN_LATENT_UP,                          "blk.%d.ffn_latent_up" },
+     { LLM_TENSOR_FFN_POST_CONV,                          "blk.%d.ffn_post_conv" },
+     { LLM_TENSOR_FFN_RES_QUERY,                          "blk.%d.ffn_res_query" },
++    { LLM_TENSOR_LOOP_MSG_QUERY,                         "blk.%d.loop_msg_query" },
++    { LLM_TENSOR_LOOP_Q_CTRL_DOWN,                       "blk.%d.loop_q_ctrl_down" },
++    { LLM_TENSOR_LOOP_Q_CTRL_GAIN,                       "blk.%d.loop_q_ctrl_gain" },
++    { LLM_TENSOR_LOOP_Q_CTRL_FORGET,                     "blk.%d.loop_q_ctrl_forget" },
++    { LLM_TENSOR_LOOP_K_CTRL_DOWN,                       "blk.%d.loop_k_ctrl_down" },
++    { LLM_TENSOR_LOOP_K_CTRL_GAIN,                       "blk.%d.loop_k_ctrl_gain" },
++    { LLM_TENSOR_LOOP_K_CTRL_FORGET,                     "blk.%d.loop_k_ctrl_forget" },
++    { LLM_TENSOR_LOOP_V_CTRL_DOWN,                       "blk.%d.loop_v_ctrl_down" },
++    { LLM_TENSOR_LOOP_V_CTRL_GAIN,                       "blk.%d.loop_v_ctrl_gain" },
++    { LLM_TENSOR_LOOP_V_CTRL_FORGET,                     "blk.%d.loop_v_ctrl_forget" },
++    { LLM_TENSOR_LOOP_FFN_CTRL_DOWN,                     "blk.%d.loop_ffn_ctrl_down" },
++    { LLM_TENSOR_LOOP_FFN_CTRL_GAIN,                     "blk.%d.loop_ffn_ctrl_gain" },
++    { LLM_TENSOR_LOOP_FFN_CTRL_FORGET,                   "blk.%d.loop_ffn_ctrl_forget" },
+     { LLM_TENSOR_ATTN_NORM_2,                            "blk.%d.attn_norm_2" },
+     { LLM_TENSOR_ATTN_QKV,                               "blk.%d.attn_qkv" },
+     { LLM_TENSOR_LAYER_OUT_NORM,                         "blk.%d.layer_output_norm" },
+@@ -1137,6 +1170,19 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+     {LLM_TENSOR_FFN_LATENT_UP,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_FFN_POST_CONV,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_SSM_CONV}},
+     {LLM_TENSOR_FFN_RES_QUERY,              {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_MSG_QUERY,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_Q_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_Q_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_Q_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_K_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_K_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_K_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_V_CTRL_DOWN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_V_CTRL_GAIN,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_V_CTRL_FORGET,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_FFN_CTRL_DOWN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_FFN_CTRL_GAIN,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
++    {LLM_TENSOR_LOOP_FFN_CTRL_FORGET,       {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_MASKED_EMBD_CENTROIDS,      {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+     {LLM_TENSOR_MASKED_EMBD_ORDERING,       {LLM_TENSOR_LAYER_INPUT,     GGML_OP_NONE}},
+     // eagle3
+@@ -1267,6 +1313,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
+         case LLM_ARCH_DEEPSEEK4:
+         case LLM_ARCH_MINIMAX_01:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return true;
+         default:
+             return false;
+@@ -1299,6 +1346,7 @@ bool llm_arch_supports_rs_rollback(const llm_arch & arch) {
+         case LLM_ARCH_LFM2MOE:
+         case LLM_ARCH_BAILINGMOE3:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return true;
+         default:
+             return false;
+@@ -1315,6 +1363,7 @@ bool llm_arch_supports_mixed_batch(const llm_arch & arch) {
+         case LLM_ARCH_DFLASH:
+         case LLM_ARCH_GEMMA4_ASSISTANT:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return false;
+         default:
+             return true;
+@@ -1334,6 +1383,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
+         case LLM_ARCH_JAMBA:
+         case LLM_ARCH_FALCON_H1:
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+         case LLM_ARCH_OLMO2:
+         case LLM_ARCH_OLMOE:
+         case LLM_ARCH_DEEPSEEK2:
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -171,6 +171,7 @@ enum llm_arch {
+     LLM_ARCH_HRM_TEXT,
+     LLM_ARCH_K2_HORIZON,
+     LLM_ARCH_INKLING2,
++    LLM_ARCH_INKLING2_LOOP,
+     LLM_ARCH_UNKNOWN,
+ };
+ 
+@@ -334,6 +335,11 @@ enum llm_kv {
+     LLM_KV_ATTENTION_RELATIVE_CLIP,
+     LLM_KV_ATTENTION_LOG_SCALE_FLOOR,
+     LLM_KV_ATTENTION_LOG_SCALE_ALPHA,
++    LLM_KV_LOOP_START,
++    LLM_KV_LOOP_END,
++    LLM_KV_LOOP_COUNT,
++    LLM_KV_LOOP_GATE_RANK,
++    LLM_KV_LOOP_VARYING,
+ 
+     LLM_KV_HYPER_CONNECTION_COUNT,
+     LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS,
+@@ -571,6 +577,19 @@ enum llm_tensor {
+     LLM_TENSOR_FFN_LATENT_UP,
+     LLM_TENSOR_FFN_POST_CONV,
+     LLM_TENSOR_FFN_RES_QUERY,
++    LLM_TENSOR_LOOP_MSG_QUERY,
++    LLM_TENSOR_LOOP_Q_CTRL_DOWN,
++    LLM_TENSOR_LOOP_Q_CTRL_GAIN,
++    LLM_TENSOR_LOOP_Q_CTRL_FORGET,
++    LLM_TENSOR_LOOP_K_CTRL_DOWN,
++    LLM_TENSOR_LOOP_K_CTRL_GAIN,
++    LLM_TENSOR_LOOP_K_CTRL_FORGET,
++    LLM_TENSOR_LOOP_V_CTRL_DOWN,
++    LLM_TENSOR_LOOP_V_CTRL_GAIN,
++    LLM_TENSOR_LOOP_V_CTRL_FORGET,
++    LLM_TENSOR_LOOP_FFN_CTRL_DOWN,
++    LLM_TENSOR_LOOP_FFN_CTRL_GAIN,
++    LLM_TENSOR_LOOP_FFN_CTRL_FORGET,
+     LLM_TENSOR_ATTN_Q_NORM,
+     LLM_TENSOR_ATTN_K_NORM,
+     LLM_TENSOR_LAYER_OUT_NORM,
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3638,7 +3638,8 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+         model.arch == LLM_ARCH_MINIMAX_01 ||
+         model.arch == LLM_ARCH_MINIMAX_M3 ||
+         model.arch == LLM_ARCH_HY_V4 ||
+-        model.arch == LLM_ARCH_INKLING2) {
++        model.arch == LLM_ARCH_INKLING2 ||
++        model.arch == LLM_ARCH_INKLING2_LOOP) {
+         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+     } else if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+         // DFlash2's convolutions and selector are shape work rather than matmuls,
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -307,6 +307,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_falcon_h1(params);
+         case LLM_ARCH_INKLING2:
+             return new llama_model_inkling2(params);
++        case LLM_ARCH_INKLING2_LOOP:
++            return new llama_model_inkling2_loop(params);
+         case LLM_ARCH_LFM2:
+             return new llama_model_lfm2(params);
+         case LLM_ARCH_LFM2MOE:
+@@ -3240,7 +3242,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                     // a null filter_idx means the GGUF has no indexer tensors
+                     llama_memory_hybrid::layer_filter_cb filter_idx  = nullptr;
+                     const bool needs_mem_idx = (arch == LLM_ARCH_QWEN4EXP);
+-                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2) {
++                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+                         filter_attn = [&](uint32_t) { return true; };
+                         filter_recr = [&](uint32_t) { return true; };
+                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
+@@ -3686,6 +3688,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
+ 
+         // inkling2 has no RoPE: the relative-position bias carries the positions
+         case LLM_ARCH_INKLING2:
++        case LLM_ARCH_INKLING2_LOOP:
+             return LLAMA_ROPE_TYPE_NONE;
+ 
+         // the pairs of head values are offset by n_rot/2
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -924,6 +924,8 @@ struct llama_model {
+     // model must define these
+     virtual void load_arch_hparams(llama_model_loader & ml) = 0;
+     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
++    // optional, runs after the generic per-tensor scale pass
++    virtual void post_arch_tensors(llama_model_loader &) {}
+     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
+ 
+ protected:
+--- a/src/llama-quant.cpp
++++ b/src/llama-quant.cpp
+@@ -328,12 +328,13 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
+     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
+     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
+ 
+-    // inkling2: short conv kernels, clip scales, residual mix queries and the relative bias projection
+-    if (arch == LLM_ARCH_INKLING2) {
++    // inkling2: short conv kernels, clip scales, residual mix queries, the relative bias projection and the loop tensors
++    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+         quantize &= name.find("_conv.weight")         == std::string::npos;
+         quantize &= name.find("_clip.weight")         == std::string::npos;
+         quantize &= name.find("_res_query.weight")    == std::string::npos;
+         quantize &= name.find("attn_rel_bias.weight") == std::string::npos;
++        quantize &= name.find(".loop_")               == std::string::npos;
+     }
+ 
+     // glm5-next
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+new file mode 100644
+index 0000000..0de66ba
+--- /dev/null
++++ b/src/models/inkling2-loop.cpp
+@@ -0,0 +1,113 @@
++#include "models.h"
++
++int llama_model_inkling2_loop::layer_phys(int il) const {
++    return il < n_phys ? il : core_start + (il - n_phys) % (core_end - core_start);
++}
++
++void llama_model_inkling2_loop::load_arch_hparams(llama_model_loader & ml) {
++    llama_model_inkling2::load_arch_hparams(ml);
++
++    ml.get_key(LLM_KV_LOOP_START,     core_start);
++    ml.get_key(LLM_KV_LOOP_END,       core_end);
++    ml.get_key(LLM_KV_LOOP_COUNT,     n_passes);
++    ml.get_key(LLM_KV_LOOP_GATE_RANK, gate_rank);
++    ml.get_key(LLM_KV_LOOP_VARYING,   varying, false);
++
++    n_phys = hparams.n_layer();
++    const uint32_t block = hparams.attn_res_block_size;
++    // a fixed loop needs at least 2 passes, a variable loop at least 1
++    if (n_passes < (varying ? 1u : 2u) || !gate_rank || !core_start || core_start >= core_end || core_end > (uint32_t) n_phys ||
++        core_start % block || core_end % block || hparams.n_layer_nextn) {
++        throw std::runtime_error(format("inkling2_loop: invalid loop core [%u, %u) with block size %u, %u passes or gate rank %u for %d layers",
++                core_start, core_end, block, n_passes, gate_rank, n_phys));
++    }
++    const size_t n_slot = n_phys + (size_t) (n_passes - 1)*(core_end - core_start);
++    if (n_slot > LLAMA_MAX_LAYERS) {
++        throw std::runtime_error(format("inkling2_loop: %zu cache slots exceed the maximum of %d", n_slot, LLAMA_MAX_LAYERS));
++    }
++
++    // expand to the cache slots before load_tensors() allocates the layers and the memory
++    hparams.n_layer_all = n_slot;
++    for (int il = n_phys; il < (int) n_slot; ++il) {
++        const int p = layer_phys(il);
++        hparams.n_head_arr[il]        = hparams.n_head_arr[p];
++        hparams.n_head_kv_arr[il]     = hparams.n_head_kv_arr[p];
++        hparams.n_ff_arr[il]          = hparams.n_ff_arr[p];
++        hparams.n_ff_exp_arr[il]      = hparams.n_ff_exp_arr[p];
++        hparams.n_expert_used_arr[il] = hparams.n_expert_used_arr[p];
++        hparams.is_swa_impl[il]       = hparams.is_swa_impl[p];
++        hparams.is_recr_impl[il]      = hparams.is_recr_impl[p];
++    }
++}
++
++void llama_model_inkling2_loop::load_arch_tensors(llama_model_loader & ml) {
++    llama_model_inkling2::load_arch_tensors(ml);
++
++    const int64_t n_embd = hparams.n_embd;
++    const int64_t rank   = gate_rank;
++    const llm_tensor down[LOOP_CTRL_COUNT]   = { LLM_TENSOR_LOOP_Q_CTRL_DOWN,   LLM_TENSOR_LOOP_K_CTRL_DOWN,   LLM_TENSOR_LOOP_V_CTRL_DOWN,   LLM_TENSOR_LOOP_FFN_CTRL_DOWN   };
++    const llm_tensor gain[LOOP_CTRL_COUNT]   = { LLM_TENSOR_LOOP_Q_CTRL_GAIN,   LLM_TENSOR_LOOP_K_CTRL_GAIN,   LLM_TENSOR_LOOP_V_CTRL_GAIN,   LLM_TENSOR_LOOP_FFN_CTRL_GAIN   };
++    const llm_tensor forget[LOOP_CTRL_COUNT] = { LLM_TENSOR_LOOP_Q_CTRL_FORGET, LLM_TENSOR_LOOP_K_CTRL_FORGET, LLM_TENSOR_LOOP_V_CTRL_FORGET, LLM_TENSOR_LOOP_FFN_CTRL_FORGET };
++
++    loop_layers.resize(core_end - core_start);
++    for (uint32_t il = core_start; il < core_end; ++il) {
++        auto & l = loop_layers[il - core_start];
++        // the q, k, v and ffn message queries
++        l.msg_query = create_tensor(tn(LLM_TENSOR_LOOP_MSG_QUERY, "weight", il), {n_embd, LOOP_CTRL_COUNT}, 0);
++        for (int c = 0; c < LOOP_CTRL_COUNT; ++c) {
++            l.ctrl_down[c]   = create_tensor(tn(down[c],   "weight", il), {2*n_embd, rank}, 0);
++            l.ctrl_gain[c]   = create_tensor(tn(gain[c],   "weight", il), {rank, n_embd}, 0);
++            l.ctrl_forget[c] = create_tensor(tn(forget[c], "weight", il), {rank, n_embd}, 0);
++        }
++    }
++
++    // share the physical weights, each cache slot keeps its own KV and conv state
++    for (int il = n_phys; il < (int) hparams.n_layer(); ++il) {
++        layers[il] = layers[layer_phys(il)];
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_inkling2_loop::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(params);
++}
++
++llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama_model_inkling2::graph(params, no_build{}) {
++    const auto & m = static_cast<const llama_model_inkling2_loop &>(model);
++    const int start = m.core_start;
++    const int end   = m.core_end;
++
++    auto * cur = build_inputs();
++    std::vector<ggml_tensor *> blocks;
++    for (int il = 0; il < start; ++il) {
++        cur = build_layer(il, il, cur, blocks);
++    }
++
++    // every pass starts from the prelude output
++    auto * prelude = cur;
++    const auto prelude_blocks = blocks;
++    for (uint32_t pass = 0; pass < m.n_passes; ++pass) {
++        // the bank of the previous pass: its blocks after the first core block, and its output
++        std::vector<ggml_tensor *> bank;
++        ggml_tensor * bank_out = nullptr;
++        if (pass > 0) {
++            bank.assign(blocks.begin() + prelude_blocks.size() + 1, blocks.end());
++            bank_out = cur;
++            cur = prelude;
++            blocks = prelude_blocks;
++        }
++        for (int ip = start; ip < end; ++ip) {
++            const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
++            if (pass == 0) {
++                cur = build_layer(il, ip, cur, blocks);
++                continue;
++            }
++            const auto & loop = m.loop_layers[ip - start];
++            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
++        }
++    }
++
++    for (int il = end; il < m.n_phys; ++il) {
++        cur = build_layer(il, il, cur, blocks);
++    }
++    build_output(cur, blocks);
++}
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2335,6 +2335,36 @@ struct llama_model_inkling2 : public llama_model_base {
+     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+ };
+ 
++// the cache slots after the physical layers repeat the core [core_start, core_end) for each later pass
++struct llama_model_inkling2_loop : public llama_model_inkling2 {
++    llama_model_inkling2_loop(const struct llama_model_params & params) : llama_model_inkling2(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    int n_layer_phys() const override { return n_phys; }
++    int layer_phys(int il) const;
++
++    // weights live in the physical layers, the graph and the memory in the cache slots
++    uint32_t n_layer_physical() const override { return n_phys; }
++    int      layer_physical(int il) const override { return layer_phys(il); }
++
++    int      n_phys     = 0;
++    uint32_t core_start = 0;
++    uint32_t core_end   = 0;
++    uint32_t n_passes   = 0;
++    uint32_t gate_rank  = 0;
++    bool     varying    = false; // trained for a varying number of passes
++
++    // indexed by physical layer - core_start
++    std::vector<loop_layer> loop_layers;
++
++    struct graph : public llama_model_inkling2::graph {
++        graph(const llm_graph_params & params);
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
+ struct llama_model_lfm2 : public llama_model_base {
+     llama_model_lfm2(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;

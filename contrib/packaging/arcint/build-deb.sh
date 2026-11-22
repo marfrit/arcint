@@ -14,7 +14,7 @@
 # (docs/history.md), and older tags are built with the recipe at their tag.
 set -euo pipefail
 
-PKGVER=1.7.0
+PKGVER=1.8.0
 UPSTREAM_TAG=v${PKGVER}
 PKGREL=1
 # The public repository, not the fleet one. The fleet repo (still named
@@ -22,7 +22,7 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.7.0.tar.gz,
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.8.0.tar.gz,
 # taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
 ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-aa4af08fe4ad72bbe0e076105c5962e7fbf6f0daa4404fdf8af16c2165328cdc}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
@@ -82,10 +82,8 @@ echo "$LLAMA_TARBALL_SHA256  llama.tar.gz" | sha256sum -c
 tar xzf llama.tar.gz
 LLAMA_DIR="$work/llama/llama.cpp-${LLAMA_COMMIT}"
 cd "$LLAMA_DIR"
-for p in "$work/$SRC"/contrib/llama.cpp/patches/*.patch; do
-    [ -e "$p" ] || { echo "no contrib/llama.cpp/patches in the source tarball" >&2; exit 1; }
-    git apply --whitespace=nowarn "$p" || { echo "patch does not apply to the pin: $p" >&2; exit 1; }
-done
+# In byte order whatever the build host's locale (apply-series.sh; GitHub issue #6).
+bash "$work/$SRC/contrib/llama.cpp/apply-series.sh" "$LLAMA_DIR"
 # 0130l: a kernel source the host builds must survive the C preprocessor in every
 # define set it hands to the compiler. 0130k put directives inside backslash-continued
 # macro bodies, which fails the whole file and the production decode kernel with it.

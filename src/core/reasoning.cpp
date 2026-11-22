@@ -17,7 +17,8 @@ struct ThinkTags {
 constexpr ThinkTags kTags[] = {{markers::kThinkOpen, markers::kThinkClose},
                                {markers::kThinkOpenAngle, markers::kThinkCloseAngle},
                                {markers::kThinkOpenSquare, markers::kThinkCloseSquare},
-                               {markers::kGemmaThoughtOpen, markers::kGemmaThoughtClose}};
+                               {markers::kGemmaThoughtOpen, markers::kGemmaThoughtClose},
+                               {markers::kInkThinkOpen, markers::kInkEndMessage}};
 
 // The slice of kTags a dialect honours: the Qwen pair alone, the Qwen pair and
 // the Mistral pairs, or Gemma 4's channel alone (a Gemma model's answer that
@@ -30,6 +31,7 @@ TagRange tag_range(ChatDialect d) {
     switch (d.kind) {
         case ChatDialect::Extended: return {0, 3};
         case ChatDialect::Gemma4: return {3, 1};
+        case ChatDialect::Inkling: return {4, 1};
         default: return {0, 1};
     }
 }
@@ -129,15 +131,29 @@ const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(ChatDial
     static const std::vector<std::pair<std::string, std::string>> all   = build_pairs(ChatDialect::Extended);
     static const std::vector<std::pair<std::string, std::string>> qwen  = build_pairs(ChatDialect::Qwen);
     static const std::vector<std::pair<std::string, std::string>> gemma = build_pairs(ChatDialect::Gemma4);
+    static const std::vector<std::pair<std::string, std::string>> inkling = build_pairs(ChatDialect::Inkling);
     switch (dialect.kind) {
         case ChatDialect::Extended: return all;
         case ChatDialect::Gemma4: return gemma;
+        case ChatDialect::Inkling: return inkling;
         default: return qwen;
     }
 }
 
 ReasoningSplit split_reasoning(std::string_view raw, ThinkStart start, ChatDialect dialect) {
     ReasoningSplit out;
+    if (dialect.inkling()) {
+        // The framed-block form: one streamer pass over the whole text, so the
+        // streaming and non-streaming paths cannot disagree. A reply that never
+        // opened a thinking block has content only, and no block is closed.
+        ReasoningStreamer streamer(start, dialect);
+        const ReasoningStreamer::Step step = streamer.push(raw);
+        const ReasoningStreamer::Step tail = streamer.flush();
+        out.reasoning = std::string(strip_edge_newlines(step.reasoning + tail.reasoning));
+        out.content   = step.content + tail.content;
+        out.closed    = streamer.closed();
+        return out;
+    }
     std::string_view body  = raw;
     std::string_view close = tag_range(dialect)[0].close;   // the template opened it: this dialect's first pair
     if (!start.open()) {
@@ -206,6 +222,7 @@ ReasoningStreamer::ReasoningStreamer(ThinkStart start, ChatDialect dialect,
     // A template-opened block: its closer is the first pair's close id when the
     // vocabulary spells it as one token; -1 keeps the text fallback.
     if (in_reasoning_ && !ids_.empty() && ids_.front().second >= 0) close_id_ = ids_.front().second;
+    if (dialect_.inkling() && !ids_.empty() && ids_.front().second >= 0) close_id_ = ids_.front().second;
 }
 
 // The answer's lead after the block closed: layout and a repeated closer are
@@ -231,6 +248,7 @@ TokenField ReasoningStreamer::field_for(int token_id) const {
 }
 
 ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int token_id) {
+    if (dialect_.inkling()) return ink_push(piece, token_id);
     Step step;
     if (undecided_) {
         // The model opened the block itself, as one special token: that id
@@ -340,7 +358,206 @@ ReasoningStreamer::Step ReasoningStreamer::push(std::string_view piece, int toke
     return step;
 }
 
+namespace {
+bool ink_starts(std::string_view s, std::string_view m) {
+    return s.size() >= m.size() && s.substr(0, m.size()) == m;
+}
+bool ink_prefix(std::string_view s, std::string_view m) {
+    return s.size() < m.size() && m.substr(0, s.size()) == s;
+}
+// The layout between a block's closer and the next one, dropped as lead_of
+// drops it before a block or an answer.
+void ink_drop_lead(std::string& s) {
+    size_t i = 0;
+    while (i < s.size() && (s[i] == '\n' || s[i] == ' ' || s[i] == '\t' || s[i] == '\r')) ++i;
+    s.erase(0, i);
+}
+}  // namespace
+
+ReasoningStreamer::Step ReasoningStreamer::ink_push(std::string_view piece, int token_id) {
+    Step step;
+    // Thinking with a known closer id: only that token closes, as everywhere
+    // else, so a closer spelled from ordinary tokens stays reasoning.
+    if (ink_stage_ == InkStage::Thinking && close_id_ >= 0 && token_id == close_id_) {
+        ink_buf_.clear();
+        in_reasoning_ = false;
+        closed_       = true;
+        ink_stage_    = InkStage::AfterEnd;
+        return step;
+    }
+    ink_buf_.append(piece);
+    for (;;) {
+        if (ink_buf_.empty() && ink_stage_ != InkStage::Thinking) return step;
+        switch (ink_stage_) {
+            case InkStage::Lead: {
+                if (ink_starts(ink_buf_, markers::kInkMessageModel)) {
+                    ink_buf_.erase(0, markers::kInkMessageModel.size());
+                    ink_stage_ = InkStage::NeedKind;
+                    continue;
+                }
+                if (ink_starts(ink_buf_, markers::kInkContentThink)) {
+                    ink_buf_.erase(0, markers::kInkContentThink.size());
+                    in_reasoning_ = true;
+                    ink_stage_    = InkStage::Thinking;
+                    continue;
+                }
+                if (ink_starts(ink_buf_, markers::kInkContentText)) {
+                    ink_buf_.erase(0, markers::kInkContentText.size());
+                    ink_stage_ = InkStage::Answer;
+                    continue;
+                }
+                if (ink_prefix(ink_buf_, markers::kInkMessageModel) ||
+                    ink_prefix(ink_buf_, markers::kInkContentThink) ||
+                    ink_prefix(ink_buf_, markers::kInkContentText))
+                    return step;
+                // Plain content with no framing at all.
+                ink_stage_ = InkStage::Answer;
+                continue;
+            }
+            case InkStage::NeedKind: {
+                if (ink_starts(ink_buf_, markers::kInkContentThink)) {
+                    ink_buf_.erase(0, markers::kInkContentThink.size());
+                    in_reasoning_ = true;
+                    ink_stage_    = InkStage::Thinking;
+                    continue;
+                }
+                if (ink_starts(ink_buf_, markers::kInkContentText)) {
+                    ink_buf_.erase(0, markers::kInkContentText.size());
+                    ink_stage_ = InkStage::Answer;
+                    continue;
+                }
+                if (ink_prefix(ink_buf_, markers::kInkContentThink) ||
+                    ink_prefix(ink_buf_, markers::kInkContentText))
+                    return step;
+                // Not an answer marker: this header introduced a tool call. The
+                // header goes out with the block, for the parser to find.
+                step.content = std::string(markers::kInkMessageModel) + ink_buf_;
+                ink_buf_.clear();
+                ink_stage_ = InkStage::Tail;
+                return step;
+            }
+            case InkStage::Thinking: {
+                if (!ink_buf_.empty()) {
+                    if (close_id_ >= 0) {
+                        // The closer is a special token; text is not scanned.
+                        step.reasoning += ink_buf_;
+                        ink_buf_.clear();
+                        return step;
+                    }
+                    const size_t at = ink_buf_.find(markers::kInkEndMessage);
+                    if (at != std::string::npos) {
+                        step.reasoning += ink_buf_.substr(0, at);
+                        ink_buf_.erase(0, at + markers::kInkEndMessage.size());
+                        in_reasoning_ = false;
+                        closed_       = true;
+                        ink_stage_    = InkStage::AfterEnd;
+                        continue;
+                    }
+                    const size_t hold = text::partial_stop_suffix(ink_buf_, markers::kInkEndMessage);
+                    const size_t safe = ink_buf_.size() - hold;
+                    step.reasoning += ink_buf_.substr(0, safe);
+                    ink_buf_.erase(0, safe);
+                }
+                return step;
+            }
+            case InkStage::AfterEnd: {
+                ink_drop_lead(ink_buf_);
+                if (ink_buf_.empty()) return step;
+                if (ink_starts(ink_buf_, markers::kInkModelEnd)) {
+                    ink_buf_.clear();
+                    return step;
+                }
+                if (ink_starts(ink_buf_, markers::kInkMessageModel)) {
+                    ink_buf_.erase(0, markers::kInkMessageModel.size());
+                    ink_stage_ = InkStage::NeedKind;
+                    continue;
+                }
+                if (ink_starts(ink_buf_, markers::kInkContentThink)) {
+                    ink_buf_.erase(0, markers::kInkContentThink.size());
+                    in_reasoning_ = true;
+                    ink_stage_    = InkStage::Thinking;
+                    continue;
+                }
+                if (ink_starts(ink_buf_, markers::kInkContentText)) {
+                    ink_buf_.erase(0, markers::kInkContentText.size());
+                    ink_stage_ = InkStage::Answer;
+                    continue;
+                }
+                if (ink_prefix(ink_buf_, markers::kInkMessageModel) ||
+                    ink_prefix(ink_buf_, markers::kInkContentThink) ||
+                    ink_prefix(ink_buf_, markers::kInkContentText) ||
+                    ink_prefix(ink_buf_, markers::kInkModelEnd))
+                    return step;
+                ink_stage_ = InkStage::Answer;
+                continue;
+            }
+            case InkStage::Answer: {
+                if (!ink_buf_.empty()) {
+                    const size_t eos = ink_buf_.find(markers::kInkModelEnd);
+                    const size_t end = ink_buf_.find(markers::kInkEndMessage);
+                    if (eos != std::string::npos && (end == std::string::npos || eos < end)) {
+                        step.content += ink_buf_.substr(0, eos);
+                        ink_buf_.clear();
+                        return step;
+                    }
+                    if (end != std::string::npos) {
+                        step.content += ink_buf_.substr(0, end);
+                        ink_buf_.erase(0, end + markers::kInkEndMessage.size());
+                        ink_stage_ = InkStage::AfterEnd;
+                        continue;
+                    }
+                    size_t hold = text::partial_stop_suffix(ink_buf_, markers::kInkEndMessage);
+                    hold = std::max(hold, text::partial_stop_suffix(ink_buf_, markers::kInkModelEnd));
+                    const size_t safe = ink_buf_.size() - hold;
+                    step.content += ink_buf_.substr(0, safe);
+                    ink_buf_.erase(0, safe);
+                }
+                return step;
+            }
+            case InkStage::Tail: {
+                const size_t eos = ink_buf_.find(markers::kInkModelEnd);
+                if (eos != std::string::npos) {
+                    step.content += ink_buf_.substr(0, eos);
+                    ink_buf_.clear();
+                    return step;
+                }
+                // A call block is handed out whole (the parser needs it); hold
+                // only a partial model-end marker, which a text-fallback token
+                // stream may split. The tool parser gets the bytes when it has
+                // them.
+                const size_t hold = text::partial_stop_suffix(ink_buf_, markers::kInkModelEnd);
+                const size_t safe = ink_buf_.size() - hold;
+                step.content += ink_buf_.substr(0, safe);
+                ink_buf_.erase(0, safe);
+                return step;
+            }
+        }
+    }
+}
+
+ReasoningStreamer::Step ReasoningStreamer::ink_flush() {
+    Step step;
+    switch (ink_stage_) {
+        case InkStage::Thinking: step.reasoning = ink_buf_; break;
+        case InkStage::NeedKind:
+            // The turn ended right after a header: keep what arrived rather
+            // than dropping it, as the tool parser keeps an unterminated block.
+            step.content = std::string(markers::kInkMessageModel) + ink_buf_;
+            break;
+        case InkStage::AfterEnd: {
+            ink_drop_lead(ink_buf_);
+            const size_t eos = ink_buf_.find(markers::kInkModelEnd);
+            step.content = eos == std::string::npos ? ink_buf_ : ink_buf_.substr(0, eos);
+            break;
+        }
+        default: step.content = ink_buf_; break;
+    }
+    ink_buf_.clear();
+    return step;
+}
+
 ReasoningStreamer::Step ReasoningStreamer::flush() {
+    if (dialect_.inkling()) return ink_flush();
     Step step;
     if (buffer_.empty()) return step;
     if (in_reasoning_) step.reasoning = buffer_;   // never closed: it stays reasoning

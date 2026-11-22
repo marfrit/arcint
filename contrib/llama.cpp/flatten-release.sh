@@ -35,11 +35,9 @@ fi
 
 cd "$T/pin"
 git init -q .
-for p in "$T"/series/contrib/llama.cpp/patches/*.patch; do
-    git apply --whitespace=nowarn "$p" || { echo "does not apply: $p" >&2; exit 1; }
-done
+bash "$T"/series/contrib/llama.cpp/apply-series.sh "$T/pin"
 rm -rf .git
-n=$(ls "$T"/series/contrib/llama.cpp/patches/*.patch | wc -l)
+n=$(bash "$T"/series/contrib/llama.cpp/apply-series.sh --list | wc -l)
 sync_tree "$T/pin"
 cat > "$W/FLATTENED.md" <<EOF
 # arcint: the patched llama.cpp, flattened

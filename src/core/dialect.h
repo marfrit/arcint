@@ -12,11 +12,14 @@ namespace lgc {
 //   Extended  the Qwen pair plus the angle- and square-bracket pairs of the
 //             Mistral family; tool calls are Qwen's (not parsed on that family)
 //   Gemma4    Gemma 4's thought channel and its own tool-call form
+//   Inkling   Inkling 2 Mini's message-block framing: a reasoning block, one
+//             or more answer blocks and tool-call blocks, all closed by the
+//             same marker; tool calls are its own JSON form
 //
 // Converts implicitly from bool for the callers that predate the third
 // dialect: true meant "extended tags".
 struct ChatDialect {
-    enum Kind : unsigned char { Qwen, Extended, Gemma4 };
+    enum Kind : unsigned char { Qwen, Extended, Gemma4, Inkling };
     Kind kind = Qwen;
 
     constexpr ChatDialect() = default;
@@ -25,6 +28,7 @@ struct ChatDialect {
 
     constexpr bool extended() const { return kind == Extended; }
     constexpr bool gemma4() const { return kind == Gemma4; }
+    constexpr bool inkling() const { return kind == Inkling; }
     // Assistant tool calls are replayed into the template with their arguments as
     // an object, whatever the template's capability probe says. Gemma 4's template
     // renders an object in its own key:value form and a JSON string by stripping
@@ -32,11 +36,15 @@ struct ChatDialect {
     // see its earlier calls in a syntax it never writes.
     // What the model's template does with a request that says nothing about
     // thinking: the Qwen templates (Granite's too) think; Gemma 4's reads
-    // `enable_thinking | default(false)`. An unset request is resolved to this
+    // `enable_thinking | default(false)`. Inkling's template takes a reasoning
+    // effort, not an enable flag, and leaves the answer's channel to the effort. An unset request is resolved to this
     // before the render, the sampler row and the answer-row switch read it, so
     // the three cannot disagree.
+    // Inkling's template reads only reasoning_effort and thinks at 0.9 when a request names none:
+    // an unset request is a thinking turn there (1.8.0; false here made arcint set enable_thinking=false,
+    // which the effort mapping then rendered as none).
     constexpr bool thinks_by_default() const { return kind != Gemma4; }
-    constexpr bool replays_arguments_as_object() const { return kind == Gemma4; }
+    constexpr bool replays_arguments_as_object() const { return kind == Gemma4 || kind == Inkling; }
     friend constexpr bool operator==(ChatDialect a, ChatDialect b) { return a.kind == b.kind; }
     friend constexpr bool operator!=(ChatDialect a, ChatDialect b) { return a.kind != b.kind; }
 };

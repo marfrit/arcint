@@ -1,3 +1,24 @@
+arcint (1.8.0-1) trixie; urgency=medium
+
+  * NEW: Thinking Machines' Inkling 2 Mini (inkling2_loop) on libllama: the
+    model port (0133-0139, 0145), flash attention with an indexed
+    relative-position bias and sinks (0140-0144, 0146), the Inkling chat
+    dialect, reasoning_effort for templates with their own effort map
+    (off and enable_thinking=false -> none, numbers and numeric strings
+    0-0.99, other names a 400 listing the allowed set).
+  * Speed for Inkling on the B60: small CONCAT/REPEAT kernels (0147), the
+    depth mix as one stack (0148), OpenCL SIGMOID on a strided f32 input
+    (0149, the expert gate no longer a CPU split per layer), SITU as one GLU
+    op (0150). Fixed before release (0152): the bias bins in the quantized
+    pairs' carried-softmax prompt path read at the absolute key.
+  * Sampling with top-k off draws in one pass instead of sorting the
+    vocabulary; the patch series applies in byte order whatever the locale
+    (GitHub issue #6, contrib/llama.cpp/apply-series.sh); --device picks one
+    card on a platform with two; the B70's own 2D GEMM tiles (0132).
+  * The existing models give the same logits as 1.7.0 (release gate).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Sun, 22 Nov 2026 19:00:00 +0100
+
 arcint (1.7.0-1) trixie; urgency=medium
 
   * NEW, opt-in and experimental: the KV window. LLAMA_KV_STREAM_UNSAFE=1 and

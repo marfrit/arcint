@@ -29,3 +29,31 @@ model cannot take a tool request at all. The keyword is accepted and ignored:
 escape it; minja has never done that and no admitted template asks for it.)
 
 Upstream: worth a PR against google/minja.
+
+## Trailing comma in a dictionary literal (2026-11-22)
+
+`minja.hpp`, `Parser::parseDictionary`: a `,` directly before the closing
+`}` threw `Expected value expression`. Python/Jinja accepts the trailing
+comma, and Inkling 2 Mini's `chat_template.jinja` writes every tool spec that
+way, so without this the template could not be parsed and the model could not
+be served. The parser now returns the dictionary when the comma is followed by
+`}`, exactly as Jinja does.
+
+Upstream: worth a PR against google/minja.
+
+## `float` filter (2026-11-22)
+
+`minja.hpp`, `Context::builtins`: Jinja's `float` filter was absent, so a
+numeric `reasoning_effort` in Inkling 2 Mini's template (`set num = eff | float`)
+threw `Value is not callable: null` on every render. Accepts numbers unchanged
+and parses strings with Jinja's fallback of `0.0` on failure.
+
+Upstream: worth a PR against google/minja.
+
+## `tojson` options and `dictsort(case_sensitive=)` (2026-11-22)
+
+Inkling 2 Mini passes `tojson(sort_keys=true, separators=(",", ":"))` and
+`dictsort(case_sensitive=true)`. `tojson` now accepts both keywords: compact
+separators are `dump`'s behaviour at indent -1, and `sort_keys` sorts object
+keys recursively, like Python. `dictsort` no longer rejects extra keywords and
+accepts `case_sensitive` (keys sort as strings either way).

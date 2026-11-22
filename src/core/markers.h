@@ -39,6 +39,28 @@ inline constexpr std::string_view kGemmaToolOpen  = "<" "|tool" "_call>";
 inline constexpr std::string_view kGemmaToolClose = "<tool" "_call|>";
 inline constexpr std::string_view kGemmaStrDelim  = "<" "|\"" "|>";
 
+
+// Inkling 2 Mini's message framing. Every block of a turn is a header, a
+// content marker, the body and the shared closer; the assistant turn is one
+// block per reasoning/text/tool-call part. `...Model` is the assistant header,
+// `...Think` the reasoning content marker (its opener is that header and this
+// marker together), `...Text` the answer marker, `...ToolJson` the call
+// marker, and `...End` closes every block. `...ModelEnd` is the vocabulary's
+// end-of-generation token.
+inline constexpr std::string_view kInkMessageModel  = "<" "|message_" "model" "|>";
+inline constexpr std::string_view kInkMessageUser   = "<" "|message_" "user" "|>";
+inline constexpr std::string_view kInkMessageSystem = "<" "|message_" "system" "|>";
+inline constexpr std::string_view kInkMessageTool   = "<" "|message_" "tool" "|>";
+inline constexpr std::string_view kInkContentThink  = "<" "|content_" "thinking" "|>";
+// The reasoning block's opener: the assistant header and the content marker in
+// one string, because a model output spells both before its reasoning.
+inline constexpr std::string_view kInkThinkOpen = "<" "|message_" "model|><|content_" "thinking" "|>";
+inline constexpr std::string_view kInkContentText   = "<" "|content_" "text" "|>";
+inline constexpr std::string_view kInkContentImage  = "<" "|content_" "image" "|>";
+inline constexpr std::string_view kInkContentToolJson = "<" "|content_" "invoke_tool_json" "|>";
+inline constexpr std::string_view kInkEndMessage    = "<" "|end_" "message" "|>";
+inline constexpr std::string_view kInkModelEnd      = "<" "|content_" "model_end_sampling" "|>";
+
 // ChatML's turn framing: the start-of-turn and end-of-turn markers.
 inline constexpr std::string_view kTurnStart = "<" "|im_" "start" "|>";
 inline constexpr std::string_view kTurnEnd   = "<" "|im_" "end" "|>";

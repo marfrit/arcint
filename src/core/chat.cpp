@@ -1,6 +1,10 @@
 #include "core/chat.h"
 
+#include <algorithm>
+#include <cerrno>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -14,6 +18,19 @@
 
 namespace lgc {
 namespace {
+
+// "0.45" -> 0.45: the whole string a finite decimal number (no name, no trailing text)
+bool effort_number(std::string_view s, double& out) {
+    if (s.empty() || s.size() > 32) return false;
+    const std::string t(s);
+    char* end = nullptr;
+    errno = 0;
+    const double v = std::strtod(t.c_str(), &end);
+    if (end != t.c_str() + t.size() || errno != 0 || !std::isfinite(v)) return false;
+    if (t.find_first_of("xXpPnNiI") != std::string::npos) return false;   // hex, nan, inf
+    out = v;
+    return true;
+}
 
 using json = nlohmann::json;
 
@@ -399,11 +416,27 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
     // hands it to the template (Qwen3.8's reads reasoning_effort).
     if (body.contains("reasoning_effort") && !body["reasoning_effort"].is_null()) {
         const json& e = body["reasoning_effort"];
-        if (!e.is_string()) return "reasoning_effort must be a string";
-        const std::string level = e.get<std::string>();
-        req.has_enable_thinking = true;
-        req.enable_thinking     = level != "none" && level != "off";
-        req.reasoning_effort    = level;
+        // Inkling's template takes a number in [0, 0.99] as well as a name
+        // (chat_template.jinja, emit_thinking_effort): the number reaches the
+        // template through the passthrough object unchanged, which is what a
+        // chat_template_kwargs.reasoning_effort number does too.
+        if (e.is_number()) {
+            const double num = e.get<double>();
+            if (!(num >= 0.0 && num <= 0.99)) return "reasoning_effort must be in [0, 0.99]";
+            req.has_enable_thinking = true;
+            req.enable_thinking     = num > 0.0;
+            req.chat_template_kwargs["reasoning_effort"] = num;
+        } else {
+            if (!e.is_string()) return "reasoning_effort must be a string or a number in [0, 0.99]";
+            const std::string level = e.get<std::string>();
+            req.has_enable_thinking = true;
+            req.enable_thinking     = level != "none" && level != "off";
+            req.reasoning_effort    = level;
+            // A number sent as a JSON string ("0.45": pi's thinkingLevelMap values are strings) is
+            // kept as the string here, as in 1.7.0 for every template: a template with its own effort
+            // map (Inkling's) gets the number in template_context and its range is checked there
+            // (check_strict_reasoning_effort); another template ignores a level it does not name.
+        }
     }
     if (body.contains("chat_template_kwargs") && !body["chat_template_kwargs"].is_null()) {
         const json& kw = body["chat_template_kwargs"];
@@ -431,6 +464,11 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
         json passthrough = json::object();
         for (auto it = kw.begin(); it != kw.end(); ++it)
             if (!it.value().is_null()) passthrough[it.key()] = it.value();
+        // a typed numeric reasoning_effort (above) already sits in the kwargs object: the client's
+        // own object replaces it only where it names reasoning_effort itself (1.8.0 review S1)
+        if (req.chat_template_kwargs.is_object() && req.chat_template_kwargs.contains("reasoning_effort") &&
+            !passthrough.contains("reasoning_effort"))
+            passthrough["reasoning_effort"] = req.chat_template_kwargs["reasoning_effort"];
         req.chat_template_kwargs = std::move(passthrough);
         // One construction, one reserved-key list: the keys minja's context
         // sets itself are refused by name (a client must not override the
@@ -566,6 +604,15 @@ json tool_call_arguments_for_template(const std::string& arguments, bool templat
     return json(arguments);
 }
 
+bool is_inkling_template(std::string_view template_src) {
+    return template_src.find(markers::kInkMessageUser) != std::string_view::npos &&
+           template_src.find(markers::kInkContentImage) != std::string_view::npos;
+}
+
+ChatDialect dialect_from_template(std::string_view template_src, ChatDialect fallback) {
+    return is_inkling_template(template_src) ? ChatDialect(ChatDialect::Inkling) : fallback;
+}
+
 bool reserved_template_context_key(std::string_view key) {
     // The names minja's chat-template context sets before it merges
     // extra_context (third_party/minja/chat-template.hpp, ChatTemplate::apply):
@@ -620,6 +667,17 @@ bool reasoning_effort_level_known(std::string_view level) {
 
 std::string template_reasoning_effort(std::string_view level, std::string_view src) {
     if (src.find("reasoning_effort") == std::string_view::npos) return {};
+    if (is_inkling_template(src)) {
+        // Inkling's effort_map takes all seven names, minimal and max included,
+        // and each has its own value (0.1 vs 0.2): pass the name verbatim, no
+        // nearest-level rewrite. none is its 0.0, not an off switch.
+        for (const char* l : {"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+            if (level == l && template_quotes(src, l)) return std::string(l);
+        // "off" is the switch other clients send for no reasoning: Inkling's
+        // name for it is none (0.0); without this it fell to the default 0.9
+        if (level == "off" && template_quotes(src, "none")) return "none";
+        return {};
+    }
     const std::string_view l = level == "minimal" ? std::string_view("low") : level;
     if (l != "low" && l != "medium" && l != "high" && l != "xhigh") return {};
     if (template_quotes(src, l)) return std::string(l);
@@ -656,9 +714,47 @@ std::optional<std::string> load_chat_template_file(const std::string& path, std:
 std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src) {
     std::vector<std::string> out;
     if (template_src.find("reasoning_effort") == std::string_view::npos) return out;
+    if (is_inkling_template(template_src)) {
+        for (const char* l : {"none", "minimal", "low", "medium", "high", "xhigh", "max"})
+            if (template_quotes(template_src, l)) out.emplace_back(l);
+        return out;
+    }
     for (const char* l : {"low", "medium", "high", "xhigh"})
         if (template_quotes(template_src, l)) out.emplace_back(l);
     return out;
+}
+
+std::optional<std::string> check_strict_reasoning_effort(const ChatRequest& req,
+                                                         const std::vector<std::string>& levels) {
+    const auto has = [&](std::string_view l) {
+        return std::find(levels.begin(), levels.end(), l) != levels.end();
+    };
+    const auto known = [&](const std::string& v) {
+        if (double n = 0.0; effort_number(v, n)) return n >= 0.0 && n <= 0.99;   // "0.45"
+        return v == "off" ? has("none") : has(v);
+    };
+    const auto refuse = [&](const std::string& v) {
+        std::string allowed;
+        for (const std::string& l : levels) allowed += (allowed.empty() ? "\"" : ", \"") + l + "\"";
+        return "reasoning_effort \"" + v + "\" is not one this model takes: one of " + allowed +
+               (has("none") ? ", \"off\" (= \"none\")" : "") + ", or a number in [0, 0.99]";
+    };
+    if (req.chat_template_kwargs.is_object()) {
+        const auto it = req.chat_template_kwargs.find("reasoning_effort");
+        if (it != req.chat_template_kwargs.end() && !it->is_null()) {   // the explicit kwarg wins
+            if (it->is_number()) {
+                const double n = it->get<double>();
+                if (!(n >= 0.0 && n <= 0.99)) return std::string("reasoning_effort must be in [0, 0.99]");
+                return std::nullopt;
+            }
+            if (!it->is_string()) return std::string("reasoning_effort must be a string or a number in [0, 0.99]");
+            const std::string v = it->get<std::string>();
+            if (!known(v)) return refuse(v);
+            return std::nullopt;
+        }
+    }
+    if (!req.reasoning_effort.empty() && !known(req.reasoning_effort)) return refuse(req.reasoning_effort);
+    return std::nullopt;
 }
 
 EffectiveEffort effective_reasoning_effort(const ChatRequest& req) {
@@ -696,12 +792,22 @@ nlohmann::json template_context(const ChatRequest& req, std::string& error,
             extra[it.key()] = it.value();
         }
     }
+    const bool inkling = is_inkling_template(template_src);
+    if (inkling && extra.contains("reasoning_effort") && extra["reasoning_effort"] == "off")
+        extra["reasoning_effort"] = "none";
+    if (double n = 0.0; inkling && extra.contains("reasoning_effort") && extra["reasoning_effort"].is_string() &&
+                        effort_number(extra["reasoning_effort"].get<std::string>(), n))
+        extra["reasoning_effort"] = n;
     if (req.has_enable_thinking) extra["enable_thinking"] = req.enable_thinking;
     if (req.has_preserve_thinking) extra["preserve_thinking"] = req.preserve_thinking;
     // The explicit kwarg wins (it is already in extra), as enable_thinking does:
     // effective_reasoning_effort is the one place that decides it.
     if (const EffectiveEffort eff = effective_reasoning_effort(req);
         eff.present && !req.chat_template_kwargs.contains("reasoning_effort")) {
+        if (double n = 0.0; inkling && effort_number(eff.level, n)) {   // "0.45": Inkling takes the number
+            extra["reasoning_effort"] = n;
+            return extra;
+        }
         const std::string level = template_reasoning_effort(eff.level, template_src);
         if (!level.empty()) {
             log::debug("req", "reasoning_effort %s reaches the template context as %s",
@@ -709,6 +815,12 @@ nlohmann::json template_context(const ChatRequest& req, std::string& error,
             extra["reasoning_effort"] = level;
         }
     }
+    // Inkling's template ignores enable_thinking and reads only reasoning_effort,
+    // with 0.9 for an absent one: a client that switched thinking off and named
+    // no level gets none (0.0), the template's own off. The card's caveat holds:
+    // none is the template's lowest setting, not a guarantee of no reasoning.
+    if (inkling && !extra.contains("reasoning_effort") && req.has_enable_thinking && !req.enable_thinking)
+        extra["reasoning_effort"] = "none";
     return extra;
 }
 
@@ -810,10 +922,16 @@ std::optional<std::string> parse_template_kwarg_default(std::string_view kv, std
     if (k == "force_nonempty_content" && !v.is_boolean())
         return std::string("--chat-template-kwarg force_nonempty_content needs true or false "
                            "(the JSON booleans; 1, yes and True do not trigger it)");
-    if (k == "reasoning_effort" &&
-        !(v.is_string() && reasoning_effort_level_known(v.get<std::string>())))
-        return std::string("--chat-template-kwarg reasoning_effort needs one of none, off, minimal, "
-                           "low, medium, high, xhigh");
+    if (k == "reasoning_effort") {
+        if (v.is_number()) {
+            const double num = v.get<double>();
+            if (!(num >= 0.0 && num <= 0.99))
+                return std::string("--chat-template-kwarg reasoning_effort needs a number in [0, 0.99]");
+        } else if (!(v.is_string() && reasoning_effort_level_known(v.get<std::string>()))) {
+            return std::string("--chat-template-kwarg reasoning_effort needs one of none, off, minimal, "
+                               "low, medium, high, xhigh, or a number in [0, 0.99]");
+        }
+    }
     key   = k;
     value = std::move(v);
     return std::nullopt;

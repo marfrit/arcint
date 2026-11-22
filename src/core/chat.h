@@ -160,6 +160,15 @@ std::optional<std::string> load_chat_template_file(const std::string& path, std:
 // a template that calls the builtin, so it is refused by name.
 bool reserved_template_context_key(std::string_view key);
 
+// Template detection, as mainline's is_inkling_template does
+// (common/parsers/inkling.cpp, 0003-chat-implement-inkling-parser-32381.patch):
+// the Inkling templates are the ones that write a user message header and an
+// image content marker. A loaded model's dialect is decided by this pure
+// function from its template text, so a unit whose admission table does not
+// know the model yet still speaks its chat form.
+bool is_inkling_template(std::string_view template_src);
+ChatDialect dialect_from_template(std::string_view template_src, ChatDialect fallback);
+
 // The `extra_context` a request produces: the typed switches
 // (enable_thinking, preserve_thinking) plus every non-reserved
 // chat_template_kwargs key, unchanged. Empty when the request set neither, so
@@ -250,6 +259,14 @@ bool promote_reasoning_to_content(const nlohmann::json& chat_template_kwargs,
 // reasoning_effort variable: the ones it quotes as a token, and only when it
 // reads the variable at all (empty otherwise). /props publishes them.
 std::vector<std::string> template_reasoning_effort_levels(std::string_view template_src);
+
+// For a template with its own effort map (Inkling's raises on a name it does not
+// know, and ignores enable_thinking): the request's reasoning_effort, typed or as
+// chat_template_kwargs.reasoning_effort, must be one of `levels`, "off" (taken as
+// "none"), a number in [0, 0.99], or absent. The refusal names the allowed set;
+// the caller answers it with a 400 instead of the template's raise_exception.
+std::optional<std::string> check_strict_reasoning_effort(const ChatRequest& req,
+                                                         const std::vector<std::string>& levels);
 
 // M0 stub prompt rendering.
 //

@@ -46,7 +46,7 @@ Unit:
 
 Serving build:
 
-    git -C <llama.cpp> apply <arcint>/contrib/llama.cpp/patches/*.patch
+    <arcint>/contrib/llama.cpp/apply-series.sh <llama.cpp>
     cmake -S . -B build-ll -DCMAKE_BUILD_TYPE=Release -DARCINT_LLAMA=ON \
           -DARCINT_LLAMA_DIR=<llama.cpp> -DGGML_OPENCL_USE_ADRENO_KERNELS=OFF \
           -DARCINT_GIT_SHA=$(git rev-parse --short=12 HEAD)

@@ -10,5 +10,16 @@
     "src=opencl op=MUL_MAT type=f32 k=128 cols=5-15 path=generic reason=no-fast-path",
     "src=opencl op=MUL_MAT type=f32 k=2560 cols=16+ path=generic reason=no-fast-path",
     "src=opencl op=MUL_MAT type=f32 k=2560 cols=5-15 path=generic reason=no-fast-path"
+  ],
+  "inkling": [
+    "src=opencl op=FLASH_ATTN indexed-bias path=declined reason=row-blocks",
+    "src=opencl op=MUL_MAT type=f32 k=16 cols=16+ path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=2304 cols=16+ path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=2304 cols=5-15 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=64 cols=1-4 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=64 cols=16+ path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT type=f32 k=64 cols=5-15 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT_ID type=q8_0 k=1152 path=generic reason=no-fast-path",
+    "src=opencl op=MUL_MAT_ID type=q8_0 k=2304 path=generic reason=no-fast-path"
   ]
 }
