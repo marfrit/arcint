@@ -459,3 +459,11 @@ TEST(inkling_reasoning_effort_numeric_string_is_the_number) {
     const nlohmann::json ctx = template_context(q, e, "{%- if reasoning_effort == 'low' -%}l{%- endif -%}");
     CHECK(!ctx.contains("reasoning_effort"));
 }
+
+// A request that names no effort is the template's own default (0.9), a thinking turn.
+// Mutation: put Inkling back among the dialects that do not think by default and the
+// chat route sets enable_thinking=false, which renders as none (0).
+TEST(inkling_thinks_by_default) {
+    CHECK(ChatDialect(ChatDialect::Inkling).thinks_by_default());
+    CHECK(!ChatDialect(ChatDialect::Gemma4).thinks_by_default());
+}

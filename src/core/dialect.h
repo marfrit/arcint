@@ -40,7 +40,10 @@ struct ChatDialect {
     // effort, not an enable flag, and leaves the answer's channel to the effort. An unset request is resolved to this
     // before the render, the sampler row and the answer-row switch read it, so
     // the three cannot disagree.
-    constexpr bool thinks_by_default() const { return kind != Gemma4 && kind != Inkling; }
+    // Inkling's template reads only reasoning_effort and thinks at 0.9 when a request names none:
+    // an unset request is a thinking turn there (1.8.0; false here made arcint set enable_thinking=false,
+    // which the effort mapping then rendered as none).
+    constexpr bool thinks_by_default() const { return kind != Gemma4; }
     constexpr bool replays_arguments_as_object() const { return kind == Gemma4 || kind == Inkling; }
     friend constexpr bool operator==(ChatDialect a, ChatDialect b) { return a.kind == b.kind; }
     friend constexpr bool operator!=(ChatDialect a, ChatDialect b) { return a.kind != b.kind; }
