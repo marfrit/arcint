@@ -119,6 +119,9 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   22.60 -> 26.75 (+18.4 %) at 4,096, prefill level. Measured and dropped (CPU): a loop self-draft (1 pass: same top
   70.4 %, 2 passes 76.3 %: no gain at a draft cost of 0.5-0.75 forward a token); expert reuse across passes
   (consecutive passes share 58 % of the experts; the model is resident, nothing to prefetch).
+  The output head (Q8_0, 0.49 GB a token) requantized from BF16: Q6_K mean KL 0.000115, same top 99.19 %, -23 %
+  bytes; Q4_K KL 0.00116, same top 98.37 %, -47 % (CPU, against the Q8_0 head's logits): inside the bar, worth
+  ~0.25-0.5 ms a token; it goes with the weight-format decision.
 - **Flash attention on the card** (fa3, fbfcece): all 17 bias cases run and pass (decode 1-8 rows through the GQA
   and split kernels, the 512-row prompt through dpas2), the full FLASH_ATTN_EXT suite 3,171 / 3,171, the decode and
   the Xe2 prompt mutations red. The 9-64-row single-batch shape is declined on purpose (reason=row-blocks).
