@@ -1,19 +1,16 @@
 # arcint
 
-An inference server for Intel Arc: OpenAI-compatible endpoints for a short
-list of models on the Arc Pro B60, from the dense Qwen3.8-27B to the
-512-expert Qwen3.8-Flash-Next on one card plus host RAM, and since 1.8.0
-Thinking Machines' Inkling 2 Mini. Since 1.1.0 it also does text-to-image:
-Z-Image Turbo, Qwen-Image (lettering, German included), FLUX.2 klein with
-image editing, and an ESRGAN upscaler; since 1.2.0 voice and vision: image
-input to the chat endpoint, speech to text, and German text to speech that
-clones enrolled voices.
+An inference server for Intel Arc Pro B70 and B60 (Battlemage): OpenAI-compatible endpoints for a
+short list of models. The 32 GB B70 serves the 512-expert Qwen3.8-Flash-Next at its full 262,144-token
+context with an expert cache in host RAM (decode 53.8 / 34.9 / 24.6 / 15.9 t/s at 4k / 65k / 131k / 261k
+tokens; the needle found at 104k). The 24 GB B60 serves the dense Qwen3.8-27B and, since 1.8.0, Thinking
+Machines' Inkling 2 Mini. Since 1.1.0 arcint also does text-to-image: Z-Image Turbo, Qwen-Image (lettering,
+German included), FLUX.2 klein with image editing, and an ESRGAN upscaler; since 1.2.0 voice and vision:
+image input to the chat endpoint, speech to text, and German text to speech that clones enrolled voices.
 
-**Hardware Sold: the Arc A770.** The Arc A770 was supported and gated through
-release 1.7.0. Its hardware has been sold and the card is no longer available
-to the project, so no release gate runs on it any more. Every A770 number in
-this file is historical, last measured with release 1.7.0, and is marked as
-such. Its last recorded state: [docs/a770-reference.md](docs/a770-reference.md).
+The Arc A770 is retired: the hardware is no longer available, so no release gate runs on it after 1.7.0.
+Its numbers in this file are historical (last measured with 1.7.0); its last recorded state is
+[docs/a770-reference.md](docs/a770-reference.md).
 
 arcint runs GGUF files through libllama (llama.cpp at a pinned commit) with
 ggml's OpenCL backend and a published series of Intel kernels
