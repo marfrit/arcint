@@ -292,15 +292,16 @@ request; llama.cpp's issue for a line-based detector went stale.
 | speech out | Qwen3-TTS-12Hz-1.7B-Base (`qwen3tts`) with its audio-generation projector (speaker encoder, code predictor, acoustic decoder) | Q8_0 GGUF + Q8_0 mmproj with the code head and embedding at f16 | backbone on the Arc Pro B60, the projector on the CPU; on demand | German; enrolled voices only |
 | speech in | Whisper large-v3-turbo (whisper.cpp) | whisper.cpp's `.bin` | Arc Pro B60, on demand | German first; `/v1/audio/transcriptions` |
 
-The engine admits these architectures (Inkling 2 Mini, `qwen35`, `qwen35moe`, `qwen4exp`,
+The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`,
 `llama` at the Mistral Small 24B and Llama 2 7B geometries, `qwen2vl` for vision, `gemma4` at
-the E4B geometry, `granite` at the 8B geometry, `dory` at the 1.0-4B geometry, and under `--tts`
+the E4B geometry, `granite` at the 8B geometry, `dory` at the 1.0-4B geometry, `inkling2_loop` at the Inkling 2
+Mini geometry (24 physical blocks x 2304, 24/8 heads), and under `--tts`
 `qwen3tts`) and refuses others
 at load, an untested size of an admitted architecture included. Gemma 4 E4B and Granite 4.2 8B
 were admitted 2026-11-06 from their files' metadata and templates (`code`); Dory1.0-4B (a looped
 nGPT, with `--llama-dory-loops` and `--llama-dory-kv`; since then also the opt-in
-`--llama-dory-max-loops`, a loop count per request) on 2026-11-07; none has been
-loaded or served here yet (DESIGN §2).
+`--llama-dory-max-loops`, a loop count per request) on 2026-11-07; Inkling 2 Mini on 2026-11-22,
+served on the B60 (DESIGN §2).
 Flash-Next's other files are on-demand options on the same endpoint: IQ2_XS,
 faster and less exact, and UD-Q3_K_XL, inside the KL bar once the host has
 the RAM for its bank (DESIGN §7.2).
