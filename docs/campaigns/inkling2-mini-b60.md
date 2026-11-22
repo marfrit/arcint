@@ -37,9 +37,14 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
   input with relative positions `build_inp_mem_hybrid_iswa_rel`) and `690b87d8` (#32704, the loop slots
   after the scale pass). Every ggml op the graph uses exists at our pin `3e4dfa8` (`code`, checked
   2026-11-22); the new parts are in libllama's graph, memory and hparams.
-- **Flash attention with the bias in the kernel:** llama.cpp #32740 (open; CUDA, ROCm, Vulkan: a compact
-  `[n_head, n_rel]` table indexed in the kernel; the decode kernel needs the bias as a compile-time variant,
-  as a runtime branch it cost ~25 % on CUDA's vec kernel; the tile-only path lost 13-15 % decode) (`paper`).
+- **Flash attention with the bias in the kernel:** llama.cpp #32740 (open; CUDA, ROCm, Vulkan, declined
+  on OpenCL and CPU): the bias stays a table `[n_head, n_bins, n_tokens]` (per query token, since the bias
+  is low-rank and token-dependent: `attn_rel_bias · Rcur`, minus the sink; 1,025 bins, 98.4 KB a token)
+  indexed by `[n_kv, n_tokens]` bins inside the kernel, `mask + bias` rounded to f16 once (`code`). Its
+  op slots `src[6]`/`src[7]`/`op_params[5]` collide with arcint's paged attention, so the port takes its
+  own slots. The plan for our kernels (`flash_attn_dpas`, `flash_attn_gqa_dpas`, the split decode and its
+  merge, compile-time variants, six red cases): `inkling2-fa-bias-design.md`. The alternative to price:
+  GodGMN's in-kernel bias from the static per-layer weight (16 MACs per row and key, no per-token table).
 - **Fusions:** the GodGMN `inkling-rdna3` branch (`docs/inkling-rdna3.md`): L2 clip, the loop controller,
   depth mixing, short conv and concat + state store fused, ~7,650 -> ~3,000 kernels a token, decode 31.9 ->
   64.0 t/s on an RX 7900 XTX (`paper`); vLLM #69028's stacked controller GEMMs and the FP32 merge fused
@@ -65,8 +70,10 @@ NVFP4, the rest MXFP8 (19.5 GB); ggml-org's GGUF conversion: BF16 52.2 GB, Q8_0 
 
 ## Current state
 
-2026-11-22 01:10: references checked out (mainline `690b87d8`), the original checkpoint and ggml-org's
-BF16 / IQ4_NL / imatrix downloading. Nothing built.
+2026-11-22 02:30: the port to the pin in progress (four of seven commits: arch and hparams, the
+relative-position input and conv-state store, the text model and loader, the expert scales); arcint's
+chat side in progress; the FA design note written (`inkling2-fa-bias-design.md`); mainline's Vulkan build
+for the baseline arm built; weights downloaded (IQ4_NL complete). Nothing measured.
 
 ## Where it lives
 
