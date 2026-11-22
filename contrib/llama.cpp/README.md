@@ -8637,3 +8637,26 @@ keys is a width below the Intel kernel's required sub-group; three test cases no
 Gate on the card: `test-export-graph-ops` writes the graph's 294 unique op shapes, and
 `test-backend-ops -b OpenCL --test-file` replays them against the CPU reference; the SCALE view,
 LOG, ARANGE and small SOFT_MAX cases are in the suite directly. No FA kernel is touched.
+
+## 0146-inkling2-rel-bias-indexed-flash-attention.patch
+
+Wires the Inkling 2 Mini rel attention to the indexed bias op of 0140-0142. With flash attention
+on, `build_attn_mha` builds the FLASH_ATTN_EXT node, attaches the compact table (F32
+`[n_head, n_bins, n_tokens]`) and the distance indices (I32 `[n_kv, n_tokens]`), and asks the
+layer's backend through `ggml_backend_supports_op` on that node. A backend that supports it reads
+the bias in its kernel; the CPU does. A backend that declines it - OpenCL until 0143-0144 land,
+CUDA, and the rest that 0140 makes decline - gets the dense fallback: the bias is gathered from
+the table by the indices and added to the mask in F32 before the one F16 rounding, exactly what
+the model used to build itself. With flash attention off the model's existing dense fold is
+untouched. The sink logit already rides inside the table (minus the per-head sink), so the FA
+sink argument stays the zero vector.
+
+Gate, CPU, IQ4_NL, `-c 2048`, three chunks, against the FA-on mainline base logits: the indexed
+arm at `-fa on` has mean KL 0.000000 and same top 99.967 %, the dense arm with the indexed op
+forced declined has mean KL 0.000000 and the same top. Red case: dropping the table read in the
+CPU reference gives mean KL 4.011524 and same top 27.208 % on the indexed arm, while the dense
+arm is unchanged (0.001894 against that base, because a FA-on base cannot be matched with flash
+attention off; the mainline build's own `-fa off` is 0.001954 against the same base).
+
+The card run is owed: the OpenCL kernels are 0143-0144 of the other branch; until they are in
+the series, an Inkling run on OpenCL declines the indexed bias and takes the dense fallback.

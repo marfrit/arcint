@@ -1,0 +1,167 @@
+0146: the inkling2 rel attention passes the compact bias table and the distance indices to FLASH_ATTN_EXT when flash attention is on and the layer's backend supports the indexed bias, and otherwise keeps the dense fold in the F16 mask with the sink still a zero vector.
+
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3096,7 +3096,9 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+          ggml_tensor * v_mla,
+              int64_t   n_kv_max,
+                float   kq_scale,
+-                 int   il) const {
++                 int   il,
++         ggml_tensor * bias_table,
++         ggml_tensor * bias_indices) const {
+     const bool v_trans = v->nb[1] > v->nb[2];
+ 
+     // split the batch into streams if needed
+@@ -3111,6 +3113,22 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+     k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+     v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+ 
++    // the dense fallback for a backend that declines the indexed bias: gather the table
++    // by the indices, then add it to the mask before the F16 rounding, as the model has
++    auto dense_bias_mask = [&]() {
++        ggml_tensor * bias = ggml_get_rows(ctx0, bias_table, bias_indices);
++        bias = ggml_reshape_4d(ctx0, bias, q->ne[2], bias_indices->ne[0], q->ne[1], n_stream);
++        bias = ggml_cont(ctx0, ggml_permute(ctx0, bias, 2, 0, 1, 3));
++        cb(bias, "kq_b", il);
++        ggml_tensor * mask = kq_mask->type == GGML_TYPE_F32 ? kq_mask : ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
++        mask = ggml_add(ctx0, bias, mask);
++        if (cparams.flash_attn) {
++            mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
++        }
++        cb(mask, "kq_mask_rel_pos", il);
++        return mask;
++    };
++
+     ggml_tensor * cur;
+ 
+     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+@@ -3139,6 +3157,27 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+         ggml_flash_attn_ext_set_n_kv_max(cur, static_cast<int32_t>(n_kv_max));
+         ggml_prec_set_acc(cur, GGML_PREC_F32);
+ 
++        if (bias_table) {
++            ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
++            // the backend of the layer must support the op with the bias attached, or the
++            // kernel would read a mask without it; find that backend, the CPU is the fallback
++            ggml_backend_t backend = backend_cpu;
++            const ggml_backend_dev_t dev = model.dev_layer(il);
++            if (dev) {
++                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
++                    ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
++                    if (ggml_backend_get_device(b) == dev) {
++                        backend = b;
++                        break;
++                    }
++                }
++            }
++            if (!ggml_backend_supports_op(backend, cur)) {
++                ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
++                cur->src[3] = dense_bias_mask();
++            }
++        }
++
+         if (v_mla) {
+ #if 0
+             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.
+@@ -3692,7 +3731,9 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_tensor * v_mla,
+             float     kq_scale,
+             int       il,
+-        ggml_tensor * kq_mask) const {
++        ggml_tensor * kq_mask,
++        ggml_tensor * bias_table,
++        ggml_tensor * bias_indices) const {
+     const bool is_swa = hparams.is_swa(il);
+ 
+     auto * k_rot = is_swa ? inp->self_k_rot_swa : inp->self_k_rot;
+@@ -3755,7 +3796,8 @@ ggml_tensor * llm_graph_context::build_attn(
+     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
+     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
+ 
+-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il);
++    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, 0, kq_scale, il,
++                                            bias_table, bias_indices);
+     cb(cur, "kqv_out", il);
+ 
+     if (v_rot) {
+@@ -4440,21 +4482,27 @@ ggml_tensor * llm_graph_context::build_attn(
+         ggml_tensor * v_cur,
+         ggml_tensor * kq_b,
+         ggml_tensor * sinks,
++        ggml_tensor * bias_table,
++        ggml_tensor * bias_indices,
+             float     kq_scale,
+             int       il) const {
+     const bool is_swa = hparams.is_swa(il);
+ 
+     auto * inp_attn = inp->get_attn();
+ 
+-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+     ggml_tensor * kq_mask = is_swa ? inp_attn->self_kq_mask_swa : inp_attn->self_kq_mask;
++    if (cparams.flash_attn) {
++        // flash attention takes the raw F16 mask and the compact table: the bias is added to
++        // the mask by the kernel, or by build_attn_mha's dense fallback on a backend that declines it
++        return build_attn(inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, sinks, nullptr,
++                kq_scale, il, kq_mask, bias_table, bias_indices);
++    }
++
++    // a mask per head, in the dense layout of the input mask
+     if (kq_mask->type != GGML_TYPE_F32) {
+         kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
+     }
+     kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+-    if (cparams.flash_attn) {
+-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+-    }
+     cb(kq_mask, "kq_mask_rel_pos", il);
+ 
+     return build_attn(inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, sinks, nullptr, kq_scale, il, kq_mask);
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1335,7 +1335,9 @@ struct llm_graph_context {
+             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                 int64_t   n_kv_max,
+                   float   kq_scale,
+-                    int   il) const;
++                    int   il,
++            ggml_tensor * bias_table = nullptr,
++            ggml_tensor * bias_indices = nullptr) const;
+ 
+     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
+ 
+@@ -1424,7 +1426,9 @@ struct llm_graph_context {
+             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
+                   float   kq_scale,
+                     int   il,
+-            ggml_tensor * kq_mask = nullptr) const;
++            ggml_tensor * kq_mask = nullptr,
++            ggml_tensor * bias_table = nullptr,
++            ggml_tensor * bias_indices = nullptr) const;
+ 
+     llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
+ 
+@@ -1542,6 +1546,8 @@ struct llm_graph_context {
+             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+             ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+             ggml_tensor * sinks, // [n_head_q]
++            ggml_tensor * bias_table,   // F32 [n_head_q, n_bins, n_tokens]
++            ggml_tensor * bias_indices, // I32 [n_kv, n_tokens]
+                   float   kq_scale,
+                     int   il) const;
+ 
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -367,9 +367,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+ 
++        // flash attention takes the compact table and the indices, the dense gather stays
++        // the fallback: with flash attention off, or on a backend that declines the op
+         cur = build_attn(inp,
+                 nullptr, nullptr, nullptr,
+-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il);
++                Qcur, Kcur, Vcur, kq_b, sinks, table, rel_pos, 1.0f/sqrtf(n_embd_head), il);
+ 
+         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
