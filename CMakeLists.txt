@@ -315,6 +315,7 @@ if(ARCINT_TESTS)
     tests/test_dory.cpp
     tests/test_dory_request.cpp
     tests/test_gemma4.cpp
+    tests/test_inkling.cpp
     tests/test_markers.cpp
     tests/test_stream_utf8.cpp
     tests/test_stop_think_ids.cpp
