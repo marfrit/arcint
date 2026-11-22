@@ -327,12 +327,12 @@ generated tokens, measured at a context depth of 0, 4,096 and 32,768 tokens.
 | Engine | pp512 t/s at depth 0 / 4,096 / 32,768 | tg128 t/s at depth 0 / 4,096 / 32,768 |
 |---|---|---|
 | arcint 1.8.0 (OpenCL), flash attention on, B60 | 429.1 / 397.4 / 337.5 | 36.6 / 33.7 / 29.9 |
-| arcint 1.8.0 before 0150 (OpenCL), flash attention on, B70 (220 W cap) | 658.2 / 627.2 / 550.6 | 40.1 / 39.2 / 37.5 |
+| arcint 1.8.0 (OpenCL), flash attention on, B70 (220 W cap) | 671.9 / 640.6 / 561.4 | 45.3 / 41.6 / 39.0 |
 | arcint at first light (the port and the flash-attention bias, before the speed work) | 183.9 / 177.5 / 164.1 | 24.0 / 22.6 / 20.8 |
 | mainline llama.cpp, Vulkan backend, same tool and card | 33.3 / 32.3 / 30.1 | 8.3 / 10.1 / 10.2 |
 
 The B70 gives the same answers (mean KL against the CPU reference identical to the B60's, the
-acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 15-30 % on generation:
+acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 23-30 % on generation:
 Inkling's decode is bound by the number of small kernel launches more than by memory bandwidth.
 
 Against Vulkan on the B60, arcint is 11-13x faster on the prompt and
