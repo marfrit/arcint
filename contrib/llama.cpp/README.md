@@ -8782,3 +8782,10 @@ test-backend-ops `-o SITU` (correctness, merged and split, [2304,8,1,1], [2304,5
 small shape, plus the split [1152,...] forms): six cases, pass on the CPU. On a card the same
 six compare the OpenCL kernel against the CPU reference. The KL red case, dropping the sigmoid
 in the CPU op, gives mean KL 1.787650 and same top 56.044 %.
+
+On the card (Arc Pro B60 at a 165 W cap, Inkling 2 Mini IQ4_NL, OpenCL, flash attention on, `measured-here`),
+0149 vs 0149+0150: tg128 34.88 -> 36.60 t/s at depth 0 (+4.9 %), 32.23 -> 33.74 at 4,096, 28.78 -> 29.93 at
+32,768; pp512 +2.7 % (417.9 -> 429.1). Mean KL against the CPU base 0.001931 -> 0.001947, same top 98.501 ->
+98.175 %. test-backend-ops `-o SITU` on the card: 6 / 6 (the op's name is the GLU variant's; `-o GLU` selects
+nothing); the red case (sigmoid dropped in `kernel_situ_f32`) fails all 6 (ERR ~0.5) and moves the model's KL
+to 1.78; SWIGLU unchanged, 24 / 24.
