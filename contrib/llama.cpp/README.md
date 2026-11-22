@@ -8660,3 +8660,27 @@ attention off; the mainline build's own `-fa off` is 0.001954 against the same b
 
 The card run is owed: the OpenCL kernels are 0143-0144 of the other branch; until they are in
 the series, an Inkling run on OpenCL declines the indexed bias and takes the dense fallback.
+
+## 0147-opencl-small-concat-repeat.patch
+
+The OpenCL CONCAT and REPEAT kernels gave one work item a whole output row and walked
+it in a strided loop, so a few kilobytes cost a full serial chain: `kernel_concat_b4`
+at 2304x2 to 2304x5 and `kernel_repeat_f32` at 2304x1, 2304x3 and 2304x4 took 16 and
+20 us per launch. Both now have a small variant that copies one element per work item,
+rows flattened over dims 0 and 1, local size 256, and it runs only when the output holds
+at most 16384 elements (64 KiB of F32): large copies keep the old geometry. Only 4-byte
+elements take the small variant, and the copy stays byte-identical.
+
+`test-backend-ops` gains the decode shapes: CONCAT along dim 1 of [2304,1] pieces
+(2304x2 to 2304x5), the dim 0 2304+2304 split (4608x1), narrow 4x2304 and 4x1024 rows,
+and REPEAT of [2304,1] to itself, to 3 and to 4 rows. The same entries are in the perf
+list, so `perf -o CONCAT` and `perf -o REPEAT` time exactly these shapes.
+
+Gate, CPU build: `test-backend-ops -b CPU -o CONCAT` 205/205, `-o REPEAT` 21/21.
+
+Gate on the card, owed, both builds:
+
+    test-backend-ops -b GPUOpenCL -o CONCAT
+    test-backend-ops -b GPUOpenCL -o REPEAT
+    test-backend-ops perf -b GPUOpenCL -o CONCAT
+    test-backend-ops perf -b GPUOpenCL -o REPEAT
