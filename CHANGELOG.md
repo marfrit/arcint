@@ -66,6 +66,17 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   prefill unchanged. The residual against the unfused chain (KL 0.0005-0.0007) is the sigmoid's exp evaluated in another
   program.
 
+- **Dense Qwen4 27B plumbing in the llama engine** (patches 0161-0165), ahead of the checkpoint. `qwen4exp` decides MoE or
+  dense per layer from metadata (`mlp_only_layers`, `decoder_sparse_step`), loads dense FFN tensors, runs a full-attention
+  layer without QSA indexer tensors as dense attention, and requires the GDN/QSA schedule instead of assuming 3:1; the
+  converter writes the per-layer metadata, accepts a checkpoint without MTP and reads the GDN geometry from `text_config`.
+  A numpy fixture (no transformers model classes, no remote code) stands in for the weights. Evidence (`measured-here`):
+  the converter on a torch host (CPU only) matches the fixture's GGUF in every tensor and key, with and without an MTP
+  block; on the card (B60) the shape suite at the published 27B shapes passes (HC 4 x 5120 rank 640, QSA 24/4 heads at
+  256 over 2048 cells, GDN 16/48 at 128, the dense FFN at 14336 and 17408) and the fixture's OpenCL logits match the
+  CPU's (mean KLD 0.000137, 0.000001 without QSA, also at micro-batch 1); Flash-Next's MoE path keeps its logits (mean
+  KLD 0, same top p 100 %, on a synthetic qwen4exp MoE model; the real file's CPU arm is owed). The real checkpoint decides the layer count, the schedule and the MTP layout.
+
 ## 1.8.0 — 2026-11-22
 
 Release gate against 1.7.0 (`measured-here`, 2026-11-22, RC 64ad74b0 = the release code; the 1.7.0 package and its llama tools against the RC's; B60 at a 165 W cap, B70 at 220 W). **The existing models** (0147, 0149 and 0150 touch generic OpenCL ops): the agent's 27B Q4_K_M at micro-batch 1 against the CPU Q8_0 reference, mean KL 0.010389 / 96.313 % top-1 on both (1.7.0's own gate figure); the iwo4 coder file and Dory against a 1.7.0 run, KL 0 and 100 % top-1 (the same logits); Flash-Next (experts on the CPU) against a 1.7.0 run, KL 0, 100 %. llama-bench pp512 / tg128 old / new, alternating: the agent 1024.3-1024.8 / 1025.1-1026.1 and 19.72-19.74 / 19.73-19.74; the coder 1807.9-1808.9 / 1808.0-1808.7 and 70.14-70.21 / 70.12-70.13; Dory 1941.3-1944.7 / 1920.5-1932.5 (spreads of 4-22 t/s) and 34.47 / 34.37-34.41. The agent's 12-answer arms on its unit flags (MTP 5): 48.25, 46.01 / 47.13, 47.64 t/s, identical texts, draft acceptance 49.3 % in every run. Flash-Next's 12-answer arms on its unit flags (B70, IQ3_S, MTP 3): old 42.50 / new 42.95, 43.56 t/s, identical texts, draft acceptance 73.0 % in every run (a first old run was lost to a port collision with a parallel window; a rerun's new arms read 44.84 and 43.99 with the same texts, its old arms ran beside a recipe build on the shared host and are not counted); its downgrade keys are the accepted ones on both. No downgrade line new. The op suites on the B70 with the release tools: CONCAT 123, REPEAT 15, SCALE 6, SIGMOID 8, SWIGLU 24, SITU 6, FLASH_ATTN_EXT 3,173 (B70; the two new 0152 cases red on 0150). **Inkling 2 Mini:** mean KL against the CPU reference at 32,768 tokens 0.005965 / 98.065 % top-1 with q8_0 KV (f16 0.005306); the needle found at 64,000 and 120,000 tokens with q8_0 KV on the B70 (131,072 cells), and on the B60 unit's own arguments (q8_0 KV, 49,152 cells) at 45,000 and 8,000 tokens (21,935 MiB, GTT 260 MiB); the acceptance task 10/10 at effort low; two concurrent lanes answer right. The xe kernel log counts no new wedge, CAT error or job timeout in the gate windows.

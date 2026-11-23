@@ -9046,3 +9046,244 @@ dense; coder qwen35moe and Flash-Next qwen4exp gate by SOFT_MAX and keep the exi
 
 The red case: a build whose kernel writes the biased selection value as the weight (in
 `mul_mv_iq_q8_1.cl`). The +-3 Inkling cases and the card KL then fail while the ids stay right.
+
+## 0161-qwen4exp-dense-layer-rule.patch
+
+Qwen3.8-Flash-Next's own model card calls it "an experimental preview of the architecture that
+will underpin Qwen4" (`model_type qwen4_exp`), so `qwen4exp` is the code a dense Qwen4 27B will
+serve through. It was MoE-only: every layer built a router and expert tensors, and the graph's
+`GGML_ASSERT(ffn_gate_inp != nullptr)` rejected any layer without one. A dense GGUF could not load.
+
+The per-layer rule is vLLM's reading of the config, now from metadata: a layer is **MoE** iff it is
+not in `mlp_only_layers`, `num_experts > 0`, and `(il+1) % decoder_sparse_step == 0`; otherwise it
+is a dense MLP(`feed_forward_length`). The patch adds `{arch}.mlp_only_layers` as a per-layer bool
+vector (true = mlp-only, the converter translates HF's index list and pads the MTP block: false,
+or true for a checkpoint without expert tensors, whose MTP block is then dense too), and reuses `{arch}.moe_every_n_layers` for `decoder_sparse_step` with 1 as the absent
+default. Dense layers load `ffn_gate`/`ffn_up`/`ffn_down` only; MoE layers take the unchanged
+router/expert/shared-expert code, and the dense branch in `build_layer_ffn` is gated on
+`ffn_gate_inp == nullptr`, so an existing MoE GGUF builds today's graph.
+
+Two assumptions left the loader. The GDN/QSA schedule is read from
+`attention.recurrent_layers`; if that key is absent, `full_attention_interval` is now required
+instead of defaulting to 4 (the 3:1 schedule is not known for Qwen4). The indexer is optional by
+presence: a full-attention layer with none of the four indexer tensors runs dense attention, the
+memory filter allocates the indexer cache only for layers that carry it, and the load log says
+`layer N has no QSA indexer tensors, running dense attention`; a partial set (1-3 of 4) is an
+error, and a file with no indexer key group at all allocates no indexer cache. The load log also names each dense MLP layer and the MoE/dense counts. HC low rank and the
+HC stream count stay metadata-only (a 320 rank is nowhere hard-coded).
+
+`measured-here`, CPU: the dense fixture (0163) fails on the pre-patch build (integer divide by
+`expert_used = 0` in the expert width) and loads and runs after it (PPL 292.9699,
+`llama-perplexity -c 128 -b 16 -t 2`); a synthetic qwen4exp MoE model saved with the new build keeps the old
+build's logits at mean KLD 0.000000 and same top p 100.000 (0165). The real Flash-Next GGUF's
+CPU KL is owed on a host that holds it.
+
+## 0162-qwen4exp-converter-dense-metadata.patch
+
+The converter now accepts a dense qwen4_exp config (`num_experts` 0 or absent) and keeps the arch
+name **qwen4exp**: the runtime decides MoE or dense per layer, so a second dense arch or a
+different GGUF name would split one model family across two code paths for no gain. The same
+converter serves the current Flash-Next file; the new keys are defaults that reproduce today's
+all-MoE graph (step 1, mlp_only false).
+
+`set_gguf_parameters` writes `mlp_only_layers` as the per-layer bool vector (HF's indices, padded
+over `block_count - num_hidden_layers` with false, or with true for a checkpoint without expert
+tensors) and `moe_every_n_layers` from
+`decoder_sparse_step` (default 1, 0 refused). The indexer key group is written only when the
+config carries `indexer_n_heads`, so a checkpoint without QSA carries no indexer keys. `FFN_GATE`,
+`FFN_UP` and `FFN_DOWN` join the arch's tensor list, so `mlp.gate_proj`/`up_proj`/`down_proj`
+map to the dense tensors 0161 asks for; an MoE layer's `mlp.experts.*` and shared-expert names are
+unchanged. Which of the two published dense widths (14336, 17408) is real stays the config's
+`intermediate_size`; the loader reads it, nothing is baked in.
+
+A checkpoint with no MTP block now converts. `_QwenMtpMixin.__init__` used to assert
+`opt_num_mtp_layers != 0`; the count comes from `mtp_num_hidden_layers` or the indexed
+`mtp.layers.N` tensors, and zero now logs `no MTP layers in the checkpoint, converting the
+trunk only` and writes no `nextn_predict_layers` key. One MTP block (`--mtp`, below) still takes
+the shared remapper: `mtp.layers.N.*` to `model.layers.<num_hidden_layers>.*`,
+`mtp.pre_fc_norm_*` to `enorm`/`hnorm`, and qwen4exp's `_MTP_EXTRA` sends
+`fc_embedding`/`fc_hidden` through the `eh_proj` concatenation and `hyper_connection_mixer` to
+`nextn_hc_head`.
+
+The GDN geometry had come from the wrong config layer. `AutoConfig` resolves
+`model_type: qwen4_exp` to the multimodal outer `Qwen4ExpConfig`, which carries only the image
+ids; the text fields live under `text_config`. A checkpoint that spells the GDN counts at the
+root therefore gets `Qwen4ExpTextConfig`'s defaults - 16 key heads, 32 value heads - and
+`_reorder_v_heads` reshapes a 6-element `A_log` into `[16, 2, 1, 1]`. qwen4exp now registers a
+raw `config.json` hparams loader, bypassing `AutoConfig` for this model type; `TextModel`
+merges `text_config` afterwards, so the nested layout (the real one) and a flat text-only
+layout both keep their own `linear_num_key_heads` / `linear_num_value_heads`. The indexed-layer
+spelling is accepted as `full_attention`, `indexed_attention` (transformers 5.8's name) or
+`qwen_sparse_attention` (5.17's canonical name after the text config's `__post_init__`
+rewrite), so compress ratios are written for QSA layers in the real layout too. Evidence: `code` and the transformers source
+(`transformers/models/qwen4_exp/configuration_qwen4_exp.py`, fetched 2026-11-23: defaults 16/32,
+`model_type = "qwen4_exp"`, `sub_configs_defaults.text_config = Qwen4ExpTextConfig`);
+Flash-Next's `text_config` at `de4b8e4d43` has 16/48/128, Qwen3.5-9B's 16/32/128.
+
+The converter keeps the raw-config path for the text model and should: the outer
+`Qwen4ExpConfig` is vision+text and its text class enforces `num_experts > 0` and drops keys
+it does not declare (`intermediate_size`, `mlp_only_layers`, `decoder_sparse_step`,
+`mtp_num_hidden_layers`), which a dense text-only model needs. The fixture's config is still
+authored so transformers accepts it: integer `image_token_id`, `video_token_id`,
+`vision_start_token_id`, `vision_end_token_id` inside the fixture vocabulary, a minimal
+`vision_config`, and a strict-valid text config - `num_experts` 512, `num_experts_per_tok` 1,
+positive `moe_intermediate_size`/`shared_expert_intermediate_size`, `indexer_kv_heads` 1,
+`indexer_budget` divisible by `indexer_compress_ratio`, and `full_attention` entries. Every
+trunk layer is in `mlp_only_layers`, so the runtime still selects the dense path for all of
+them; a checkpoint with no `.mlp.experts` tensors makes the converter pad the MTP block dense
+too (Flash-Next has expert tensors, so its MTP stays MoE). This round-trips through
+`AutoConfig` under transformers 5.17 as well as through the raw path.
+
+The fixture now writes that nested layout (the real checkpoint's `full_attention` spelling),
+and its GDN ratio is 3 (2 key / 6 value heads at 32), the Qwen4 27B's reported 16/48 ratio. `tools/qwen4-v-reorder-check.py` asserts the
+permutation against an explicitly built reference index at ratio 3 (fixture and Flash-Next
+16/48) and at the pre-existing ratio 2 (Qwen3.5-9B 16/32); with torch it runs the converter's
+own `_reorder_v_heads` at all three and fails unless the ratio-2 output equals the old
+permutation. Without torch it checks the numpy reference and says the converter half is
+skipped.
+
+The torch run found the fixture's own writer missing the converter's 1-D reorder: `ssm_a` (the
+converter's `A_log`) and `ssm_dt.bias` are per-V-head tensors, and the converter reorders them
+as `(num_v, head_dim=1)` like `in_proj_a`/`in_proj_b`. The llama.cpp GDN graph consumes the
+tiled V order that the converter emits (the same order `in_proj_z` and `out_proj` carry), so the
+fixture writer now applies the same reorder to `A_log` and `dt_bias`; the earlier 1.4-1.7 max
+diffs were permutations, not rounding. The compare tool now prints a `FAIL values ...` line
+with the element count and only prints the one-ulp note when the tensor is within tolerance.
+`qwen4exp.vocab_size` is removed from the fixture GGUF: the generic loader reads `n_vocab` from
+`tokenizer.ggml.tokens` when the key is absent, and the converter does not write it for a GPT-2
+vocab. `CONVERTED_GGUF=<converted.gguf> tools/qwen4-dense-fixture-check.sh` now runs the
+loader-level gate: the fixture's logits saved by `llama-perplexity`, then the converter's GGUF
+with `--kl-divergence` against them, requiring mean KLD 0 and same top p 100.
+
+The fixture also ships a tokenizer, so `Qwen2Model.set_vocab` runs without an override: a
+minimal byte-level BPE (`tokenizer.json`, `tokenizer_config.json`) with the 256 GPT-2 byte
+tokens and no prefix space. It carries one merge, joining byte 0 and byte 1, so llama.cpp finds
+the merges key a GPT-2 vocab requires; no text contains that pair, so encoding stays one token
+per byte and `get_vocab_base_pre` sees the same sequence; the patch adds its `chkhsh` branch
+mapping to the `gpt-2` pre-tokenizer (the only structural match in llama.cpp). The merged
+string is a normal vocab entry at the last id, so it stays out of the emitted token ids. This
+branch is for the synthetic fixture alone - a real Qwen4 tokenizer keeps its own pre hash.
+The fixture GGUF now writes the same GPT-2 vocab and merges, so the converter's GGUF and the
+fixture's GGUF tokenize `probe.txt` identically and can be compared at the logits; tokenizer
+keys themselves stay outside the comparison.
+
+**Evidence class**: `code` for the converter change, `measured-here` for the torch run (0163).
+That run first found the MTP assert before any file was written; this patch removes it, and the
+fixture gained its tokenizer for the run. The 0163
+fixture writes the same checkpoint as safetensors + `config.json` + tokenizer for that run, and
+its GGUF is written through gguf-py's qwen4exp tensor mapping with the same transforms as
+`modify_tensors`, so the loader test exercises the names and shapes the converter produces. The
+two commands are in 0163; a torch host runs them on the no-MTP and MTP variants.
+
+## 0163-qwen4exp-dense-fixture.patch
+
+No dense Qwen4 weights exist, so the plumbing is built against a synthetic fixture:
+`tools/qwen4-dense-fixture.py` writes random weights with numpy (no transformers model classes,
+no `trust_remote_code`, no Python model loader) at scaled-down published ratios - hidden 512,
+Q 12 : KV 2 heads at head 32 (the 24:4 ratio), HC 4 streams with low rank 64 (640/5120), GDN
+key value 2:6 heads at 32 (16:48), QSA on layers 2 and 4, layer 4 deliberately without indexer
+tensors, a dense SwiGLU MLP of 1408 on all six layers, no PLE keys - as safetensors +
+`config.json`, a minimal byte-level BPE tokenizer, a `probe.txt` for perplexity, and a GGUF.
+A fixed seed makes it reproducible.
+
+`config.json` is the HF layout: outer `model_type` `qwen4_exp`, the text fields under
+`text_config`, as the real checkpoint has them. `--mtp` writes the MTP variant: `mtp_num_hidden_layers` 1 in the text config and one nextn block in
+the qwen35 / Flash-Next layout - a full-attention QSA layer at `mtp.layers.0`, `fc_embedding` +
+`fc_hidden` (concatenated to `eh_proj` as the converter does), `pre_fc_norm_embedding` /
+`pre_fc_norm_hidden`, and a `hyper_connection_mixer` with the down/up pair. The GGUF gets
+`block_count` 7, `nextn_predict_layers` 1 and one extra indexer compress ratio. It also
+carries `mtp.norm`, the qwen35-style `shared_head_norm`: 0161 adds that tensor to the arch's
+list and loads it optional (`TENSOR_NOT_REQUIRED`) because a Qwen4 checkpoint may ship it, but
+`graph_mtp` does not consume it - the head norm the graph uses is `nextn_hc_head_norm`. The
+check asserts both are loaded.
+
+`tools/qwen4-dense-fixture-check.sh` runs the V-head reorder test, generates the fixture, runs
+`llama-perplexity` on the CPU and asserts the indexer-fallback log line, the dense-MLP classification and a finite PPL. It
+runs three arms at `measured-here`, CPU, `-c 128 -b 16 -t 2`: the mixed one above (PPL
+292.9699) and `--no-qsa`, a checkpoint with no indexer keys and no indexer tensors at all
+(dense attention everywhere, PPL 297.9606), and `--mtp` (trunk PPL 292.9699; the same trunk
+weights). RED on the pre-0161 build (integer divide by zero before the loader reaches the
+assert); GREEN after it. The mixed arm runs one dense-attention layer without an indexer
+beside a QSA layer, and no PLE, in the same forward; the no-QSA arm exercises the absent key
+group and the absent cache. The MTP arm loads the nextn tensors (`n_layer_all = 7`) and
+`llama-cli --spec-type draft-mtp` builds and runs the in-model MTP graph (`mtp_tok_embd-6`,
+`mtp_h_input` nodes), which perplexity does not exercise; `nextn.shared_head_norm` loads
+optional when the checkpoint carries it.
+
+**Converter comparison** (a torch host, CPU only, after `convert_hf_to_gguf.py` runs end to end -
+no `set_vocab` override). The reorder check first, then both variants:
+
+```
+python3 tools/qwen4-v-reorder-check.py
+
+python3 tools/qwen4-dense-fixture.py --out <dir> && \
+python3 convert_hf_to_gguf.py <dir>/hf --outtype f32 --outfile <dir>/converted.gguf && \
+python3 tools/qwen4-dense-fixture-compare.py <dir>/qwen4-dense-fixture.gguf <dir>/converted.gguf
+CONVERTED_GGUF=<dir>/converted.gguf bash tools/qwen4-dense-fixture-check.sh
+
+python3 tools/qwen4-dense-fixture.py --out <dir-mtp> --mtp && \
+python3 convert_hf_to_gguf.py <dir-mtp>/hf --outtype f32 --outfile <dir-mtp>/converted.gguf && \
+python3 tools/qwen4-dense-fixture-compare.py <dir-mtp>/qwen4-dense-fixture-mtp.gguf <dir-mtp>/converted.gguf
+```
+
+`qwen4-dense-fixture-compare.py` checks the tensor name set, every shape, every value within
+1e-5 (bit-exactness is reported but not required: torch and numpy libm may differ by one ulp),
+and every `qwen4exp.*` key; tokenizer keys are excluded by design.
+
+`measured-here`, a torch host (CPU only, transformers 5.17): both variants convert end to end and
+match the fixture's GGUF: the plain one 123 tensors and 31 `qwen4exp.*` keys, the MTP one 151
+tensors and 32 keys, every name and shape equal and every value within 1e-5. The V-head reorder
+check passes at ratio 3 (the fixture and Flash-Next's 16/48) and keeps the earlier permutation at
+ratio 2 (Qwen3.5-9B's 16/32).
+
+## 0164-test-backend-ops-dense-qwen4-shapes.patch
+
+Four real-shape groups are added to the eval (and where the GDN cases sit, the perf) list:
+- HC `4 x 5120` with low rank 640, 1 and 4 tokens;
+- QSA attention, 24 query heads on 4 KV heads at head size 256, over the selected 2048 cells,
+  1 decode row and 6 verify rows;
+- GDN 16 key/value heads at 128 with 48 V heads (v_repeat 3), 1 and 4 tokens;
+- a dense SwiGLU FFN at 5120 hidden with intermediate 14336 and the disputed 17408, gate/up and
+  down, a 4-token activation.
+
+`measured-here`, CPU: `HC_MIX` 2/2, `GATED_DELTA_NET -p head_count=16` 21/21 (the group's other
+cases included), `FLASH_ATTN_EXT -p kv=2048` 26/26, and the four FFN `MUL_MAT` cases 4/4 pass. `measured-here`,
+card (B60, OpenCL): `HC_MIX` 2/2, `GATED_DELTA_NET` 21/21, `FLASH_ATTN_EXT` 26/26, the FFN
+`MUL_MAT` groups 21/21 and 2/2, nothing unsupported. The commands:
+
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o HC_MIX -p 'n_embd=5120'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o GATED_DELTA_NET -p 'head_count=16'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o FLASH_ATTN_EXT -p 'kv=2048'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o MUL_MAT -p 'm=(14336|17408)'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o MUL_MAT -p 'm=5120,n=4,k=(14336|17408)'
+
+## 0165-qwen4exp-moe-frozen-check.patch
+
+The serving qwen4exp (Flash-Next) path is frozen: its MoE behaviour and its logits must stay
+bit-identical. `tools/qwen4exp-moe-frozen-check.sh` takes `BASE_BIN_DIR` (the pre-change build)
+and `NEW_BIN_DIR`, saves a synthetic qwen4exp MoE model at a fixed seed with the new build,
+writes the base build's logits and compares the new build's logits with `--kl-divergence`. The
+gate is mean KLD 0 and same top p 100 %.
+
+`measured-here`, CPU, pre-0161 against this tree: mean KLD 0.000000, same top p 100.000, PPL
+126.5492 both (evidence: the per-layer rule leaves every MoE layer's `ffn_gate_inp` path and its
+indexer cache in place). The real Flash-Next GGUF's CPU arm (and its KL) is still owed.
+
+`measured-here`, card (B60, OpenCL) against the CPU, the fixture's logits at `-c 128`: the mixed
+fixture mean KLD 0.000137 (same top p 97.18 %) at the default batch and 0.000133 at `-ub 1`;
+`--no-qsa` 0.000001 and 0.000000; the MTP variant's trunk equals the mixed fixture's. The fixture's
+weights are F32 at hidden 512, so its few fallback lines (small-K F32/F16 products) are the
+fixture's shapes, not the 27B's. The commands, at the published dense shapes and the context the
+unit serves:
+
+    # fixture CPU vs OpenCL logits (KL), the same file on both arms
+    tools/qwen4-dense-fixture.py --out <dir>
+    <cpu build>/bin/llama-perplexity -m <dir>/qwen4-dense-fixture.gguf \
+        -f <dir>/probe.txt -c 128 -b 16 --save-all-logits <dir>/cpu.logits
+    <opencl build>/bin/llama-perplexity -m <dir>/qwen4-dense-fixture.gguf \
+        -f <dir>/probe.txt -c 128 -b 16 --kl-divergence \
+        --kl-divergence-base <dir>/cpu.logits
+    # the shapes on the card: the 0164 commands above, and `perf` for the same -o/-p sets
+    # the memory line for the HC model at the served 262,144 context: the load's KV cache,
+    # compute buffer and model MiB, plus the guard's figures (the card's used/total, the
+    # process's fdinfo vram0 and GTT) at `--n-ctx 262144`; the real GGUF is owed
