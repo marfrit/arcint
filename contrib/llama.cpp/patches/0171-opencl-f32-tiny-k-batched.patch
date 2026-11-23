@@ -1,0 +1,113 @@
+0171: a batched F32 product of a tiny K (1-8 rows) over a wide N on its own kernel: one lane a row, the K loop in registers; the weight is an activation, so the tiled and GEMV paths both decline the shape.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index ec685b0..df35ce9 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1112,6 +1112,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
+     cl_kernel kernel_cpy_f32_f32_rows = nullptr;
+     cl_kernel kernel_mul_mat_f32_f32;
++    cl_kernel kernel_mul_mat_f32_f32_smallk = nullptr;   // a batched product of a tiny K (Inkling's depth mix)
+     cl_kernel kernel_mul_mat_f16_f16;
+     cl_kernel kernel_mul_mat_f16_f32_1row;
+     cl_program program_mul_mv_f16_f32_mrow;
+@@ -3933,6 +3934,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+             build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+ 
+         CL_CHECK((backend_ctx->kernel_mul_mat_f32_f32 = clCreateKernel(backend_ctx->program_mul_mv_f32_f32, "kernel_mul_mat_f32_f32", &err), err));
++        CL_CHECK((backend_ctx->kernel_mul_mat_f32_f32_smallk = clCreateKernel(backend_ctx->program_mul_mv_f32_f32, "kernel_mul_mat_f32_f32_smallk", &err), err));
+         GGML_LOG_CONT(".");
+     }
+ 
+@@ -33808,6 +33810,48 @@ static int ggml_cl_flat_cols(const ggml_tensor * src0, const ggml_tensor * src1,
+     return (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+ }
+ 
++// a batched F32 product of a tiny K (1-8 rows) over a wide N: Inkling 2 Mini's depth mix
++// (2304 rows, K = a block count 1-6, one or three columns a token, a column a token as the
++// batch). The tiled GEMMs' BK is 16 and the GEMV's K is 64, so both decline it and the
++// generic matvec runs one work-group a (row block, column): the weight is an activation, so
++// one lane a row and the K loop in registers is the shape's own path. One launch, and no
++// buffer: the output is dst's row.
++static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    static const char * env = getenv("GGML_OPENCL_F32_SMALLK");
++    static const bool   on  = env == nullptr || atoi(env) != 0;
++    if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_mul_mat_f32_f32_smallk == nullptr ||
++        src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        src0->ne[0] != src1->ne[0] || src0->ne[0] < 1 || src0->ne[0] > 8 || src0->ne[1] != dst->ne[1] ||
++        src0->ne[1] < 256 || src0->ne[2] != src1->ne[2] || src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 ||
++        dst->ne[1] != src1->ne[1] || dst->ne[2] != src1->ne[2] ||
++        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    const int ne00 = (int) src0->ne[0], ne01 = (int) src0->ne[1];
++    const int n_cols = (int) (src1->ne[1] * src1->ne[2]);
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++    cl_kernel k = backend_ctx->kernel_mul_mat_f32_f32_smallk;
++    CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(k, 4, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(k, 5, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(k, 6, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(k, 7, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(k, 8, sizeof(int),      &n_cols));
++    size_t gws[2] = { (size_t)CEIL_DIV(ne01, 64) * 64, (size_t)n_cols };
++    size_t lws[2] = { 64, 1 };
++    backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, dst);
++    return true;
++}
++
+ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     static const char * env = getenv("GGML_OPENCL_F32_SKINNY");
+@@ -34135,6 +34191,9 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+     if (ggml_cl_mul_mat_f32_skinny(backend, src0, src1, dst)) {
+         return;
+     }
++    if (ggml_cl_mul_mat_f32_smallk(backend, src0, src1, dst)) {
++        return;
++    }
+ 
+ #ifdef GGML_OPENCL_SOA_Q
+     // ARC-LAB 0115: Q4_0, Q8_0, IQ4_XS, IQ4_NL x 2-16 columns, ahead of the Q8_0 GEMMs below (16 columns
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+index ec71b87..f8fbfa6 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+@@ -116,3 +116,27 @@ kernel void kernel_mul_mat_f32_f32(
+         }
+     }
+ }
++
++// a batched F32 product of a tiny K over a wide N: out[r] of column c = sum_k a[k][r] * b[k][c],
++// with a's rows the wide N (an activation, not a weight) and a column a token as the batch.
++// One work-item a row, the K loop (1-8) in registers; a broadcast weight would read a's row
++// once a column, the shape reads it once a row block.
++kernel void kernel_mul_mat_f32_f32_smallk(
++        global char * src0,
++        ulong offset0,
++        global char * src1,
++        ulong offset1,
++        global float * dst,
++        ulong offsetd,
++        int ne00,
++        int ne01,
++        int n_cols) {
++    const int c = get_global_id(1), r = get_global_id(0);
++    if (r >= ne01 || c >= n_cols) return;
++    global const float * a = (global const float *)(src0 + offset0) + (ulong) r;
++    global const float * b = (global const float *)(src1 + offset1) + (ulong) c * ne00;
++    float s = 0.f;
++    for (int k = 0; k < ne00; ++k) s += a[(ulong) k * ne01] * b[k];
++    global float * d = (global float *)((global char *) dst + offsetd);
++    d[(ulong) c * ne01 + r] = s;
++}

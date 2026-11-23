@@ -1,0 +1,37 @@
+0180: GGML_OPENCL_F32_SMALLK and GGML_OPENCL_F32_SMALL_M default on (unset = on, 0 or off = off); GGML_OPENCL_F32_WIDE_N stays default off. Both arms measured across every production model that can reach them: KLD 0.000000, top p 100 %, no bounds abort. The default tree is 0175/0176/0178 plus this flip.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index ef20f74..baf85d9 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -33842,11 +33842,13 @@ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, siz
+ // generic matvec runs one work-group a (row block, column): the weight is an activation, so
+ // one lane a row and the K loop in registers is the shape's own path. One launch, no buffer,
+ // and the strides are the tensors' own: a transposed src0 view is read as it lies, so the
+-// model's depth mix needs no copy on the row axis. GGML_OPENCL_F32_SMALLK=1 turns it on.
++// model's depth mix needs no copy on the row axis. On by default; GGML_OPENCL_F32_SMALLK=0 turns it off.
+ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    // unset is on: the card measured it across the models that can reach it (measured-here,
++    // B60/B70: agent KLD 0.000000 top p 100 %, Flash-Next IQ3_S 0.000000), and 0 turns it off
+     static const char * env = getenv("GGML_OPENCL_F32_SMALLK");
+-    static const bool   on  = env != nullptr && atoi(env) != 0;
++    static const bool   on  = env == nullptr || atoi(env) != 0;
+     // rows of the product are src0's ne1 and dst's ne0; the columns of a batch are src1's ne1
+     if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_mul_mat_f32_f32_smallk == nullptr ||
+         src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+@@ -33925,11 +33927,12 @@ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor
+ // 64 columns, so each work-group runs the whole 144-block K loop for a handful of outputs
+ // (2.0 ms a call, 384 calls, 4.9 % of a prompt window, B60, profiled). Its own layout is the
+ // split-K GEMV: one work-group a (token, column, row), the K split into 16-aligned slices,
+-// the slices summed. GGML_OPENCL_F32_SMALL_M=1 turns it on; unset keeps today's selection.
++// the slices summed. On by default; GGML_OPENCL_F32_SMALL_M=0 turns it off.
+ static bool ggml_cl_mul_mat_f32_small_m(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    // unset is on, like the tiny-K arm: 0 turns it off
+     static const char * env = getenv("GGML_OPENCL_F32_SMALL_M");
+-    static const bool   on  = env != nullptr && atoi(env) != 0;
++    static const bool   on  = env == nullptr || atoi(env) != 0;
+     const int ne00 = (int) src0->ne[0], ne01 = (int) src0->ne[1], ne11 = (int) src1->ne[1];
+     const int ntok = (int) (src0->ne[2] * src0->ne[3]);
+     if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_gemv_f32_f32_splitk_batch == nullptr ||

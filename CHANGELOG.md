@@ -116,6 +116,16 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
 - **Docs: the runtime the numbers need.** README and `docs/docker.md` state the compute runtime, kernel and xe module
   behind the measurements, and the image against native with the same `llama-bench` command on a B70 (0.5-2 % slower
   decode in the image); README says arcint loads on one card and how llama.cpp's tools are pinned to one.
+- **Inkling 2 Mini's depth mix off the generic F32 GEMM** (patches 0170-0172, 0175-0180). The depth-mix products
+  (a tiny-K product batched over the tokens on an 8-slot view, and a 2x4 product per token) ran on the generic and
+  the tiled F32 GEMM at about 1-2 ms a call; they now take a batched tiny-K kernel (0171, 0175-0177, 0179) and 0157's
+  split-K GEMV in a batched dispatch (0178), on by default (0180; `GGML_OPENCL_F32_SMALLK=0` / `_SMALL_M=0` turn
+  them off); 0170's wide-N GEMM stays off (no measured gain). The tiny-K and small-M dispatches carry a host-side bounds check
+  (`GGML_OPENCL_BOUNDS=1` aborts before a launch that would read or write past its backend buffer). Evidence (`measured-here`,
+  B60, Inkling IQ4_NL, two rounds): pp4096 at ub 512 522.5 -> 628.2 t/s (+20.2 %; 676.6 with the int8 expert tile
+  `GGML_OPENCL_KQ_MM_ID_I8=1`), ub 1024 552.0 -> 712.2 with both; decode at 4k 36.0 -> 36.4; KL to the CPU reference
+  0.001979 against 0.001952 (same top p 98.50 %), 0.001949 at micro-batch 1; the op cases pass with the bounds check
+  on and the red builds fail them; the agent 27B and Flash-Next give identical logits with the arms on and off.
 
 ## 1.8.0 — 2026-11-22
 

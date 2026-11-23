@@ -1,0 +1,54 @@
+0177: the tiny-K batched arm takes a 3-D src0's batch stride (a slab a token, its step nb[2]) as an argument instead of reading slab 0 for every column, and requires a contiguous 3-D src0.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 28c4f48..f446fc2 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -33830,6 +33830,7 @@ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor
+         src0->ne[3] != 1 || src1->ne[3] != 1 ||
+         (src0->ne[2] != 1 && src0->ne[2] != src1->ne[2]) ||
+         src0->nb[0] % sizeof(float) != 0 || src0->nb[1] % sizeof(float) != 0 || src0->nb[2] % sizeof(float) != 0 ||
++        (src0->ne[2] > 1 && !ggml_is_contiguous(src0)) ||
+         src1->nb[0] % sizeof(float) != 0 || src1->nb[1] % sizeof(float) != 0 ||
+         !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+         return false;
+@@ -33854,6 +33855,9 @@ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor
+     const int ka = (int) (src0->nb[0] / sizeof(float)), ra = (int) (src0->nb[1] / sizeof(float));
+     const int kb = (int) (src1->nb[0] / sizeof(float)), rb = (int) (src1->nb[1] / sizeof(float));
+     const int kd = (int) (dst->nb[0] / sizeof(float)),  rd = (int) (dst->nb[1] / sizeof(float));
++    // a 3-D src0 is a batch: a slab a token, its step the tensor's own (a view of the stack keeps
++    // the stack's stride) — skipping it read token 0's states for every column, wrong outputs
++    const int ba = src0->ne[2] > 1 ? (int) (src0->nb[2] / sizeof(float)) : 0;
+     CL_CHECK(clSetKernelArg(k, 6, sizeof(int),      &ne00));
+     CL_CHECK(clSetKernelArg(k, 7, sizeof(int),      &ne01));
+     CL_CHECK(clSetKernelArg(k, 8, sizeof(int),      &n_cols));
+@@ -33863,6 +33867,7 @@ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor
+     CL_CHECK(clSetKernelArg(k, 12, sizeof(int),     &rb));
+     CL_CHECK(clSetKernelArg(k, 13, sizeof(int),     &kd));
+     CL_CHECK(clSetKernelArg(k, 14, sizeof(int),     &rd));
++    CL_CHECK(clSetKernelArg(k, 15, sizeof(int),     &ba));
+     size_t gws[2] = { (size_t)CEIL_DIV(ne01, 64) * 64, (size_t)n_cols };
+     size_t lws[2] = { 64, 1 };
+     backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, dst);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+index 7c27ef7..a1f9a40 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+@@ -133,13 +133,15 @@ kernel void kernel_mul_mat_f32_f32_smallk(
+         int n_cols,
+         int ka, int ra,   // a's K step and row step, floats (nb[0], nb[1] / 4)
+         int kb, int rb,   // b's K step and column step
+-        int kd, int rd) { // dst's row step and column step
++        int kd, int rd,   // dst's row step and column step
++        int ba) {         // a's batch (token) step; 0 where a is a single shared weight
+     const int c = get_global_id(1), r = get_global_id(0);
+     if (r >= ne01 || c >= n_cols) return;
+     global const float * a = (global const float *)(src0 + offset0);
+     global const float * b = (global const float *)(src1 + offset1);
+     float s = 0.f;
+-    for (int k = 0; k < ne00; ++k) s += a[(ulong) k * ka + (ulong) r * ra] * b[(ulong) k * kb + (ulong) c * rb];
++    const ulong ab = (ulong) c * ba;   // the depth mix's stack: a token a slab, a slab a stack stride
++    for (int k = 0; k < ne00; ++k) s += a[(ulong) k * ka + (ulong) r * ra + ab] * b[(ulong) k * kb + (ulong) c * rb];
+     global float * d = (global float *)(dst + offsetd);
+     d[(ulong) c * rd + (ulong) r * kd] = s;
+ }

@@ -9388,6 +9388,38 @@ cases OK; `test-opencl-kq-i8` is all OK device-free.
   (98.34 %) at the default batch; 0.001988 at `-ub 1`, identical to the baseline (the decode
   batch does not take this arm).
 
+## 0170-opencl-f32-wide-n-gemm.patch
+
+Two of Inkling 2 Mini's three generic-matvec shapes go to the tiled F32 GEMM
+(`kernel_mul_mm_f32_f32_l4_lm`) that `ggml_cl_mul_mat_f32_skinny` already runs: the relative
+bias table (K 16, 1025 rows, a 2-D weight over a 3-D src1 whose ne[2] is the tokens) and the
+controller pairs (K 64, 2304 rows, 512-2048 columns). The GEMV arm's row bound (256 above 8
+columns) is a one-column-shape bound, so the GEMM branch takes any row count; K need only be a
+multiple of the kernel's BK 16 (a single block at K 16, four at K 64, ks stays 1, no slice
+sum). A batched src1 keeps one K slice and advances a batch per 64-column block: the kernel's
+`i13 / r3`, `i12 / r2` split gets r2 = b's batches and r3 = 1, and `batch_stride_b` becomes a
+batch's columns (`ne00 * ne11`) where it was a slice's K. The f16-copy GEMM (0110) declines
+these: it requires a 2-D src1, and it would multiply through an f16 copy of the weight, where
+the l4 path is exact F32. Shapes the arm already accepted are unchanged: for them `kslice` and
+`ne00 * ne11` coincide only when ks == 1 and the batch is flat, and the 2-D case keeps
+`kslice`.
+
+## 0171-opencl-f32-tiny-k-batched.patch
+
+The depth mix's second product — src0 an activation [K <= 8, 2304, tokens], src1 the scores
+[K, 1-3, tokens] — fits none of the existing paths: the tiled GEMM needs K a multiple of BK 16,
+the GEMV arm K % 64, and the f16 copy a 2-D src1. `kernel_mul_mat_f32_f32_smallk` takes it
+batched: a lane a row (a 64-row block), the K loop (1-8) in registers, one work-item a column
+of a batch, the batch on the second dimension. `GGML_OPENCL_F32_SMALLK=0` turns it off and
+leaves the generic matvec.
+
+## 0172-opencl-f32-wide-n-tests.patch
+
+test-backend-ops at the graph's shapes: `MUL_MAT` f32/f32 1025 x 512 and 2048 columns at K 16,
+2304 x the same columns at K 64, and a new `test_mul_mat_f32_wide` (a 2-D weight, a 3-D b) at
+2304 rows, K 1 / 6, one or three columns a token, 512 and 2048 tokens. CPU: 8/8 OK, the CPU
+MUL_MAT suite unchanged; the OpenCL build compiles and the matvec kernel file passes `cpp -P`.
+
 ## 0173-expert-cache-projected-bytes.patch
 
 The spill guard's cache suggestion needs on-card bytes for a flag it has not started. The
@@ -9406,3 +9438,139 @@ bytes, verdict).
 the projection at 40,000 is 40,409 MiB (the load's own figure), the suggestion is 19,107; the
 restart with 19,107 starts (cache 19,437 MiB on the card) and measures 32,402 of 32,656 MiB after
 the first request, against 32,192 predicted.
+
+## 0175-opencl-f32-tiny-k-batched-guard.patch / 0176-opencl-f32-tiny-k-batched-tests.patch
+
+A card profile put [2304, 1|3|4, 512] of the depth mix's second product on the generic F32 matvec:
+1,408 + 384 + 128 calls at 1.078 / 1.667 / 1.498 ms, 4.7 MB of output a call, 22-75 GB/s against
+the card's 456. The arm declined every one of them: it compared src0's rows (ne1 = 2304) with
+dst's *columns* (ne1 = 1..4) instead of dst's ne0. Corrected, with the tensors' own strides
+(src0's K and row steps, src1's, dst's) so a transposed src0 view is in reach, and one lane a
+row, the K loop in registers, a column a block of 64 lanes. At decode the shape [2304, 1, 1] is
+one launch a mix and launch-bound, so a faster kernel does not help there — the launch count
+does, and the transposed copy is the launch to fold: `ggml_cont` of a `ggml_transpose` feeding
+this product. A CPU reference refuses a transposed mul_mat src0
+(`GGML_ASSERT(!ggml_is_transposed(a))`, seen locally), so the fold has to be the backend's own
+read and the graph keeps the copy for now; the fusion of CONT(TRANSPOSE(x)) into this arm is the
+way to take it without a copy.
+
+0171 shipped the tiny-K arm on when unset and 0170's wide-N GEMM unconditional; 0175 put them
+behind `GGML_OPENCL_F32_SMALLK=1` (the mix shapes) and `GGML_OPENCL_F32_WIDE_N=1` (the K 16 / 64
+wide-N ones), and 0180 then made the tiny-K and small-M arms default on. `GGML_OPENCL_F32_WIDE_N` stays default **off** — a card run showed no
+measurable gain from it, so the default tree is the 0175/0176/0178 build on, not 0170's. The
+wide-N GEMM no longer takes shapes the old selection already served (its row bound, or K a
+multiple of the GEMV's 64), and its slice sum runs only above one K slice: unconditional, it
+copied 12,595,200 elements a call, 218 ms of a prompt window, and gained nothing.
+
+The permuted `kernel_cpy_f32_f32_pack` of [24, 1025, 512] (1.33 ms a call, ~75 GB/s each way) is
+producer `ggml_cont(ggml_permute(table, 1, 0, 2, 3))` after the relative-bias table product and
+consumer `ggml_get_rows(table, rel_pos)`: the permute exists because the gather walks the
+distance axis, which get_rows only does on ne1, so folding it needs a gather that walks ne0, not
+a GEMM read.
+
+
+## 0177-opencl-f32-tiny-k-batched-batch-stride.patch
+
+A card run of 0175/0176 with `GGML_OPENCL_F32_SMALLK=1` gave KLD 10.38 at the default batch (top-p
+agreement 0.07 %) and op `MUL_MAT(m=2304,k=6,n=1..4,nb=512,n_slot=8)` ERR ~2.0 — the four shapes
+whose src0 is a 3-D view over the depth-mix stack; the plain 2-D ones and the decode shape
+(nb = 1) passed. Cause: a 3-D src0 is a slab a token at its own nb[2] (the view keeps the stack's
+stride), and the kernel's address had only the K and row steps, so every column read slab 0. The
+batch step is an argument now (0 for a shared 2-D weight), and the arm requires a contiguous 3-D
+src0 so a slab's step is the tensor's own. The CPU cannot show it: the arm is Intel OpenCL only
+and the CPU reference computes the batched product with its own kernel, so only a device run (or
+the op test's CPU comparison on the device) sees the layout.
+
+The card then put the n=3 and n=4 cases on the fault: `MUL_MAT(m=2304,k=6,n=3,nb=512,n_slot=8)`
+read out of bounds ("Engine memory CAT error" and a timed-out job, `clWaitForEvents -14`), which
+is 0179's subject; n=1 was correct from 0177 on.
+
+## 0178-opencl-f32-split-k-gemv-batched.patch / 0179-opencl-f32-tiny-k-batched-column-stride.patch
+
+Two independent F32 arms, both behind their own knob and both off by default.
+
+0178 is the depth mix's **first** product: `scores = mul_mat(states, queries)` in
+`src/models/inkling2.cpp:216`, src0 the `rms_norm` of a `view_3d` of the bank stack (K 2,304 on
+ne0, M the block count 2 on ne1, the 512 tokens on ne2), src1 `msg_query` [2,304, 4] repeated over
+the tokens, dst [2, 4, 512]. The profile put `kernel_mul_mm_f32_f32_l4_lm` at 128x1x512 for exactly
+this dst: the tiled GEMM's column tile is 64, so a call ran 512 batches of a 64x64 tile holding
+8 outputs, each work-group the whole 144-block K loop — 2.0 ms a call, 384 calls, 4.9 % of a
+prompt window (measured-here, B60, pp4096 ub 512). `kernel_gemv_f32_f32_splitk_batch` is its own
+layout: one work-group a (token, column, row), the K split into 16-aligned slices and summed. The
+split is **36, a slice 64** floats: 2,304 = 36 * 64, and a 64-way split would leave 36-long slices,
+off the 16 alignment, so the largest aligned slice is 64. Target: 9.44 MB of src0, 18.87 MB of
+src1 (4.72 MB unique; the repeat is materialized), 16 KB of dst — 28.3 MB, **~71 us at 400 GB/s**
+against 2.0 ms. `GGML_OPENCL_F32_SMALL_M=1` turns it on; unset keeps 0175-0177's selection.
+
+0179 fixes the tiny-K arm's OOB: a batch's columns were flattened as (token, column) and b and
+dst were stepped by the flattened index, so a token's slab step was multiplied by the column
+count (`dst[c*rd]`, `src1[c*rb]`, and src0's slab by `c*ba`). n=1 has one column a token and was
+correct; n=3 and n=4 read src0 3x and 4x past its buffer (src1 and dst are contiguous, so their
+flattened index stayed in range). The column is split into its extents now
+(`nc1 = src1->ne[1]` binds it, b and dst advance a token by their own nb[2], src0's slab by the
+token index), so every read stays inside.
+
+The red series cannot reach the K=1 case by construction: its mutation (0175/0177's K sum cut to
+its first term) is the *whole* sum when K=1, so `MUL_MAT(m=2304,k=1,n=1,nb=512,n_slot=8)` passes
+there and only the K>1 cases fail. What failed the K=1 case on the card was 0177's stride defect
+— the slab-0 read — at ERR 1.999, which is why 0177's own red is the right one for it.
+
+Both arms also compute, before the enqueue, the furthest byte each kernel can reach from the
+global size and the strides handed to it (a view's offset included) and compare it with the
+allocation of the backend buffer the tensor lives in (`CL_MEM_SIZE` of its `data_device`):
+`GGML_OPENCL_BOUNDS=1` aborts a violation, and the check is what an op run on the card exercises
+first. It catches a read or write past the allocation, not one into a neighbouring tensor of the
+same buffer; in the op cases below each tensor is its buffer, so there the max byte equals the
+buffer exactly. 0170's wide-N arm (off by default) has no such check:
+
+0179's cases (the mix layout, src0 a contiguous copy of the transposed slice, k a block count,
+n a query count, nb 512 tokens, n_slot 8):
+- k=6, n=1: src0 6 * 2304 * 512 * 4 = 28.31 MB, src1 1 * 6 * 512 * 4 = 49.2 KB, dst
+  2304 * 1 * 512 * 4 = 4.72 MB — max bytes 28,311,552 / 49,152 / 4,718,592, each equal to its
+  buffer;
+- k=6, n=3: src1 3 * 6 * 512 * 4 = 147.5 KB (max 147,456), dst 2304 * 3 * 512 * 4 = 14.16 MB
+  (max 14,155,776);
+- k=6, n=4: src1 4 * 6 * 512 * 4 = 196.6 KB (max 196,608), dst 2304 * 4 * 512 * 4 = 18.87 MB
+  (max 18,874,368);
+- k=1, n=1: src0 1 * 2304 * 512 * 4 = 4.72 MB (max 4,718,592), dst 4.72 MB.
+0178's shape (k 2304, m 2, n 4, nb 512): src0 2 * 2304 * 512 * 4 = 9,437,184, src1
+4 * 2304 * 512 * 4 = 18,874,368, dst 2 * 4 * 512 * 4 = 16,384, partials 36 * 4096 * 4 = 589,824 —
+each is its buffer's size, read and written to its last float.
+
+
+**Card, measured-here (B60, Inkling 2 Mini IQ4_NL, the series through 0179):** op
+`MUL_MAT` green 2,980/2,980 with `GGML_OPENCL_BOUNDS=1`; the red series fails 6 of the 7 targeted
+cases, and the kernel log shows no fault either way. pp4096 at ub 512: 0167-0169 alone 522.5 t/s,
+`SMALL_M` 538.1 (+3.0 %), `SMALLK` 606.9 (+16.2 %), both 628.2 (+20.2 %), both with the int8
+expert arm 676.6 (+29.5 %); ub 1024 with both and the int8 arm 712.2. Decode at d4096 36.0 ->
+36.4 t/s. KL against the CPU reference with both arms: default batch 0.001979 (0167-0169's baseline
+0.001952), `-ub 1` 0.001949. 0178's kernel reaches ~1.6 ms a call — its gain is mostly the
+`l4_lm` node it removes, not the new arm's own throughput.
+
+**0178's 1.6 ms a call:** the tensors are 28.3 MB (71 us at 400 GB/s), the traffic 75.5 MB (189 us).
+The launch is 36 slices x 4,096 outputs, 147,456 work-groups of which 16 lanes work at a 64-float
+slice. Each work-group reads 256 B of an src0 row and 256 B of an src1
+column and writes one float, so the traffic is 75.5 MB — src0 four times (one per query column,
+9.44 MB each time) and src1 twice (one per slot row, 18.87 MB each time) — and a call is 921
+work-groups a core in 1.6 ms, 1.7 us a group. The time is the barrier tree, not the bytes: four
+steps of the 16-lane reduction and a store per work-group, 36 work-groups a output. The next
+step, not written: one work-group a token, its eight outputs (2 rows x 4 columns) as four
+subgroups of 16 lanes with the K loop inside the subgroup and no split-K or slice-sum launch —
+a token's src0 2 x 9 KB read four times and its src1 4 x 9 KB twice, the same 75.5 MB at a
+barrier-free reduction. Beyond that the repeat is the observation: src1's four query columns are
+the same rows for all 512 tokens (18.9 MB of repeated data, 4.7 MB unique), and reading one slab
+would need the graph to hand the arm the 2-D parent, which the dispatch cannot see.
+
+## 0180-opencl-f32-arms-on-by-default.patch
+
+`GGML_OPENCL_F32_SMALLK` and `GGML_OPENCL_F32_SMALL_M` are on unless set to `0` (`off` also works);
+`GGML_OPENCL_F32_WIDE_N` stays off, its arm having shown no measured gain (0170/0172 stay in the
+series because 0175, 0176 and 0178 are built on their hunks). Unset, the tree takes 0175-0179's
+arms and 0167-0169's dispatch otherwise.
+
+Evidence that no other production model reaches the arms (`measured-here`, the arms on against off
+on the same card, `GGML_OPENCL_BOUNDS=1`): Qwen3.8 27B on the B60, mean KLD 0.000000 between the
+two runs, same top p 100 %; Flash-Next IQ3_S on the B70 (experts on the CPU), 0.000000 and 100 %;
+no bounds abort. That matches the code: both arms take only F32 x F32 products, and no node of
+those models has K <= 8 (SMALLK) or a 3-D activation on both sides with at most 8 rows and columns
+(SMALL_M); their F32 tensors are 2-D weights with K of 128 and more, or 1-D scales.

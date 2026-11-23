@@ -1,0 +1,84 @@
+0179: the tiny-K batched arm splits a batch's flattened column into (token, column) and steps b and dst by their own slab strides; before, a token's step was multiplied by the column count, so n=3 and n=4 read and wrote past the buffer (an out-of-bounds read and a timed-out job on the card). src0's slab step is the token index alone. A launch's furthest byte is checked against the buffer's allocation.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 2fd7496..ef20f74 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -33884,16 +33884,35 @@ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor
+     // a 3-D src0 is a batch: a slab a token, its step the tensor's own (a view of the stack keeps
+     // the stack's stride) — skipping it read token 0's states for every column, wrong outputs
+     const int ba = src0->ne[2] > 1 ? (int) (src0->nb[2] / sizeof(float)) : 0;
++    // a batch's columns are (token, column) flattened: the column count binds the column index,
++    // and b and dst advance a token by their own slab steps — stepping them by the flattened
++    // column multiplied a token's step by the column count and read past the buffer
++    const int nc1 = (int) src1->ne[1];
++    const int bb  = src1->ne[2] > 1 ? (int) (src1->nb[2] / sizeof(float)) : 0;
++    const int bd  = dst->ne[2]  > 1 ? (int) (dst->nb[2]  / sizeof(float)) : 0;
++    // the furthest byte a (row, flattened column) can reach: the column is split, so the extents
++    // bind it — never the flattened count a tensor's slab step is multiplied by
++    {
++        const size_t upto0 = offset0 + (size_t) (ne00 - 1) * ka * sizeof(float) + (size_t) (ne01 - 1) * ra * sizeof(float) + (size_t) (src0->ne[2] > 1 ? src0->ne[2] - 1 : 0) * ba * sizeof(float) + sizeof(float);
++        const size_t upto1 = offset1 + (size_t) (ne00 - 1) * kb * sizeof(float) + (size_t) (src1->ne[1] - 1) * rb * sizeof(float) + (size_t) (src1->ne[2] - 1) * bb * sizeof(float) + sizeof(float);
++        const size_t uptod = offsetd + (size_t) (dst->ne[0] - 1) * kd * sizeof(float) + (size_t) (dst->ne[1] - 1) * rd * sizeof(float) + (size_t) (dst->ne[2] - 1) * bd * sizeof(float) + sizeof(float);
++        ggml_cl_bounds("F32 tiny-K", "src0", extra0->data_device, upto0);
++        ggml_cl_bounds("F32 tiny-K", "src1", extra1->data_device, upto1);
++        ggml_cl_bounds("F32 tiny-K", "dst",  extrad->data_device, uptod);
++    }
+     CL_CHECK(clSetKernelArg(k, 6, sizeof(int),      &ne00));
+     CL_CHECK(clSetKernelArg(k, 7, sizeof(int),      &ne01));
+     CL_CHECK(clSetKernelArg(k, 8, sizeof(int),      &n_cols));
+-    CL_CHECK(clSetKernelArg(k, 9, sizeof(int),      &ka));
+-    CL_CHECK(clSetKernelArg(k, 10, sizeof(int),     &ra));
+-    CL_CHECK(clSetKernelArg(k, 11, sizeof(int),     &kb));
+-    CL_CHECK(clSetKernelArg(k, 12, sizeof(int),     &rb));
+-    CL_CHECK(clSetKernelArg(k, 13, sizeof(int),     &kd));
+-    CL_CHECK(clSetKernelArg(k, 14, sizeof(int),     &rd));
+-    CL_CHECK(clSetKernelArg(k, 15, sizeof(int),     &ba));
++    CL_CHECK(clSetKernelArg(k, 9, sizeof(int),      &nc1));
++    CL_CHECK(clSetKernelArg(k, 10, sizeof(int),     &ka));
++    CL_CHECK(clSetKernelArg(k, 11, sizeof(int),     &ra));
++    CL_CHECK(clSetKernelArg(k, 12, sizeof(int),     &kb));
++    CL_CHECK(clSetKernelArg(k, 13, sizeof(int),     &rb));
++    CL_CHECK(clSetKernelArg(k, 14, sizeof(int),     &kd));
++    CL_CHECK(clSetKernelArg(k, 15, sizeof(int),     &rd));
++    CL_CHECK(clSetKernelArg(k, 16, sizeof(int),     &ba));
++    CL_CHECK(clSetKernelArg(k, 17, sizeof(int),     &bb));
++    CL_CHECK(clSetKernelArg(k, 18, sizeof(int),     &bd));
+     size_t gws[2] = { (size_t)CEIL_DIV(ne01, 64) * 64, (size_t)n_cols };
+     size_t lws[2] = { 64, 1 };
+     backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, dst);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+index a1f9a40..3e676ea 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+@@ -130,18 +130,24 @@ kernel void kernel_mul_mat_f32_f32_smallk(
+         ulong offsetd,
+         int ne00,
+         int ne01,
+-        int n_cols,
++        int n_cols,       // ne1 * ne2 of the batch: (token, column) back to back
++        int nc1,          // the columns a token: the extent the column index is bound by
+         int ka, int ra,   // a's K step and row step, floats (nb[0], nb[1] / 4)
+         int kb, int rb,   // b's K step and column step
+         int kd, int rd,   // dst's row step and column step
+-        int ba) {         // a's batch (token) step; 0 where a is a single shared weight
++        int ba,           // a's batch (token) step; 0 where a is a single shared weight
++        int bb, int bd) { // b's and dst's batch (token) step, floats
+     const int c = get_global_id(1), r = get_global_id(0);
+-    if (r >= ne01 || c >= n_cols) return;
++    if (r >= ne01 || c >= n_cols || nc1 < 1) return;
++    // the flattened column c is (token, column): one axis, so each tensor's own slab step —
++    // stepping b or dst by c alone left a token's step multiplied by nc1, past the buffer
++    const int c1 = c % nc1, c2 = c / nc1;
+     global const float * a = (global const float *)(src0 + offset0);
+     global const float * b = (global const float *)(src1 + offset1);
+     float s = 0.f;
+-    const ulong ab = (ulong) c * ba;   // the depth mix's stack: a token a slab, a slab a stack stride
+-    for (int k = 0; k < ne00; ++k) s += a[(ulong) k * ka + (ulong) r * ra + ab] * b[(ulong) k * kb + (ulong) c * rb];
++    const ulong ab = (ulong) c2 * ba;   // the depth mix's stack: a token a slab, a slab a stack stride
++    const ulong o1 = (ulong) c1 * rb + (ulong) c2 * bb;
++    for (int k = 0; k < ne00; ++k) s += a[(ulong) k * ka + (ulong) r * ra + ab] * b[(ulong) k * kb + o1];
+     global float * d = (global float *)(dst + offsetd);
+-    d[(ulong) c * rd + (ulong) r * kd] = s;
++    d[(ulong) c1 * rd + (ulong) c2 * bd + (ulong) r * kd] = s;
+ }
