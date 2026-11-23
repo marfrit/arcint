@@ -13,6 +13,7 @@
 #include "exec/slot_loan.h"
 #include "core/admission.h"
 #include "core/dory.h"
+#include "core/swa_window.h"
 #include "core/markers.h"
 
 #ifdef ARCINT_LLAMA
@@ -715,6 +716,11 @@ public:
         }
         if (model_ == nullptr)
             throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.gguf_path.c_str()));
+        // --llama-swa-window: the model's window (0: none, the flag changes nothing)
+        swa_window_ = cfg.llama_swa_window;
+        n_swa_      = llama_model_n_swa(model_);
+        if (swa_window_ && n_swa_ > 0)
+            log::info("load", "--llama-swa-window: the sliding-window layers keep %d cells + a ubatch", n_swa_);
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
         if (ec_on) {
             llama_expert_cache_info ec{};
@@ -846,6 +852,17 @@ public:
                 throw std::runtime_error(no);
             status_.dory_present = true;
             status_.dory         = ds;
+            // --llama-swa-window with last_loop: the mode overwrites each loop
+            // pass's KV, so a prompt's prefill depends on where the chunk
+            // boundaries fall (upstream's own test compares such a model only
+            // against the same batch; the probe measures 0.0268 nats mean KL on
+            // the same prompt in another ubatch split). A checkpoint resume puts
+            // the continuation on other boundaries, so the window cache cannot be
+            // held to the probe's equivalence there: refused, per_loop serves.
+            if (cfg.llama_swa_window && ds.kv_mode == "last_loop")
+                throw std::runtime_error("--llama-swa-window with a last_loop Dory KV: that mode's prefill is chunk-boundary "
+                                         "dependent by design, so a checkpoint resume cannot be held to the same logits; "
+                                         "serve --llama-dory-kv per_loop or start without --llama-swa-window");
         }
 #else
         if (admitted == AdmittedModel::Dory1_0_4B)
@@ -925,6 +942,11 @@ public:
             pool   = static_cast<int64_t>(n_ctx_) * lanes_;
         }
         n_batch_    = cfg.prefill_chunk > 0 ? cfg.prefill_chunk : 2048;
+#ifndef ARCINT_LLAMA_SWA_WINDOW
+        if (cfg.llama_swa_window)
+            throw std::runtime_error("--llama-swa-window: this build's llama.cpp lacks contrib/llama.cpp patch 0153 "
+                                     "(llama_memory_attn_seq_pos_min)");
+#endif
         llama_context_params cp = llama_context_default_params();
         cp.n_ctx           = static_cast<uint32_t>(pool);
         cp.n_seq_max       = static_cast<uint32_t>(lanes_);
@@ -942,6 +964,10 @@ public:
         cp.kv_resident_size = cfg.llama_kv_resident_mib > 0 ? (uint32_t) cfg.llama_kv_resident_mib * 1024u * 1024u : 0;
         cp.type_k          = kv_type(cfg.llama_kv_k);
         cp.type_v          = kv_type(cfg.llama_kv_v);
+        // --llama-swa-window: the library default (true) gives the SWA layers the
+        // whole context, so a prefix trim is exact; false sizes them to
+        // n_swa + n_ubatch, and the saves below carry that window in a checkpoint
+        cp.swa_full        = !cfg.llama_swa_window;
         // CPU threads: the CPU-side experts' decode is memory-bound, and the
         // physical cores beat the SMT threads (measured-here, Flash-Next on a
         // 8-core/16-thread host: 11.4 t/s at 8 threads, 9.0 at 16)
@@ -1148,16 +1174,23 @@ public:
         comb_stalled_.assign(static_cast<size_t>(lanes_), false);
         // context checkpoints only where llama.cpp makes them: a memory that
         // cannot remove a partial sequence (recurrent, or the recurrent part
-        // of a hybrid). An attention-only cache trims, and its PARTIAL_ONLY
-        // state would be the whole KV
+        // of a hybrid, or the SWA window when it is window-sized). An
+        // attention-only full-size cache trims, and its PARTIAL_ONLY state
+        // would be the whole KV
         ckpt_max_  = cfg.llama_checkpoints;
         ckpt_step_ = static_cast<size_t>(std::max(cfg.llama_checkpoint_step, 1));
-        const bool can_snapshot = llama_model_is_hybrid(model_) || llama_model_is_recurrent(model_);
+        const bool can_snapshot = llama_model_is_hybrid(model_) || llama_model_is_recurrent(model_) ||
+                                  (swa_window_ && n_swa_ > 0);
         if (const std::string no = checkpoints_refusal(cfg.llama_checkpoints_asked, can_snapshot, a); !no.empty())
             throw std::runtime_error(no);
         ckpt_on_   = ckpt_max_ > 0 && can_snapshot;
         if (ckpt_max_ > 0 && !can_snapshot)
             log::info("load", "context checkpoints: none, a '%s' model has no recurrent memory; its attention cache trims", a.c_str());
+        // the baseline the save's guard compares against: the partial state of an
+        // empty lane. It holds the recurrent headers and no SWA cell, so a
+        // checkpoint whose size does not exceed it carries no sliding-window state
+        if (ckpt_on_ && swa_window_ && n_swa_ > 0)
+            ckpt_empty_bytes_ = llama_state_seq_get_size_ext(ctx_, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         n_ubatch_  = static_cast<int>(cp.n_ubatch);
         ckpts_.resize(static_cast<size_t>(lanes_));
 
@@ -1231,8 +1264,10 @@ public:
         }
         if (ckpt_on_) {
             user_start_ = tokenizer_->encode(user_start_text());
-            log::info("load", "context checkpoints: up to %d a lane, %zu tokens apart, user messages %s", ckpt_max_,
-                      ckpt_step_, user_start_.empty() ? "not found in the template" : "found");
+            log::info("load", "context checkpoints: up to %d a lane, %zu tokens apart, user messages %s%s%s", ckpt_max_,
+                      ckpt_step_, user_start_.empty() ? "not found in the template" : "found",
+                      swa_window_ && n_swa_ > 0 ? ", carrying the sliding window (empty state " : "",
+                      swa_window_ && n_swa_ > 0 ? log::format("%zu bytes)", ckpt_empty_bytes_).c_str() : "");
         }
 
         char desc[128] = {};
@@ -1750,13 +1785,22 @@ public:
             while (common < have.size() && common < prompt.size() && have[common] == prompt[common]) ++common;
             if (common == prompt.size()) --common;
             llama_memory_t mem = llama_get_memory(ctx_);
-            if (common < have.size() && !llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(common), -1)) {
-                const Checkpoint* c = restore_ckpt_locked(seq, common);
-                if (c != nullptr && llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(c->n_tokens), -1)) {
-                    common = c->n_tokens;
-                } else {
-                    llama_memory_seq_rm(mem, seq, -1, -1);
-                    common = 0;
+            if (common < have.size()) {
+                // --llama-swa-window: a window-sized SWA cache's trim is exact
+                // only when its retained history reaches the next query's
+                // window; otherwise llama.cpp's seq_rm would succeed and leave
+                // the window short, so the lane resumes from a checkpoint there
+                // (core/swa_window.h)
+                const bool swa_ok = !(swa_window_ && n_swa_ > 0) ||
+                                    swa_window_trim_complete(n_swa_, llama_memory_attn_seq_pos_min(mem, seq), common);
+                if (!swa_ok || !llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(common), -1)) {
+                    const Checkpoint* c = restore_ckpt_locked(seq, common);
+                    if (c != nullptr && llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(c->n_tokens), -1)) {
+                        common = c->n_tokens;
+                    } else {
+                        llama_memory_seq_rm(mem, seq, -1, -1);
+                        common = 0;
+                    }
                 }
             }
             drop_ckpts_after_locked(seq, common);
@@ -2354,8 +2398,12 @@ private:
                 // (llama.cpp leaves the memory untouched when it refuses);
                 // without one, or if the drafter's cut is refused, the lane
                 // clears. The drafter keeps what stands below the cut.
+                // --llama-swa-window: the same window rule as generate()'s;
+                // the target's trim rides spec_->seq_rm below
+                const bool swa_ok = !(swa_window_ && n_swa_ > 0) ||
+                                    swa_window_trim_complete(n_swa_, llama_memory_attn_seq_pos_min(llama_get_memory(ctx_), seq), common);
                 const Checkpoint* c = nullptr;
-                if (!llama_memory_seq_rm(llama_get_memory(ctx_), seq, static_cast<llama_pos>(common), -1)) {
+                if (!swa_ok || !llama_memory_seq_rm(llama_get_memory(ctx_), seq, static_cast<llama_pos>(common), -1)) {
                     c      = restore_ckpt_locked(seq, common);
                     common = c != nullptr ? c->n_tokens : 0;
                 }
@@ -2674,12 +2722,12 @@ private:
 
     // A checkpoint of what `seq` holds after n_tokens tokens: only the part of
     // the memory llama.cpp cannot roll back (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY:
-    // a hybrid model's recurrent state), in host memory, with the drafter's
-    // carried row. At most --llama-checkpoints; when full, llama.cpp's
-    // eviction: first the ones within the step of an earlier one that an
-    // earlier request made, then the oldest. One already at n_tokens is kept
-    // (the lane's tokens below it are unchanged, so is its state). Caller
-    // holds mu_.
+    // a hybrid model's recurrent state, and the SWA window when --llama-swa-window
+    // sizes the cache to it), in host memory, with the drafter's carried row.
+    // At most --llama-checkpoints; when full, llama.cpp's eviction: first the
+    // ones within the step of an earlier one that an earlier request made, then
+    // the oldest. One already at n_tokens is kept (the lane's tokens below it
+    // are unchanged, so is its state). Caller holds mu_.
     void save_ckpt_locked(int seq, size_t n_tokens) {
         auto& list = ckpts_[static_cast<size_t>(seq)];
         while (!list.empty() && list.back().n_tokens > n_tokens) list.pop_back();
@@ -2695,6 +2743,20 @@ private:
         c.state.resize(size);
         if (llama_state_seq_get_data_ext(ctx_, c.state.data(), size, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != size) {
             log::warn("slot", "lane %d: checkpoint at %zu tokens failed", seq, n_tokens);
+            return;
+        }
+        // --llama-swa-window: a lane's partial state must hold cells (its SWA
+        // window and, on a hybrid, the recurrent cell); the empty-lane baseline
+        // is headers only, so a state that does not exceed it carries nothing a
+        // restore could resume from. A hybrid's recurrent cell alone would pass
+        // this; that the SWA part is really in the blob is what
+        // tools/swa_ckpt_probe.cpp and the load's size line verify
+        if (swa_window_ && n_swa_ > 0 && ckpt_empty_bytes_ > 0 && n_tokens > 0 && size <= ckpt_empty_bytes_) {
+            if (!ckpt_no_swa_warned_) {
+                ckpt_no_swa_warned_ = true;
+                log::warn("slot", "lane %d: checkpoint at %zu tokens (%zu bytes) does not exceed the empty state's %zu bytes: it carries no cache state; dropping such checkpoints",
+                          seq, n_tokens, size, ckpt_empty_bytes_);
+            }
             return;
         }
         if (spec_) c.dft_state = spec_->carried_state(seq, n_tokens);
@@ -3223,7 +3285,11 @@ private:
     // --llama-checkpoints: per lane, the recurrent state at token counts the
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;
-    bool                                  ckpt_on_   = false;   // a hybrid or recurrent model, N > 0
+    bool                                  ckpt_on_   = false;   // a hybrid or recurrent model, or a window-sized SWA cache, N > 0
+    bool                                  swa_window_ = false;   // --llama-swa-window: the SWA cache holds n_swa + ubatch
+    int                                   n_swa_      = 0;       // llama_model_n_swa of the loaded model
+    size_t                                ckpt_empty_bytes_ = 0;   // a checkpoint's partial state of an empty lane: no SWA cells
+    bool                                  ckpt_no_swa_warned_ = false;   // one warning, not one a checkpoint
     bool                                  kv_stream_paged_ = false;   // the start probe: the card takes paged FA
     int                                   ckpt_max_  = 32;
     size_t                                ckpt_step_ = 8192;

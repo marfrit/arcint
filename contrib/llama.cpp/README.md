@@ -8814,6 +8814,74 @@ Two test-backend-ops cases run the quantized pair's prompt path with the bias, I
 (decode) and its prompt case is f16, so the whole FLASH_ATTN_EXT suite passed on 0150 even with
 64-key blocks forced (3,171 / 3,171). With the two cases: 3,173 / 3,173 on 0152 at both block sizes.
 
+## 0153-attn-seq-pos-min.patch
+
+`llama_memory_seq_pos_min` for a hybrid memory is the **max** over its attention and
+recurrent parts, and the recurrent cell sits at the newest position (one cell a sequence),
+so on a hybrid it reports that position and hides the sliding-window cache's oldest cell.
+A window-sized SWA cache (`swa_full = false`) cannot be trimmed to an arbitrary prefix:
+`llama_kv_cache_iswa::seq_rm` forwards to the SWA cache, whose `seq_rm` always returns true,
+so a cut below the retained window drops exactly the keys the next query would attend to.
+arcint had no way to ask the attention part.
+
+0153 adds `llama_memory_attn_seq_pos_min(llama_memory_t, llama_seq_id)` to `llama-ext.h`:
+the SWA cache's `seq_pos_min` for a hybrid-iswa or iswa memory, the memory's own value
+otherwise. `src/llama-context.cpp` implements it by the memory's concrete type (RTTI); it
+reads a cache, writes nothing, and is valid before and after a decode.
+
+**arcint's use** (`code`, `--llama-swa-window`): the flag sets `llama_context_params.swa_full
+= false`, so the SWA layers hold `n_swa + n_ubatch` cells padded to 256 instead of the whole
+context. `src/core/swa_window.h` decides a prefix cut: the retained history (this call)
+must start at or below the next query's oldest key (`common - n_swa + 1`, clamped at 0);
+otherwise the lane resumes from the newest context checkpoint at or below `common` and
+prefills from it, and clears if there is none. The checkpoint's
+`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` state already carries the SWA cells at the pin
+(`llama_kv_cache_iswa::state_write` calls `kv_swa->state_write`; the base cache writes
+nothing under the flag), so no state-format change was needed — only the position query.
+
+**CPU measurement** (`measured-here`, the recipe host, the pinned tree with the series,
+`-DGGML_OPENCL=OFF`, Inkling 2 Mini IQ4_NL, the 8-core CPU build, `tools/swa_ckpt_probe.cpp`):
+the partial state at 2,048 tokens is 163.7 MiB and at 512 tokens 83.7 MiB at f16 (delta 80.0
+MiB = 512 cells x 40 SWA layers x 4,096 bytes: the window is in the blob). The probe's arms,
+on the same model: a control arm prefills the same edited prompt in another ubatch split
+(mean KL 0, the CPU's batch-shape floor here), an append-only follow-up against a fresh full
+prefill has the same top token and mean KL 0, and an edited prompt below the ring resumes
+from its checkpoint with the same top token and mean KL 0.001496 (the restored SWA cells are
+re-found in the ring's slot order, so the FA sums them in another order; the model's
+batch-shape floor is 0). The pre-change trim-only arm is skipped on a hybrid (its recurrent
+refusal blocks the trim, `n_rs_seq` 0); on the attention-only SWA models below it runs and
+is the red case. The arcint unit case (`tests/test_swa_window.cpp`) is red 4 of 7 with the
+old always-true rule.
+
+**Other SWA models** (`measured-here`, same host, the same probe): Dory1.0-4B Q5_K_M,
+`per_loop` (24 global + 72 SWA cache layers, window 1,024): floor 0, append-only 0, the
+checkpoint resume same top and mean KL 0.011592; the trim-only arm keeps a hole — mean KL
+5.887903, top token differs. Gemma 4 E4B Q4_K_M (4 global + 20 SWA, window 512): floor 0,
+append-only 0, the checkpoint resume same top and mean KL 0.022537; trim-only mean KL
+22.814130, top differs. Both resumes are inside the 0.03 answer-level bar with the same top
+token; the residual is cell re-placement, not the window.
+
+**The depth cost of the full-size cache on the CPU** (`measured-here`, llama-bench on the
+same 8-thread CPU build, f16 KV, one repetition each; the `swa_full=false` arm is the stock
+tool, the `true` arm is the same tool with `cparams.swa_full` forced true, a measurement
+build only): Gemma 4 E4B at 16,384 depth pp16384 48.33 -> 61.56 t/s and tg64 8.67 -> 12.56
+t/s with the window (prefill +27 %, decode +45 %: its 20 SWA layers over 16k masked keys).
+Inkling 2 Mini at the same depth pp16384 18.79 -> 19.87 and tg16 7.34 -> 7.94 t/s: the
+single 16-token decode reads no separable effect there, its CPU token is weight-bound
+(7-8 t/s) and the two runs sat in different host-load windows; the card is where the
+effect was measured (30.4/31.9 t/s in llama-bench at depth 16,384 against 20.5 q8_0 /
+24.3 f16 served with the full-size cache). The window cache never regressed the CPU decode.
+
+**Dory's `last_loop` is refused with the flag** (`code`, arcint's load): that mode overwrites
+each loop pass's KV, so a prompt's prefill depends on where its chunk boundaries fall
+(upstream compares such a model only against the same batch; DESIGN's Dory paragraph). The
+probe measures it: the floor arm — the *same* prompt in another ubatch split — is mean KL
+0.026827 nats; the append-only follow-up 0.002890 same top, the checkpoint resume 0.008718
+same top, trim-only 6.011353 top differs. A checkpoint resume puts the continuation on other
+boundaries than the full prefill, so the window cache cannot be held to the probe's
+equivalence there; `--llama-dory-kv per_loop` serves with the flag, `last_loop` starts
+without it.
+
 ## 0156-opencl-q8_0-mul_mat_id-int8-dot.patch
 
 Inkling 2 Mini's four coda layers keep their experts in Q8_0: gate_up K=2304 and down K=1152,

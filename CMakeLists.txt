@@ -208,6 +208,16 @@ if(ARCINT_LLAMA)
   else()
     message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0111: a weight the card declines at load is not reported")
   endif()
+  # contrib/llama.cpp 0153: the attention part's own oldest retained position
+  # (llama_memory_attn_seq_pos_min in llama-ext.h), which a window-sized SWA
+  # cache needs to decide whether a prefix trim is exact; without it
+  # --llama-swa-window is refused at start
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_memory_attn_seq_pos_min")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_SWA_WINDOW=1)
+    message(STATUS "contrib/llama.cpp 0153 present: --llama-swa-window is built")
+  else()
+    message(STATUS "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0153: --llama-swa-window is refused at start")
+  endif()
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
     # 0024: an expert cache per card under the layer split
@@ -289,6 +299,7 @@ if(ARCINT_TESTS)
     tests/test_chat_render.cpp
     tests/test_text.cpp
     tests/test_config.cpp
+    tests/test_swa_window.cpp
     tests/test_verify_walk.cpp
     tests/test_mtp_trace.cpp
     tests/test_mtp_capture.cpp
@@ -364,6 +375,14 @@ if(ARCINT_TESTS)
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
     target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
     target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
+    # --llama-swa-window on a real model (a1): a window-sized SWA cache's
+    # checkpoint resume against a fresh full prefill, and its red arms (the
+    # trim-only cut, a checkpoint without the SWA part). Not a ctest case: it
+    # needs a GGUF; run by hand, CPU is enough (tools/swa_ckpt_probe.cpp).
+    add_executable(arcint-swa-ckpt-probe tools/swa_ckpt_probe.cpp)
+    target_link_libraries(arcint-swa-ckpt-probe PRIVATE arcint_core)
+    target_include_directories(arcint-swa-ckpt-probe PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/include")
+    target_compile_options(arcint-swa-ckpt-probe PRIVATE -Wall -Wextra -Wpedantic)
     # Renders a chat template read from a file with the engine's own minja setup,
     # over a matrix of tools / thinking / exchange shapes (tools/template_probe.cpp).
     # Not a ctest case: it needs a template taken from a GGUF, which is never

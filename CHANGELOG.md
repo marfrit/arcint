@@ -32,6 +32,32 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   this: a kernel-argument count, and an f32 slice start in floats on float4 pointers (the 27B's KL had gone to 0.54).
   test-backend-ops carries the production shapes the split-K reaches (the 27B's ssm_alpha/beta, the coder's routers,
   Flash-Next's MTP injects); the red builds fail them on the card.
+- **`--llama-swa-window`: a window-sized sliding-window KV cache (opt-in).** The library's default
+  sizes every SWA layer to the whole context (`swa_full`); the flag sets `swa_full = false`, so the
+  SWA layers keep `n_swa + n_ubatch` cells (padded to 256). `measured-here` CPU: Inkling 2 Mini f16
+  8k 1,536 -> 496 MiB, 32k 6,144 -> 1,264, 131k 24,576 -> 4,336 (q8_0:q4_0 131k 9,984 -> 1,762;
+  262,144 at q8_0:q4_0 19,968 -> 3,426); Dory1.0-4B `per_loop` 8k 3,072 -> 1,200, 32k 12,288 ->
+  3,504, 131k 49,152 -> 12,720; Gemma 4 E4B 8k 448 -> 168, 32k 1,792 -> 552, 131k 7,168 -> 2,088.
+  A SWA cache cannot be trimmed to an arbitrary prefix; the context checkpoints already carry its
+  cells under `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (163.7 MiB a full Inkling window at f16), and
+  patch 0153 (`llama_memory_attn_seq_pos_min`) exposes the attention part's oldest retained position
+  — a hybrid's `seq_pos_min` is the max over its parts and the recurrent cell masks it.
+  `src/core/swa_window.h` resumes from the newest checkpoint when the retained history starts above
+  the next query's window. Red first: `tests/test_swa_window.cpp` (old always-true rule, red 4 of 7)
+  and `tools/swa_ckpt_probe.cpp` (trim-only arm: Dory 5.887903 nats, Gemma 22.814130, top token
+  differs; the resume arms same top, mean KL 0.001496 / 0.011592 / 0.022537, inside the answer bar).
+  Dory's `last_loop` is refused with the flag: its prefill is chunk-boundary dependent (0.026827
+  nats floor on the same prompt in another batch shape), so a resume cannot be held to the same
+  logits; `per_loop` serves with it. Off by default: at the full-size SWA cache prefix reuse is
+  exact without the rule. Card (B60, q8_0 KV, measured-here): 49,152 cells VRAM 21,334 -> 17,382 MiB; decode after a 15,790-token
+  prompt 20.6 -> 30.5 t/s (+48 %), prefill 333 -> 370; 131,072 and 262,144 cells decode 30.4, needles at 120k
+  and 250k right (262k: 20,918 MiB after load, 22,031 after the needle); an edited follow-up resumes from its
+  checkpoint (10,836 of 11,351 tokens reused, 1.6 s instead of 30.3 s); the agent's checkpoint resume unchanged. CPU depth cost at 16,384 (llama-bench, one repetition each, f16):
+  Gemma 4 E4B pp 48.33 -> 61.56 t/s, tg64 8.67 -> 12.56 with the window (+27 %, +45 %);
+  Inkling pp 18.79 -> 19.87, tg16 7.34 -> 7.94 (its 16-token CPU decode is weight-bound,
+  no separable effect; the card's 30.4/31.9 at depth 16,384 against 20.5 q8_0 / 24.3 f16
+  served full-size is the device evidence).
+
 
 ## 1.8.0 — 2026-11-22
 

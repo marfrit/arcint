@@ -1,0 +1,56 @@
+0153: expose the attention memory's own oldest retained position (llama_memory_attn_seq_pos_min), so a window-sized SWA cache can tell whether a prefix trim is exact.
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -12,6 +12,8 @@
+ #include "llama-kv-cache.h"
+ #include "llama-memory-hybrid.h"
+ #include "llama-memory-hybrid-idx.h"
++#include "llama-memory-hybrid-iswa.h"
++#include "llama-kv-cache-iswa.h"
+ #include "llama-mmap.h"
+ #include "llama-model.h"
+ #include "llama-moe-cache.h"
+@@ -5416,6 +5418,23 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
+     return ctx->get_memory();
+ }
+ 
++// the attention memory's own oldest retained position (llama-ext.h). The
++// hybrid's seq_pos_min() takes the max over the attention and the recurrent
++// parts, and the recurrent cell's position is the newest, so it cannot answer
++// for a window-sized SWA cache; the SWA cache's min is what a prefix trim reads
++llama_pos llama_memory_attn_seq_pos_min(const llama_memory_t mem, llama_seq_id seq_id) {
++    if (mem == nullptr) {
++        return -1;
++    }
++    if (auto * h = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
++        return h->get_mem_attn()->get_swa()->seq_pos_min(seq_id);
++    }
++    if (auto * i = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
++        return i->get_swa()->seq_pos_min(seq_id);
++    }
++    return mem->seq_pos_min(seq_id);
++}
++
+ float * llama_get_embeddings_nextn(llama_context * ctx) {
+     ctx->synchronize();
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -106,6 +106,14 @@ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_c
+ // the backend buffers that a state write of this memory would touch - empty caches report none
+ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+ 
++// the attention memory's own oldest retained position. A hybrid memory's
++// seq_pos_min() is the max over its parts and its recurrent cell sits at the
++// newest position, so that value hides a sliding-window cache's oldest cell.
++// With swa_full = false a prefix trim is exact only while the SWA cache still
++// holds the keys below the next query's window (arcint's --llama-swa-window);
++// the sequence id is the context's, -1 for a memory without attention layers.
++LLAMA_API llama_pos llama_memory_attn_seq_pos_min(const llama_memory_t mem, llama_seq_id seq_id);
++
+ // Turn the KV cache attention rotation on or off for the contexts created from this model.
+ // Useful for testing purposes.
+ LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
