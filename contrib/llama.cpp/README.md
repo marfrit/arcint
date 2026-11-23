@@ -9287,3 +9287,63 @@ unit serves:
     # the memory line for the HC model at the served 262,144 context: the load's KV cache,
     # compute buffer and model MiB, plus the guard's figures (the card's used/total, the
     # process's fdinfo vram0 and GTT) at `--n-ctx 262144`; the real GGUF is owed
+
+## 0167-opencl-q8_0-mul_mat_id-prompt-kernel.patch
+
+Inkling 2 Mini's four coda layers (20-23) keep their experts in Q8_0 while layers 0-19 hold
+IQ4_NL: gate_up K=2304 -> 2 x 2304 rows and down K=1152 -> 2304 rows, 128 experts, top-8.
+0156 serves their **decode** batch (`n_tok < 16`) on the int8 dot; a **prompt** batch had no
+GEMM and fell to `kernel_mul_mv_id_q8_0_f32_flat`, the flat float matvec — one float dot per
+value, at 512 tokens about 800 ms a layer for gate_up against 87 ms for an IQ4_NL layer on the
+same card (`measured-here`, B60, 23.2 % of a pp4096 ub512 profile).
+
+0167 adds `kernel_mul_mm_id_q8_0_i8` to `mul_mm_kq_i8.cl`, beside the IQ3_S and IQ4_NL kernels
+of 0071: one work-group takes I8XT = 32 route pairs of one expert and I8XSG = 8 sub-group
+groups of 16 output rows, stages the pairs' int8 activations a 256-weight super-block in local
+memory, and runs the s8 8x16x32 DPAS a 32-block per 8-pair group, K ascending, scaled by the
+weight block's `d` and the activation's per-32 scale — the IQ4_NL kernel's body and macros
+(`I8_COLS`, `I8_STAGE`, `I8_DPAS`, `I8_STORE`) unchanged. The difference is the weight read:
+a Q8_0 block holds its 32 codes as s8 already, so the b operand is the flat plane's 32 bytes
+read as eight words (no decode, no grid table, no K super-block), and `ws` is the block's half
+scale. The block's index is `(expert * ne01 + row) * (ne00 / 32) + kb / 32`, the flat plane's
+layout 0156's decode kernel uses.
+
+`kq_i8_ops.inc` gains `kq_i8_q80_wanted(GGML_OPENCL_Q8_MM_ID)`: unset is **on** (a Q8_0 prompt
+MUL_MAT_ID has no other GEMM), `0` and `off` (case-insensitive) turn it off. The Q8_0 decode arm
+is not gated by it. The program gate is the union — the int8 program is built when either the
+K-quant arm's `GGML_OPENCL_KQ_MM_ID_I8` or this arm wants it, so the default path pays the
+program compile a unit start. One limitation stays: the kernel is the SG16 s8
+DPAS, so it runs on Intel only (Adreno's SG8 arm is 0156's and the K-quant tile's).
+
+## 0168-opencl-q8_0-mul_mat_id-prompt-dispatch.patch
+
+`ggml_cl_mul_mat_id_q8_0_prompt` takes a prompt batch the way the IQ experts take theirs:
+`kernel_moe_route_tiles` sorts the (token, slot) pairs by expert into 32-pair tiles (the IQ
+arm's route, and its per-ids cache), `kernel_kq_mm_id_quant_i8` quantizes src1's columns to the
+q8_1-style int8 form the tile kernel stages (one activation a column — the frozen gate/up
+broadcast serves one column a token, not one a pair), and `kernel_mul_mm_id_q8_0_i8` runs the
+tile. Guards: `n_tok >= 16`, ne12 == n_tok, src0's ne3 == 1, ne00 a multiple of 32, ne01 a multiple of 16,
+at most 512 experts (the route kernel's local arrays), contiguous, the flat Q8_0 SoA planes, not an expert cache's `.slots` / `.bank`, and the int8 kernels built.
+Anything else keeps the generic arm, so the card's fallback is exactly today's.
+
+The dispatch sits after 0156's decode arm in `ggml_cl_mul_mat_id`; 0156's function and its
+guards are byte-identical.
+
+## 0169-opencl-q8_0-mul_mat_id-prompt-tests.patch
+
+Six test-backend-ops `MUL_MAT_ID` cases in the coda shapes: 128 experts, top-8, 2304 rows, the
+gate/up K 2304 with a broadcast b and the down K 1152 with a column a pair (ne11 = 8), at 16
+tokens (the arm's floor), 512 and 2048 (the prefill chunks). They are in the eval list; the perf
+list keeps 0156's decode cases, which stay as they were.
+
+CPU: `test-backend-ops -b CPU -o MUL_MAT_ID` 1038/1038, the Q8_0 arms 84/84 and the six new
+cases OK; `test-opencl-kq-i8` is all OK device-free.
+
+`measured-here`, card (B60 at its 165 W cap, Inkling 2 Mini IQ4_NL with the Q8_0 coda):
+- `MUL_MAT_ID` 542/616, the 74 failures all `mxfp4` (known, before this patch); the red build
+  (the kernel's `ws` scale dropped) fails 47 Q8_0 cases.
+- `llama-bench -fa 1 -p 4096 -b 4096`, two rounds: `-ub 512` 410.6 -> 522.4 t/s (+27.2 %). The
+  prompt profile's Q8_0 MUL_MAT_ID share falls from 23.2 % on the flat matvec to 2.1 % on the tile.
+- KL against the CPU reference: 0.001952 (same top p 98.50 %) against the baseline's 0.001950
+  (98.34 %) at the default batch; 0.001988 at `-ub 1`, identical to the baseline (the decode
+  batch does not take this arm).
