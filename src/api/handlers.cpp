@@ -520,7 +520,11 @@ json props(const Context& ctx) {
         // backend fills from --llama-kv (config.h's llama_kv_dtype); the stub
         // leaves it empty on purpose, which is what lets this print null
         // instead of guessing.
-        {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
+        // cache_prompt (llama.cpp server's switch) is served on both completion
+        // routes: false evaluates a request's prompt in full, reusing no prefix
+        // and resuming no checkpoint. Named here so a client can see it supported.
+        {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)},
+                   {"cache_prompt", "supported (default true; false evaluates the prompt in full)"}}},
         // The KV stream (0119-0122, docs/campaigns/kv-streaming-design.md): what was asked
         // and what the card's start probe answered. `requested` false is off; `paged_fa`
         // false with requested true can only be seen under the red switch, because the
@@ -1120,6 +1124,10 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // thinking turn whose block never opened is the sampler's own guard. Set
     // after finish_prepare, which owns input.sampler.
     prep.input.sampler.thinking_turn = prep.req.enable_thinking;
+    // llama.cpp server's cache_prompt: false evaluates this request's prompt
+    // in full and resumes no checkpoint; the lane's KV still stays for a later
+    // request that allows reuse.
+    prep.input.cache_prompt = prep.req.cache_prompt;
     // the media, in marker order across the whole request (the renderer put one
     // marker per part into the prompt)
     for (const ChatMessage& m : prep.req.messages)
@@ -1155,6 +1163,10 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
                            /*nothink=*/false, prep.req.prompt_ids)) {
         return err;
     }
+
+    // llama.cpp server's cache_prompt: false evaluates this request's prompt
+    // in full and resumes no checkpoint (set before the prompt's start state).
+    prep.input.cache_prompt = prep.req.cache_prompt;
 
     // The same start state the chat path gives the mask and the loop guard: a
     // raw prompt that ends inside an open block starts the turn there, so the
@@ -1396,6 +1408,8 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
                  {"usage", usage_json(stats)}};
     if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
     if (dory_named(stats)) body["dory"] = dory_json(stats);
+    // arcint.timings, as on the chat route: the same object, the same flag.
+    if (prep.req.timings) body["timings"] = timings_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -1766,6 +1780,11 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     json final_extra = json::object();
     if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
     if (dory_named(stats)) final_extra["dory"] = dory_json(stats);
+    // arcint.timings: with usage opted in, the object rides the usage chunk as
+    // on the chat route; without usage there is no such chunk, so it rides the
+    // finish chunk.
+    if (prep.req.timings && !prep.req.stream_include_usage)
+        final_extra["timings"] = timings_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"text", ""},
                                              {"logprobs", nullptr},
@@ -1774,7 +1793,9 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     }
 
     if (prep.req.stream_include_usage) {
-        if (!sse_send(write, chunk(json::array(), json{{"usage", usage_json(stats)}}))) return;
+        json usage_extra = {{"usage", usage_json(stats)}};
+        if (prep.req.timings) usage_extra["timings"] = timings_json(stats);
+        if (!sse_send(write, chunk(json::array(), usage_extra))) return;
     }
     write("data: [DONE]\n\n");
 }

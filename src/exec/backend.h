@@ -298,6 +298,11 @@ struct GenerationInput {
     std::vector<ImagePart> images;
 
     std::string   prompt;
+    // The request's `cache_prompt` (llama.cpp server's switch, default true):
+    // false means this request's prompt is evaluated in full — no prefix
+    // reuse and no checkpoint resume. KV kept after the full prefill is still
+    // available to a later request that allows reuse.
+    bool cache_prompt = true;
     // When non-empty, THESE are the prompt and `prompt` is not tokenised
     // (CompletionRequest::prompt_ids; the KLD gate's replay of the reference
     // capture's token windows).

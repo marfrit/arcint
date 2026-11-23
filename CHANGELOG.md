@@ -102,6 +102,20 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   answered with GTT at 308 MiB); Inkling at 131,072 full SWA (30,834) and Flash-Next with a 40,000 MiB expert cache
   (53,627) are refused; the latter suggests `--llama-expert-cache 19107`, and the restart with it starts and
   measures 32,402 of the B70's 32,656 MiB after the first request (32,192 predicted).
+- **Request fields and the multi-GPU warning.** `cache_prompt: false` is honoured (it was ignored: two
+  identical requests reused 4,092 of 4,096 prompt tokens); `n_predict` is an alias of `max_tokens`; `arcint:
+  {timings: true}` returns timings on `/v1/completions`. Fields that would change the result and that arcint cannot
+  honour are refused with HTTP 400 naming the field and a reason, instead of being dropped silently (one table in
+  `src/core/chat.cpp`; README "Running" lists them); their default values stay accepted (an OpenAI SDK's
+  `response_format: text`, `logprobs: false`, `n: 1`, `top_logprobs: null` or `0`, also on `/v1/responses`). A load
+  warning names the visible GPUs when there is more than one and no `--device` was given, and says the model loads
+  on GPU.0 (arcint has loaded on one card since 1.8.0; the layer split over several cards is llama.cpp's own tools'). Card evidence (`measured-here`, B60,
+  Inkling): `cache_prompt` true/true/false/true gives `cache_n` 0/1,397/0/1,397 (prefill 3,024/144/2,926/143 ms), the
+  chat route the same; the warning lists both cards without `--device` and is absent
+  with it.
+- **Docs: the runtime the numbers need.** README and `docs/docker.md` state the compute runtime, kernel and xe module
+  behind the measurements, and the image against native with the same `llama-bench` command on a B70 (0.5-2 % slower
+  decode in the image); README says arcint loads on one card and how llama.cpp's tools are pinned to one.
 
 ## 1.8.0 — 2026-11-22
 

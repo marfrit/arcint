@@ -191,3 +191,50 @@ TEST(openclcard_ggml_value_is_the_pick_in_asked_order) {
     CHECK_EQ(ggml_opencl_devices_value(pick_cards(cpu_first_host(), words({"B70"})).cards),
              std::string("1:1"));
 }
+
+// The load-time warning for "more than one GPU visible, no card chosen". The
+// decision is pure and the device lists are faked here. RED before the function
+// existed: it returned an empty string for every input, so the warning cases
+// failed. One-line mutation after the fix: change `gpu_count < 2` to
+// `gpu_count < 3` -- the two-card warning case fails again.
+TEST(openclcard_multi_gpu_warning_when_the_operator_chose_none) {
+    const std::string w = unselected_multi_gpu_warning(new_host(), /*device_given=*/false,
+                                                      /*ze_affinity_set=*/false);
+    CHECK(!w.empty());
+    CHECK(has(w, "Intel(R) Arc(TM) Pro B60 Graphics"));
+    CHECK(has(w, "Intel(R) Arc(TM) Pro B70 Graphics"));
+    CHECK(has(w, "0:0"));
+    CHECK(has(w, "0:1"));
+    CHECK(has(w, "GPU.0"));
+    CHECK(has(w, "--device"));
+    CHECK(has(w, "ZE_AFFINITY_MASK"));
+    // GGML_OPENCL_DEVICES is not advertised: the loader overwrites it
+    CHECK(!has(w, "GGML_OPENCL_DEVICES"));
+}
+
+TEST(openclcard_multi_gpu_warning_is_detected_on_one_platform) {
+    // Two Intel cards on one OpenCL platform (0:0 and 0:1) are still two GPUs;
+    // counting the devices, not the platforms, is what makes this detected.
+    const std::string w = unselected_multi_gpu_warning(new_host(), false, false);
+    CHECK(!w.empty());
+}
+
+TEST(openclcard_multi_gpu_warning_counts_a_two_platform_host) {
+    const std::string w = unselected_multi_gpu_warning(old_host(), false, false);
+    CHECK(!w.empty());
+}
+
+TEST(openclcard_no_warning_on_a_single_gpu_host) {
+    const std::vector<ClDeviceDesc> one = {gpu(0, 0, "Intel(R) Arc(TM) Pro B60 Graphics")};
+    CHECK(unselected_multi_gpu_warning(one, false, false).empty());
+    // and a CPU device does not count as a card
+    const std::vector<ClDeviceDesc> cpu_only = {cpu(0, 0, "Intel(R) Core(TM) CPU")};
+    CHECK(unselected_multi_gpu_warning(cpu_only, false, false).empty());
+}
+
+TEST(openclcard_no_warning_when_a_card_or_the_visibility_was_chosen) {
+    CHECK(unselected_multi_gpu_warning(new_host(), true, false).empty());   // --device given
+    CHECK(unselected_multi_gpu_warning(new_host(), false, true).empty());   // ZE_AFFINITY_MASK set
+    // GGML_OPENCL_DEVICES is not a choice this decision reads: the loader
+    // always replaces it with its own pick.
+}

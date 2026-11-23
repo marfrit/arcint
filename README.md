@@ -76,6 +76,15 @@ its design and record are at the tag
 The A770 rows in this section and the next are historical (card retired,
 last measured with release 1.7.0); the B60 rows are current.
 
+The numbers here are native builds on Debian trixie with Intel's compute
+runtime 26.27.39122.11 (IGC 2.38.2) and Linux 7.0.14, whose xe module differs
+from stable v7.0.14 only by upstream 9f83c94469ff ("drm/xe: Order ring writes
+before ring tail updates", in mainline from v7.2): a write barrier before the
+ring tail is published, a correctness fix that costs a little time if anything. The
+container image ships Fedora 43's runtime 26.18 and an x86-64-v3 build; with
+`llama-bench` on a B70 it decodes 0.5-2 % slower than the native build
+([docs/docker.md](docs/docker.md), "The GPU runtime").
+
 llama.cpp's community GPU tables ([Vulkan](https://github.com/ggml-org/llama.cpp/discussions/10879),
 [SYCL](https://github.com/ggml-org/llama.cpp/discussions/23313)) compare cards on one
 file, Llama 2 7B at Q4_0: every layer on the card, 512 tokens of prefill (pp512), 128
@@ -495,6 +504,38 @@ service's production flags, Flash-Next's expert cache included
   unit keeps MTP.
 - One process holds its card's VRAM for its whole lifetime: whatever else
   was serving that card has to stop first.
+- **One card per model on a host with several GPUs.** arcint never splits a
+  model on its own (only `--llama-layer-split` does): since 1.8.0 it loads on one card, the one `--device` names, or GPU.0
+  if none is given. In arcint only `--device` or `ZE_AFFINITY_MASK` choose the
+  card; `GGML_OPENCL_DEVICE(S)` don't. When more than one GPU is visible and
+  `--device` was not given, it logs "N GPU devices are visible (...); none
+  chosen with --device: loading on GPU.0 (name)". llama.cpp's own tools
+  (`llama-bench`, `llama-server`) and arcint before 1.8.0 split a model's
+  layers over every visible card, a cross-card hop per layer (on two B70s a
+  user measured Inkling 2 Mini's decode 5x slower than on one); for those
+  tools, `GGML_OPENCL_DEVICE=0` pins one device.
+- **Request fields.** `cache_prompt: false` evaluates that request's prompt
+  in full (no prefix reuse, no checkpoint resume); the KV it leaves is kept
+  for later requests that allow reuse; the default is `true`, as in
+  llama-server. `n_predict` (at least 1; -1, llama.cpp's default, means unset) is an alias of
+  `max_tokens`, and
+  `arcint: {timings: true}` returns the timings on `/v1/completions` too. A
+  field that would change the result and that this build cannot honour is
+  refused with HTTP 400 naming the field and the reason, not dropped
+  silently: `min_tokens`, a non-empty `cache_salt`, `logprobs`/`top_logprobs`/
+  `n_probs`/`prompt_logprobs` asking for probabilities, `min_keep` above 0,
+  `logit_bias` (object or array form), a non-empty `grammar`, `json_schema` or
+  `samplers`, `response_format` other than `{type: text}`, `best_of` other than 1, `use_beam_search`, `bad_words`,
+  `allowed_token_ids`, `truncate_prompt_tokens` other than -1, `typical_p`,
+  `mirostat`, `dynatemp_*`, `xtc_probability`, `tfs_z`, `top_n_sigma`,
+  `dry_multiplier` outside their default value, `include_stop_str_in_output:
+  true`, `skip_special_tokens: false`, `spaces_between_special_tokens:
+  false`, `chat_format`, and `return_tokens`, `return_progress`,
+  `timings_per_token`, `response_fields`. Default values of all of these are
+  accepted (`grammar: ""`, `json_schema: {}`, `samplers: []`, `top_n_sigma: -1.0`
+  included), so an OpenAI SDK's `response_format: {type: text}`,
+  `logprobs: false`, `n: 1`, `top_logprobs: null` or `0` pass; the list and its
+  reasons live in one table (`src/core/chat.cpp`, `kRequestFieldRefusals`).
 - **No authentication by default, permissive CORS, no TLS.** `--api-key`
   (or `--api-key-file PATH`) adds a bearer token on every route but `/health`
   (GET/HEAD only) — `/props`, `/metrics` and `/slots` included, an unknown path too, and

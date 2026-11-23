@@ -179,6 +179,30 @@ measured on compute-runtime 26.27.39122.11 with IGC 2.38.2 (Intel's release
 packages, on Debian trixie). Debian trixie ships no Intel compute runtime at
 all, which is why the image is Fedora-based.
 
+Image against native, the same patched llama.cpp tree built twice
+(`measured-here`, 2026-11-23, Arc Pro B70 capped at 220 W, Inkling 2 Mini
+IQ4_NL, `llama-bench -p 512 -n 128 -d 0,4096,32768 -ngl 99 -fa on -r 3`, two
+interleaved rounds on a quiet host): natively (`GGML_NATIVE=ON`, runtime
+26.27) pp512 669-675 and tg128 45.3 t/s, at depth 4,096 638-643 and 41.6, at
+32,768 563-564 and 39.0; in the 1.8.0 image's builder (`GGML_NATIVE=OFF`,
+x86-64-v3) with the image's runtime 26.18, pp512 663 and tg128 44.3-44.7, at
+4,096 634 and 41.3, at 32,768 557 and 38.8. The image costs 0.5-2 % in decode
+and 1-1.5 % in prefill. Served through arcint, decode is equally close
+(43.4 against 43.2 t/s over six runs each); single runs dropped to 22-33 t/s in
+both setups while build jobs ran on the same host's CPUs, because decode on
+these cards is bound by the host's kernel submission.
+
+The host's kernel matters too: the numbers here run on Linux 7.0.14 with an
+xe module that differs from stable v7.0.14 only by upstream 9f83c94469ff
+("drm/xe: Order ring writes before ring tail updates", a cherry-pick of
+136360290f31, in mainline from v7.2). It adds a write barrier before the ring
+tail is published: a correctness fix that, if anything, costs a little time,
+named here as a difference, not as a source of speed.
+
+Keep `GGML_OPENCL_KERNEL_CACHE_DIR` on a persistent volume: with a cold cache
+the image starts in about 90 s on a B70 (14 s with the cache warm), because
+every kernel is compiled again.
+
 Served from the two-tier images of 0.7.x (`measured-here`, 2026-10-07, both
 built from this tree in a privileged Debian container with podman, the A770
 bound in): the coder (`--engine llama`, its production GGUF, MTP 4, q8_0:q4_0

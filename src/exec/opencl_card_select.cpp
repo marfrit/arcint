@@ -1,4 +1,5 @@
 #include "exec/opencl_card_select.h"
+#include "util/log.h"
 
 #include <algorithm>
 #include <cctype>
@@ -120,6 +121,25 @@ std::string ggml_opencl_devices_value(const std::vector<ClDeviceDesc>& cards) {
     for (const ClDeviceDesc& c : cards)
         s += (s.empty() ? "" : ",") + std::to_string(c.platform) + ":" + std::to_string(c.device);
     return s;
+}
+
+std::string unselected_multi_gpu_warning(const std::vector<ClDeviceDesc>& all, bool device_given, bool ze_affinity_set) {
+    if (device_given || ze_affinity_set) return {};
+    // Count GPUs, not platforms: two cards on one platform are two cards.
+    size_t      gpu_count = 0;
+    std::string first;
+    for (const ClDeviceDesc& d : all) {
+        if (!d.gpu) continue;
+        if (++gpu_count == 1) first = d.name;
+    }
+    if (gpu_count < 2) return {};
+    // The loader always sets GGML_OPENCL_DEVICES to its own pick (GPU.0 alone
+    // without --device), so the layer split does not happen here: the model
+    // loads on GPU.0. The warning is about a choice the operator did not make.
+    return log::format(
+        "%zu GPU devices are visible (%s); none chosen with --device: loading on GPU.0 (%s); "
+        "pass --device GPU.N (or a device-name substring) to choose, or set ZE_AFFINITY_MASK",
+        gpu_count, all_gpus(all).c_str(), first.c_str());
 }
 
 }  // namespace lgc

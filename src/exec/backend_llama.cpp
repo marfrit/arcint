@@ -15,6 +15,7 @@
 #include "core/spill_guard.h"
 #include "core/dory.h"
 #include "core/swa_window.h"
+#include "exec/kv_prefix.h"
 #include "core/markers.h"
 
 #ifdef ARCINT_LLAMA
@@ -497,8 +498,21 @@ public:
         // one OpenCL platform may hold several cards: the pick is by device
         // (exec/opencl_card_select.h), and GGML_OPENCL_DEVICES names exactly
         // those devices for ggml's OpenCL backend (0023), one card or two
-        const ClPick picked = pick_cards(opencl_enumerate(), wanted);
+        const std::vector<ClDeviceDesc> visible = opencl_enumerate();
+        const ClPick picked = pick_cards(visible, wanted);
         if (!picked.error.empty()) throw std::runtime_error(picked.error);
+        // The promised load-time warning: more than one GPU visible and no card
+        // chosen (no --device, no ZE_AFFINITY_MASK). GGML_OPENCL_DEVICES is not
+        // read: the loader below overwrites it with this build's own pick, so
+        // without --device the model loads on GPU.0 rather than over every card.
+        const auto env_set = [](const char* name) {
+            const char* v = getenv(name);
+            return v != nullptr && v[0] != 0;
+        };
+        if (const std::string w = unselected_multi_gpu_warning(
+                visible, cfg.device_given, env_set("ZE_AFFINITY_MASK"));
+            !w.empty())
+            log::warn("load", "%s", w.c_str());
         const std::vector<ClDeviceDesc>& cards = picked.cards;
         const bool split = cards.size() > 1;
         if (split && cfg.llama_layer_split <= 0)
@@ -2036,15 +2050,16 @@ public:
                 throw std::runtime_error(log::format("the slot loan's state is %s; refusing this request (a lent slot must never be read as an expert)",
                                                      llama_context_slot_loan_state(ctx_) ? llama_context_slot_loan_state(ctx_) : "unusable"));
 #endif
-            // The longest prefix this lane still holds is reused; one token is
-            // always run, for its logits. A recurrent state cannot step back:
-            // where llama.cpp refuses the partial removal the lane resumes from
-            // its newest checkpoint inside the prefix, else it starts over.
             // --llama-dory-max-loops: a slot whose cells were written at another count is dropped before the
             // match, so the whole prompt is prefilled at this request's count
             dory_prepare_locked(seq, in, have, stats);
-            size_t common = 0;
-            while (common < have.size() && common < prompt.size() && have[common] == prompt[common]) ++common;
+            // The longest prefix this lane still holds is reused, unless the
+            // request said cache_prompt false; one token is always run, for its
+            // logits. A recurrent state cannot step back: where llama.cpp
+            // refuses the partial removal the lane resumes from its newest
+            // checkpoint inside the prefix, else it starts over. A request with
+            // cache_prompt false never resumes from a checkpoint.
+            size_t common = kv_prefix_common(have, prompt, prompt.size(), in.cache_prompt);
             if (common == prompt.size()) --common;
             llama_memory_t mem = llama_get_memory(ctx_);
             if (common < have.size()) {
@@ -2056,7 +2071,7 @@ public:
                 const bool swa_ok = !(swa_window_ && n_swa_ > 0) ||
                                     swa_window_trim_complete(n_swa_, llama_memory_attn_seq_pos_min(mem, seq), common);
                 if (!swa_ok || !llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(common), -1)) {
-                    const Checkpoint* c = restore_ckpt_locked(seq, common);
+                    const Checkpoint* c = in.cache_prompt ? restore_ckpt_locked(seq, common) : nullptr;
                     if (c != nullptr && llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(c->n_tokens), -1)) {
                         common = c->n_tokens;
                     } else {
@@ -2649,8 +2664,7 @@ private:
                 throw std::runtime_error(log::format("the slot loan's state is %s; refusing this request (a lent slot must never be read as an expert)",
                                                      llama_context_slot_loan_state(ctx_) ? llama_context_slot_loan_state(ctx_) : "unusable"));
 #endif
-            size_t common = 0;
-            while (common < have.size() && common < n_pre && have[common] == prompt[common]) ++common;
+            size_t common = kv_prefix_common(have, prompt, n_pre, in.cache_prompt);
             // ARCINT_MTP_CAPTURE (exec/mtp_capture.h): every prompt token must decode, or its rows
             // are missing from the capture; the lane starts empty (the same cut a diverging prompt takes)
             if (mtp_capture_on()) common = 0;
@@ -2666,7 +2680,7 @@ private:
                                     swa_window_trim_complete(n_swa_, llama_memory_attn_seq_pos_min(llama_get_memory(ctx_), seq), common);
                 const Checkpoint* c = nullptr;
                 if (!swa_ok || !llama_memory_seq_rm(llama_get_memory(ctx_), seq, static_cast<llama_pos>(common), -1)) {
-                    c      = restore_ckpt_locked(seq, common);
+                    c      = in.cache_prompt ? restore_ckpt_locked(seq, common) : nullptr;
                     common = c != nullptr ? c->n_tokens : 0;
                 }
                 if (!spec_->seq_rm(seq, common)) common = 0;

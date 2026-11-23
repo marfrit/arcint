@@ -703,6 +703,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--device") {
             if (!value(v)) return fail("--device needs a value");
             cfg.device = std::string(v);
+            cfg.device_given = true;
         } else if (arg == "--host") {
             if (!value(v)) return fail("--host needs a value");
             cfg.host = std::string(v);

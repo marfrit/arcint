@@ -56,6 +56,10 @@ struct ChatRequest {
 
     bool stream = false;
 
+    // llama.cpp server's cache_prompt (default true). False: this request's
+    // prompt is evaluated in full, no prefix reuse and no checkpoint resume.
+    bool cache_prompt = true;
+
     // stream_options.include_usage. Defaults on: DESIGN.md §3.7 requires usage
     // in the final chunk, so opting out is the client's explicit choice.
     bool stream_include_usage = true;
@@ -102,6 +106,11 @@ struct CompletionRequest {
     bool             stream = false;
     bool             echo   = false;
     bool             stream_include_usage = true;
+    // llama.cpp server's cache_prompt (default true); false evaluates the
+    // prompt in full for this request only.
+    bool             cache_prompt = true;
+    // arcint.timings: the per-response timing object, as on the chat route.
+    bool             timings = false;
     SamplerOverrides sampler;
 };
 
@@ -120,6 +129,18 @@ struct SpeechRequest {
 };
 
 // Both return an error message on rejection and leave the output untouched.
+// One refused request field and the reason the server gives. The refusal code
+// reads this table, the release notes list the same rows, and there is no
+// second copy of the strings. Default-valued fields are not in it.
+struct RequestFieldRefusal {
+    const char* field;
+    const char* reason;
+};
+const RequestFieldRefusal* request_field_refusals();
+size_t                     request_field_refusal_count();
+// nullptr when the field is not refused (or is accepted at its default)
+const char* request_field_refusal_reason(const char* field);
+
 std::optional<std::string> parse_chat_request(const nlohmann::json& body, ChatRequest& out);
 std::optional<std::string> parse_completion_request(const nlohmann::json& body,
                                                     CompletionRequest& out);

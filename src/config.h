@@ -262,6 +262,9 @@ struct Config {
     // --device: the N-th GPU in OpenCL enumeration (GPU.N) or a device-name
     // substring; two cards, GPU.0,GPU.1, for --llama-layer-split.
     std::string device = "GPU.0";
+    // whether --device was given: the load-time multi-GPU warning fires only
+    // when the operator chose no card (the default pick is not a choice).
+    bool device_given = false;
 
     std::string host = "127.0.0.1";
     int         port = 8090;

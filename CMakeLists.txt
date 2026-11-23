@@ -362,6 +362,12 @@ if(ARCINT_TESTS)
     tests/test_reqid.cpp
     tests/test_tokenize.cpp
     tests/test_opencl_card_select.cpp
+    tests/test_cache_prompt.cpp
+    tests/test_completion_timings.cpp
+    tests/test_ignored_fields.cpp
+    tests/test_request_defaults.cpp
+    tests/test_refusal_table.cpp
+    tests/test_request_shapes.cpp
     tests/test_template_file.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)

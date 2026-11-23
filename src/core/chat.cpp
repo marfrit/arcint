@@ -176,6 +176,27 @@ std::optional<std::string> read_sampler(const json& b, SamplerOverrides& s) {
         if (auto e = integer("max_completion_tokens", s.max_tokens)) return e;
     }
 
+    // llama.cpp's older name for the token budget. -1 is llama.cpp's default
+    // ("unset") and leaves max_tokens alone; 0 means evaluate the prompt only
+    // and has no arcint equivalent, so it is refused. Explicit max_tokens wins.
+    if (!b.contains("n_predict") || b["n_predict"].is_null()) {
+    } else if (!b["n_predict"].is_number_integer()) {
+        return "n_predict must be an integer";
+    } else {
+        const int64_t v = b["n_predict"].get<int64_t>();
+        if (v == -1) {
+            // unset, as llama.cpp reads it
+        } else if (v < 1) {
+            const char* why = request_field_refusal_reason("n_predict");
+            return log::format("n_predict is not served: %s",
+                               why != nullptr ? why : "n_predict 0 is not served");
+        } else if (v > INT32_MAX) {
+            return "n_predict is out of range";
+        } else if (!s.max_tokens) {
+            s.max_tokens = static_cast<int>(v);
+        }
+    }
+
     if (b.contains("seed") && !b["seed"].is_null()) {
         if (!b["seed"].is_number_integer()) return "seed must be an integer";
         s.seed = static_cast<uint64_t>(b["seed"].get<int64_t>());
@@ -262,12 +283,194 @@ std::optional<std::string> read_stream(const json& b, bool& stream, bool& includ
     return std::nullopt;
 }
 
+// llama.cpp server's cache_prompt. True (the default) lets a request reuse
+// the lane's KV; false evaluates its prompt in full. A typed non-boolean is
+// refused rather than read as either.
+std::optional<std::string> read_cache_prompt(const json& b, bool& cache_prompt) {
+    if (!b.contains("cache_prompt") || b["cache_prompt"].is_null()) return std::nullopt;
+    if (!b["cache_prompt"].is_boolean()) return "cache_prompt must be a boolean";
+    cache_prompt = b["cache_prompt"].get<bool>();
+    return std::nullopt;
+}
+
+// The arcint extension namespace, shared by the chat and completions routes.
+// The one field both serve is `timings`; anything else is refused by name
+// rather than accepted and dropped. `v` is optional on these routes (the
+// Responses surface requires it); absent keeps today's body exactly.
+std::optional<std::string> read_arcint(const json& body, bool& timings) {
+    if (!body.contains("arcint") || body["arcint"].is_null()) return std::nullopt;
+    const json& a = body["arcint"];
+    if (!a.is_object()) return "arcint must be an object";
+    for (auto it = a.begin(); it != a.end(); ++it) {
+        if (it.key() == "timings") {
+            if (!it.value().is_boolean()) return "arcint.timings must be a boolean";
+            timings = it.value().get<bool>();
+            continue;
+        }
+        if (it.key() == "v") {
+            if (!it.value().is_number_integer() || it.value().get<int64_t>() != 1)
+                return "arcint.v must be 1 when it is sent";
+            continue;
+        }
+        return log::format("arcint.%s is not served in this build", it.key().c_str());
+    }
+    return std::nullopt;
+}
+
+// The fields benchmark clients send that this build does not serve and that
+// would change the result if dropped. The tree's pattern for an unsupported
+// option is a refusal by name (n > 1, `speed`, unknown `arcint.*`), not a
+// silent drop. Values at the field's own default change nothing and are
+// accepted. Fields this build does serve (seed, ignore_eos, stop,
+// stop_token_ids, top_k/top_p/min_p/temperature, penalties, max_tokens,
+// n_predict >= 1, echo) are read elsewhere and are not in this list.
+//
+// Every refusal's reason comes from request_field_refusals() below; the same
+// rows are listed in the release notes.
+
+bool is_positive_int(const json& v) { return v.is_number_integer() && v.get<int64_t>() > 0; }
+bool is_nonempty_string(const json& v) { return v.is_string() && !v.get<std::string>().empty(); }
+bool is_nonempty_array(const json& v) { return v.is_array() && !v.empty(); }
+bool is_nonempty_object(const json& v) { return v.is_object() && !v.empty(); }
+bool is_true(const json& v) { return v.is_boolean() && v.get<bool>(); }
+bool is_false(const json& v) { return v.is_boolean() && !v.get<bool>(); }
+bool any_present(const json&) { return true; }
+bool nonempty_array_or_string(const json& v) {
+    return (v.is_array() && !v.empty()) || (is_nonempty_string(v));
+}
+bool logit_bias_present(const json& v) {
+    return (v.is_object() && !v.empty()) || (v.is_array() && !v.empty());
+}
+bool not_text_response_format(const json& v) {
+    return !(v.is_object() && v.value("type", std::string()) == "text");
+}
+bool sigma_not_minus_one(const json& v) { return !v.is_number() || v.get<double>() != -1.0; }
+bool n_predict_refused(const json& v) {
+    if (!v.is_number_integer()) return true;
+    const int64_t n = v.get<int64_t>();
+    return n == 0 || n < -1;
+}
+bool logprobs_asks(const json& v) { return is_true(v) || is_positive_int(v); }
+bool best_of_not_one(const json& v) { return !v.is_number_integer() || v.get<int64_t>() != 1; }
+bool truncate_not_minus_one(const json& v) {
+    return !(v.is_number_integer() && v.get<int64_t>() == -1);
+}
+bool float_not_one(const json& v) { return !v.is_number() || v.get<double>() != 1.0; }
+bool float_not_zero(const json& v) { return !v.is_number() || v.get<double>() != 0.0; }
+bool int_not_zero(const json& v) { return !v.is_number_integer() || v.get<int64_t>() != 0; }
+
+std::optional<std::string> read_result_changing_fields(const json& b) {
+    struct Rule {
+        const char* field;
+        bool (*trips)(const json&);
+    };
+    static const Rule kRules[] = {
+        {"min_tokens", is_positive_int},
+        {"cache_salt", is_nonempty_string},
+        {"n_probs", is_positive_int},
+        {"logprobs", logprobs_asks},
+        {"min_keep", is_positive_int},
+        {"top_logprobs", is_positive_int},
+        {"prompt_logprobs", any_present},
+        {"samplers", nonempty_array_or_string},
+        {"return_tokens", is_true},
+        {"return_progress", is_true},
+        {"timings_per_token", is_true},
+        {"response_fields", nonempty_array_or_string},
+        {"logit_bias", logit_bias_present},
+        {"grammar", is_nonempty_string},
+        {"json_schema", is_nonempty_object},
+        {"response_format", not_text_response_format},
+        {"best_of", best_of_not_one},
+        {"use_beam_search", is_true},
+        {"bad_words", is_nonempty_array},
+        {"allowed_token_ids", is_nonempty_array},
+        {"truncate_prompt_tokens", truncate_not_minus_one},
+        {"typical_p", float_not_one},
+        {"mirostat", int_not_zero},
+        {"dynatemp_range", float_not_zero},
+        {"dynatemp_exponent", float_not_one},
+        {"xtc_probability", float_not_zero},
+        {"tfs_z", float_not_one},
+        {"top_n_sigma", sigma_not_minus_one},
+        {"n_predict", n_predict_refused},
+        {"dry_multiplier", float_not_zero},
+        {"include_stop_str_in_output", is_true},
+        {"skip_special_tokens", is_false},
+        {"spaces_between_special_tokens", is_false},
+        {"chat_format", any_present},
+    };
+    for (const Rule& r : kRules) {
+        if (!b.contains(r.field) || b[r.field].is_null()) continue;
+        if (!r.trips(b[r.field])) continue;
+        const char* why = request_field_refusal_reason(r.field);
+        return log::format("%s is not served: %s", r.field,
+                           why != nullptr ? why : "this build does not serve it");
+    }
+    return std::nullopt;
+}
+
 }  // namespace
+
+// One list, two readers: read_result_changing_fields() and the n_predict
+// check take every refusal's reason from here; the same rows are listed in the
+// release notes. A field's value at its own default is accepted.
+const RequestFieldRefusal kRequestFieldRefusals[] = {
+    {"min_tokens", "this build cannot force a minimum length; use max_tokens or stop"},
+    {"cache_salt", "this build has no salted KV cache; an unsalted reuse would cross tenants"},
+    {"n_probs", "this build returns no token probabilities; send 0 or omit it"},
+    {"logprobs", "this build returns no token probabilities; send 0/false or omit it"},
+    {"min_keep", "min_keep is a sampler floor for the candidate list; this build serves one sampler row and cannot honour it"},
+    {"top_logprobs", "this build returns no token probabilities; send 0 or null"},
+    {"prompt_logprobs", "this build returns no prompt logprobs"},
+    {"samplers", "the sampler order is the operator's; send no order or omit it"},
+    {"return_tokens", "this build writes no raw token ids in the response"},
+    {"return_progress", "this build emits no prompt-processing progress events"},
+    {"timings_per_token", "this build reports timings once per request, not per token"},
+    {"response_fields", "this build writes a fixed response body"},
+    {"logit_bias", "logit_bias changes the distribution; it is not applied here"},
+    {"grammar", "request-time grammars are not served; --tool-grammar is the operator's switch"},
+    {"json_schema", "request-time grammars are not served; --tool-grammar is the operator's switch"},
+    {"response_format", "JSON-mode output is not served; the answer is the model's own text"},
+    {"best_of", "one slot serves one sequence; only 1 is accepted"},
+    {"use_beam_search", "beam search is not served; one sequence, one sampler"},
+    {"bad_words", "bad_words would change the distribution; it is not applied here"},
+    {"allowed_token_ids", "allowed_token_ids would change the distribution; it is not applied here"},
+    {"truncate_prompt_tokens", "prompt truncation is not served; only -1 (no truncation) is accepted"},
+    {"n_predict", "n_predict 0 would evaluate the prompt only; only -1 (unset) and >= 1 are accepted; use max_tokens for a token budget"},
+    {"typical_p", "the served sampler has no typical sampling; use top_p"},
+    {"mirostat", "mirostat sampling is not served; the served sampler is one row"},
+    {"dynatemp_range", "dynamic temperature is not served"},
+    {"dynatemp_exponent", "dynamic temperature is not served"},
+    {"xtc_probability", "XTC sampling is not served"},
+    {"tfs_z", "tail-free sampling is not served"},
+    {"top_n_sigma", "sigma-based truncation is not served"},
+    {"dry_multiplier", "DRY repetition breaking is not served (loop_guard is the served one)"},
+    {"include_stop_str_in_output", "the stop string is never echoed into the text"},
+    {"skip_special_tokens", "special tokens are decoded out; false would ask for text this build cannot produce"},
+    {"spaces_between_special_tokens", "special tokens are decoded out, so the spacing switch changes nothing this build writes"},
+    {"chat_format", "the chat template is the model's, chosen by the operator; a request cannot replace it"},
+};
+
+const RequestFieldRefusal* request_field_refusals() { return kRequestFieldRefusals; }
+
+size_t request_field_refusal_count() {
+    return sizeof(kRequestFieldRefusals) / sizeof(kRequestFieldRefusals[0]);
+}
+
+const char* request_field_refusal_reason(const char* field) {
+    if (field == nullptr) return nullptr;
+    for (const RequestFieldRefusal& r : kRequestFieldRefusals)
+        if (std::string_view(r.field) == field) return r.reason;
+    return nullptr;
+}
 
 std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out) {
     if (!body.is_object()) return "request body must be a JSON object";
 
     ChatRequest req;
+    if (auto e = read_result_changing_fields(body)) return e;
+    if (auto e = read_cache_prompt(body, req.cache_prompt)) return e;
     if (body.contains("model") && body["model"].is_string()) {
         req.model = body["model"].get<std::string>();
     }
@@ -391,23 +594,7 @@ std::optional<std::string> parse_chat_request(const json& body, ChatRequest& out
     // chat route serves is `timings`; anything else is refused by name rather
     // than accepted and dropped. `v` is optional here (the Responses surface
     // requires it); absent keeps today's body exactly.
-    if (body.contains("arcint") && !body["arcint"].is_null()) {
-        const json& a = body["arcint"];
-        if (!a.is_object()) return "arcint must be an object";
-        for (auto it = a.begin(); it != a.end(); ++it) {
-            if (it.key() == "timings") {
-                if (!it.value().is_boolean()) return "arcint.timings must be a boolean";
-                req.timings = it.value().get<bool>();
-                continue;
-            }
-            if (it.key() == "v") {
-                if (!it.value().is_number_integer() || it.value().get<int64_t>() != 1)
-                    return "arcint.v must be 1 when it is sent";
-                continue;
-            }
-            return log::format("arcint.%s is not served in this build", it.key().c_str());
-        }
-    }
+    if (auto e = read_arcint(body, req.timings)) return e;
 
     // OpenAI's own switch. "none"/"off" turn thinking off and every other
     // level on, minimal included (OpenAI's lowest level, not a switch; the
@@ -487,6 +674,9 @@ std::optional<std::string> parse_completion_request(const json& body, Completion
     if (!body.is_object()) return "request body must be a JSON object";
 
     CompletionRequest req;
+    if (auto e = read_result_changing_fields(body)) return e;
+    if (auto e = read_cache_prompt(body, req.cache_prompt)) return e;
+    if (auto e = read_arcint(body, req.timings)) return e;
     if (body.contains("model") && body["model"].is_string()) {
         req.model = body["model"].get<std::string>();
     }

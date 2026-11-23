@@ -33,6 +33,13 @@ HttpResult invalid(std::string message, std::string param = {}) {
                                            "invalid_request", param)};
 }
 
+// The chat table's reason for the same field name, so both surfaces say one
+// thing; the caller's fallback is used only if the field is absent there.
+std::string refused_reason(const char* field, const char* fallback) {
+    const char* r = request_field_refusal_reason(field);
+    return r != nullptr ? r : fallback;
+}
+
 HttpResult unsupported(std::string message, std::string param) {
     return HttpResult{400, responses_error(std::move(message), "invalid_request",
                                            "unsupported_parameter", param)};
@@ -48,7 +55,8 @@ bool known_top_level(std::string_view key) {
         "frequency_penalty", "parallel_tool_calls", "stream", "stream_options",
         "background", "max_output_tokens", "max_tool_calls", "reasoning",
         "safety_identifier", "prompt_cache_key", "truncation", "instructions",
-        "store", "service_tier", "top_logprobs", "arcint"};
+        "store", "service_tier", "top_logprobs", "response_format", "logprobs",
+        "n", "arcint"};
     for (const char* k : kKnown) if (key == k) return true;
     return false;
 }
@@ -653,6 +661,36 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
     if (body.contains("text")) {
         if (auto err = read_text(body["text"], req)) return err;
     }
+
+    // The OpenAI SDK's defaults, on this surface too: response_format
+    // {"type":"text"}, logprobs false, n 1, and top_logprobs null or 0. The
+    // values that would change the output stay refused, by their own names.
+    if (body.contains("response_format") && !body["response_format"].is_null()) {
+        const json& rf = body["response_format"];
+        if (!rf.is_object()) return invalid("response_format must be an object or null", "response_format");
+        const std::string type = rf.value("type", std::string());
+        if (type == "json_object" || type == "json_schema") {
+            return unsupported("response_format is not served: " +
+                                   refused_reason("response_format",
+                                                  "JSON-mode output is not served"),
+                               "response_format");
+        }
+        if (type != "text") return invalid("response_format.type must be text", "response_format");
+    }
+    if (body.contains("logprobs") && !body["logprobs"].is_null()) {
+        if (!body["logprobs"].is_boolean()) return invalid("logprobs must be a boolean or null", "logprobs");
+        if (body["logprobs"].get<bool>()) {
+            return unsupported("logprobs is not served: " +
+                                   refused_reason("logprobs", "this build returns no token probabilities"),
+                               "logprobs");
+        }
+    }
+    if (body.contains("n") && !body["n"].is_null()) {
+        if (!body["n"].is_number_integer()) return invalid("n must be an integer or null", "n");
+        if (body["n"].get<int64_t>() != 1) {
+            return unsupported("n must be 1: one slot serves one sequence", "n");
+        }
+    }
     if (body.contains("reasoning")) {
         if (auto err = read_reasoning(body["reasoning"], req)) return err;
     }
@@ -797,9 +835,16 @@ std::optional<HttpResult> parse_response_request(const json& body, ResponseReque
         return unsupported("max_tool_calls is not served in 1.3.0: no cross-call counting exists "
                            "(docs/campaigns/feyntalk.md Scope)", "max_tool_calls");
     }
-    if (body.contains("top_logprobs")) {
-        return unsupported("top_logprobs is not served in 1.3.0: logprobs are absent from this "
-                           "surface (docs/campaigns/feyntalk.md Scope)", "top_logprobs");
+    if (body.contains("top_logprobs") && !body["top_logprobs"].is_null()) {
+        if (!body["top_logprobs"].is_number_integer()) {
+            return invalid("top_logprobs must be an integer or null", "top_logprobs");
+        }
+        if (body["top_logprobs"].get<int64_t>() != 0) {
+            return unsupported("top_logprobs is not served: " +
+                                   refused_reason("top_logprobs",
+                                                  "this build returns no token probabilities"),
+                               "top_logprobs");
+        }
     }
     if (body.contains("arcint")) {
         if (auto err = read_arcint(body["arcint"], req)) return err;
