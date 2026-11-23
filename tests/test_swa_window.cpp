@@ -4,7 +4,7 @@
 // The mechanism: llama.cpp's seq_rm() on a window-sized SWA cache always returns
 // true (it cannot refuse, unlike the recurrent memory), so a lane that cuts a
 // prompt there leaves a hole below the window's start unless the cache still
-// holds it. The backend reads llama_memory_seq_pos_min() before the cut and
+// holds it. The backend reads llama_memory_attn_seq_pos_min() before the cut and
 // resumes from a checkpoint when the hole would be there. Off (the library's
 // full-size SWA cache), every trim is exact and the rule is not consulted.
 #include "config.h"

@@ -16,7 +16,7 @@
 
 namespace lgc {
 
-// `pos_min` is llama_memory_seq_pos_min() of the lane before the cut (the SWA
+// `pos_min` is llama_memory_attn_seq_pos_min() of the lane before the cut (the SWA
 // cache's oldest retained position, -1 when it holds nothing), `common` the
 // shared prefix in tokens, `n_swa` the model's sliding window (0: no SWA, the
 // ordinary attention cache trims exactly). True: trimming to `common` leaves

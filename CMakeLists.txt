@@ -211,12 +211,12 @@ if(ARCINT_LLAMA)
   # contrib/llama.cpp 0153: the attention part's own oldest retained position
   # (llama_memory_attn_seq_pos_min in llama-ext.h), which a window-sized SWA
   # cache needs to decide whether a prefix trim is exact; without it
-  # --llama-swa-window is refused at start
+  # the build stops (the backend's prefix cuts call it)
   if(ARCINT_LLAMA_EXT_H MATCHES "llama_memory_attn_seq_pos_min")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_SWA_WINDOW=1)
     message(STATUS "contrib/llama.cpp 0153 present: --llama-swa-window is built")
   else()
-    message(STATUS "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0153: --llama-swa-window is refused at start")
+    message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0153 (llama_memory_attn_seq_pos_min): apply the series")
   endif()
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
@@ -375,7 +375,7 @@ if(ARCINT_TESTS)
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
     target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
     target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
-    # --llama-swa-window on a real model (a1): a window-sized SWA cache's
+    # --llama-swa-window on a real model: a window-sized SWA cache's
     # checkpoint resume against a fresh full prefill, and its red arms (the
     # trim-only cut, a checkpoint without the SWA part). Not a ctest case: it
     # needs a GGUF; run by hand, CPU is enough (tools/swa_ckpt_probe.cpp).

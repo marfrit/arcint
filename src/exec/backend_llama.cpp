@@ -721,6 +721,8 @@ public:
         n_swa_      = llama_model_n_swa(model_);
         if (swa_window_ && n_swa_ > 0)
             log::info("load", "--llama-swa-window: the sliding-window layers keep %d cells + a ubatch", n_swa_);
+        else if (swa_window_)
+            log::warn("load", "--llama-swa-window: this model has no sliding-window layers, the flag changes nothing");
 #ifdef ARCINT_LLAMA_EXPERT_CACHE
         if (ec_on) {
             llama_expert_cache_info ec{};

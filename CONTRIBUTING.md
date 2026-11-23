@@ -23,7 +23,7 @@ A release takes `development` as it stands, runs the full release gate (`DESIGN.
 
 ## Patches to llama.cpp
 
-`contrib/llama.cpp/patches` is applied in C-locale order onto the pinned llama.cpp commit. Each patch starts with a line `NNNN: <one sentence>`, then an empty line, then a plain diff (no mail header). Every patch has a section in `contrib/llama.cpp/README.md`.
+`contrib/llama.cpp/patches` is applied in C-locale order onto the pinned llama.cpp commit. Each new patch starts with a line `NNNN: <one sentence>`, then an empty line, then a plain diff (no mail header). Every patch has a section in `contrib/llama.cpp/README.md`.
 
 Parallel work takes patch numbers from disjoint ranges, assigned before the work starts.
 

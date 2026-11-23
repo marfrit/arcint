@@ -1088,7 +1088,7 @@ The other quants are options (§7.2). The dense agent's q8_0:q4_0 KV: KL 0.00565
 97.30 % against the CPU reference; the coder's searched quant: 0.02367 /
 95.43 % against Q8_0 (`measured-here`, `docs/llama-engine.md`).
 
-**A window-sized SWA cache** (`--llama-swa-window`, 1.8.1 item a1; opt-in,
+**A window-sized SWA cache** (`--llama-swa-window`, 1.8.1; opt-in,
 `measured-here` CPU, 2026-11-22, the recipe host's 8-core build with
 `-DGGML_OPENCL=OFF`, patch 0153): the KV the load logs, true vs false, at
 f16 — Inkling 2 Mini (8 global + 40 SWA cache layers) 8k 1,536 -> 496 MiB,

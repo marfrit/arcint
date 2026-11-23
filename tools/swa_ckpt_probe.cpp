@@ -7,9 +7,9 @@
 // the rule and the flag). Build CPU only against the pinned tree:
 //
 //   g++ -O2 -std=c++17 -I include -I ggml/include -I src tools/swa_ckpt_probe.cpp
-//       -o /tmp/swa_ckpt_probe -L build/bin -lllama -Wl,-rpath,$PWD/build/bin
+//       -o swa_ckpt_probe -L build/bin -lllama -Wl,-rpath,$PWD/build/bin
 //
-//   /tmp/swa_ckpt_probe model.gguf [n_ctx]
+//   ./swa_ckpt_probe model.gguf [n_ctx]
 //
 // The arms:
 //   A  append-only follow-up, no cut: must match a fresh full prefill

@@ -8907,12 +8907,12 @@ in the one-column program, which is now always done; the q8_0 matvec above stays
 Four test-backend-ops cases take exactly the coda shapes (Q8_0, 128 experts, top-8, K 2304, 2304
 rows, 1 and 4 tokens; K 1152, 2304 rows, 1 and 4 tokens) in the test list and in the perf list, so
 perf mode times them. The CPU build's `test-backend-ops -o MUL_MAT_ID` passes, the OpenCL build
-compiles and the .cl passes the C preprocessor. The card numbers are still to be taken: the gate is
-the same answers within rounding, then the launches of `perf -o "MUL_MAT_ID.*Q8_0"` before and after.
+compiles and the .cl passes the C preprocessor. On the card (`measured-here`, B60): the q8_0
+`MUL_MAT_ID` cases pass, and a red build (the kernel's dot broken) fails 29 of them.
 
 ## 0157-opencl-tiny-mv-splitk.patch
 
-Carried from 0151 of the ink-tmv tree, renumbered: it was written against an older base, so it
+Developed as patch 0151 on a working branch and renumbered here (its comments still say 0151): it was written against an older base, so it
 is applied here after 0156 with offsets resolved and the logic unchanged. A one-column decode
 matvec of few output rows leaves most of the card idle: the f32 GEMV puts one work-group per
 output row (out=48 on 160 cores) and the flat q8_0 kernel one work-group every 8 rows (out=24 is
@@ -8925,19 +8925,24 @@ reaches about 256 while K divides by 4 * slices; `kernel_mul_mv_q8_0_f32_splitk`
 >= 1024, blocks divisible by the slice count. A multi-column step (an MTP or spec verify, ne11 > 1)
 keeps the existing kernels. `GGML_OPENCL_F32_SKINNY=0` still turns the f32 arm off.
 
-Fourteen test-backend-ops cases are added for the Inkling 2 Mini decode shapes (one activation row,
-K=2304, f32 and q8_0 weights, out 2, 3, 4, 5, 24, 32, 64, 128, 384) in the test list and the perf
-list, timed before and after. The CPU build's `test-backend-ops -o MUL_MAT` passes and the OpenCL
-build compiles.
+test-backend-ops carries the Inkling 2 Mini decode shapes (one activation row, K=2304, f32 and q8_0
+weights, out 2, 3, 4, 5, 24, 32, 64, 128, 384) in the test list and the perf list, and the production
+shapes the split-K reaches: the agent 27B's `ssm_alpha` / `ssm_beta` (F32 48 x 5120, and a q8_0 twin),
+the coder's routers (F32 184 x 2048 and 256 x 2048, which stay unsplit) and Flash-Next's MTP head injects
+(Q8_0 4 x 10240, split 64 ways; and 320 x 10240). Two defects were found on the card only and fixed:
+the q8_0 host set one kernel argument too many (CL_INVALID_ARG_INDEX), and the f32 kernel started each
+slice in floats on float4 pointers, so every slice past the first read the wrong rows (the 27B's KL
+went to 0.54). On the card (`measured-here`, B60): `MUL_MAT` 2965 of 2965; the red build (the slice
+bug) fails 14 f32 split-K cases.
 
 The split-K takes every model whose decode has a one-column matvec with out < 512 and K >= 1024
 of f32 or flat q8_0 weights. In the agent's Qwen3.8-27B Q4_K_M all 96 such tensors are the
 48 gated delta-net layers' `ssm_alpha.weight` and `ssm_beta.weight` (5120 x 48, five slices), whose
-F32 weights the f32 arm covers. Qwen3.8-Flash-Next IQ3_S has none: its F32 two-dimensional
-weights are `ssm_conv1d.weight` (K 4) and its only two-dimensional Q8_0 weight is
-`ffn_down_shexp.weight` (K 640, below 1024); `output_hc_down.weight` has 320 rows but is BF16,
-which neither kernel covers. Inkling 2 Mini's f32 48-row `ssm_alpha` / `ssm_beta` and its small
-q8_0 projections are the shapes the new cases use; the card numbers are still to be taken.
+F32 weights the f32 arm covers. Qwen3.8-Flash-Next's main model has none; its MTP head's two
+Q8_0 injects (4 x 10240) take the q8_0 arm. The coder's 1-D shared-expert gate (F32 [2048], a
+1 x 2048 product) takes the f32 arm, 32 slices. On the card (`measured-here`, B60/B70): KL to the
+CPU reference at micro-batch 1 the agent 0.010389 -> 0.010350, the coder 0.005796 -> 0.005664,
+Dory and Flash-Next bit-identical; Inkling decode +1.2 to +1.3 % from 0156 + 0157.
 
 ## 0158-ggml-norm-clip-fused.patch
 
@@ -8971,7 +8976,8 @@ gate on the IQ4_NL file, base logits the same window:
 | mean KL vs the base logits, same top | - | 0.000000, 99.967 % |
 
 Both graphs lose 1,104 nodes: the clips' 1,248 launch nodes a token become 144 NORM_CLIP nodes.
-On a card that is the launch count the patch removes; no card number was taken here.
+On the card (`measured-here`, B60): `NORM_CLIP` 8 of 8, its red build 0 of 8; Inkling decode
+34.13 -> 35.69 t/s at 4k (+4.6 %), 37.06 -> 38.93 at depth 0, KL to the CPU reference inside the bar.
 
 test-backend-ops `-o NORM_CLIP`: eight cases, the q/k/rel shapes of decode and of a 512-token
 prompt and an odd width (8/8 on the CPU build; on a card the same eight compare the kernel with
