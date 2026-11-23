@@ -8984,3 +8984,65 @@ prompt and an odd width (8/8 on the CPU build; on a card the same eight compare 
 the CPU reference). Red case, dropping MIN(factor, 1) in the CPU op (and in the kernel for the
 card tree): mean KL 3.417977, same top 38.938 %, and the unfused-chain equivalence check mismatches
 all eight shapes (max abs 0.61 to 14.5).
+
+## 0159-opencl-topk-moe-sigmoid-router.patch
+
+Patch 0064's top-k MoE fusion matched only a SOFT_MAX router. Inkling 2 Mini gates with
+`LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` and a per-expert selection bias, so its router ran
+unfused: sigmoid, reshape, bias add, argsort, view, get_rows, reshape, sum_rows, scale(sum, 1,
+1e-20), div, reshape — 11 nodes a layer, 48 layer visits a decode token.
+
+The matcher (`ggml_opencl_can_fuse_topk_moe_sigmoid`) scans the same tail after the sigmoid:
+ARGSORT, VIEW, GET_ROWS, RESHAPE, SUM_ROWS, then either `SCALE(sum, 1, eps)` + DIV or CLAMP + DIV,
+and the closing RESHAPE; the bias ADD is optional and is used only for the selection, the weights
+stay the unbiased probabilities. The fused kernel (`kernel_topk_moe_sigmoid_norm_n*`) takes one
+token a sub-group, reduces the k maxima over the lanes with descending ties to the lower expert,
+writes ids at the VIEW and weights at DIV (the closing RESHAPE is a view of DIV at the same byte
+offset, but its `nb[1]` is 4 because `ne[0] == 1`; DIV holds the contiguous k-float rows,
+`nb[1] == k*4`, which is the row stride the write needs), accumulates the selected p f32 serially
+by lane 0 in the j order SUM_ROWS uses, then adds eps or clamps and divides. Softmax arms keep
+the existing kernel and the same 9-node dispatch unchanged.
+
+`measured-here`, CPU tree (`test-export-graph-ops` at `-c 2048`, 0158 vs this patch) and the CPU KL
+gate on the IQ4_NL file, base logits the same window:
+
+| | before | after |
+|---|---|---|
+| decode graph nodes (`tg`) | 9,755 | 9,755 |
+| mean KL vs the base logits, default batch | - | 0.000000 |
+| mean KL vs a `-ub 1` base logits at `-ub 1` | - | -0.000000 |
+
+The CPU graph is unchanged by construction: the fusion is OpenCL-only, so the CPU gates cannot
+see it; the card numbers below are the evidence for the fused path. The batch base logits
+compared against the `-ub 1` decode path read 0.001989, a pre-existing path difference.
+
+`measured-here`, card (B60): KL against the CPU reference 0.001950 at the default
+batch and 0.001988 at `-ub 1` (the 0158 build reads 0.001999 / 0.002078, the path difference); KL
+against 0158's own `-ub 1` logits 0.000543, same top 99.251 %; decode d4096 35.52 -> 35.94 t/s,
+d0 38.89 -> 39.15. The 0.000543 is the sigmoid's own codegen: the fused kernel evaluates
+`1/(1+exp(-x))` inside the IQ matvec program, the unfused chain in `sigmoid.cl`'s work-item
+kernel, so p differs in the last bits and near-ties can flip an id; bit-identity of p would
+require dispatching the standalone sigmoid kernel, which deletes the fusion. Stated, not hidden.
+
+An earlier version regressed on the card: its `wnode` (10/9) wrote the closing RESHAPE,
+whose `nb[1] == 4` is not the row stride — 44 op cases failed and prefill fell to 412 t/s; its
+`k % 4` float4 sum path could not be separated from that bug and is dropped. The weight node is
+the DIV, card-proven.
+
+test-backend-ops: the builder gains the `norm_eps` arm and Inkling's router shapes, 128 experts
+top 8, n_tokens 1 and 512, with the bias pinned at +-3 (so a fused arm that writes the biased
+value as the weight fails clearly). The graph is built in the emitted node order; `validate_graph`
+asserts it on every backend, and a fused-launch counter
+(`ggml_backend_opencl_topk_moe_sigmoid_fused_count` through `get_proc_address`) fails the case
+when it did not reach the SIGMOID kernel; the card green run printed "fused arm reached" for the
+cases and `GGML_OPENCL_FUSE_TOPK_MOE=0` passes them on the unfused chain. CPU build 426/426.
+
+Architectures that set `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` (`code`): afmoe, cohere2moe,
+glm-dsa, glm4-moe, glm5-next, hy-v3, k2-horizon, laguna, mimo2, nemotron-h-moe, nemotron-h,
+step35 and inkling2 match when metadata has `expert_weights_norm` and there is no group
+selection; deepseek2 routes through `n_expert_groups`, llama4 selects on the logits and has
+`norm_w` false, so they do not match. Production: Inkling matches; Qwen3.8 27B and Dory are
+dense; coder qwen35moe and Flash-Next qwen4exp gate by SOFT_MAX and keep the existing arm.
+
+The red case: a build whose kernel writes the biased selection value as the weight (in
+`mul_mv_iq_q8_1.cl`). The +-3 Inkling cases and the card KL then fail while the ids stay right.

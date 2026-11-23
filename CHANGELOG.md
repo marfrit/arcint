@@ -32,6 +32,7 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   this: a kernel-argument count, and an f32 slice start in floats on float4 pointers (the 27B's KL had gone to 0.54).
   test-backend-ops carries the production shapes the split-K reaches (the 27B's ssm_alpha/beta, the coder's routers,
   Flash-Next's MTP injects); the red builds fail them on the card.
+
 - **`--llama-swa-window`: a window-sized sliding-window KV cache (opt-in).** The library's default
   sizes every SWA layer to the whole context (`swa_full`); the flag sets `swa_full = false`, so the
   SWA layers keep `n_swa + n_ubatch` cells (padded to 256). `measured-here` CPU: Inkling 2 Mini f16
@@ -58,6 +59,12 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   no separable effect; the card's 30.4/31.9 at depth 16,384 against 20.5 q8_0 / 24.3 f16
   served full-size is the device evidence).
 
+- **Inkling 2 Mini's SIGMOID MoE router as one launch** (patch 0159): 0064's fused top-k kernel gains a sigmoid arm
+  (with the selection bias and the renormalised weights); softmax routers keep their kernel. Card evidence (`measured-here`,
+  B60): the op test reaches the fused arm (counted) and its red build fails 24 cases; Inkling KL to the CPU reference
+  0.001950 (default batch) and 0.001988 (micro-batch 1), against 0158's 0.001999 / 0.002078; decode at 4k +0.6 to +1.2 %,
+  prefill unchanged. The residual against the unfused chain (KL 0.0005-0.0007) is the sigmoid's exp evaluated in another
+  program.
 
 ## 1.8.0 — 2026-11-22
 

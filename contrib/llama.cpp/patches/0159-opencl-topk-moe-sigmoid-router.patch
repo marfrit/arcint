@@ -1,0 +1,536 @@
+0159: fuse Inkling 2 Mini's SIGMOID MoE router (norm + top-k + renormalised weights) into 0064's top-k kernel.
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1232,6 +1232,9 @@ struct ggml_backend_opencl_context {
+     // the MoE router's softmax + top-k + normalized weights in one kernel, Intel:
+     // NPER buckets 4, 8, 16, 32, 64 (n_expert <= 64, 128, 256, 512, 1024)
+     cl_kernel kernel_topk_moe[5] = {};
++    // the SIGMOID router arm (Inkling 2 Mini): same buckets, separate kernels so
++    // the softmax arm's kernel and dispatch stay exactly as they were
++    cl_kernel kernel_topk_moe_sigmoid[5] = {};
+     cl_kernel kernel_topk_moe_legacy = nullptr;      // GGML_OPENCL_TOPK_MOE_LEGACY=1: the old work-group-per-token kernel
+     bool topk_moe_legacy = false;
+     // SCALE -> SILU / SCALE -> SIGMOID -> SCALE fused, Intel
+@@ -2865,6 +2868,11 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         CL_CHECK((backend_ctx->kernel_topk_moe[2] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n16", &err), err));
+                         CL_CHECK((backend_ctx->kernel_topk_moe[3] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n32", &err), err));
+                         CL_CHECK((backend_ctx->kernel_topk_moe[4] = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_n64", &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe_sigmoid[0] = clCreateKernel(prog, "kernel_topk_moe_sigmoid_norm_n4",  &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe_sigmoid[1] = clCreateKernel(prog, "kernel_topk_moe_sigmoid_norm_n8",  &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe_sigmoid[2] = clCreateKernel(prog, "kernel_topk_moe_sigmoid_norm_n16", &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe_sigmoid[3] = clCreateKernel(prog, "kernel_topk_moe_sigmoid_norm_n32", &err), err));
++                        CL_CHECK((backend_ctx->kernel_topk_moe_sigmoid[4] = clCreateKernel(prog, "kernel_topk_moe_sigmoid_norm_n64", &err), err));
+                         CL_CHECK((backend_ctx->kernel_topk_moe_legacy = clCreateKernel(prog, "kernel_topk_moe_softmax_norm_legacy", &err), err));
+                         CL_CHECK((backend_ctx->kernel_scale_act = clCreateKernel(prog, "kernel_scale_act_f32", &err), err));
+                     }
+@@ -11620,6 +11628,183 @@ static void ggml_cl_topk_moe_fused(ggml_backend_t backend, ggml_cgraph * cgraph,
+     backend_ctx->enqueue_ndrange_kernel(kk, 1, gws, lws, n[8]);
+ }
+ 
++// The SIGMOID router arm of the same fusion (llama.cpp's
++// LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID: Inkling 2 Mini's 128 experts, top 8):
++// SIGMOID, RESHAPE, [ADD the selection bias], ARGSORT, VIEW, GET_ROWS, RESHAPE,
++// SUM_ROWS, CLAMP | SCALE(1,eps), DIV, RESHAPE -> one kernel. The bias ADD
++// carries only the selection; the weights are the unbiased probabilities, as
++// llama-graph passes them. Returns the nodes fused (10 without the bias, 11
++// with it; 0: not this pattern), with the bias tensor and the norm arm.
++struct ggml_opencl_topk_moe_sigmoid {
++    int          nf;
++    bool         has_bias;
++    ggml_tensor * bias;
++    bool         eps_norm;   // SCALE(sum, 1, eps) instead of CLAMP
++    float        cmin, cmax, eps;
++};
++
++static bool ggml_opencl_can_fuse_topk_moe_sigmoid(const ggml_backend_opencl_context * backend_ctx,
++                                                  const ggml_cgraph * cgraph, int i,
++                                                  ggml_opencl_topk_moe_sigmoid * out) {
++    static const char * env = getenv("GGML_OPENCL_FUSE_TOPK_MOE");
++    if (backend_ctx->kernel_topk_moe_sigmoid[4] == nullptr || (env != nullptr && atoi(env) == 0) ||
++        i + 10 > cgraph->n_nodes) {
++        return false;
++    }
++    ggml_tensor ** n = cgraph->nodes + i;
++    if (n[0]->op != GGML_OP_UNARY || ggml_get_unary_op(n[0]) != GGML_UNARY_OP_SIGMOID ||
++        n[0]->type != GGML_TYPE_F32 || n[0]->src[0]->type != GGML_TYPE_F32 ||
++        n[0]->src[0]->nb[0] != sizeof(float) || n[0]->src[1] != nullptr ||
++        n[0]->ne[0] > 1024 || n[0]->ne[2] != 1 || n[0]->ne[3] != 1) {
++        return false;
++    }
++    const int64_t n_expert = n[0]->ne[0];
++    if (n[1]->op != GGML_OP_RESHAPE || n[1]->src[0] != n[0] || n[1]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // the selection bias is optional: llama4's sigmoid has none, Inkling's ADD
++    // feeds ARGSORT while GET_ROWS reads the unbiased probs
++    bool has_bias = false;
++    int j = 2;
++    if (n[2]->op == GGML_OP_ADD && n[2]->src[0] == n[0] && n[2]->type == GGML_TYPE_F32 &&
++        ggml_is_contiguous(n[2]->src[1]) && n[2]->src[1]->type == GGML_TYPE_F32 &&
++        n[2]->src[1]->ne[0] == n_expert && n[2]->src[1]->ne[1] == 1 &&
++        n[2]->src[1]->nb[0] == sizeof(float)) {
++        has_bias = true;
++        j = 3;
++    }
++    // the rest of the scan: ARGSORT, VIEW, GET_ROWS, RESHAPE, SUM_ROWS, the norm,
++    // DIV, RESHAPE. Without the bias j == 2; with it j == 3 and the window is 11.
++    if (i + j + 8 > cgraph->n_nodes) {
++        return false;
++    }
++    const int nf = j + 8;
++    const int argsort = j, view = j + 1, get_rows = j + 2, reshape_i = j + 3,
++              sum_rows = j + 4, norm = j + 5, div = j + 6, reshape_o = j + 7;
++    const ggml_tensor * sel = has_bias ? n[2] : n[0];
++    if (n[argsort]->op != GGML_OP_ARGSORT || n[argsort]->src[0] != sel ||
++        ggml_get_op_params_i32(n[argsort], 0) != GGML_SORT_ORDER_DESC ||
++        n[view]->op != GGML_OP_VIEW || n[view]->src[0] != n[argsort] ||
++        n[view]->view_offs != 0 || n[view]->ne[0] > 32 ||
++        n[get_rows]->op != GGML_OP_GET_ROWS || n[get_rows]->src[0] != n[1] || n[get_rows]->src[1] != n[view] ||
++        n[reshape_i]->op != GGML_OP_RESHAPE || n[reshape_i]->src[0] != n[get_rows] ||
++        n[sum_rows]->op != GGML_OP_SUM_ROWS || n[sum_rows]->src[0] != n[reshape_i] ||
++        n[norm]->src[0] != n[sum_rows] ||
++        n[div]->op != GGML_OP_DIV || n[div]->src[0] != n[reshape_i] || n[div]->src[1] != n[norm] ||
++        n[reshape_o]->op != GGML_OP_RESHAPE || n[reshape_o]->src[0] != n[div] ||
++        n[div]->type != GGML_TYPE_F32 || !ggml_is_contiguous(n[div])) {
++        return false;
++    }
++    bool eps_norm = false;
++    float cmin = 0.0f, cmax = 0.0f, eps = 0.0f;
++    if (n[norm]->op == GGML_OP_CLAMP) {
++        memcpy(&cmin, (const float *) n[norm]->op_params + 0, sizeof(float));
++        memcpy(&cmax, (const float *) n[norm]->op_params + 1, sizeof(float));
++    } else if (n[norm]->op == GGML_OP_SCALE) {
++        float s_ = 0.0f;
++        memcpy(&s_,  (const float *) n[norm]->op_params + 0, sizeof(float));
++        memcpy(&eps, (const float *) n[norm]->op_params + 1, sizeof(float));
++        if (s_ != 1.0f || eps <= 0.0f) return false;
++        eps_norm = true;
++    } else {
++        return false;
++    }
++    if (n[norm]->type != GGML_TYPE_F32 || n[div]->src[0]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    static const enum ggml_op ops_sig[10] = { GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW,
++                                              GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
++                                              GGML_OP_DIV, GGML_OP_RESHAPE };
++    static const enum ggml_op ops_bias[11] = { GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT,
++                                               GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS,
++                                               GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE };
++    // the norm node is CLAMP or SCALE: compare the ops with the norm slot the
++    // graph actually has, so a SCALE there is not read as a CLAMP mismatch
++    enum ggml_op ops_copy[11];
++    memcpy(ops_copy, has_bias ? ops_bias : ops_sig, (size_t) nf * sizeof(enum ggml_op));
++    ops_copy[sum_rows + 1] = n[norm]->op;
++    const int outs[2] = { i + view, i + reshape_o };
++    if (!ggml_can_fuse_subgraph(cgraph, i, nf, ops_copy, outs, 2)) {
++        return false;
++    }
++    out->nf = nf;
++    out->has_bias = has_bias;
++    out->bias = has_bias ? n[2]->src[1] : nullptr;
++    out->eps_norm = eps_norm;
++    out->cmin = cmin; out->cmax = cmax; out->eps = eps;
++    return true;
++}
++
++// patch 0159: how many times the SIGMOID top-k arm ran, for test-backend-ops'
++// "the test reached the fused arm" check. One per fused launch.
++static int64_t g_topk_moe_sigmoid_fused_count = 0;
++static int64_t ggml_backend_opencl_topk_moe_sigmoid_fused_count(void) {
++    return g_topk_moe_sigmoid_fused_count;
++}
++
++static void ggml_cl_topk_moe_sigmoid_fused(ggml_backend_t backend, ggml_cgraph * cgraph, int i,
++                                           const ggml_opencl_topk_moe_sigmoid * p) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    ggml_tensor ** n = cgraph->nodes + i;
++    g_topk_moe_sigmoid_fused_count++;
++    const ggml_tensor * logits = n[0]->src[0];
++    const int view = p->has_bias ? 4 : 3;
++    // the weights the consumer reads: the closing RESHAPE is a view of DIV at the
++    // same byte offset, but its nb[1] is 4 (ne[0] == 1), unusable as the row
++    // stride; DIV holds the contiguous k-float rows (nb[1] == k*4), so the kernel
++    // writes there. Card-proven: multi-token KL 0.001950, -ub1 0.001988.
++    const int wnode = p->has_bias ? 9 : 8;
++    const ggml_tensor * ids = n[view];
++    const ggml_tensor * w   = n[wnode];
++    ggml_tensor_extra_cl * el = (ggml_tensor_extra_cl *) logits->extra;
++    ggml_tensor_extra_cl * ei = (ggml_tensor_extra_cl *) ids->extra;
++    ggml_tensor_extra_cl * ew = (ggml_tensor_extra_cl *) w->extra;
++    const cl_ulong offl = el->offset + logits->view_offs, offi = ei->offset + ids->view_offs, offw = ew->offset + w->view_offs;
++    const cl_ulong nbl1 = logits->nb[1], nbi1 = ids->nb[1], nbw1 = w->nb[1];
++    const int n_expert = (int) logits->ne[0], k = (int) ids->ne[0], n_tok = (int) logits->ne[1];
++    int bucket = 0;
++    for (int b = 0; b < 5; ++b) {
++        if ((4 << b) * 16 >= n_expert) { bucket = b; break; }
++    }
++    cl_kernel kk = backend_ctx->kernel_topk_moe_sigmoid[bucket];
++    int a = 0;
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_mem),   &el->data_device));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &offl));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &nbl1));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_mem),   &ei->data_device));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &offi));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &nbi1));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_mem),   &ew->data_device));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &offw));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &nbw1));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &n_expert));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &k));
++    const int sg_size = 16, tokens_per_wg = 4;
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &n_tok));
++    const float cmin = p->cmin, cmax = p->cmax, eps = p->eps;
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(float),    &cmin));
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(float),    &cmax));
++    if (p->has_bias) {
++        ggml_tensor_extra_cl * eb = (ggml_tensor_extra_cl *) p->bias->extra;
++        const cl_ulong offb = eb->offset + p->bias->view_offs;
++        CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_mem),   &eb->data_device));
++        CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &offb));
++        const int one = 1;
++        CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &one));
++    } else {
++        CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_mem),   nullptr));
++        const cl_ulong offb = 0;
++        CL_CHECK(clSetKernelArg(kk, a++, sizeof(cl_ulong), &offb));
++        const int zero = 0;
++        CL_CHECK(clSetKernelArg(kk, a++, sizeof(int),      &zero));
++    }
++    CL_CHECK(clSetKernelArg(kk, a++, sizeof(float),    &eps));
++    size_t lws[1], gws[1];
++    lws[0] = tokens_per_wg * sg_size;
++    gws[0] = (size_t) ((n_tok + tokens_per_wg - 1) / tokens_per_wg) * lws[0];
++    backend_ctx->enqueue_ndrange_kernel(kk, 1, gws, lws, n[wnode]);
++}
++
+ // SCALE (s, bias b) -> SILU, or SCALE -> SIGMOID [-> SCALE (s2, no bias)], on
+ // contiguous f32 of one shape: the count of nodes fused (0: none)
+ static int ggml_opencl_can_fuse_scale_act(const ggml_backend_opencl_context * backend_ctx, const ggml_cgraph * cgraph, int i,
+@@ -12261,6 +12446,14 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+             i += 9;
+             continue;
+         }
++        if (!backend_ctx->disable_fusion) {
++            ggml_opencl_topk_moe_sigmoid sig;
++            if (ggml_opencl_can_fuse_topk_moe_sigmoid(backend_ctx, cgraph, i, &sig)) {
++                ggml_cl_topk_moe_sigmoid_fused(backend, cgraph, i, &sig);
++                i += sig.nf - 1;
++                continue;
++            }
++        }
+         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+             ggml_opencl_op_norm_fused(backend, node, cgraph->nodes[i+1], cgraph->nodes[i+2]);
+             i += 2;
+@@ -18532,6 +18725,9 @@ static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q,
+ }
+ 
+ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, "ggml_backend_opencl_topk_moe_sigmoid_fused_count") == 0) {
++        return (void *) ggml_backend_opencl_topk_moe_sigmoid_fused_count;
++    }
+     if (strcmp(name, "ggml_backend_opencl_set_tensor_slices") == 0) {
+         return (void *) ggml_backend_opencl_set_tensor_slices;
+     }
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+@@ -2577,3 +2577,74 @@ kernel void kernel_scale_act_f32(global const char * x, ulong offx, global char
+     const float r = act == 0 ? v / (1.0f + exp(-v)) : s2 / (1.0f + exp(-v));
+     ((global float *)(d + offd))[i] = r;
+ }
++
++// ---- the same top-k as one kernel for a SIGMOID router (llama.cpp's
++// LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID, Inkling 2 Mini): p = sigmoid(logit),
++// an optional per-expert bias added only for the selection (the weights stay
++// the unbiased probabilities), the k largest selection values in descending
++// order (ties: the lower expert), and their probabilities normalized by the
++// clamped sum or by the sum plus a fixed epsilon (llama-graph's
++// expert_weights_norm_eps path: SCALE(sum, 1, eps) before DIV).
++//
++// The unfused chain's order is kept: the weights are the p of the selected ids
++// in the argsort's descending order, accumulated f32 serially by lane 0 in the
++// same j order as SUM_ROWS, then divided. Same shape of kernel, same sub-group
++// a token, same buckets; the softmax kernels above are untouched. ----
++#define TOPK_MOE_SIG_BODY(NPER) \
++    const int sg = get_sub_group_id(), ln = get_sub_group_local_id(); \
++    const int t = get_group_id(0) * TOPK_MOE_TOKENS_PER_WG + sg; \
++    if (t >= n_tok) return; \
++    \
++    global const float * x = (global const float *)(lg + offl + (ulong)t * nbl1); \
++    global const float * bsel = has_bias ? (global const float *)(bias + offb) : NULL; \
++    global int * io = (global int *)(ids + offi + (ulong)t * nbi1); \
++    global float * wo = (global float *)(w + offw + (ulong)t * nbw1); \
++    \
++    float p[NPER]; \
++    ulong sel = 0; \
++    _Pragma("unroll") \
++    for (int j = 0; j < NPER; ++j) { \
++        const int i = ln + TOPK_MOE_SG_SIZE * j; \
++        p[j] = i < n_expert ? 1.0f / (1.0f + exp(-x[i])) : -INFINITY; \
++    } \
++    \
++    float wsum = 0.0f; \
++    for (int j = 0; j < k; ++j) { \
++        float bv = -INFINITY; \
++        int   bi = INT_MAX; \
++        _Pragma("unroll") \
++        for (int q = 0; q < NPER; ++q) { \
++            const int i = ln + TOPK_MOE_SG_SIZE * q; \
++            const float sv = p[q] + (has_bias && i < n_expert ? bsel[i] : 0.0f); \
++            if ((sel & (1UL << q)) == 0 && sv > bv) { bv = sv; bi = i; } \
++        } \
++        const float gv = sub_group_reduce_max(bv); \
++        const int   gi = sub_group_reduce_min(bv == gv ? bi : INT_MAX); \
++        /* the unbiased probability at the selected id, from the lane holding it */ \
++        const int   sq = gi < n_expert ? gi / TOPK_MOE_SG_SIZE : 0; \
++        const float pv = (gi < n_expert && (gi & (TOPK_MOE_SG_SIZE - 1)) == ln) ? p[sq] : 0.0f; \
++        const float pw = sub_group_reduce_add(pv); \
++        if (ln == 0) { io[j] = gi; wo[j] = pw; wsum += pw; } \
++        if (gi < n_expert && (gi & (TOPK_MOE_SG_SIZE - 1)) == ln) sel |= 1UL << sq; \
++    } \
++    if (ln == 0) { \
++        /* SCALE(sum, 1, eps) then DIV, or clamp then DIV: the unfused order */ \
++        const float sum = norm_eps > 0.0f ? (wsum + norm_eps) : clamp(wsum, cmin, cmax); \
++        for (int j = 0; j < k; ++j) wo[j] = wo[j] / sum; \
++    }
++
++#define TOPK_MOE_SIG_KERNEL(N) \
++__attribute__((intel_reqd_sub_group_size(TOPK_MOE_SG_SIZE))) \
++kernel void kernel_topk_moe_sigmoid_norm_n##N(global const char * lg, ulong offl, ulong nbl1, \
++                                              global char * ids, ulong offi, ulong nbi1, \
++                                              global char * w, ulong offw, ulong nbw1, \
++                                              int n_expert, int k, int n_tok, float cmin, float cmax, \
++                                              global const char * bias, ulong offb, int has_bias, float norm_eps) { \
++    TOPK_MOE_SIG_BODY(N) \
++}
++
++TOPK_MOE_SIG_KERNEL(4)
++TOPK_MOE_SIG_KERNEL(8)
++TOPK_MOE_SIG_KERNEL(16)
++TOPK_MOE_SIG_KERNEL(32)
++TOPK_MOE_SIG_KERNEL(64)
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1299,6 +1299,10 @@ struct test_case {
+     virtual bool run_whole_graph() { return false; }
+     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
+     virtual bool use_weight_context() { return false; }
++    // patch 0159: a whole-graph case that is meant to land on a fused arm says so,
++    // and its built graph is checked against that arm's node order
++    virtual int fusion_arm() { return 0; }   // 0 none, 1 the OpenCL SIGMOID top-k arm
++    virtual std::string validate_graph(ggml_cgraph * gf) { GGML_UNUSED(gf); return ""; }
+ 
+     ggml_cgraph * gf = nullptr;
+     ggml_cgraph * gb = nullptr;
+@@ -1476,6 +1480,15 @@ struct test_case {
+             ggml_graph_add_node(gf, sentinel);
+         }
+ 
++        // patch 0159: a case that names a fused arm checks its built node order here,
++        // on every backend, so it cannot silently pass on the unfused chain
++        std::string graph_err = validate_graph(gf);
++        if (!graph_err.empty()) {
++            test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, false, graph_err);
++            print_test_result_locked(output_printer, result);
++            return test_status_t::FAIL;
++        }
++
+         // randomize tensors
+         initialize_tensors(ctx.get());
+         if (ctx_weights) {
+@@ -1561,13 +1574,41 @@ struct test_case {
+         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
+             fused_nodes_to_verify.push_back(out);
+         }
++        // patch 0159: count the fused launches the case causes; 0 means the test
++        // measured the unfused chain and its red mutation would not be seen
++        int64_t fused_before = 0;
++        int64_t (*fused_count)(void) = nullptr;
++        if (fusion_arm() != 0) {
++            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend1));
++            fused_count = (int64_t (*)(void)) ggml_backend_reg_get_proc_address(
++                reg, "ggml_backend_opencl_topk_moe_sigmoid_fused_count");
++            if (fused_count) {
++                fused_before = fused_count();
++            }
++        }
++
+         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                                fused_nodes_to_verify.size());
+ 
++        bool reached_fused = false;
++        if (fused_count) {
++            const char * env_fuse = getenv("GGML_OPENCL_FUSE_TOPK_MOE");
++            const bool fusion_on = getenv("GGML_OPENCL_DISABLE_FUSION") == nullptr &&
++                                   (env_fuse == nullptr || atoi(env_fuse) != 0);
++            const int64_t delta = fused_count() - fused_before;
++            if (fusion_on && delta <= 0) {
++                ud.ok = false;
++            } else if (delta > 0) {
++                reached_fused = true;
++                printf("[%s] fused arm reached: %lld launch(es) ", current_op_name.c_str(), (long long) delta);
++            }
++        }
++
+         // Create test result
+         bool        test_passed = ud.ok && cmp_ok;
+-        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
++        std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" :
++                                    (fusion_arm() != 0 && fused_count && !reached_fused ? "fused arm not reached" : "test failed"));
+         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
+                            error_msg);
+ 
+@@ -8148,6 +8189,8 @@ struct test_topk_moe : public test_case {
+     const bool bias_probs;
+     const MoeGatingFunc gating_func;
+     const float scale_w;
++    const float norm_eps;
++    const float bias_mag;   // 1.0 keeps the uniform init; larger pins a bias the fused arm must carry
+     ggml_tensor * weights {};
+     ggml_tensor * selected_experts {};
+ 
+@@ -8156,17 +8199,22 @@ struct test_topk_moe : public test_case {
+                   bool                   with_norm       = false,
+                   bool                   bias_probs      = false,
+                   MoeGatingFunc          gating_func     = GATING_FUNC_SOFTMAX,
+-                  float                  scale_w         = 0.0f) :
++                  float                  scale_w         = 0.0f,
++                  float                  norm_eps        = 0.0f,
++                  float                  bias_mag        = 1.0f) :
+         ne(ne),
+         n_expert_used(n_expert_used),
+         with_norm(with_norm),
+         bias_probs(bias_probs),
+         gating_func(gating_func),
+-        scale_w(scale_w) {
++        scale_w(scale_w),
++        norm_eps(norm_eps),
++        bias_mag(bias_mag) {
+         GGML_ASSERT(n_expert_used <= ne[0]);
++        GGML_ASSERT(!norm_eps || with_norm);
+     }
+ 
+-    std::string vars() override { return VARS_TO_STR6(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w); }
++    std::string vars() override { return VARS_TO_STR8(ne, n_expert_used, with_norm, bias_probs, gating_func, scale_w, norm_eps, bias_mag); }
+ 
+     std::string op_desc(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+@@ -8186,6 +8234,11 @@ struct test_topk_moe : public test_case {
+             (gating_func == GATING_FUNC_SQRT_SOFTPLUS) ? ggml_sqrt(ctx, ggml_softplus(ctx, logits)) : logits;
+         ggml_set_name(probs, "probs");
+ 
++        // the router's own graph order: the probs reshape after the sigmoid, the
++        // bias add on the unary output, then the argsort
++        ggml_tensor * probs_3d = ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens);
++        ggml_set_name(probs_3d, "probs_3d");
++
+         ggml_tensor * selection_probs = probs;
+         if (bias_probs) {
+             ggml_tensor * exp_probs_b = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+@@ -8197,7 +8250,7 @@ struct test_topk_moe : public test_case {
+         selected_experts = ggml_argsort_top_k(ctx, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+         ggml_set_name(selected_experts, "selected_experts");
+ 
+-        weights = ggml_get_rows(ctx, ggml_reshape_3d(ctx, probs, 1, n_expert, n_tokens), selected_experts); // [1, n_expert_used, n_tokens]
++        weights = ggml_get_rows(ctx, probs_3d, selected_experts); // [1, n_expert_used, n_tokens]
+         ggml_set_name(weights, "weights");
+ 
+         if (gating_func == GATING_FUNC_SOFTMAX_WEIGHT) {
+@@ -8211,7 +8264,12 @@ struct test_topk_moe : public test_case {
+             ggml_tensor * weights_sum = ggml_sum_rows(ctx, weights); // [1, n_tokens]
+             ggml_set_name(weights_sum, "weights_sum");
+ 
+-            weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5, INFINITY);
++            if (norm_eps > 0.0f) {
++                // llama-graph's expert_weights_norm_eps arm: SCALE(sum, 1, eps)
++                weights_sum = ggml_scale_bias(ctx, weights_sum, 1.0f, norm_eps);
++            } else {
++                weights_sum = ggml_clamp(ctx, weights_sum, 6.103515625e-5, INFINITY);
++            }
+             weights = ggml_div(ctx, weights, weights_sum); // [n_expert_used, n_tokens]
+             weights = ggml_reshape_3d(ctx, weights, 1, n_expert_used, n_tokens);
+         }
+@@ -8223,9 +8281,66 @@ struct test_topk_moe : public test_case {
+         ggml_set_name(weights, "weights");
+         return weights;
+     }
++    // patch 0159: a bias large enough that a fused arm which carries the biased
++    // selection value as the weight fails clearly, not in the last bits
++    void initialize_tensors(ggml_context * ctx) override {
++        test_case::initialize_tensors(ctx);
++        if (bias_mag <= 1.0f) {
++            return;
++        }
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->name && strcmp(t->name, "exp_probs_b") == 0) {
++                const size_t nels = ggml_nelements(t);
++                std::vector<float> data(nels);
++                for (size_t i = 0; i < nels; ++i) {
++                    data[i] = (i & 1) ? -bias_mag : bias_mag;
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, nels * sizeof(float));
++            }
++        }
++    }
++
+     // Verify two outputs
+     std::vector<ggml_tensor *> fusion_test_nodes() override { return { selected_experts, weights }; }
+ 
++    // The SIGMOID arm of the OpenCL top-k fusion: norm on, eps or clamp, k <= 16
++    int fusion_arm() override {
++        return (gating_func == GATING_FUNC_SIGMOID && with_norm && scale_w == 0.0f &&
++                n_expert_used <= 32 && ne[0] <= 1024) ? 1 : 0;
++    }
++
++    // Prove the built graph is in the node order the matcher accepts, so a test
++    // that cannot reach the fused arm fails instead of passing on the unfused chain.
++    std::string validate_graph(ggml_cgraph * gf) override {
++        if (fusion_arm() != 1) {
++            return "";
++        }
++        const int nf = bias_probs ? 11 : 10;
++        const enum ggml_op want11[11] = { GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT,
++                                          GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS,
++                                          GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE };
++        const enum ggml_op want10[10] = { GGML_OP_UNARY, GGML_OP_RESHAPE, GGML_OP_ARGSORT,
++                                          GGML_OP_VIEW, GGML_OP_GET_ROWS, GGML_OP_RESHAPE, GGML_OP_SUM_ROWS,
++                                          GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE };
++        const int norm_j = nf - 3;   // the norm node before DIV: CLAMP or SCALE
++        const int n_nodes = ggml_graph_n_nodes(gf);
++        for (int i = 0; i + nf <= n_nodes; ++i) {
++            bool ok = true;
++            for (int j = 0; j < nf; ++j) {
++                const ggml_tensor * node = ggml_graph_node(gf, i + j);
++                const enum ggml_op want = j == norm_j ? node->op : (bias_probs ? want11[j] : want10[j]);
++                if (node->op != want || (j == norm_j && want != GGML_OP_CLAMP && want != GGML_OP_SCALE)) {
++                    ok = false;
++                    break;
++                }
++            }
++            if (ok && ggml_get_unary_op(ggml_graph_node(gf, i)) == GGML_UNARY_OP_SIGMOID) {
++                return "";   // the arm's node sequence is present at i
++            }
++        }
++        return "TOPK_MOE SIGMOID arm: the built graph is not in the node order the fusion accepts";
++    }
++
+     // allow output in arbitrary order
+     double err(const float * a, const float * b, size_t n) override {
+         std::vector<float> a2(n);
+@@ -13738,6 +13853,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // the smallest and the largest private-array bucket
+     test_cases.emplace_back(new test_topk_moe({64, 1, 1, 1}, 8, true, false, GATING_FUNC_SOFTMAX, 0.0f));
+     test_cases.emplace_back(new test_topk_moe({1024, 1, 1, 1}, 10, true, false, GATING_FUNC_SOFTMAX, 0.0f));
++    // Inkling 2 Mini's SIGMOID router: 128 experts, top 8, a per-expert
++    // selection bias pinned at +-3 (the real bias is small; a fused arm that
++    // carries the biased value as the weight has to fail here clearly), weights
++    // renormalised by SCALE(sum, 1, 1e-20), one decode token and a 512-token
++    // prefill chunk. The softmax cases above stay as they
++    // are: the SIGMOID arm is a separate kernel and dispatch.
++    test_cases.emplace_back(new test_topk_moe({128, 1, 1, 1},   8, true, true, GATING_FUNC_SIGMOID, 0.0f, 1e-20f, 3.0f));
++    test_cases.emplace_back(new test_topk_moe({128, 512, 1, 1}, 8, true, true, GATING_FUNC_SIGMOID, 0.0f, 1e-20f, 3.0f));
+ 
+     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
