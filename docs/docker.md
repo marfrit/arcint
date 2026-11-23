@@ -182,22 +182,29 @@ all, which is why the image is Fedora-based.
 Image against native, the same patched llama.cpp tree built twice
 (`measured-here`, 2026-11-23, Arc Pro B70 capped at 220 W, Inkling 2 Mini
 IQ4_NL, `llama-bench -p 512 -n 128 -d 0,4096,32768 -ngl 99 -fa on -r 3`, two
-interleaved rounds on a quiet host): natively (`GGML_NATIVE=ON`, runtime
+interleaved rounds; recipe builds were held off, the production agent on
+the other card was up and idle, other containers on the host kept running,
+and the load average was 6.6 at the first arm (the tail of the container image's own build)
+and 1.1-1.2 in the second round): natively (`GGML_NATIVE=ON`, runtime
 26.27) pp512 669-675 and tg128 45.3 t/s, at depth 4,096 638-643 and 41.6, at
 32,768 563-564 and 39.0; in the 1.8.0 image's builder (`GGML_NATIVE=OFF`,
 x86-64-v3) with the image's runtime 26.18, pp512 663 and tg128 44.3-44.7, at
 4,096 634 and 41.3, at 32,768 557 and 38.8. The image costs 0.5-2 % in decode
 and 1-1.5 % in prefill. Served through arcint, decode is equally close
 (43.4 against 43.2 t/s over six runs each); single runs dropped to 22-33 t/s in
-both setups while build jobs ran on the same host's CPUs, because decode on
-these cards is bound by the host's kernel submission.
+both setups while build jobs ran on the same host's CPUs, which fits decode on
+these cards being bound by the host's kernel submission (an inference, not
+measured).
 
 The host's kernel matters too: the numbers here run on Linux 7.0.14 with an
-xe module that differs from stable v7.0.14 only by upstream 9f83c94469ff
-("drm/xe: Order ring writes before ring tail updates", a cherry-pick of
-136360290f31, in mainline from v7.2). It adds a write barrier before the ring
-tail is published: a correctness fix that, if anything, costs a little time,
-named here as a difference, not as a source of speed.
+out-of-tree xe module whose only change on the submission path against stable
+v7.0.14 is upstream 9f83c94469ff ("drm/xe: Order ring writes before ring tail
+updates", a cherry-pick of 136360290f31, in mainline from v7.2). It adds a write
+barrier before the ring tail is published: a correctness fix that, if anything,
+costs a little time, named here as a difference, not as a source of speed. The
+module's other changes against v7.0.14 are an access check for observation
+streams, two checks on imported buffers in the display code, and the trace
+headers' include path for the out-of-tree build.
 
 Keep `GGML_OPENCL_KERNEL_CACHE_DIR` on a persistent volume: with a cold cache
 the image starts in about 90 s on a B70 (14 s with the cache warm), because

@@ -77,11 +77,11 @@ The A770 rows in this section and the next are historical (card retired,
 last measured with release 1.7.0); the B60 rows are current.
 
 The numbers here are native builds on Debian trixie with Intel's compute
-runtime 26.27.39122.11 (IGC 2.38.2) and Linux 7.0.14, whose xe module differs
-from stable v7.0.14 only by upstream 9f83c94469ff ("drm/xe: Order ring writes
-before ring tail updates", in mainline from v7.2): a write barrier before the
-ring tail is published, a correctness fix that costs a little time if anything. The
-container image ships Fedora 43's runtime 26.18 and an x86-64-v3 build; with
+runtime 26.27.39122.11 (IGC 2.38.2) and Linux 7.0.14 with an out-of-tree xe
+module, whose only change on the submission path against stable v7.0.14 is
+upstream 9f83c94469ff ("drm/xe: Order ring writes before ring tail updates", in
+mainline from v7.2): a write barrier before the ring tail is published, a
+correctness fix that costs a little time if anything. The container image ships Fedora 43's runtime 26.18 and an x86-64-v3 build; with
 `llama-bench` on a B70 it decodes 0.5-2 % slower than the native build
 ([docs/docker.md](docs/docker.md), "The GPU runtime").
 
@@ -341,8 +341,9 @@ generated tokens, measured at a context depth of 0, 4,096 and 32,768 tokens.
 | mainline llama.cpp, Vulkan backend, same tool and card | 33.3 / 32.3 / 30.1 | 8.3 / 10.1 / 10.2 |
 
 The B70 gives the same answers (mean KL against the CPU reference identical to the B60's, the
-acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 23-30 % on generation:
-Inkling's decode is bound by the number of small kernel launches more than by memory bandwidth.
+acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 23-30 % on generation,
+which fits Inkling's decode being bound by the number of small kernel launches more than by
+memory bandwidth (an inference).
 
 Against Vulkan on the B60, arcint is 11-13x faster on the prompt and
 2.9-4.4x on generation. The speed work after first light: small copy kernels
