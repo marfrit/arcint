@@ -8813,3 +8813,100 @@ Two test-backend-ops cases run the quantized pair's prompt path with the bias, I
 (16,448 keys, 128 rows). No case reached that path before: 0142's quantized bias cases have 4 rows
 (decode) and its prompt case is f16, so the whole FLASH_ATTN_EXT suite passed on 0150 even with
 64-key blocks forced (3,171 / 3,171). With the two cases: 3,173 / 3,173 on 0152 at both block sizes.
+
+## 0156-opencl-q8_0-mul_mat_id-int8-dot.patch
+
+Inkling 2 Mini's four coda layers keep their experts in Q8_0: gate_up K=2304 and down K=1152,
+128 experts, top-8. Their `MUL_MAT_ID` had no OpenCL fast path, so a decode token took the generic
+flat float kernel (`kernel_mul_mv_id_q8_0_f32_flat`, one float dot per value) with the downgrade
+line `op=MUL_MAT_ID type=q8_0 k=1152|2304 path=generic reason=no-fast-path`: 8 launches at about
+84 us each, 0.67 ms of the token, against the IQ4_NL experts' `kernel_mul_mv_id_iq4_nl_q8_1`
+(88 launches, 4.8 ms, about 330 GB/s on the same card at 1.8.0). The IQ types reach their fast
+path through `ggml_cl_kq_type_index`, which returns -1 for Q8_0, so the Q8_0 product fell through
+to the generic arm.
+
+The new arm, `ggml_cl_mul_mat_id_q8_0`, takes Q8_0's decode shapes the same way the IQ types do:
+`kernel_kq_quantize_q8_1` quantizes the activation to q8_1, and `kernel_mul_mv_id_q8_0_q8_1` in
+`mul_mv_iq_q8_1.cl` runs the int8 dot of the existing `mv_q8_0` helper on the flat Q8_0 planes,
+one work-group per (expert pair, token) on the third dimension. The pair is the group id: slot i =
+k % n_used, token t = k / n_used, the expert from `ids`, the activation column (i % ne11) + t *
+ne11, and the weight blocks at the expert's rows (e * ne01 + row), as the matvec does. Guarded to
+`n_tok < 16` (a decode batch; prefill keeps the flat kernel), Q8_0 / f32 / i32 / f32, ne00 divisible
+by 32, contiguous, the flat SoA planes (`ggml_cl_is_q8_0_soa`), not an expert cache's `.slots` /
+`.bank` (their -1 ids are not placed here), and src0's ne3 = 1. The kernel is built with `-DMV_Q8_0`
+in the one-column program, which is now always done; the q8_0 matvec above stays behind the 0115 arm.
+
+Four test-backend-ops cases take exactly the coda shapes (Q8_0, 128 experts, top-8, K 2304, 2304
+rows, 1 and 4 tokens; K 1152, 2304 rows, 1 and 4 tokens) in the test list and in the perf list, so
+perf mode times them. The CPU build's `test-backend-ops -o MUL_MAT_ID` passes, the OpenCL build
+compiles and the .cl passes the C preprocessor. The card numbers are still to be taken: the gate is
+the same answers within rounding, then the launches of `perf -o "MUL_MAT_ID.*Q8_0"` before and after.
+
+## 0157-opencl-tiny-mv-splitk.patch
+
+Carried from 0151 of the ink-tmv tree, renumbered: it was written against an older base, so it
+is applied here after 0156 with offsets resolved and the logic unchanged. A one-column decode
+matvec of few output rows leaves most of the card idle: the f32 GEMV puts one work-group per
+output row (out=48 on 160 cores) and the flat q8_0 kernel one work-group every 8 rows (out=24 is
+3 work-groups). Both get a split-K variant that reduces a K slice of one (row) per work-group into
+partials, and `kernel_sum_slices_f32` sums the slices in a fixed order, so a shape sees a fixed
+slice count and a fixed order. `kernel_gemv_f32_f32_splitk` (in `mul_mm_f32_f32_l4_lm.cl`) covers
+f32 weights at one activation row, out < 512 and K >= 1024, the slices picked so out * slices
+reaches about 256 while K divides by 4 * slices; `kernel_mul_mv_q8_0_f32_splitk` (in
+`mul_mv_q8_0_f32_flat.cl`) covers the flat q8_0 planes at one column, 2D weight, out < 512 and K
+>= 1024, blocks divisible by the slice count. A multi-column step (an MTP or spec verify, ne11 > 1)
+keeps the existing kernels. `GGML_OPENCL_F32_SKINNY=0` still turns the f32 arm off.
+
+Fourteen test-backend-ops cases are added for the Inkling 2 Mini decode shapes (one activation row,
+K=2304, f32 and q8_0 weights, out 2, 3, 4, 5, 24, 32, 64, 128, 384) in the test list and the perf
+list, timed before and after. The CPU build's `test-backend-ops -o MUL_MAT` passes and the OpenCL
+build compiles.
+
+The split-K takes every model whose decode has a one-column matvec with out < 512 and K >= 1024
+of f32 or flat q8_0 weights. In the agent's Qwen3.8-27B Q4_K_M all 96 such tensors are the
+48 gated delta-net layers' `ssm_alpha.weight` and `ssm_beta.weight` (5120 x 48, five slices), whose
+F32 weights the f32 arm covers. Qwen3.8-Flash-Next IQ3_S has none: its F32 two-dimensional
+weights are `ssm_conv1d.weight` (K 4) and its only two-dimensional Q8_0 weight is
+`ffn_down_shexp.weight` (K 640, below 1024); `output_hc_down.weight` has 320 rows but is BF16,
+which neither kernel covers. Inkling 2 Mini's f32 48-row `ssm_alpha` / `ssm_beta` and its small
+q8_0 projections are the shapes the new cases use; the card numbers are still to be taken.
+
+## 0158-ggml-norm-clip-fused.patch
+
+Inkling 2 Mini clips three rows per layer visit: the q rows at head width 128 over 24 heads, the
+k rows at 128 over 8, and the relative rows at width 16 over 24 heads. Each clip ran as a chain
+of small ops on the row: the optional per-channel scale, sqr, sum_rows, sqrt, scale_bias(1, eps),
+fill(threshold), div, clamp(0, 1) and mul, 9 nodes with a scale and 8 without, 26 a visit, 48
+visits a decode token. The thresholds are the metadata's `attention.qk_clip` 22.627417 for q and
+k and `attention.relative_clip` 8.0 for the relative rows; the eps is the graph's 1e-6.
+
+The patch adds `GGML_OP_NORM_CLIP`: src0 the rows, src1 the per-channel scale or null, op params
+threshold and eps; `ggml_norm_clip` builds it and the Inkling graph's `clip()` emits it, so no fill
+constant is created. The CPU reference keeps the chain's order: the per-channel mul, the sum of
+squares in row order with the wide accumulator the existing `sum_rows` uses, sqrt, then the
+scale_bias order `norm*1 + eps`, then `threshold/norm`, then MIN(factor, 1) before MAX(factor, 0),
+then the mul. It is bit-identical to the unfused chain at all eight test shapes (max abs 0).
+
+`kernel_norm_clip_f32` in `norm_clip.cl` runs one 32-lane work-group a row, the row sum in a fixed
+lane order (a strided per-lane partial, then a tree with barriers), f32 throughout, and re-reads
+the scaled row for the multiply. `supports_op` admits f32 rows that are contiguous, with no scale
+or an f32 scale of the row's own channel and head count. The OpenCL build compiles and the .cl goes
+through the C preprocessor.
+
+`measured-here`, CPU tree (`test-export-graph-ops` at `-c 2048`, 0157 vs this patch) and the CPU KL
+gate on the IQ4_NL file, base logits the same window:
+
+| | base | patch |
+|---|---|---|
+| decode graph nodes (`tg`) | 10,859 | 9,755 |
+| prefill graph nodes (`pp`) | 10,979 | 9,875 |
+| mean KL vs the base logits, same top | - | 0.000000, 99.967 % |
+
+Both graphs lose 1,104 nodes: the clips' 1,248 launch nodes a token become 144 NORM_CLIP nodes.
+On a card that is the launch count the patch removes; no card number was taken here.
+
+test-backend-ops `-o NORM_CLIP`: eight cases, the q/k/rel shapes of decode and of a 512-token
+prompt and an odd width (8/8 on the CPU build; on a card the same eight compare the kernel with
+the CPU reference). Red case, dropping MIN(factor, 1) in the CPU op (and in the kernel for the
+card tree): mean KL 3.417977, same top 38.938 %, and the unfused-chain equivalence check mismatches
+all eight shapes (max abs 0.61 to 14.5).

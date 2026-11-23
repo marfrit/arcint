@@ -1,0 +1,564 @@
+0158: fuse Inkling 2 Mini's three norm clips into one ggml op, with a CPU reference and an f32 OpenCL kernel.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 4b9695f..8661cf4 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -552,6 +552,7 @@ extern "C" {
+         GGML_OP_ROPE,
+         GGML_OP_ROPE_BACK,
+         GGML_OP_CLAMP,
++        GGML_OP_NORM_CLIP,
+         GGML_OP_CONV_TRANSPOSE_1D,
+         GGML_OP_IM2COL,
+         GGML_OP_IM2COL_BACK,
+@@ -1816,6 +1817,15 @@ extern "C" {
+             float                 min,
+             float                 max);
+ 
++    // per row: scale the row by b (if given), then scale it down to an L2 norm of at most threshold
++    // out = clamp(threshold/norm, 0, 1) * (a*b), norm = sqrt(sum((a*b)^2)) + eps
++    GGML_API struct ggml_tensor * ggml_norm_clip(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            struct ggml_tensor  * b,
++            float                 threshold,
++            float                 eps);
++
+     // in-place, returns view(a)
+     GGML_API struct ggml_tensor * ggml_clamp_inplace(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index b8325ba..6f7afd6 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1945,6 +1945,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_clamp(params, tensor);
+             } break;
++        case GGML_OP_NORM_CLIP:
++            {
++                ggml_compute_forward_norm_clip(params, tensor);
++            } break;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             {
+                 ggml_compute_forward_conv_transpose_1d(params, tensor);
+@@ -2413,6 +2417,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = 1; //TODO
+             } break;
++        case GGML_OP_NORM_CLIP:
++            {
++                n_tasks = n_threads;
++            } break;
+         case GGML_OP_SOFT_MAX:
+             {
+                 n_tasks = MIN(n_threads, ggml_nrows(node->src[0]));
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 1492020..517eba9 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -6401,6 +6401,87 @@ void ggml_compute_forward_clamp(
+     }
+ }
+ 
++// ggml_compute_forward_norm_clip
++
++// the unfused chain reads: mul (per-channel), sqr, sum_rows, sqrt, scale_bias(1, eps),
++// fill, div, clamp, mul. same order here, so a graph that emits it stays bit-identical.
++static void ggml_compute_forward_norm_clip_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++
++    const float threshold = ggml_get_op_params_f32(dst, 0);
++    const float eps       = ggml_get_op_params_f32(dst, 1);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int n  = ggml_nrows(src0);
++    const int nc = src0->ne[0];
++
++    GGML_TENSOR_UNARY_OP_LOCALS
++
++    GGML_ASSERT( nb0 == sizeof(float));
++    GGML_ASSERT(nb00 == sizeof(float));
++    const size_t nb10_s1 = src1 ? src1->nb[0] : 0;
++    const size_t nb11_s1 = src1 ? src1->nb[1] : 0;
++    GGML_ASSERT(!src1 || (nb10_s1 == sizeof(float) && src1->ne[0] == ne00));
++
++    const int64_t ne11 = src1 ? src1->ne[1] : 1;
++
++    for (int j = ith; j < n; j += nth) {
++        const int64_t i1 = j % ne01;
++        const int64_t i2 = (j / ne01) % ne02;
++        const int64_t i3 = j / (ne01*ne02);
++
++        const float * src0_ptr = (const float *) ((const char *) src0->data + i1*nb01 + i2*nb02 + i3*nb03);
++        const float * src1_ptr = src1 ? (const float *) ((const char *) src1->data + (i1 % ne11)*nb11_s1) : NULL;
++        float * dst_ptr = (float *) ((char *) dst->data + i1*nb1 + i2*nb2 + i3*nb3);
++
++        // sum_rows accumulates in wide precision and rounds once
++        ggml_float sum = 0.0;
++        for (int i = 0; i < nc; i++) {
++            float v = src0_ptr[i];
++            if (src1_ptr) {
++                v *= src1_ptr[i];
++            }
++            const float sq = v*v;
++            sum += (ggml_float) sq;
++        }
++
++        float norm = sqrtf((float) sum);
++        norm = norm*1.0f + eps;
++        float factor = threshold / norm;
++        factor = MAX(MIN(factor, 1.0f), 0.0f);
++
++        for (int i = 0; i < nc; i++) {
++            float v = src0_ptr[i];
++            if (src1_ptr) {
++                v *= src1_ptr[i];
++            }
++            dst_ptr[i] = v*factor;
++        }
++    }
++}
++
++void ggml_compute_forward_norm_clip(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_norm_clip_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_rope_apply
+ 
+ void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index ca648df..bfef2a8 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -64,6 +64,7 @@ void ggml_compute_forward_rope_apply(const struct ggml_compute_params * params,
+ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_norm_clip(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 1e92643..9e22349 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -108,6 +108,7 @@ set(GGML_OPENCL_KERNELS
+     tri
+     fill
+     clamp
++    norm_clip
+     cpy
+     cvt
+     diag_mask_inf
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index c9fdae3..b0cf381 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -987,6 +987,7 @@ struct ggml_backend_opencl_context {
+     cl_program program_add_id;
+     cl_program program_moe_add_id_glu;
+     cl_program program_clamp;
++    cl_program program_norm_clip;
+     cl_program program_cvt;
+     cl_program program_diag_mask_inf;
+     cl_program program_gelu;
+@@ -1072,6 +1073,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_fill;
+     cl_kernel kernel_fill_f16 = nullptr;
+     cl_kernel kernel_clamp, kernel_clamp_nc;
++    cl_kernel kernel_norm_clip_f32;
+     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
+               kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
+               kernel_geglu_erf_f16, kernel_geglu_quick_f16, kernel_situ_f32;
+@@ -2268,6 +2270,22 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         GGML_LOG_CONT(".");
+     }
+ 
++    // norm_clip
++    {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "norm_clip.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("norm_clip.cl");
++#endif
++        backend_ctx->program_norm_clip =
++            build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
++
++        CL_CHECK((backend_ctx->kernel_norm_clip_f32 = clCreateKernel(backend_ctx->program_norm_clip, "kernel_norm_clip_f32", &err), err));
++        GGML_LOG_CONT(".");
++    }
++
+     // cpy
+     {
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+@@ -13038,6 +13056,14 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
+         case GGML_OP_CLAMP:
+             return op->src[0]->type == GGML_TYPE_F32;
++        case GGML_OP_NORM_CLIP:
++            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
++                   ggml_is_contiguous_rows(op->src[0]) &&
++                   (!op->src[1] || (op->src[1]->type == GGML_TYPE_F32 &&
++                                    ggml_is_contiguous_rows(op->src[1]) &&
++                                    op->src[1]->ne[0] == op->src[0]->ne[0] &&
++                                    op->src[1]->ne[1] == op->src[0]->ne[1] &&
++                                    op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1));
+         case GGML_OP_SOFT_MAX:
+         case GGML_OP_NORM:
+             return true;
+@@ -21174,6 +21200,77 @@ static void ggml_cl_fill(ggml_backend_t backend, const ggml_tensor * src0, const
+     backend_ctx->enqueue_ndrange_kernel(kernel, 1, global_work_size, local_work_size, dst);
+ }
+ 
++static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_ASSERT(src0);
++    GGML_ASSERT(src0->extra);
++    GGML_ASSERT(dst);
++    GGML_ASSERT(dst->extra);
++
++    ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++
++    const int      ne0  = (int) src0->ne[0];
++    const int      ne1  = (int) src0->ne[1];
++    const int      ne2  = (int) src0->ne[2];
++    const int      ne3  = (int) src0->ne[3];
++    const cl_ulong nb01 = src0->nb[1];
++    const cl_ulong nb02 = src0->nb[2];
++    const cl_ulong nb03 = src0->nb[3];
++    const cl_ulong nb1  = dst->nb[1];
++    const cl_ulong nb2  = dst->nb[2];
++    const cl_ulong nb3  = dst->nb[3];
++
++    const float threshold = ggml_get_op_params_f32(dst, 0);
++    const float eps       = ggml_get_op_params_f32(dst, 1);
++
++    cl_mem buf1 = extra0->data_device;
++    cl_ulong offset1 = offset0;
++    cl_ulong nb11 = 0;
++    int has_scale = 0;
++    if (src1) {
++        ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++        buf1 = extra1->data_device;
++        offset1 = extra1->offset + src1->view_offs;
++        nb11 = src1->nb[1];
++        has_scale = 1;
++    }
++
++    cl_kernel kernel = backend_ctx->kernel_norm_clip_f32;
++
++    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_ulong), &nb01));
++    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &nb02));
++    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_ulong), &nb03));
++    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_mem),   &buf1));
++    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &nb11));
++    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(int),      &has_scale));
++    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nb2));
++    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &nb3));
++    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &ne0));
++    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &ne1));
++    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &ne2));
++    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(int),      &ne3));
++    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(float),    &threshold));
++    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(float),    &eps));
++
++    const size_t lsz = 32;
++    const size_t nrows = (size_t) ne1*ne2*ne3;
++    size_t global_work_size[] = { nrows*lsz, 1, 1 };
++    size_t local_work_size[]  = { lsz, 1, 1 };
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
+ static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -41557,6 +41654,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_clamp;
+             break;
++        case GGML_OP_NORM_CLIP:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_norm_clip;
++            break;
+         case GGML_OP_NORM:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/norm_clip.cl b/ggml/src/ggml-opencl/kernels/norm_clip.cl
+new file mode 100644
+index 0000000..c344b26
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/norm_clip.cl
+@@ -0,0 +1,80 @@
++//------------------------------------------------------------------------------
++// norm_clip
++//------------------------------------------------------------------------------
++// one work-group a row: per-channel scale, the row sum of squares in a fixed
++// order, min(1, threshold/norm), the multiply. same order as the unfused chain.
++#define NORM_CLIP_LS 32
++
++kernel void kernel_norm_clip_f32(
++        global char * src0,
++        ulong         offset0,
++        ulong         nb01,
++        ulong         nb02,
++        ulong         nb03,
++        global char * src1,
++        ulong         offset1,
++        ulong         nb11,
++        int           has_scale,
++        global char * dst,
++        ulong         offsetd,
++        ulong         nb1,
++        ulong         nb2,
++        ulong         nb3,
++        int           ne0,
++        int           ne1,
++        int           ne2,
++        int           ne3,
++        float         threshold,
++        float         eps
++) {
++    src0 = src0 + offset0;
++    dst  = dst  + offsetd;
++
++    const int row = get_group_id(0);
++    const int i1 = row % ne1;
++    const int i2 = (row / ne1) % ne2;
++    const int i3 = row / (ne1*ne2);
++
++    global const float * x = (global const float *)(src0 + i3*nb03 + i2*nb02 + i1*nb01);
++    global       float * y = (global       float *)(dst  + i3*nb3  + i2*nb2  + i1*nb1);
++
++    global const float * s = 0;
++    if (has_scale) {
++        s = (global const float *)(src1 + offset1 + i1*nb11);
++    }
++
++    const int lane = get_local_id(0);
++    __local float red[NORM_CLIP_LS];
++
++    float ss = 0.0f;
++    for (int i = lane; i < ne0; i += NORM_CLIP_LS) {
++        float v = x[i];
++        if (has_scale) {
++            v *= s[i];
++        }
++        ss += v*v;
++    }
++
++    red[lane] = ss;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (int st = NORM_CLIP_LS/2; st > 0; st >>= 1) {
++        if (lane < st) {
++            red[lane] += red[lane + st];
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++
++    float norm = sqrt(red[0]);
++    norm = norm*1.0f + eps;
++    float factor = threshold / norm;
++    factor = min(factor, 1.0f);
++    factor = max(factor, 0.0f);
++
++    for (int i = lane; i < ne0; i += NORM_CLIP_LS) {
++        float v = x[i];
++        if (has_scale) {
++            v *= s[i];
++        }
++        y[i] = v*factor;
++    }
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 5881344..9a57c18 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1054,6 +1054,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "ROPE",
+     "ROPE_BACK",
+     "CLAMP",
++    "NORM_CLIP",
+     "CONV_TRANSPOSE_1D",
+     "IM2COL",
+     "IM2COL_BACK",
+@@ -1114,7 +1115,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GATED_DELTA_NET_REPLAY",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1171,6 +1172,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "rope(x)",
+     "rope_back(x)",
+     "clamp(x)",
++    "norm_clip(x)",
+     "conv_transpose_1d(x)",
+     "im2col(x)",
+     "im2col_back(x)",
+@@ -1231,7 +1233,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "gated_delta_net_replay(q, k, v, g, beta, s, rec, ctrl)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
++static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4183,6 +4185,35 @@ struct ggml_tensor * ggml_clamp(
+     return ggml_clamp_impl(ctx, a, min, max, false);
+ }
+ 
++struct ggml_tensor * ggml_norm_clip(
++    struct ggml_context * ctx,
++    struct ggml_tensor  * a,
++    struct ggml_tensor  * b,
++    float                 threshold,
++    float                 eps) {
++    GGML_ASSERT(ggml_is_contiguous_rows(a));
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++
++    if (b) {
++        GGML_ASSERT(b->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_is_contiguous_rows(b));
++        GGML_ASSERT(b->ne[0] == a->ne[0]);
++        GGML_ASSERT(b->ne[1] == a->ne[1]);
++        GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
++    }
++
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
++
++    ggml_set_op_params_f32(result, 0, threshold);
++    ggml_set_op_params_f32(result, 1, eps);
++
++    result->op     = GGML_OP_NORM_CLIP;
++    result->src[0] = a;
++    result->src[1] = b;
++
++    return result;
++}
++
+ struct ggml_tensor * ggml_clamp_inplace(
+     struct ggml_context * ctx,
+     struct ggml_tensor  * a,
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index d163849..5fec3cb 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -162,16 +162,7 @@ std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const
+ 
+ // scale each row down to an L2 norm of at most threshold, after the optional per-channel scale
+ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor * scale, float threshold) {
+-    if (scale) {
+-        cur = ggml_mul(ctx0, cur, scale);
+-    }
+-
+-    ggml_tensor * norm = ggml_sqrt(ctx0, ggml_sum_rows(ctx0, ggml_sqr(ctx0, cur)));
+-    norm = ggml_scale_bias(ctx0, norm, 1.0f, 1e-6f);
+-
+-    ggml_tensor * factor = ggml_div(ctx0, ggml_fill(ctx0, norm, threshold), norm);
+-
+-    return ggml_mul(ctx0, cur, ggml_clamp(ctx0, factor, 0.0f, 1.0f));
++    return ggml_norm_clip(ctx0, cur, scale, threshold, 1e-6f);
+ }
+ 
+ ggml_tensor * llama_model_inkling2::graph::res_stack_tensor() {
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 7b53c55..26b5a10 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6645,6 +6645,38 @@ struct test_clamp : public test_case {
+     }
+ };
+ 
++struct test_norm_clip : public test_case {
++    const std::array<int64_t, 4> ne;
++    const bool has_scale;
++    const float threshold;
++    const float eps;
++
++    std::string vars() override {
++        return VARS_TO_STR4(ne, has_scale, threshold, eps);
++    }
++
++    test_norm_clip(std::array<int64_t, 4> ne = {128, 24, 1, 1},
++            bool has_scale = true, float threshold = 22.627417f, float eps = 1e-6f)
++        : ne(ne), has_scale(has_scale), threshold(threshold), eps(eps) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
++        ggml_set_name(a, "a");
++
++        ggml_tensor * scale = nullptr;
++        if (has_scale) {
++            const int64_t ne_s[2] = { ne[0], ne[1] };
++            scale = ggml_new_tensor(ctx, GGML_TYPE_F32, 2, ne_s);
++            ggml_set_name(scale, "scale");
++        }
++
++        ggml_tensor * out = ggml_norm_clip(ctx, a, scale, threshold, eps);
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++};
++
+ // GGML_OP_FLOOR
+ struct test_floor : public test_case {
+     const ggml_type type;
+@@ -12676,6 +12708,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_trunc     (type, {1024, 1024, 1, 1}));
+     }
+ 
++    // Inkling 2 Mini's three clips at the shapes the decode step and a 512-token
++    // prompt see (q, k, rel), plus an odd width
++    test_cases.emplace_back(new test_norm_clip({128, 24, 1, 1}, true));
++    test_cases.emplace_back(new test_norm_clip({128, 8, 1, 1}, false));
++    test_cases.emplace_back(new test_norm_clip({16, 24, 1, 1}, true, 8.0f));
++    test_cases.emplace_back(new test_norm_clip({128, 24, 512, 1}, true));
++    test_cases.emplace_back(new test_norm_clip({128, 8, 512, 1}, false));
++    test_cases.emplace_back(new test_norm_clip({16, 24, 512, 1}, true, 8.0f));
++    test_cases.emplace_back(new test_norm_clip({13, 3, 5, 1}, true));
++    test_cases.emplace_back(new test_norm_clip({7, 5, 2, 2}, false, 8.0f));
++
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));

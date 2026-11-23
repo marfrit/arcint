@@ -1,0 +1,192 @@
+0156: Q8_0 MUL_MAT_ID on the int8 dot for a decode batch (Inkling 2 Mini's coda experts)
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1253,6 +1253,7 @@ struct ggml_backend_opencl_context {
+     // 0115's arm (GGML_OPENCL_KQ_MV_NCOLS): Strata's form, the q8_1 matvec at up to 8 columns for the IQ types,
+     // Q4_0 and Q8_0 (kq_mv_arm columns, 4 by default and then no arm)
+     cl_kernel kernel_mul_mv_q80_q8_1[8]   = {};
++    cl_kernel kernel_mul_mv_id_q8_0_q8_1 = nullptr;  // 0156: Q8_0 MUL_MAT_ID on the int8 dot (decode)
+     int       kq_mv_arm = 4;
+     cl_kernel kernel_mul_mm_q40_f16       = nullptr;
+     cl_kernel kernel_mul_mm_kq2d_q40      = nullptr;   // Xe2: Q4_0 on 2D block loads, fp16
+@@ -2796,10 +2797,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                 if (const char * e = getenv("GGML_OPENCL_KQ_MV_NCOLS")) {
+                     backend_ctx->kq_mv_arm = std::max(4, std::min(8, atoi(e)));
+                 }
++                // 0156: the decode MUL_MAT_ID kernel of Q8_0 is built in the one-column program
++                // (always: -DMV_Q8_0); the q8_0 matvec above stays behind the 0115 arm.
+                 for (int nc = 1; nc <= backend_ctx->kq_mv_arm; ++nc) {
+                     const std::string opts = compile_opts + " -DN_DST=" + std::to_string(backend_ctx->kq_q8_1_ndst) +
+                         " -DN_SIMDGROUP=4 -DNCOLS=" + std::to_string(nc) + (nc > 1 ? " -cl-intel-256-GRF-per-thread" : "") +
+-                        (backend_ctx->kq_mv_arm > 4 ? " -DMV_Q8_0" : "") +
++                        (nc == 1 || backend_ctx->kq_mv_arm > 4 ? " -DMV_Q8_0" : "") +
+                         iq_extra_opts;   // the IQ4 codebook in local memory on every card (0035; -DIQ4_KV_SELECT: the A770's selects before)
+                     bool q3k = false, q2k = false;   // 0116 / 0117: a Q3_K or Q2_K failure costs that type alone
+                     cl_program prog = ggml_cl_build_program_q3k_q2k(backend_ctx, iq_src.c_str(), opts,
+@@ -2822,6 +2825,9 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                             CL_CHECK((backend_ctx->kernel_mul_mv_id_kq_q8_1[3 + i] = clCreateKernel(prog, iq_id_n[i], &err), err));
+                         }
+                     }
++                    if (nc == 1) {
++                        CL_CHECK((backend_ctx->kernel_mul_mv_id_q8_0_q8_1 = clCreateKernel(prog, "kernel_mul_mv_id_q8_0_q8_1", &err), err));
++                    }
+                     if (nc == 1 && q3k) {
+                         CL_CHECK((backend_ctx->kernel_get_rows_q3_K = clCreateKernel(prog, "kernel_get_rows_q3_K", &err), err));
+                     }
+@@ -36857,6 +36863,85 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+ }
+ #endif // GGML_OPENCL_SOA_Q
+ 
++#ifdef GGML_OPENCL_SOA_Q
++// 0156: Q8_0's MUL_MAT_ID at a decode batch. The generic flat kernel below does a float dot
++// per value with the f32 activation; a decode token's top-8 pairs take the IQ types' form:
++// the q8_1 quantized activation (2 int8 terms a value) and the flat Q8_0 planes on the int8
++// dot (kernel_mul_mv_id_q8_0_q8_1). More than 15 tokens keep the flat float kernel.
++static bool ggml_cl_mul_mat_id_q8_0(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
++                                    const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++    if (src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (backend_ctx->kernel_mul_mv_id_q8_0_q8_1 == nullptr || backend_ctx->kernel_kq_quantize_q8_1 == nullptr) {
++        return false;
++    }
++    const int ne00 = (int)src0->ne[0];
++    const int ne01 = (int)src0->ne[1];
++    const int ne11 = (int)src1->ne[1];
++    const int ne12 = (int)src1->ne[2];
++    const int n_used = (int)ids->ne[0];
++    const int n_tok  = (int)ids->ne[1];
++    if (n_tok >= 16 || ne12 != n_tok || src0->ne[3] != 1 || src1->ne[3] != 1) {
++        return false;
++    }
++    if (ne00 % 32 != 0 || src0->ne[2] < n_used || !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
++        !ggml_is_contiguous(dst) || dst->nb[0] != sizeof(float)) {
++        return false;
++    }
++    // the planes of the flat weight: the expert's rows are read at e * ne01 blocks, so a
++    // view must be the parent's shape (the flat kernel's per-block addressing does the same)
++    const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
++    if (!ggml_cl_is_q8_0_soa(src0) || (src0->view_src != nullptr &&
++        (src0->view_offs != 0 || soa0->ne[0] != src0->ne[0] || soa0->ne[1] != src0->ne[1] || soa0->ne[2] != src0->ne[2]))) {
++        return false;
++    }
++    // an expert cache's slots and bank carry -1 ids this arm does not place
++    const char * nm = src0->name;
++    const size_t ln = strlen(nm);
++    if ((ln > 6 && strcmp(nm + ln - 6, ".slots") == 0) || (ln > 5 && strcmp(nm + ln - 5, ".bank") == 0)) {
++        return false;
++    }
++    const int n_vals = ne00 * ne11 * ne12;
++    ggml_cl_kq_quantize_src1(backend_ctx, src1, n_vals, dst);
++    ggml_tensor_extra_cl_q8_0 * e0 = (ggml_tensor_extra_cl_q8_0 *) soa0->extra;
++    ggml_tensor_extra_cl * extra2 = (ggml_tensor_extra_cl *) ids->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
++    const cl_ulong offq = 0;
++    const cl_ulong offseti = extra2->offset + ids->view_offs;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const cl_ulong nbi1 = ids->nb[1];
++    const cl_ulong nb1 = dst->nb[1];
++    const cl_ulong nb2 = dst->nb[2];
++    const cl_ulong res = (cl_ulong) n_vals;
++    cl_uint a = 0;
++    cl_kernel kernel = backend_ctx->kernel_mul_mv_id_q8_0_q8_1;
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e0->q));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offq));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e0->d));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xq.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xd.buffer));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extra2->data_device));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offseti));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nbi1));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_used));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne11));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &nb2));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_ulong), &res));
++    CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &n_tok));
++    const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;   // N_DST * N_SIMDGROUP
++    size_t global_work_size[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, (size_t)n_used * n_tok };
++    size_t local_work_size[]  = { 16, 4, 1 };
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++    return true;
++}
++#endif // GGML_OPENCL_SOA_Q
++
+ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -36949,6 +37034,9 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
+         }
+         return;
+     }
++    if (ggml_cl_mul_mat_id_q8_0(backend_ctx, src0, src1, src2, dst)) {
++        return;
++    }
+ #endif
+     if (backend_ctx->gpu_family == INTEL) {
+         ggml_cl_downgrade("op=MUL_MAT_ID type=%s k=%d path=generic reason=no-fast-path", ggml_type_name(src0->type), (int) src0->ne[0]);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_iq_q8_1.cl
+@@ -1884,6 +1884,27 @@ kernel void kernel_mul_mv_q8_0_q8_1(global const uchar * q, ulong offq, global c
+     mv_q8_0(q + offq, dp, (ulong)first_row * (ne00 / 32), ne00 / 32, first_row, ne01,
+             xq, xd, (ulong)ne00 * NCOLS, (global float *)(dst + offd), nb1 / sizeof(float));
+ }
++// 0156: MUL_MAT_ID of Q8_0's flat planes on the int8 dot: pair k = get_group_id(2),
++// slot i = k % n_used, token t = k / n_used, expert ids[t][i], activation column
++// (i % ne11) + t * ne11; the weight blocks are the expert's rows, as the matvec above.
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mv_id_q8_0_q8_1(global const uchar * q, ulong offq, global const half * dp,
++                                      global const char * xq, global const float * xd,
++                                      global const char * ids, ulong offi, ulong nbi1, int n_used, int ne11,
++                                      global char * dst, ulong offd, ulong nb1, ulong nb2, int ne00, int ne01,
++                                      ulong res, int n_tok) {
++    const int k = (int)get_group_id(2);
++    const int i = k % n_used, t = k / n_used;
++    if (t >= n_tok) return;
++    const int e = ((global const int *)(ids + offi + (ulong)t * nbi1))[i];
++    const int first_row = FIRST_ROW;
++    if (first_row >= ne01 || e < 0) return;   // a skipped pair's rows stay zero
++    const int n32 = ne00 / 32;
++    const int col = (i % ne11) + t * ne11;
++    mv_q8_0(q + offq, dp, ((ulong)e * ne01 + first_row) * n32, n32, first_row, ne01,
++            xq + (ulong)col * ne00, xd + (ulong)col * n32, res,
++            (global float *)(dst + offd + t * nb2 + i * nb1), nb1 / sizeof(float));
++}
+ #endif
+ MV_KERNEL(kernel_mul_mv_iq2_xxs_q8_1, 6)
+ MV_KERNEL(kernel_mul_mv_iq2_s_q8_1, 7)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -11921,6 +11921,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ 
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 2, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 128, false, 8192, 1, 5120)); // Llama-4-Maverick-17B-128E-PAB-Q8_0
++    // patch 0156: Q8_0's decode MUL_MAT_ID on the int8 dot: 128 experts, top-8, one and four
++    // tokens, the coda gate_up (K 2304) and down (K 1152), 2304 rows
++    for (int n : {1, 4}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, n, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
++    }
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
+     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
+ #endif
+@@ -14140,6 +14146,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // 2560 -> 640 and IQ4_NL down 640 -> 2560, 512 experts, 10 used, at a
+     // prefill batch (>= 16 tokens takes the GEMM, not the matvec). The perf
+     // and correctness modes cover both the fp16 and the int8 arm.
++    // 0156: its Q8_0 decode cases, the same shapes as the test list.
++    for (int bs : {1, 4}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, bs, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
++    }
+     for (int bs : {16, 512}) {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));

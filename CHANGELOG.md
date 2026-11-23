@@ -18,6 +18,21 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased (branch `development`)
+
+Card-proven, not yet through a release gate. Each item names its card evidence (`measured-here`, B60 / B70 at 165 / 220 W caps).
+
+- **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
+  (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
+  three norm clips as one op (`GGML_OP_NORM_CLIP`). Inkling on the B60, three interleaved rounds: decode 36.59 -> 38.93 t/s
+  (+6.4 %) at depth 0, 33.72 -> 35.69 (+5.8 %) at 4k, prefill +0.6 %. KL to the CPU reference inside the bar on every
+  production model, also at micro-batch 1: the agent 27B 0.01039 -> 0.01035, Inkling 0.00201 -> 0.00208 (ub 1), the coder
+  0.005796 -> 0.005664 (toward the CPU: 0157 takes its 1-D shared-expert gate), Dory and Flash-Next bit-identical; a served
+  Flash-Next greedy A/B with MTP gives 6 of 6 identical texts. 0157's two card-only defects were found and fixed before
+  this: a kernel-argument count, and an f32 slice start in floats on float4 pointers (the 27B's KL had gone to 0.54).
+  test-backend-ops carries the production shapes the split-K reaches (the 27B's ssm_alpha/beta, the coder's routers,
+  Flash-Next's MTP injects); the red builds fail them on the card.
+
 ## 1.8.0 — 2026-11-22
 
 Release gate against 1.7.0 (`measured-here`, 2026-11-22, RC 64ad74b0 = the release code; the 1.7.0 package and its llama tools against the RC's; B60 at a 165 W cap, B70 at 220 W). **The existing models** (0147, 0149 and 0150 touch generic OpenCL ops): the agent's 27B Q4_K_M at micro-batch 1 against the CPU Q8_0 reference, mean KL 0.010389 / 96.313 % top-1 on both (1.7.0's own gate figure); the iwo4 coder file and Dory against a 1.7.0 run, KL 0 and 100 % top-1 (the same logits); Flash-Next (experts on the CPU) against a 1.7.0 run, KL 0, 100 %. llama-bench pp512 / tg128 old / new, alternating: the agent 1024.3-1024.8 / 1025.1-1026.1 and 19.72-19.74 / 19.73-19.74; the coder 1807.9-1808.9 / 1808.0-1808.7 and 70.14-70.21 / 70.12-70.13; Dory 1941.3-1944.7 / 1920.5-1932.5 (spreads of 4-22 t/s) and 34.47 / 34.37-34.41. The agent's 12-answer arms on its unit flags (MTP 5): 48.25, 46.01 / 47.13, 47.64 t/s, identical texts, draft acceptance 49.3 % in every run. Flash-Next's 12-answer arms on its unit flags (B70, IQ3_S, MTP 3): old 42.50 / new 42.95, 43.56 t/s, identical texts, draft acceptance 73.0 % in every run (a first old run was lost to a port collision with a parallel window; a rerun's new arms read 44.84 and 43.99 with the same texts, its old arms ran beside a recipe build on the shared host and are not counted); its downgrade keys are the accepted ones on both. No downgrade line new. The op suites on the B70 with the release tools: CONCAT 123, REPEAT 15, SCALE 6, SIGMOID 8, SWIGLU 24, SITU 6, FLASH_ATTN_EXT 3,173 (B70; the two new 0152 cases red on 0150). **Inkling 2 Mini:** mean KL against the CPU reference at 32,768 tokens 0.005965 / 98.065 % top-1 with q8_0 KV (f16 0.005306); the needle found at 64,000 and 120,000 tokens with q8_0 KV on the B70 (131,072 cells), and on the B60 unit's own arguments (q8_0 KV, 49,152 cells) at 45,000 and 8,000 tokens (21,935 MiB, GTT 260 MiB); the acceptance task 10/10 at effort low; two concurrent lanes answer right. The xe kernel log counts no new wedge, CAT error or job timeout in the gate windows.
