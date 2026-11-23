@@ -32,6 +32,9 @@ TagRange tag_range(ChatDialect d) {
         case ChatDialect::Extended: return {0, 3};
         case ChatDialect::Gemma4: return {3, 1};
         case ChatDialect::Inkling: return {4, 1};
+        // Neutral: the Qwen pair's ids decide a block where the vocabulary holds them as one
+        // token each; the text rule is absent (a "runs" model's tags are not guessed at).
+        case ChatDialect::Neutral: return {0, 0};
         default: return {0, 1};
     }
 }
@@ -132,16 +135,25 @@ const std::vector<std::pair<std::string, std::string>>& think_tag_pairs(ChatDial
     static const std::vector<std::pair<std::string, std::string>> qwen  = build_pairs(ChatDialect::Qwen);
     static const std::vector<std::pair<std::string, std::string>> gemma = build_pairs(ChatDialect::Gemma4);
     static const std::vector<std::pair<std::string, std::string>> inkling = build_pairs(ChatDialect::Inkling);
+    // Neutral keeps the Qwen pair for the id table, while its text range is empty.
+    static const std::vector<std::pair<std::string, std::string>> neutral = build_pairs(ChatDialect::Qwen);
     switch (dialect.kind) {
         case ChatDialect::Extended: return all;
         case ChatDialect::Gemma4: return gemma;
         case ChatDialect::Inkling: return inkling;
+        case ChatDialect::Neutral: return neutral;
         default: return qwen;
     }
 }
 
 ReasoningSplit split_reasoning(std::string_view raw, ThinkStart start, ChatDialect dialect) {
     ReasoningSplit out;
+    if (dialect.neutral()) {
+        // no text scan: the neutral dialect splits only by single-token ids (the token path);
+        // a text-only caller gets the bytes as they came
+        out.content = std::string(raw);
+        return out;
+    }
     if (dialect.inkling()) {
         // The framed-block form: one streamer pass over the whole text, so the
         // streaming and non-streaming paths cannot disagree. A reply that never
@@ -216,9 +228,16 @@ ReasoningStreamer::ReasoningStreamer(ThinkStart start, ChatDialect dialect,
                                      const std::vector<std::pair<int, int>>& open_close_ids)
     : in_reasoning_(start.open()), undecided_(!start.open()), dialect_(dialect), ids_(open_close_ids) {
     after_close_ = start.closed();
-    for (const auto& pair : think_tag_pairs(dialect_)) closers_.push_back(pair.second);
-    // a template-opened block closes on this dialect's first pair, not the Qwen one
-    close_ = tag_range(dialect_)[0].close;
+    // the neutral dialect has no text tags: only the vocabulary's single-token ids decide
+    // a block, so neither a text closer list nor a text close tag is armed
+    const bool neutral = dialect_.neutral();
+    if (!neutral) {
+        for (const auto& pair : think_tag_pairs(dialect_)) closers_.push_back(pair.second);
+        // a template-opened block closes on this dialect's first pair, not the Qwen one
+        close_ = tag_range(dialect_)[0].close;
+    } else {
+        close_ = {};
+    }
     // A template-opened block: its closer is the first pair's close id when the
     // vocabulary spells it as one token; -1 keeps the text fallback.
     if (in_reasoning_ && !ids_.empty() && ids_.front().second >= 0) close_id_ = ids_.front().second;

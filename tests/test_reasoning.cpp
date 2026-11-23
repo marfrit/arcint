@@ -227,3 +227,19 @@ TEST(reasoning_streaming_and_nonstreaming_drop_the_closer_line_breaks) {
     CHECK_EQ(split.content, content);
     CHECK_EQ(split.reasoning, reasoning);
 }
+
+TEST(reasoning_neutral_does_not_scan_text_and_the_two_paths_agree) {
+    // the neutral dialect has no text tags; a text-only caller and the token path without
+    // single-token ids must both leave the bytes as content, exactly the same split.
+    const std::string raw = std::string(think_tag_pairs(ChatDialect::Qwen)[0].first) + "a b" +
+                            std::string(think_tag_pairs(ChatDialect::Qwen)[0].second) + "answer";
+    const ReasoningSplit text = split_reasoning(raw, ThinkStart{}, ChatDialect(ChatDialect::Neutral));
+    std::vector<std::pair<std::string, int>> pieces;
+    for (char c : raw) pieces.emplace_back(std::string(1, c), -1);
+    const ReasoningSplit toks = split_reasoning_tokens(pieces, ThinkStart{}, ChatDialect(ChatDialect::Neutral), {});
+    CHECK_EQ(text.content, raw);
+    CHECK_EQ(toks.content, raw);
+    CHECK(text.reasoning.empty());
+    CHECK(toks.reasoning.empty());
+    CHECK_EQ(text.content, toks.content);   // streaming and non-streaming are one output
+}

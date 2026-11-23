@@ -135,6 +135,11 @@ struct Config {
     // history starts above the next query's window resumes from one (core/
     // swa_window.h). Off by default: prefix reuse is exact at the library default.
     bool llama_swa_window = false;
+    // --llama-allow-spill: opt out of the spill guard. A start whose
+    // device demand plus the request-growth margin does not fit the card's driver
+    // figure runs anyway, with a WARN that names every part; without it such a start
+    // is refused at load. Off by default: no silent fallback.
+    bool llama_allow_spill = false;
     // --llama-checkpoints N / --llama-checkpoint-step T: per lane, up to N
     // snapshots of the state llama.cpp cannot roll back (a hybrid model's
     // recurrent layers), taken where llama.cpp's server takes its context

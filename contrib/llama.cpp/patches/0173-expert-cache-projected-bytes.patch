@@ -1,0 +1,205 @@
+0173: the expert cache's projected bytes at a budget, for the spill guard's cache suggestion
+
+diff --git a/src/llama-expert-cache.cpp b/src/llama-expert-cache.cpp
+index 09c8a8a..2a8de6c 100644
+--- a/src/llama-expert-cache.cpp
++++ b/src/llama-expert-cache.cpp
+@@ -569,6 +569,7 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+             }
+         }
+     }
++    ranked_        = ranked;   // 0173: the projection replays this ranking at another budget
+     // slots in that order until the budget is spent, each of its layer's size
+     // (Strata generate.cpp:2691-2709), each layer's zero slot counted; every
+     // layer keeps at least one slot (its bank then fits 512 matrices with its
+@@ -757,6 +758,8 @@ bool llama_expert_cache::init(llama_model & model, const llama_model_loader & ml
+     ggml_set_name(tab_id, "expert_id");
+     ggml_backend_buffer_type_t buft   = ggml_backend_dev_buffer_type(dev);
+     tail_buft = buft;
++    buft_slots_   = buft;
++    n_spare_base  = n_spare;
+     ggml_backend_buffer_t      bslots = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
+     // the loan's tail slot tensors in their own buffer: the loan frees it and
+     // the refill re-allocates it (buft_alloc_buffer_n, the tensor list, no range).
+@@ -2358,6 +2361,108 @@ void llama_expert_cache::after_graph(ggml_backend_sched_t sched, uint32_t n_toke
+     }
+ }
+ 
++size_t llama_expert_cache::project_device_bytes(size_t budget) const {
++    if (layers.empty() || buft_slots_ == nullptr) return n_bytes;
++    // 1) the slot plan: the same walk init runs, over the stored ranking
++    std::vector<std::vector<int>> chosen(layers.size());
++    std::vector<std::vector<char>> taken(layers.size());
++    for (size_t i = 0; i < layers.size(); ++i) taken[i].assign((size_t) layers[i].n_expert, 0);
++    size_t used = 0;
++    for (const auto & L : layers) used += L.nb2[0] + L.nb2[1] + L.nb2[2];
++    std::vector<int> layer_of(model_->layers.size(), -1);
++    for (int i = 0; i < (int) layers.size(); ++i) layer_of[layers[i].il] = i;
++    const int n_expert = layers[0].n_expert;
++    for (const auto & [il, e] : ranked_) {
++        if (il < 0 || il >= (int) layer_of.size() || layer_of[il] < 0 || e < 0 || e >= n_expert) continue;
++        const int i = layer_of[il];
++        const auto & L = layers[(size_t) i];
++        const size_t b = L.nb2[0] + L.nb2[1] + L.nb2[2];
++        if (used + b > budget) break;
++        if (taken[i][(size_t) e] || (int) chosen[i].size() + 1 >= L.n_expert) continue;
++        taken[i][(size_t) e] = 1;
++        chosen[i].push_back(e);
++        used += b;
++    }
++    std::vector<int> n_slots(layers.size());
++    for (size_t i = 0; i < layers.size(); ++i) {
++        if (chosen[i].empty()) chosen[i].push_back(0);
++        n_slots[i] = (int) chosen[i].size();
++    }
++    // 2) the lend set at this budget: candidates whose slot bytes fit the ask, in order
++    std::vector<llama_loan_book::LendCandidate> cand(layers.size());
++    for (size_t i = 0; i < layers.size(); ++i) {
++        const auto & L = layers[i];
++        cand[i].lendable = L.candidate;
++        cand[i].bytes = L.candidate ? (int64_t) n_slots[i] * (int64_t) (L.nb2[0] + L.nb2[1] + L.nb2[2]) : 0;
++    }
++    const auto pick = llama_loan_book::choose_lend_layers(cand, lend_bytes_);
++    std::vector<char> lent(layers.size(), 0);
++    for (int i : pick.chosen) lent[(size_t) i] = 1;
++    // 3) the slot buffer context: non-candidate slots, Q8_0 banks, the tables; size only
++    auto buft_size = [&](ggml_context * gc) { return ggml_backend_alloc_ctx_tensors_from_buft_size(gc, buft_slots_); };
++    const int n_rows = [&] { int r = 0; for (const auto & L : layers) r += L.n_tab; return r; }();
++    ggml_init_params ip{ (size_t) (layers.size() * 6 + 8) * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * main_ctx = ggml_init(ip);
++    ggml_new_tensor_3d(main_ctx, GGML_TYPE_I32, 1, n_expert, n_rows);   // tables
++    ggml_new_tensor_2d(main_ctx, GGML_TYPE_I32, 1, n_expert);           // ids
++    ggml_context * tail_ctx = ggml_init(ip);
++    for (size_t i = 0; i < layers.size(); ++i) {
++        const auto & L = layers[i];
++        const ggml_context * sc = L.candidate ? tail_ctx : main_ctx;
++        const int n_bank = L.n_expert - n_slots[i];
++        const int n_spare = std::min(n_spare_base, std::max(0, 512 - (n_bank + 1)));
++        for (int k = 0; k < 3; ++k) {
++            if (!L.candidate)      ggml_new_tensor_3d(const_cast<ggml_context *>(sc), L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], n_slots[i] + 1);
++            if (L.src[k]->type == GGML_TYPE_Q8_0)
++                ggml_new_tensor_3d(main_ctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], n_bank + 1 + n_spare);
++        }
++    }
++    const size_t slots_size = buft_size(main_ctx);
++    // 4) the lend tail: a buffer over the picked layers' slot tensors
++    ggml_context * lend_ctx = ggml_init(ip);
++    for (int i : pick.chosen) {
++        const auto & L = layers[(size_t) i];
++        for (int k = 0; k < 3; ++k)
++            ggml_new_tensor_3d(lend_ctx, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], n_slots[(size_t) i] + 1);
++    }
++    const size_t lend_size = pick.chosen.empty() ? 0 : buft_size(lend_ctx);
++    // 5) candidate layers outside the lend: one small buffer a layer
++    size_t spare_size = 0;
++    for (size_t i = 0; i < layers.size(); ++i) {
++        if (!layers[i].candidate || lent[i]) continue;
++        ggml_context * gc = ggml_init(ip);
++        const auto & L = layers[i];
++        for (int k = 0; k < 3; ++k)
++            ggml_new_tensor_3d(gc, L.src[k]->type, L.src[k]->ne[0], L.src[k]->ne[1], n_slots[i] + 1);
++        spare_size += buft_size(gc);
++        ggml_free(gc);
++    }
++    // 6) the gather mirror at load: the largest bank/lend tensor's rows, as init computes it
++    size_t q = 0, d = 0;
++    for (size_t i = 0; i < layers.size(); ++i) {
++        const auto & L = layers[i];
++        const int n_bank = L.n_expert - n_slots[i];
++        const int n_spare = std::min(n_spare_base, std::max(0, 512 - (n_bank + 1)));
++        for (int k = 0; k < 3; ++k) {
++            const size_t nb = L.src[k]->type == GGML_TYPE_Q8_0 ? 0 : (size_t) (n_bank + 1 + n_spare);
++            const size_t nl = L.candidate ? (size_t) n_slots[i] : 0;
++            for (size_t n : { nb, nl }) {
++                if (n == 0) continue;
++                if (L.src[k]->type == GGML_TYPE_IQ4_NL) {
++                    const size_t bps = (size_t) L.src[k]->ne[0] * L.src[k]->ne[1] / 32;
++                    q = std::max(q, n * bps * 16);
++                    d = std::max(d, n * bps * 2);
++                } else {
++                    q = std::max(q, n * L.nb2[k]);
++                }
++            }
++        }
++    }
++    const size_t total = slots_size + lend_size + spare_size + q + d;
++    ggml_free(lend_ctx); ggml_free(tail_ctx); ggml_free(main_ctx);
++    return total;
++}
++
+ llama_expert_cache_stats llama_expert_cache::stats() const {
+     llama_expert_cache_stats s;
+     s.decode_hits   = n_hits;
+diff --git a/src/llama-expert-cache.h b/src/llama-expert-cache.h
+index 37d9de2..82b1eea 100644
+--- a/src/llama-expert-cache.h
++++ b/src/llama-expert-cache.h
+@@ -211,6 +211,9 @@ struct llama_expert_cache {
+     // gather mirror's reserve; the host USM banks are NOT device memory and are
+     // left out (n_bank_bytes is their figure). Used by the card's own bound.
+     size_t device_bytes() const { return n_bytes; }
++    // 0173: the device bytes this cache's slot/bank/spare/tail/gather allocation would take at
++    // `budget`, using the cache's own per-layer geometry and ranking; no allocation is made.
++    size_t project_device_bytes(size_t budget) const;
+     // round 21: the host-USM bank bytes GTT should carry (the eviction guard's
+     // reference), and the rows a swap left dirty for the next lend.
+     size_t host_bank_bytes() const { return n_bank_bytes; }
+@@ -372,6 +375,10 @@ private:
+     // multi-token decode steps (a verify): routed pairs and distinct experts, summed over the layers
+     uint64_t           n_multi_pairs = 0, n_multi_unique = 0, n_multi_unique_bank = 0, n_multi_steps = 0;
+     size_t             n_bytes = 0, n_bank_bytes = 0;
++    // 0173: the slot buffer's type (for the size-only projection) and the spare entry count
++    // before a layer's bank limit reduces it
++    ggml_backend_buffer_type_t buft_slots_ = nullptr;
++    int                n_spare_base = 0;
+     size_t             max_bank_tensor_ = 0;   // round 20: the stream ring's largest slot content
+     // round 20: the backend's bank-stream ring bytes (0 while not allocated)
+     void (*bank_stream_ring)(ggml_backend_dev_t, size_t *, size_t *) = nullptr;
+@@ -381,6 +388,7 @@ private:
+     // rules: the xe mixing's pseudo-counts and cu's tie-break), empty for round
+     // robin; and the model, to get the geometry and the cache count at teardown
+     std::vector<std::pair<int, int>> profile_ranked;
++    std::vector<std::pair<int, int>> ranked_;   // 0173: the full ranking used at init
+     const llama_model * model_ = nullptr;
+ };
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 5eb4700..215e3f6 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -96,6 +96,11 @@ struct llama_device_memory_data {
+ // TODO: convert to C-style data structure
+ using llama_memory_breakdown = std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data>;
+ 
++// 0173: the device bytes expert cache i would take at `budget` bytes, from its own per-layer
++// geometry and ranking (the same slot/bank/tail/gather allocation it makes at load), without
++// allocating. 0 when i is out of range.
++LLAMA_API size_t llama_model_expert_cache_projected_bytes(const struct llama_model * model, int i, size_t budget);
++
+ LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
+ LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 8442bd6..40d924c 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2114,6 +2114,11 @@ static void llama_expert_cache_info_from(const llama_expert_cache_stats & s, lla
+     info->bank_bytes    = s.bank_bytes;
+ }
+ 
++size_t llama_model_expert_cache_projected_bytes(const llama_model * model, int i, size_t budget) {
++    if (model == nullptr || i < 0 || i >= (int) model->expert_caches.size()) return 0;
++    return model->expert_caches[(size_t) i]->project_device_bytes(budget);
++}
++
+ bool llama_model_expert_cache_info(const llama_model * model, llama_expert_cache_info * info) {
+     if (model == nullptr || model->expert_caches.empty() || info == nullptr) {
+         return false;
+@@ -3555,6 +3560,7 @@ int32_t llama_model_n_layer_nextn(const llama_model * model) {
+     return model->hparams.n_layer_nextn;
+ }
+ 
++
+ int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
+     return model->hparams.dflash_selector_top_k;
+ }

@@ -15,11 +15,15 @@ namespace lgc {
 //   Inkling   Inkling 2 Mini's message-block framing: a reasoning block, one
 //             or more answer blocks and tool-call blocks, all closed by the
 //             same marker; tool calls are its own JSON form
+//   Neutral   the "runs" tier's default: think blocks are split only by the
+//             vocabulary's single-token tag ids (no text scan), no tool-call
+//             parsing. The Qwen dialect replaces it only when the template
+//             carries the Qwen call form (core/chat.cpp).
 //
 // Converts implicitly from bool for the callers that predate the third
 // dialect: true meant "extended tags".
 struct ChatDialect {
-    enum Kind : unsigned char { Qwen, Extended, Gemma4, Inkling };
+    enum Kind : unsigned char { Qwen, Extended, Gemma4, Inkling, Neutral };
     Kind kind = Qwen;
 
     constexpr ChatDialect() = default;
@@ -29,6 +33,7 @@ struct ChatDialect {
     constexpr bool extended() const { return kind == Extended; }
     constexpr bool gemma4() const { return kind == Gemma4; }
     constexpr bool inkling() const { return kind == Inkling; }
+    constexpr bool neutral() const { return kind == Neutral; }
     // Assistant tool calls are replayed into the template with their arguments as
     // an object, whatever the template's capability probe says. Gemma 4's template
     // renders an object in its own key:value form and a JSON string by stripping

@@ -12,6 +12,7 @@
 #include "exec/mtp_head_file.h"   // a head file without output.weight needs --llama-mtp-vocab
 #include "exec/slot_loan.h"
 #include "core/admission.h"
+#include "core/spill_guard.h"
 #include "core/dory.h"
 #include "core/swa_window.h"
 #include "core/markers.h"
@@ -739,6 +740,7 @@ public:
                 log::info("load", "expert cache: %lld slots, %.2f GiB on the card %s, the other experts of its layers %.2f GiB in host memory",
                           static_cast<long long>(ei.slots), static_cast<double>(ei.bytes) / (1u << 30), dn ? dn : "?",
                           static_cast<double>(ei.bank_bytes) / (1u << 30));
+                status_.mem_host_banks += ei.bank_bytes;
             }
             if (split) {
                 // a card given a budget that built no cache (no MoE layer of
@@ -754,6 +756,7 @@ public:
             log::info("load", "expert cache: %lld slots, %.2f GiB on the card, the other experts %.2f GiB in host memory",
                       static_cast<long long>(ec.slots), static_cast<double>(ec.bytes) / (1u << 30),
                       static_cast<double>(ec.bank_bytes) / (1u << 30));
+            status_.mem_host_banks = ec.bank_bytes;
 #endif
         }
 
@@ -812,18 +815,22 @@ public:
         // --tts admits the audio-generation backbone's own architecture (Qwen3-TTS;
         // docs/milestone-1.2.0.md D4): its gen half needs --mmproj, checked after
         // this, and its text path is not served (the asset is not a language model).
-        const AdmittedModel admitted = admit_model(a, geometry, cfg.tts);
-        if (admitted == AdmittedModel::None)
-            throw std::runtime_error(admission_refusal(cfg.gguf_path, arch));
+        const Admission admitted = admit_model(a, geometry, cfg.tts);
+        tier_           = admitted.tier;
+        admitted_model_ = admitted.model;
+        if (const std::string no = tts_backbone_refusal(a, cfg.tts); !no.empty())
+            throw std::runtime_error(no);
+        // the hard refusal is gone (operator 2026-11-23): anything libllama loads that the
+        // spill guard passes is "runs". The tier's own refusals below are the only ones.
         // 'llama' at a second geometry: Llama 2 7B, the model of the community
         // llama-bench GPU tables (operator, 2026-11-04), so that arcint can stand in
         // one of their rows (tools/llama_scoreboard.py). A base model: no chat
         // template, so it takes the ChatML fallback below and is meant for the
         // token-id /v1/completions route.
-        llama2_7b_ = admitted == AdmittedModel::Llama2_7B;
-        dialect_   = dialect_of(admitted);
+        llama2_7b_ = admitted.model == AdmittedModel::Llama2_7B;
+        dialect_   = dialect_of(admitted.model);
 #ifdef ARCINT_LLAMA_DORY
-        if (admitted == AdmittedModel::Dory1_0_4B) {
+        if (admitted.model == AdmittedModel::Dory1_0_4B) {
             // the effective loop count and KV mode: the flag, else the file's value read back from
             // the loaded model's metadata (an override is not shown there), else libllama's default
             auto meta_str = [&](const std::string& key) {
@@ -867,9 +874,14 @@ public:
                                          "serve --llama-dory-kv per_loop or start without --llama-swa-window");
         }
 #else
-        if (admitted == AdmittedModel::Dory1_0_4B)
+        if (admitted.model == AdmittedModel::Dory1_0_4B)
             throw std::runtime_error("a dory model: this build's llama.cpp lacks contrib/llama.cpp patch 0108");
 #endif
+        // The "runs" tier parses no tool calls, so --tool-grammar would constrain a syntax no
+        // caller reads: refused at start.
+        if (!runs_may_use_tool_grammar(tier_) && cfg.tool_grammar)
+            throw std::runtime_error("--tool-grammar: the 'runs' tier parses no tool calls (the template's call form "
+                                     "is not known); start without --tool-grammar");
         // Gemma 4 speaks its own reasoning channel and tool-call form. --tool-grammar
         // constrains the Qwen call form, so on this model it would constrain the
         // output to a syntax the model does not use: refused at start.
@@ -901,6 +913,7 @@ public:
         think_ids_ext_   = build_think_ids(ChatDialect::Extended);
         think_ids_gemma_ = build_think_ids(ChatDialect::Gemma4);
         think_ids_inkling_ = build_think_ids(ChatDialect::Inkling);
+        think_ids_neutral_ = build_think_ids(ChatDialect::Neutral);
         // One line, at load: what the id rule found, and where the text
         // fallback is in force. A served artifact whose tags the vocabulary
         // spells as text is then recognisable in the log, not only by its
@@ -1208,27 +1221,42 @@ public:
             log::info("load", "chat template: %zu bytes from --chat-template-file (the embedded one is not used)",
                       cfg.chat_template_text.size());
         } else if (tmpl == nullptr) {
-            // --tts: the audio-generation backbone (Qwen3-TTS) ships no chat
-            // template; its prompt is built by libmtmd's gen pipeline (text +
-            // codec language), not from these messages. Fall back to ChatML so
-            // a stray chat request renders rather than crashes — the speech
-            // routes are the unit's own contract.
-            // Llama 2 7B (the GPU tables' base model) ships none either; its route is
-            // the token-id /v1/completions.
-            if (!cfg.tts && !llama2_7b_)
-                throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
-            log::warn("load", "%s carries no chat template: using the ChatML fallback for a stray chat request",
-                      cfg.gguf_path.c_str());
-            // static: tmpl points into it and is copied after this block ends
-            static const std::string chatml_fallback =
-                "{% for message in messages %}" + std::string(markers::kTurnStart) +
-                "{{ message['role'] }}\n{{ message['content'] }}" + std::string(markers::kTurnEnd) +
-                "\n{% endfor %}{% if add_generation_prompt %}" + std::string(markers::kTurnStart) +
-                "assistant\n{% endif %}";
-            tmpl = chatml_fallback.c_str();
-            template_source_ = "chatml-fallback";
+            // A "runs" model without a template: no ChatML guess. The chat routes answer a 400
+            // naming the cause; /v1/completions (token ids and text) serves. The template object
+            // is still built from empty text so /props' capability read does not crash; no chat
+            // request can reach it (handlers.cpp's has_chat_template gate).
+            if (!cfg.tts && !llama2_7b_ && !runs_builds_renderer(tier_)) {
+                status_.has_chat_template = false;
+                template_source_ = "none";
+                log::warn("load", "%s carries no chat template: chat routes answer 400 ('%s'), /v1/completions "
+                          "serves; no ChatML guess", cfg.gguf_path.c_str(),
+                          runs_no_chat_template_refusal().c_str());
+            } else {
+                // --tts: the audio-generation backbone (Qwen3-TTS) ships no chat
+                // template; its prompt is built by libmtmd's gen pipeline (text +
+                // codec language), not from these messages. Fall back to ChatML so
+                // a stray chat request renders rather than crashes — the speech
+                // routes are the unit's own contract.
+                // Llama 2 7B (the GPU tables' base model) ships none either; its route is
+                // the token-id /v1/completions.
+                if (!cfg.tts && !llama2_7b_)
+                    throw std::runtime_error(log::format("%s carries no chat template", cfg.gguf_path.c_str()));
+                log::warn("load", "%s carries no chat template: using the ChatML fallback for a stray chat request",
+                          cfg.gguf_path.c_str());
+                // static: tmpl points into it and is copied after this block ends
+                static const std::string chatml_fallback =
+                    "{% for message in messages %}" + std::string(markers::kTurnStart) +
+                    "{{ message['role'] }}\n{{ message['content'] }}" + std::string(markers::kTurnEnd) +
+                    "\n{% endfor %}{% if add_generation_prompt %}" + std::string(markers::kTurnStart) +
+                    "assistant\n{% endif %}";
+                tmpl = chatml_fallback.c_str();
+                template_source_ = "chatml-fallback";
+            }
         }
-        template_src_ = tmpl;
+        // a "runs" model with no template has no text to carry: the empty source builds the
+        // template object (so /props' capability read is safe), and no chat request reaches it
+        template_src_ = chat_template_text(tmpl);
+        status_.has_chat_template = template_source_ != "none";
         // A model without a BOS (or EOS) token reports LLAMA_TOKEN_NULL (-1), and
         // llama_vocab_get_text(-1) throws a range error (Inkling 2 Mini has no BOS):
         // the template then sees an empty string, as for a token without text.
@@ -1246,7 +1274,13 @@ public:
         // served body's dump admit valid UTF-8 only; a vocabulary or template
         // whose text is not will never build the material. One pass over the
         // vocabulary's text at load; Qwen vocabularies pass it.
-        if (dialect_.gemma4() || dialect_.inkling()) {
+        if (!runs_builds_renderer(tier_)) {
+            // The "runs" tier builds no renderer material: its parser rows advertise the Qwen
+            // call form, which an unknown model's output would not match. Token mode is off.
+            material_failed_.store(true, std::memory_order_relaxed);
+            log::warn("load", "renderer material will not be built: the 'runs' tier parses no tool calls; "
+                              "token mode is off on this unit");
+        } else if (dialect_.gemma4() || dialect_.inkling()) {
             // The gateway's renderer material carries the Qwen parser rows only
             // ("qwen3-coder/1"); advertising them for this model would be wrong.
             material_failed_.store(true, std::memory_order_relaxed);
@@ -1298,6 +1332,7 @@ public:
             status_.quant       = b == std::string::npos ? std::string() : d_s.substr(b + 1);
         }
         status_.dialect = dialect_;
+        status_.admission_tier = admission_tier_name(tier_);
         SamplerDefaults d;
         d.temperature        = 0.7f;
         d.top_p              = 0.8f;
@@ -1423,6 +1458,230 @@ public:
             if (status_.voices.empty())
                 log::warn("load", "tts: no enabled voice in %s: /v1/audio/speech refuses every voice until one "
                                   "is enrolled (tools/tts_enrol.py)", cfg.tts_profiles.c_str());
+        }
+        // The spill guard: what libllama placed on the card(s) and on the host, by
+        // kind, from its own accounting; the card's total from the driver's xe region figure (OpenCL's
+        // global size only as a logged fallback); and the start decision. This runs after every load-time
+        // device allocation: the target context, a second MTP/DFlash model and its context, the draft head's
+        // rows, the expert cache's slots/Q8_0 banks/gather mirror/loan tail, and the projector. Host-resident
+        // bytes by design (a pinned expert bank, host buffers) are their own line and never a refusal
+        // reason: only the device demand plus the request-growth margin and the other clients' share is
+        // bounded. The allocations come out of the driver's region total, which is why that figure is the
+        // budget. A part that is not known before the first request (the OpenCL scratch preallocations, the
+        // bank-stream ring, the loan's request-time reserve) is in the margin, measured on a card; anything
+        // the process holds on the card above the known demand is the fdinfo residual term below.
+        {
+            std::vector<size_t> card_weights(cards.size(), 0), card_context(cards.size(), 0),
+                                card_compute(cards.size(), 0), card_cache(cards.size(), 0),
+                                card_draft(cards.size(), 0);
+            std::vector<int> card_ec(cards.size(), -1);   // the cache index on each card
+            auto card_of = [&](ggml_backend_dev_t dev) {
+                for (size_t i = 0; i < cards.size(); ++i)
+                    if (devs_[i] == dev) return i;
+                return size_t{0};   // a buffer the pick cannot name: card 0's worst case
+            };
+            for (const auto& [buft, d] : llama_get_memory_breakdown(ctx_)) {
+                if (buft == nullptr) continue;
+                if (ggml_backend_buft_is_host(buft)) { status_.mem_host += d.total(); continue; }
+                const size_t ci = card_of(ggml_backend_buft_get_device(buft));
+                card_weights[ci] += d.model;
+                card_context[ci] += d.context;
+                card_compute[ci] += d.compute;
+                status_.mem_device_weights += d.model;
+                status_.mem_device_context += d.context;
+                status_.mem_device_compute += d.compute;
+            }
+            // the drafter is a second context and, when --llama-mtp-gguf/-dflash names a file, a
+            // second model; the MTP head rows are its own buffer. An MTP context built on the target
+            // model (no head file) reports the target's weights again, so only its context and compute
+            // terms are new here; the model's weights stay the target's line above.
+            const bool draft_shares_model = !cfg.llama_mtp_gguf.empty() ? false : (cfg.llama_mtp > 0 && !cfg.llama_dflash_on());
+            size_t head_ci = cards.empty() ? 0 : cards.size() - 1;
+            const llama_context* dctx = spec_ ? spec_->draft_context() : nullptr;
+            if (dctx != nullptr) {
+                for (const auto& [buft, d] : llama_get_memory_breakdown(dctx)) {
+                    if (buft == nullptr) continue;
+                    if (ggml_backend_buft_is_host(buft)) {
+                        // a draft context on the target model would repeat the target's host buffers
+                        if (!draft_shares_model) status_.mem_host += d.total();
+                        continue;
+                    }
+                    const size_t ci = card_of(ggml_backend_buft_get_device(buft));
+                    head_ci         = ci;
+                    // an MTP context built on the target model reports the target's weights again:
+                    // only its own context and compute are new; a separate head model adds its weights
+                    const size_t n = d.context + d.compute + (draft_shares_model ? 0 : d.model);
+                    card_draft[ci] += n;
+                    status_.mem_draft_device += n;
+                }
+                if (spec_) {
+                    const size_t hb = spec_->draft_head_device_bytes();
+                    card_draft[head_ci] += hb;
+                    status_.mem_draft_device += hb;
+                }
+            }
+            // the expert cache's own on-card figure: its slots, the Q8_0 banks, the gather mirror and the
+            // loan's tail buffer. It is allocated by llama-expert-cache.cpp outside the breakdown.
+#ifdef ARCINT_LLAMA_EXPERT_CACHE
+            {
+                const int n_ec = llama_model_expert_cache_count(model_);
+                for (int k = 0; k < n_ec; ++k) {
+                    llama_expert_cache_info ei{};
+                    if (!llama_model_expert_cache_info_dev(model_, k, &ei)) continue;
+                    size_t ci = 0;
+                    const char* dn = llama_model_expert_cache_device(model_, k);
+                    if (dn != nullptr)
+                        for (size_t i = 0; i < cards.size(); ++i)
+                            if (ggml_backend_dev_name(devs_[i]) == std::string(dn)) ci = i;
+                    card_cache[ci] += ei.bytes;
+                    card_ec[ci] = k;
+                    status_.mem_cache_device += ei.bytes;
+                }
+            }
+#endif
+            bool worst_allowed = false;
+            int worst_rank = 0;   // 0 fits, 1 allowed-spill, 2 refused
+            size_t worst_card = 0;
+            std::vector<size_t> card_totals(cards.size(), 0);
+            std::vector<llama_card_memory_data> card_cms(cards.size());
+            std::vector<SpillDecision> card_decs;
+            std::vector<CardMemoryStatus> card_cards;
+            for (size_t i = 0; i < cards.size(); ++i) {
+                llama_card_memory_data cm{};
+                const bool driver = llama_device_card_memory(devs_[i], &cm) && cm.driver;
+                const size_t total = driver ? cm.total : static_cast<size_t>(cards[i].mem_bytes);
+                if (!driver)
+                    log::warn("load", "spill guard: the driver's card figure is not available on %s (%s); using OpenCL's "
+                              "%.0f MiB, which is not the figure allocations come out of",
+                              cards[i].name.c_str(), cm.why[0] ? cm.why : "no reason", total / (1024.0 * 1024.0));
+                const size_t other = (cm.used_known && cm.process_vram0 > 0 && cm.used > cm.process_vram0)
+                                         ? cm.used - cm.process_vram0 : 0;
+                if (driver && !cm.used_known)
+                    log::warn("load", "spill guard: the driver's used is not a figure on %s (%s); the other clients' share "
+                              "stays 0 and the total still bounds the start", cards[i].name.c_str(), cm.why);
+                SpillFacts f;
+                f.weights          = card_weights[i];
+                f.context          = card_context[i];
+                f.compute          = card_compute[i];
+                f.cache_device     = card_cache[i];
+                f.cache_flag_mib   = i < cfg.llama_expert_cache_mib_dev.size()
+                                         ? static_cast<size_t>(cfg.llama_expert_cache_mib_dev[i])
+                                         : static_cast<size_t>(cfg.llama_expert_cache_mib);
+                if (card_ec[i] >= 0)
+                    f.cache_project = [this, k = card_ec[i]](size_t flag_mib) {
+                        return llama_model_expert_cache_projected_bytes(model_, k, cache_flag_bytes(flag_mib));
+                    };
+                f.draft_device     = card_draft[i];
+                // informational only: the breakdown's host buffers and the cache's pinned banks are
+                // disjoint (the cache's bbank/b_lendbank are allocated by llama-expert-cache.cpp, not
+                // registered in the model's breakdown), and neither is a refusal term.
+                f.host_by_design   = status_.mem_host + status_.mem_host_banks;
+                f.card_total       = total;
+                f.card_from_driver = driver;
+                f.process_vram0    = cm.process_vram0;
+                f.other_clients    = other;
+                f.n_ctx            = n_ctx_;
+                f.allow_spill      = cfg.llama_allow_spill;
+                const SpillDecision dec = spill_guard(f);
+                card_totals[i] = total;
+                card_cms[i]    = cm;
+                card_decs.push_back(dec);
+                CardMemoryStatus cs;
+                cs.total = total;
+                cs.weights = card_weights[i];
+                cs.context = card_context[i];
+                cs.compute = card_compute[i];
+                cs.cache = card_cache[i];
+                cs.draft = card_draft[i];
+                cs.other = other;
+                cs.unlisted = dec.unlisted;
+                cs.driver = driver;
+                cs.fits = dec.fits;
+                cs.fit_n_ctx = dec.fit_n_ctx;
+                cs.fit_cache = dec.fit_cache;
+                cs.fit_cache_flag_mib = dec.fit_cache_flag_mib;
+                cs.verdict = dec.fits ? "fits" : (dec.refuse ? "refused" : "allowed-spill");
+                card_cards.push_back(cs);
+                const int rank = dec.refuse ? 2 : (dec.fits ? 0 : 1);
+                if (rank > worst_rank) { worst_rank = rank; worst_card = i; }
+                if (i == 0) {
+                    status_.mem_card             = total;
+                    status_.mem_card_from_driver = driver;
+                    status_.mem_used_known       = cm.used_known;
+                    status_.mem_driver_used      = cm.used;
+                    status_.mem_process_vram0    = cm.process_vram0;
+                    status_.mem_other_clients    = other;
+                    status_.mem_unlisted         = dec.unlisted;
+                    status_.mem_growth_margin    = f.margin;
+                    status_.mem_spill_fits       = dec.fits;
+                    status_.mem_spill_refused    = dec.refuse;
+                    status_.mem_fit_n_ctx        = dec.fit_n_ctx;
+                    status_.mem_fit_cache        = dec.fit_cache;
+                    status_.mem_fit_cache_flag_mib = dec.fit_cache_flag_mib;
+                    status_.mem_spill_verdict    = dec.fits ? "fits" : (dec.refuse ? "refused" : "allowed-spill");
+                }
+                if (!dec.fits) {
+                    if (dec.refuse) {
+                        log::error("load", "%s", dec.text.c_str());
+                        throw std::runtime_error(dec.text);
+                    }
+                    worst_allowed = true;
+                    log::warn("load", "%s", dec.text.c_str());
+                } else {
+                    log::info("load", "%s", dec.text.c_str());
+                }
+            }
+            // /props reports the worst card's figures and verdict, not card 0's on a split
+            status_.mem_worst_card = static_cast<int>(worst_card);
+            const llama_card_memory_data& wcm = card_cms[worst_card];
+            const SpillDecision&           wdec = card_decs[worst_card];
+            const CardMemoryStatus&        wcs = card_cards[worst_card];
+            status_.mem_card             = wcs.total;
+            status_.mem_card_from_driver = wcs.driver;
+            status_.mem_device_weights   = wcs.weights;
+            status_.mem_device_context   = wcs.context;
+            status_.mem_device_compute   = wcs.compute;
+            status_.mem_cache_device     = wcs.cache;
+            status_.mem_draft_device     = wcs.draft;
+            status_.mem_other_clients    = wcs.other;
+            status_.mem_used_known       = wcm.used_known;
+            status_.mem_driver_used      = wcm.used;
+            status_.mem_process_vram0    = wcm.process_vram0;
+            status_.mem_spill_fits       = wdec.fits;
+            status_.mem_spill_refused    = wdec.refuse;
+            status_.mem_fit_n_ctx        = wdec.fit_n_ctx;
+            status_.mem_fit_cache        = wdec.fit_cache;
+            status_.mem_fit_cache_flag_mib = wdec.fit_cache_flag_mib;
+            status_.mem_unlisted         = wcs.unlisted;
+            status_.mem_growth_margin    = kSpillGrowthMarginBytes;
+            status_.mem_cards            = std::move(card_cards);
+            if (worst_rank == 2) status_.mem_spill_verdict = "refused";
+            else if (worst_rank == 1) status_.mem_spill_verdict = "allowed-spill";
+            else status_.mem_spill_verdict = "fits";
+            const double mib = 1024.0 * 1024.0;
+            const size_t dev = status_.mem_device_weights + status_.mem_device_context + status_.mem_device_compute;
+            log::info("load", "device memory (libllama's accounting): weights %.0f MiB, context %.0f MiB, compute %.0f MiB = %.0f MiB of the card's %.0f MiB (%.1f %%); expert cache %.0f MiB on the card; draft/head %.0f MiB; process device outside the breakdown %.0f MiB; host buffers %.0f MiB; pinned expert banks %.0f MiB by design (disjoint from the host buffers: the cache's banks are allocated outside the breakdown; neither is a refusal term)",
+                      status_.mem_device_weights / mib, status_.mem_device_context / mib, status_.mem_device_compute / mib,
+                      dev / mib, status_.mem_card / mib, status_.mem_card ? 100.0 * dev / status_.mem_card : 0.0,
+                      status_.mem_cache_device / mib, status_.mem_draft_device / mib, status_.mem_unlisted / mib,
+                      status_.mem_host / mib, status_.mem_host_banks / mib);
+            if (worst_allowed)
+                log::warn("load", "the spill guard's verdict is allowed-spill: --llama-allow-spill keeps the pre-guard behaviour");
+        }
+        // The "runs" tier's start warning (operator 2026-11-23): no promise, and the operator
+        // should read the downgrades, the CPU-side placements and the graph splits at start.
+        // The downgrade keys are the process's; their occurrence count is the CPU-side path's
+        // placements. Graph splits are the reserve's own counts (patch 0160).
+        if (tier_ == AdmissionTier::Runs) {
+            const auto dg = downgrades();
+            int keys = static_cast<int>(dg.size());
+            uint64_t occ = 0;
+            for (const auto& d : dg) occ += d.second;
+            llama_graph_stats gs{};
+            llama_context_graph_stats(ctx_, &gs);
+            log::warn("load", "%s", runs_start_warning(tier_, keys, occ, gs.n_splits_pp, gs.n_splits_tg).c_str());
+        } else {
+            log::info("load", "admission: %s", admission_tier_name(tier_));
         }
         // feyntalk W6a review finding 3: the material is NOT built here. The
         // load keeps the artifact path; the first GET or the first token-mode
@@ -1627,6 +1886,7 @@ public:
             case ChatDialect::Extended: return think_ids_ext_;
             case ChatDialect::Gemma4: return think_ids_gemma_;
             case ChatDialect::Inkling: return think_ids_inkling_;
+            case ChatDialect::Neutral: return think_ids_neutral_;
             default: return think_ids_qwen_;
         }
     }
@@ -2827,6 +3087,9 @@ private:
             const std::vector<int> c = tokenizer_->special_ids(close);
             const int oid = o.size() == 1 ? o.front() : -1;
             const int cid = c.size() == 1 ? c.front() : -1;
+            // The neutral dialect splits by ids alone: a pair the vocabulary spells as text is
+            // not guessed at, so it is left out (the text fallback is absent there).
+            if (dialect.neutral() && (oid < 0 || cid < 0)) continue;
             ids.open_close_ids.emplace_back(oid, cid);
             if (oid >= 0) ids.open_ids.push_back(oid);
             if (cid >= 0) ids.close_ids.push_back(cid);
@@ -2885,8 +3148,14 @@ private:
     // tools whose calls are parsed: nothing, today's path exactly.
     std::unique_ptr<LlamaToolGrammar> prepare_tool_grammar(const GenerationInput& in, Sampler& sampler) const {
         if (!in.sampler.tool_grammar || in.tools.empty()) return nullptr;
+        // the "runs" tier has no promise for the call form: refused by tier for a request too,
+        // including a Qwen-dialect runs model whose template carries the form
+        if (!runs_may_use_tool_grammar(tier_))
+            throw InputError("tool_grammar: the 'runs' tier refuses the tool-call grammar; the call form is not promised");
         // the grammar is the Qwen call form (core/toolgrammar.cpp): on a Gemma 4 model
         // a request that asks for it is refused, not run against the wrong syntax
+        if (dialect_.neutral())
+            throw InputError("tool_grammar: the neutral dialect parses no tool calls");
         if (dialect_.gemma4() || dialect_.inkling())
             throw InputError("tool_grammar constrains the Qwen tool-call form; this model calls tools in its own form");
         const auto t0 = clock_type::now();
@@ -3240,7 +3509,10 @@ private:
     ThinkBlockIds                         think_ids_ext_;    // the full tag family
     ThinkBlockIds                         think_ids_gemma_;  // Gemma 4's channel
     ThinkBlockIds                         think_ids_inkling_;  // Inkling's message framing
+    ThinkBlockIds                         think_ids_neutral_;  // the "runs" tier: id-only tags
     ChatDialect                           dialect_;          // the admitted model's tags and call form
+    AdmissionTier                         tier_ = AdmissionTier::Runs;   // the admission decision's tier
+    AdmittedModel                         admitted_model_ = AdmittedModel::None;
     bool llama2_7b_ = false;           // the GPU tables' model: no chat template
     std::unique_ptr<minja::chat_template> template_;
     std::string                           template_src_;

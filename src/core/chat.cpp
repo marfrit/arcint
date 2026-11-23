@@ -12,6 +12,7 @@
 #include <minja/chat-template.hpp>
 
 #include "core/reasoning.h"
+#include "core/toolcall.h"
 #include "core/markers.h"
 #include "util/log.h"
 #include "util/text.h"
@@ -609,8 +610,16 @@ bool is_inkling_template(std::string_view template_src) {
            template_src.find(markers::kInkContentImage) != std::string_view::npos;
 }
 
+std::string chat_template_text(const char* embedded) { return embedded ? embedded : ""; }
+
 ChatDialect dialect_from_template(std::string_view template_src, ChatDialect fallback) {
-    return is_inkling_template(template_src) ? ChatDialect(ChatDialect::Inkling) : fallback;
+    if (is_inkling_template(template_src)) return ChatDialect(ChatDialect::Inkling);
+    // The "runs" tier's neutral default becomes Qwen only when the template carries the
+    // Qwen call form; a family whose identity is Qwen keeps it (an unmeasured size).
+    if (fallback.neutral() &&
+        template_src.find(tool_call_open(ChatDialect(ChatDialect::Qwen))) != std::string_view::npos)
+        return ChatDialect(ChatDialect::Qwen);
+    return fallback;
 }
 
 bool reserved_template_context_key(std::string_view key) {

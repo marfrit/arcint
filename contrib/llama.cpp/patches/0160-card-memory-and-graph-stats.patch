@@ -1,0 +1,151 @@
+0160: the card's memory (llama_device_card_memory, the driver's region total) and graph stats for the spill guard
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index d5d3db0..7c33303 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,6 +1,7 @@
+ #include "llama-context.h"
+ #include "llama-expert-cache.h"
+ #include "llama-expert-route-trace.h"
++#include "llama-loan-book.h"
+ 
+ #include "ggml.h"
+ #include "llama-arch.h"
+@@ -857,6 +858,11 @@ void llama_context::sched_reserve() {
+         }
+     }
+ 
++    graph_n_nodes_pp = n_nodes_pp;
++    graph_n_splits_pp = n_splits_pp;
++    graph_n_nodes_tg = n_nodes_tg;
++    graph_n_splits_tg = n_splits_tg;
++
+     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+         ggml_backend_t             backend = backend_ptrs[i];
+         ggml_backend_buffer_type_t buft    = backend_buft[i];
+@@ -4822,6 +4828,13 @@ void llama_context::perf_reset() {
+     // note: the reallocation counters are not reset - they track the lifetime totals for this context
+ }
+ 
++void llama_context::graph_stats(int & n_nodes_pp, int & n_splits_pp, int & n_nodes_tg, int & n_splits_tg) const {
++    n_nodes_pp  = graph_n_nodes_pp;
++    n_splits_pp = graph_n_splits_pp;
++    n_nodes_tg  = graph_n_nodes_tg;
++    n_splits_tg = graph_n_splits_tg;
++}
++
+ llama_memory_breakdown llama_context::memory_breakdown() const {
+     std::map<ggml_backend_buffer_type_t, llama_memory_breakdown_data> ret;
+     for (const auto & [buft, size] : model.memory_breakdown()) {
+@@ -5911,6 +5924,43 @@ llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * c
+     return ctx->memory_breakdown();
+ }
+ 
++bool llama_context_graph_stats(const struct llama_context * ctx, struct llama_graph_stats * out) {
++    if (ctx == nullptr || out == nullptr) return false;
++    ctx->graph_stats(out->n_nodes_pp, out->n_splits_pp, out->n_nodes_tg, out->n_splits_tg);
++    return out->n_nodes_pp > 0;
++}
++
++// 0160: the driver's card figure for the spill guard. The same probe the loan uses: this
++// process's xe clients on the device's drm-pdev (sum_fdinfo), then
++// DRM_XE_DEVICE_QUERY_MEM_REGIONS on one of their render fds. The total is returned even when
++// the driver's used is the perfmon-less zero, with used_known false, so a guard can still bound
++// by the region total; no figure at all leaves driver false and the OpenCL total stands in.
++bool llama_device_card_memory(ggml_backend_dev_t dev, struct llama_card_memory_data * out) {
++    if (out == nullptr) return false;
++    *out = llama_card_memory_data{};
++    if (dev == nullptr) {
++        std::snprintf(out->why, sizeof(out->why), "no device");
++        return false;
++    }
++    ggml_backend_dev_props props = {};
++    ggml_backend_dev_get_props(dev, &props);
++    llama_loan_book::FdinfoScan scan;
++    llama_loan_book::scan_fdinfo("/proc/self/fdinfo", scan);
++    const llama_loan_book::FdinfoAgg agg = llama_loan_book::sum_fdinfo(scan, props.device_id);
++    if (agg.measured) out->process_vram0 = agg.vram0;
++    const llama_loan_book::CardQuery q = llama_loan_book::xe_query_card(agg.fd);
++    if (q.total > 0) {
++        out->driver     = true;
++        out->total      = q.total;
++        out->used_known = q.used > 0;
++        out->used       = q.used;
++        if (!q.ok) std::snprintf(out->why, sizeof(out->why), "%s", q.why.empty() ? "the driver's used is not a figure" : q.why.c_str());
++        return true;
++    }
++    std::snprintf(out->why, sizeof(out->why), "%s", !q.why.empty() ? q.why.c_str() : (agg.why != nullptr ? agg.why : "no xe query"));
++    return false;
++}
++
+ // the process's pending last graph (campaign expert-foresight): at the end of
+ // a request, so a continuous trace loses nothing. Nothing when the trace is off
+ void llama_expert_route_trace_flush(llama_context * ctx) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 1ed7483..c1d7bbd 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -225,6 +225,8 @@ struct llama_context {
+     void perf_reset();
+ 
+     llama_memory_breakdown memory_breakdown() const;
++    // 0160: the reserved pp/tg graphs' node and split counts, -1 when not reserved
++    void graph_stats(int & n_nodes_pp, int & n_splits_pp, int & n_nodes_tg, int & n_splits_tg) const;
+ 
+     //
+     // training
+@@ -464,6 +466,12 @@ private:
+ 
++    // 0160: the reserve's graph sizes, for the "runs" tier's start warning
++    int32_t graph_n_nodes_pp = -1;
++    int32_t graph_n_splits_pp = -1;
++    int32_t graph_n_nodes_tg = -1;
++    int32_t graph_n_splits_tg = -1;
++
+     // graph reallocations during inference where the backend assignments did not change, split by whether the
+     // graph size is the same as the previously scheduled one (unexpected) or different
+     int32_t n_reallocs_same = 0;
+     int32_t n_reallocs_diff = 0;
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index d80faae..5eb4700 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -103,6 +103,36 @@ LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * m
+ 
+ LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
+ 
++// 0160: the driver's own card figure, for the spill guard. DRM_XE_DEVICE_QUERY_MEM_REGIONS on a
++// render fd of this process's clients on the device: total is the region total allocations come
++// out of, used is the device-wide figure (the kernel's objects and every client). process_vram0
++// is this process's fdinfo residency, so used - process_vram0 is what other clients and the
++// kernel hold. The bool is false when no region total is available (no drm/xe_drm.h at build,
++// no client, a failed ioctl); the caller then uses the backend's memory_total (OpenCL's
++// CL_DEVICE_GLOBAL_MEM_SIZE) and says so. A total with the perfmon-less used of 0 is still a
++// driver figure and returns true with used_known false, so the caller can bound by the total
++// with the other clients' share at 0. Not part of the loan's rule, which keeps its own probe.
++struct llama_card_memory_data {
++    bool   driver         = false;   // a driver figure answered
++    size_t total          = 0;       // the VRAM region total, bytes
++    bool   used_known     = false;
++    size_t used           = 0;       // the device-wide used, bytes; 0 when not known
++    size_t process_vram0  = 0;       // this process's fdinfo vram0 on the device, bytes; 0 unknown
++    char   why[192]       = {};      // why not, or why used is not known
++};
++LLAMA_API bool llama_device_card_memory(ggml_backend_dev_t dev, struct llama_card_memory_data * out);
++
++// 0160: the graph the context reserved at init, for the "runs" tier's start warning: node and
++// split counts of the prompt (pp) and token (tg) graphs. -1 when not reserved (a training
++// context has tg from pp).
++struct llama_graph_stats {
++    int32_t n_nodes_pp = -1;
++    int32_t n_splits_pp = -1;
++    int32_t n_nodes_tg = -1;
++    int32_t n_splits_tg = -1;
++};
++LLAMA_API bool llama_context_graph_stats(const struct llama_context * ctx, struct llama_graph_stats * out);
++
+ // the backend buffers that a state write of this memory would touch - empty caches report none
+ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llama_memory_t mem);
+ 

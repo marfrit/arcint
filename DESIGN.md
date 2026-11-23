@@ -106,14 +106,27 @@ own red cases, KL as served and the three services
 All served Qwen models are hybrid GatedDeltaNet / attention transformers:
 most layers carry a fixed-size recurrent state (conv + delta-rule state), a
 minority are attention layers with a KV cache. The engine admits a GGUF by
-its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
-`llama` at two geometries only, Mistral Small 24B and Llama 2 7B (the model of
-the community llama-bench GPU tables, `tools/llama_scoreboard.py`), `gemma4` at
-the E4B geometry, `granite` at the 8B geometry and `dory` at the 1.0-4B geometry only (`code`: the decision is
-the pure function in `src/core/admission.cpp`, unit-tested with no model in
-`tests/test_admission.cpp`; the backend reads the numbers from the loaded
-model); anything else is refused at load, and an untested size of an admitted
-architecture is refused the same way, the message naming the admitted sizes.
+its own `general.architecture`, in three tiers (`code`: the pure decision is
+`src/core/admission.cpp`, unit-tested with no model in `tests/test_admission.cpp`;
+the backend reads the numbers from the loaded model):
+
+- **optimized for** — arcint's own kernels or fast path, release gates passed:
+  Inkling 2 Mini, the Qwen3.8 27B agent, Flash-Next.
+- **verified** — the generic path with KL, acceptance and a served check passed:
+  the coder, Dory1.0-4B, Llama 2 7B, Qwen3-TTS under `--tts`, Qwen2.5-VL-7B.
+- **runs** — anything libllama loads that passes the spill guard: no promise, a
+  start warning. Gemma 4 E4B, Granite 8B, Mistral Small 24B, every unmeasured
+  size of `qwen35` / `qwen35moe` / `qwen4exp` / `qwen2vl`, and every architecture
+  not in the table. A table-named runs model keeps its known dialect; every
+  other runs model gets the neutral one. Renderer material and token mode are
+  off, `--tool-grammar` is refused at the start and per request, and a chat
+  route without a template answers 400 `no chat template: use
+  /v1/completions` (no ChatML guess).
+
+The hard refusal is gone: an unknown architecture or an untested size is not
+refused at load, it is a "runs" start that the memory guard must pass. Qwen3-TTS
+without `--tts` is refused: it is an audio-generation backbone, not a language
+model.
 
 Two models admitted 2026-11-06 (operator's order: admit now, optimise later;
 card-free work only). The geometry and dialect claims below are what the files

@@ -9047,6 +9047,45 @@ dense; coder qwen35moe and Flash-Next qwen4exp gate by SOFT_MAX and keep the exi
 The red case: a build whose kernel writes the biased selection value as the weight (in
 `mul_mv_iq_q8_1.cl`). The +-3 Inkling cases and the card KL then fail while the ids stay right.
 
+## 0160-card-memory-and-graph-stats.patch
+
+The spill guard's budget is the driver's figure, not OpenCL's. On the B60 the two disagree
+(`measured-here`): `DRM_XE_DEVICE_QUERY_MEM_REGIONS` says 24,480 MiB, `CL_DEVICE_GLOBAL_MEM_SIZE`
+23,256 MiB, and the agent 27B peaked at 24,196 MiB without spilling, so the allocations come out
+of the region total. The patch exposes `llama_device_card_memory(dev, out)` to `llama-ext.h`: the
+loan's existing probe (this process's xe clients by drm-pdev, then the region query on one of
+their render fds), returned as the driver's total, the device-wide used when it is a figure,
+this process's fdinfo vram0, and a reason. The bool is false when no region total is available
+(no `drm/xe_drm.h`, no client, a failed ioctl); a total with the perfmon-less used of 0 is still
+a driver figure and returns true with `used_known` false. The guard then bounds by the total
+with the other clients' share at 0 and says why. It is not part of the loan's rule, which keeps
+its own probe.
+
+It also exposes `llama_context_graph_stats(ctx, out)`: the reserved prompt and token graphs'
+node and split counts, for the "runs" tier's start warning. The values are what the reserve
+logged before, kept as members.
+
+arcint's rule is `src/core/spill_guard.h` (pure, message included) and the load path in
+`src/exec/backend_llama.cpp`. Device demand is the target context's breakdown by kind plus the
+draft context's own breakdown (the in-model MTP context: its KV 416 + reserve/compute 316 + head
+rows 172 = 904 MiB at the agent's 262,144; a separate `--llama-mtp-gguf`/`--llama-dflash`
+drafter adds its own model), the expert cache's own on-card bytes (slots, Q8_0 banks, gather
+mirror, loan tail), and this process's fdinfo bytes above the known demand (a projector, the KV
+stream, lazily grown scratch). Deliberate host bytes — a pinned expert bank, host buffers — are
+a separate line and never a refusal term. Other clients (`used - fdinfo`) count.
+
+The margin is `kSpillGrowthMarginBytes` = 422 MiB = the worst measured growth beyond the full
+prediction (agent 294 at a 255k needle, Inkling 231 with the switch, Flash-Next 184 and 172 on
+two measured first-request legs, Inkling 65,536 full SWA 226) + 128 MiB headroom. A 512 MiB headroom would refuse
+the agent, which is measured to run; 128 keeps it. The card's lazy allocations are inside the
+draft breakdown and the expert-cache bytes, not in this margin.
+
+The Inkling 65,536 full-SWA start fits: breakdown 23,460, predicted 23,459 before the margin,
+23,585 after the first request, a 60,000-token needle answered with VRAM peak 23,686 and GTT at
+most 308 MiB — no spill. Inkling 131,072 full SWA is above the card by its breakdown alone
+(30,372 MiB) and is the red case; Flash-Next `--llama-expert-cache 40000` is the other red case.
+The cross-check is after the first request: `|M2 - G| <= 422 MiB` and `M2 <= card`.
+
 ## 0161-qwen4exp-dense-layer-rule.patch
 
 Qwen3.8-Flash-Next's own model card calls it "an experimental preview of the architecture that
@@ -9288,6 +9327,7 @@ unit serves:
     # compute buffer and model MiB, plus the guard's figures (the card's used/total, the
     # process's fdinfo vram0 and GTT) at `--n-ctx 262144`; the real GGUF is owed
 
+
 ## 0167-opencl-q8_0-mul_mat_id-prompt-kernel.patch
 
 Inkling 2 Mini's four coda layers (20-23) keep their experts in Q8_0 while layers 0-19 hold
@@ -9347,3 +9387,22 @@ cases OK; `test-opencl-kq-i8` is all OK device-free.
 - KL against the CPU reference: 0.001952 (same top p 98.50 %) against the baseline's 0.001950
   (98.34 %) at the default batch; 0.001988 at `-ub 1`, identical to the baseline (the decode
   batch does not take this arm).
+
+## 0173-expert-cache-projected-bytes.patch
+
+The spill guard's cache suggestion needs on-card bytes for a flag it has not started. The
+cache's own accounting is here: `llama_expert_cache::project_device_bytes(budget)` replays the
+init's slot plan over the stored ranking, recomputes the lend set at that budget, and sizes the
+slot buffer, Q8_0 banks, tables, lend tail, the candidate layers' spare buffers and the gather
+mirror with `ggml_backend_alloc_ctx_tensors_from_buft_size` on the cache's own buffer type, the
+same functions load uses. No allocation is made. `llama_model_expert_cache_projected_bytes`
+exposes it for one cache. arcint walks down from the refused flag (coarse steps, then refined upward) to the largest flag
+whose projected bytes fit the free bytes beside the other terms; the projection is not
+monotonic at low budgets, where a Q8_0 bank holds every expert. The suggestion is a flag value,
+so following it starts. `ARCINT_GUARD_TRACE=1` logs every probe (flag, projected bytes, free
+bytes, verdict).
+
+`measured-here`, B70, Flash-Next on its unit's flags with `--llama-expert-cache 40000`: refused,
+the projection at 40,000 is 40,409 MiB (the load's own figure), the suggestion is 19,107; the
+restart with 19,107 starts (cache 19,437 MiB on the card) and measures 32,402 of 32,656 MiB after
+the first request, against 32,192 predicted.

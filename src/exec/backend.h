@@ -121,6 +121,18 @@ inline std::vector<std::pair<std::string, uint64_t>> collect_downgrades(std::ini
     return parse_downgrades(all);
 }
 
+// One card's spill-guard figures for /props on a split: the worst card's verdict is also the
+// top-level device_memory verdict, and `cards` lists every card's own numbers.
+struct CardMemoryStatus {
+    size_t total = 0, weights = 0, context = 0, compute = 0, cache = 0, draft = 0;
+    size_t other = 0, unlisted = 0;
+    bool   driver = false, fits = true;
+    int    fit_n_ctx = 0;
+    size_t fit_cache = 0;        // free on-card bytes for the cache
+    size_t fit_cache_flag_mib = 0;   // the --llama-expert-cache flag value that fits
+    std::string verdict;
+};
+
 struct ModelStatus {
     // Two names. `id` is the served file's own name (the GGUF's file name; the
     // stub's "stub") and never moves. `served_id` is what the outside world is
@@ -147,6 +159,31 @@ struct ModelStatus {
     // milestone-1.2.0.md A2). The stub is false, so tests/roundtrip.sh's
     // text-only refusal exercises that branch.
     bool        mmproj_loaded = false;
+    // The spill guard's accounting: libllama's own record of what it placed, after the context
+    // was created: on the card(s) by kind, the host's buffers, and the card's memory (0 when unknown)
+    size_t      mem_device_weights = 0, mem_device_context = 0, mem_device_compute = 0, mem_host = 0, mem_card = 0;
+    // The spill guard: the card figure the guard used (xe's region total when
+    // the driver answered, OpenCL's global size otherwise), the device-wide used and this
+    // process's residency, the other clients' share, the deliberate host bank, and the
+    // verdict. `mem_spill_fits` false with `mem_spill_refused` false is an
+    // --llama-allow-spill start; both false and refused true is a start that did not happen.
+    bool        mem_card_from_driver = false;
+    bool        mem_used_known = false;
+    size_t      mem_driver_used = 0, mem_process_vram0 = 0, mem_other_clients = 0;
+    size_t      mem_host_banks = 0;   // pinned expert banks, by design; disjoint from the breakdown's host buffers
+    // Device demand outside llama_get_memory_breakdown, from its own accounting:
+    // the expert cache's slots/Q8_0 banks/gather mirror/loan tail, the MTP/DFlash draft model,
+    // context and head rows, and this process's fdinfo bytes above the known demand (a
+    // projector, lazily grown scratch, the KV stream: anything the allocation grep misses).
+    size_t      mem_cache_device = 0, mem_draft_device = 0, mem_unlisted = 0;
+    size_t      mem_growth_margin = 0;
+    bool        mem_spill_fits = true, mem_spill_refused = false;
+    int         mem_worst_card = 0;   // the card the verdict fields describe (the worst on a split)
+    int         mem_fit_n_ctx = 0;
+    size_t      mem_fit_cache = 0;        // free on-card bytes for the cache
+    size_t      mem_fit_cache_flag_mib = 0;   // the --llama-expert-cache flag value that fits
+    std::string mem_spill_verdict;   // "fits", "allowed-spill" or "refused"
+    std::vector<CardMemoryStatus> mem_cards;   // one per card, its own figures and verdict
     // The projector's own capabilities, from libmtmd's
     // `mtmd_get_cap_from_file` (EXPERIMENTAL at the pin): whether its clip
     // half takes images (`inp_vision`) and/or audio (`inp_audio`). /props
@@ -194,6 +231,11 @@ struct ModelStatus {
     // Qwens keep the Qwen tag alone, so an answer of theirs that merely
     // starts with such text stays content.
     ChatDialect dialect;
+    // The tiers: the tier the load's admission decision returned, and whether the GGUF
+    // or --chat-template-file carried a template. A "runs" start without one serves
+    // /v1/completions and answers chat routes with a 400; there is no ChatML guess.
+    std::string admission_tier;   // "optimized for", "verified", "runs"; empty on the stub
+    bool        has_chat_template = true;   // the stub and test fixtures render; the llama load sets it
 
     SamplerDefaults sampler_defaults;
 };

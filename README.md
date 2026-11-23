@@ -614,7 +614,7 @@ service's production flags, Flash-Next's expert cache included
 
 ## Scope
 
-- **Models**: the table above. Other architectures are refused at load.
+- **Models**: the table above, in the three admission tiers (DESIGN §2): `optimized for`, `verified`, and `runs` — any architecture or size libllama loads that passes the spill guard, with no promise and a start warning.
 - **Cards**: the Intel Arc Pro B70 (32 GB, Xe2, BMG-G31) and B60 (24 GB, Xe2, BMG-G21), under the xe
   kernel driver; `--device B70` / `--device B60` pick a card by name.
   One card per process, or two by layers for one model

@@ -994,3 +994,9 @@ TEST(chat_template_kwarg_parse_default_force_nonempty_content_values) {
         if (err) CHECK(err->find("true or false") != std::string::npos);
     }
 }
+
+TEST(chat_template_text_of_a_null_embedded_template_is_empty) {
+    // a runs model without a chat template: no std::string is built from a null pointer
+    CHECK_EQ(chat_template_text(nullptr), std::string());
+    CHECK_EQ(chat_template_text("{% for message in messages %}"), std::string("{% for message in messages %}"));
+}

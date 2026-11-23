@@ -474,6 +474,10 @@ std::string usage_text() {
         "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
         "                            (default f16): q8_0 takes the cache to 53 %,\n"
         "                            q8_0:q4_0 to 41 %\n"
+        "  --llama-allow-spill       run a start whose device demand plus the\n"
+        "                            request-growth margin does not fit the card, with a\n"
+        "                            warning that names every part; without it the start is\n"
+        "                            refused at load (default off: no silent fallback)\n"
         "  --llama-swa-window        size the sliding-window KV layers to the model's\n"
         "                            window + a ubatch, not the whole context (opt-in;\n"
         "                            default off: prefix reuse is exact at the library\n"
@@ -677,6 +681,8 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
                 return fail("--llama-kv takes f16, q8_0 or q8_0:q4_0");
         } else if (arg == "--llama-swa-window") {
             cfg.llama_swa_window = true;
+        } else if (arg == "--llama-allow-spill") {
+            cfg.llama_allow_spill = true;
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);

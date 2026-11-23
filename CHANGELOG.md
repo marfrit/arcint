@@ -84,6 +84,25 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   profile share 23.2 % -> 2.1 %; KL to the CPU reference 0.001952 (same top p 98.50 %) against 0.001950 (98.34 %), and
   identical at micro-batch 1; the op cases pass and the red build (scale dropped) fails 47 of them.
 
+- **The spill guard and the admission tiers** (patches 0160, 0173). At start the guard bounds the device demand against the
+  driver's card figure (xe's region total: the B60 24,480 MiB, the B70 32,656; OpenCL's global size reads 23,256 on the
+  B60 and the agent runs above it). The demand is libllama's breakdown (weights, context, compute), the expert cache's
+  on-card slots and banks from its own accounting, a draft model or in-model MTP context from its own breakdown, the
+  process's other device bytes, the other clients, and a 422 MiB growth margin (the worst measured growth beyond that
+  prediction, 294 MiB at the agent's 255k needle, plus 128). Host memory placed on purpose (a pinned expert bank) is
+  logged and never counted. A start that does not fit is refused with every part named and the `--n-ctx` (or expert
+  cache, projected through the cache's own accounting, 0173) that would fit; `--llama-allow-spill` keeps the old behaviour with a warning. `/props` carries the accounting
+  and the verdict. Admission is by tier: "optimized for" (Inkling 2 Mini, the Qwen3.8 27B agent, Flash-Next),
+  "verified" (the coder, Dory1.0-4B, Llama 2 7B for completions, Qwen3-TTS, Qwen2.5-VL-7B) and "runs" (any other model
+  libllama loads that passes the guard: no token mode, `--tool-grammar` refused at start and per request, chat
+  routes refused without a template, a start warning with the downgrade count; a model the table names keeps its known
+  dialect, any other gets a neutral one). A template-less runs model serves `/v1/completions` and answers chat with 400. Card evidence (`measured-here`): every production unit starts on its own
+  flags and the prediction lands within 106-172 MiB of the VRAM after the first request (agent 23,902 / 24,027,
+  Flash-Next 26,122 / 26,294); Inkling at 65,536 cells with the full SWA cache fits (23,459 / 23,585, and a 60k needle
+  answered with GTT at 308 MiB); Inkling at 131,072 full SWA (30,834) and Flash-Next with a 40,000 MiB expert cache
+  (53,627) are refused; the latter suggests `--llama-expert-cache 19107`, and the restart with it starts and
+  measures 32,402 of the B70's 32,656 MiB after the first request (32,192 predicted).
+
 ## 1.8.0 — 2026-11-22
 
 Release gate against 1.7.0 (`measured-here`, 2026-11-22, RC 64ad74b0 = the release code; the 1.7.0 package and its llama tools against the RC's; B60 at a 165 W cap, B70 at 220 W). **The existing models** (0147, 0149 and 0150 touch generic OpenCL ops): the agent's 27B Q4_K_M at micro-batch 1 against the CPU Q8_0 reference, mean KL 0.010389 / 96.313 % top-1 on both (1.7.0's own gate figure); the iwo4 coder file and Dory against a 1.7.0 run, KL 0 and 100 % top-1 (the same logits); Flash-Next (experts on the CPU) against a 1.7.0 run, KL 0, 100 %. llama-bench pp512 / tg128 old / new, alternating: the agent 1024.3-1024.8 / 1025.1-1026.1 and 19.72-19.74 / 19.73-19.74; the coder 1807.9-1808.9 / 1808.0-1808.7 and 70.14-70.21 / 70.12-70.13; Dory 1941.3-1944.7 / 1920.5-1932.5 (spreads of 4-22 t/s) and 34.47 / 34.37-34.41. The agent's 12-answer arms on its unit flags (MTP 5): 48.25, 46.01 / 47.13, 47.64 t/s, identical texts, draft acceptance 49.3 % in every run. Flash-Next's 12-answer arms on its unit flags (B70, IQ3_S, MTP 3): old 42.50 / new 42.95, 43.56 t/s, identical texts, draft acceptance 73.0 % in every run (a first old run was lost to a port collision with a parallel window; a rerun's new arms read 44.84 and 43.99 with the same texts, its old arms ran beside a recipe build on the shared host and are not counted); its downgrade keys are the accepted ones on both. No downgrade line new. The op suites on the B70 with the release tools: CONCAT 123, REPEAT 15, SCALE 6, SIGMOID 8, SWIGLU 24, SITU 6, FLASH_ATTN_EXT 3,173 (B70; the two new 0152 cases red on 0150). **Inkling 2 Mini:** mean KL against the CPU reference at 32,768 tokens 0.005965 / 98.065 % top-1 with q8_0 KV (f16 0.005306); the needle found at 64,000 and 120,000 tokens with q8_0 KV on the B70 (131,072 cells), and on the B60 unit's own arguments (q8_0 KV, 49,152 cells) at 45,000 and 8,000 tokens (21,935 MiB, GTT 260 MiB); the acceptance task 10/10 at effort low; two concurrent lanes answer right. The xe kernel log counts no new wedge, CAT error or job timeout in the gate windows.

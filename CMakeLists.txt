@@ -81,6 +81,7 @@ add_library(arcint_core STATIC
   src/util/utf8.cpp
   src/util/text.cpp
   src/core/admission.cpp
+  src/core/spill_guard.cpp
   src/core/dory.cpp
   src/core/reasoning.cpp
   src/core/renderer_material.cpp
@@ -208,6 +209,21 @@ if(ARCINT_LLAMA)
   else()
     message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0111: a weight the card declines at load is not reported")
   endif()
+  # contrib/llama.cpp 0160: the driver's card figure (llama_device_card_memory) and the
+  # reserved graph stats (llama_context_graph_stats). The backend uses the patch's types
+  # outside the #ifdef, so a tree without it cannot compile: refused at configure.
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_device_card_memory")
+    message(STATUS "contrib/llama.cpp 0160 present: the driver's card figure is built")
+  else()
+    message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0160 (llama_device_card_memory): the spill guard's backend needs its types")
+  endif()
+  # contrib/llama.cpp 0173: the expert cache's projected bytes at a budget; the guard's cache
+  # suggestion searches it. The backend calls it outside the #ifdef, so a missing patch refuses.
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_model_expert_cache_projected_bytes")
+    message(STATUS "contrib/llama.cpp 0173 present: the expert cache projection is built")
+  else()
+    message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0173 (llama_model_expert_cache_projected_bytes): the guard's cache suggestion needs it")
+  endif()
   # contrib/llama.cpp 0153: the attention part's own oldest retained position
   # (llama_memory_attn_seq_pos_min in llama-ext.h), which a window-sized SWA
   # cache needs to decide whether a prefix trim is exact; without it
@@ -296,6 +312,7 @@ if(ARCINT_TESTS)
     tests/test_sampling.cpp
     tests/test_stop.cpp
     tests/test_chat.cpp
+    tests/test_minja_empty.cpp
     tests/test_chat_render.cpp
     tests/test_text.cpp
     tests/test_config.cpp
@@ -323,6 +340,7 @@ if(ARCINT_TESTS)
     tests/test_raw_trace.cpp
     tests/test_stream_golden.cpp
     tests/test_admission.cpp
+    tests/test_spill_guard.cpp
     tests/test_dory.cpp
     tests/test_dory_request.cpp
     tests/test_gemma4.cpp

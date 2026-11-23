@@ -143,6 +143,10 @@ inline constexpr const char* kMediaMarker = "<__media__>";
 // any other template: a unit that asked for a file does not start without it.
 // What it cannot check is a template that parses but renders wrongly for the
 // model; that needs the GGUF. Enforced by test_template_file.cpp's chat_template_file_* cases.
+// A GGUF's embedded template pointer may be null (a "runs" model with no template); the text
+// a model carries is then the empty string, which builds the template object safely.
+std::string chat_template_text(const char* embedded);
+
 std::optional<std::string> load_chat_template_file(const std::string& path, std::string& text);
 
 // The names a chat_template_kwargs key must not take, because the vendored

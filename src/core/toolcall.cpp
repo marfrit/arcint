@@ -407,10 +407,12 @@ ToolCallParse parse_inkling_tool_calls(std::string_view text) {
 }  // namespace
 
 std::string_view tool_call_open(ChatDialect dialect) {
+    if (dialect.neutral()) return {};
     if (dialect.inkling()) return markers::kInkMessageModel;
     return dialect.gemma4() ? markers::kGemmaToolOpen : kOpen;
 }
 std::string_view tool_call_close(ChatDialect dialect) {
+    if (dialect.neutral()) return {};
     if (dialect.inkling()) return markers::kInkEndMessage;
     return dialect.gemma4() ? markers::kGemmaToolClose : kClose;
 }
@@ -469,6 +471,7 @@ ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* sc
 }
 
 ToolCallParse parse_tool_calls(std::string_view text, ChatDialect dialect, const ToolSchemas* schemas) {
+    if (dialect.neutral()) return ToolCallParse{std::string(text), {}, false};   // "runs" parses no calls
     if (dialect.inkling()) return parse_inkling_tool_calls(text);
     return dialect.gemma4() ? parse_gemma_tool_calls(text, schemas) : parse_qwen_tool_calls(text, schemas);
 }
