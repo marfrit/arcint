@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a128fff..ffd6168 100644
+index a128fff..0a3a55c 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -468,6 +468,10 @@ static std::string var_to_str(ggml_scale_mode mode) {
@@ -13,16 +13,21 @@ index a128fff..ffd6168 100644
  
  // accept FLT_MAX as infinity
  static bool isinf_or_max(float f) {
-@@ -9499,8 +9503,18 @@ struct test_flash_attn_ext : public test_case {
+@@ -9499,8 +9503,23 @@ struct test_flash_attn_ext : public test_case {
      const int64_t n_bins; // table->ne[1]; 0 when bias is off
      const bool sinks_zeros; // fill the sinks with zeros, as the model with a folded-in sink logit does
  
-+    // 0199: the port arm. port: positions, group classes and per-query sinks, and the
-+    // mask/bins built from the positions so the CPU path agrees; wrap: the kv positions
-+    // are a rotated ring, with the seam inside the first (1) or the second (2) 16-key
-+    // group of a 32-key block; window: the port's window; n_empty: that many cells at the
-+    // end of the kv axis are empty (a cache presented beyond its fill).
-+    const bool port;
++    // 0199: the port arm. port 1: the port's case - positions, group classes and per-query
++    // sinks, the table [n_bins, n_head, rows] with the bias only. port 2: its twin for the
++    // indexed-bias kernels of today - the SAME q/k/v, positions, mask and bins, the table
++    // [n_head, n_bins, rows] with the sink folded into every bin (bias - sink) and a zero
++    // sink, which is the same attention (exp(s-t)/(1+sum exp(s-t)) = exp(s)/(exp(t)+sum exp(s))),
++    // as the model's graph has it with the knob off. Both are filled from one deterministic
++    // function of the logical index, whatever the layout. wrap: the kv positions are a
++    // rotated ring, with the seam inside the first (1) or the second (2) 16-key group of a
++    // 32-key block; window: the window; n_empty: that many cells at the end of the kv axis
++    // are empty (a cache presented beyond its fill).
++    const int32_t port;
 +    const int32_t wrap;
 +    const int32_t window;
 +    const int64_t n_empty;
@@ -33,13 +38,13 @@ index a128fff..ffd6168 100644
      }
  
      double max_nmse_err() override {
-@@ -9518,10 +9532,11 @@ struct test_flash_attn_ext : public test_case {
+@@ -9518,10 +9537,11 @@ struct test_flash_attn_ext : public test_case {
                          bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                          ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
                          bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
 -                        bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false)
 +                        bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false,
-+                        bool port = false, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0)
++                        int32_t port = 0, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0)
          : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
            type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
 -          bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros) {}
@@ -47,22 +52,22 @@ index a128fff..ffd6168 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
-@@ -9583,7 +9598,9 @@ struct test_flash_attn_ext : public test_case {
+@@ -9583,7 +9603,9 @@ struct test_flash_attn_ext : public test_case {
          ggml_tensor * bi = nullptr;
          if (bias) {
              // one row of bins per head, one query (a row of all streams, flattened in stream order) per column
 -            bt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[2], n_bins, q->ne[1]*q->ne[3]);
 +            // 0194: the port's table is [n_bins, n_head, rows] - a row's bins contiguous, as ggml_mul_mat emits
-+            bt = port ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_bins, q->ne[2], q->ne[1]*q->ne[3])
-+                      : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[2], n_bins, q->ne[1]*q->ne[3]);
++            bt = port == 1 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_bins, q->ne[2], q->ne[1]*q->ne[3])
++                           : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[2], n_bins, q->ne[1]*q->ne[3]);
              ggml_set_name(bt, "bt");
              bi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, q->ne[1]*q->ne[3]);
              ggml_set_name(bi, "bi");
-@@ -9593,6 +9610,31 @@ struct test_flash_attn_ext : public test_case {
+@@ -9593,14 +9615,163 @@ struct test_flash_attn_ext : public test_case {
          ggml_flash_attn_ext_add_sinks(out, s);
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_flash_attn_ext_add_indexed_bias(out, bt, bi);
-+        if (port) {
++        if (port == 1) {
 +            // 0199: the port's cases carry the model's own layout, the graph export's
 +            // FLASH_ATTN_EXT prompt lines (inkling-ub512.txt lines 222 / 223): q a permuted
 +            // view [D, Lq, Hq] with nb [4, Hq*D*4, D*4], K/V permuted views [D, n_kv, Hk]
@@ -90,90 +95,139 @@ index a128fff..ffd6168 100644
          ggml_prec_set_acc(out, prec);
          ggml_set_name(out, "out");
  
-@@ -9601,7 +9643,70 @@ struct test_flash_attn_ext : public test_case {
+         return out;
+     }
  
++    // 0199: a value in [0, 1) that depends on (salt, index) only: the port's case and its twin
++    // must hold the same numbers whatever their layouts and whatever ran before
++    static float det01(uint64_t salt, uint64_t i) {
++        uint64_t x = (salt + 1) * 0x9E3779B97F4A7C15ull + i;
++        x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull;
++        x ^= x >> 27; x *= 0x94D049BB133111EBull;
++        x ^= x >> 31;
++        return (float) (x >> 40) * (1.0f / 16777216.0f);
++    }
++
++    // 0199: every tensor of a port case (port 1) or of its twin (port 2)
++    void init_port_tensor(ggml_tensor * t) {
++        GGML_ASSERT(nr23[1] == 1);
++        const int64_t n_kv = kv, n_q = nb, n_used = kv - n_empty, n_head = nh * nr23[0];
++        // positions: the first n_used cells hold positions 0..n_used-1 (a rotated ring when wrap:
++        // the seam sits 8 keys into a 32-key block for wrap 1, 24 keys into it for wrap 2, so it
++        // breaks the block's first or second group), the rest are empty (-1); queries at
++        // n_used-nq .. n_used-1 (the chunk at the end of its keys)
++        const int64_t shift = wrap == 0 ? 0 : n_used/2 + (wrap == 1 ? 24 : 8);
++        auto kpos = [&](int64_t j) -> int32_t {
++            return (int32_t) (j >= n_used ? -1 : (j + shift) % n_used);
++        };
++        auto qpos = [&](int64_t i) -> int32_t { return (int32_t) (n_used - n_q + i); };
++        // the sink logit of (head, row): it weighs like a seventh of a row's keys, so that a
++        // dropped or misplaced sink (the red case 2) moves the answer well past the tolerance
++        auto sinkv = [&](int64_t h, int64_t r) -> float { return 6.0f + 2.0f * det01(3, (uint64_t) (r*n_head + h)); };
++        // the bias of (bin, head, row); the last bin is the pad bin and zero, as the model's
++        // is (ggml_pad adds it): a key at or past the extent has no bias
++        auto biasv = [&](int64_t b, int64_t h, int64_t r) -> float {
++            return b == n_bins - 1 ? 0.0f : -4.0f + 8.0f * det01(4, (uint64_t) ((r*n_head + h)*n_bins + b));
++        };
++        // q / k / v by logical index (dim, row, head), through whatever view the case built
++        auto fill_view = [&](ggml_tensor * tv, uint64_t salt) {
++            ggml_tensor * base = tv->view_src ? tv->view_src : tv;
++            const size_t off = tv->view_src ? tv->view_offs : 0;
++            std::vector<uint8_t> buf(ggml_nbytes(base), 0);
++            GGML_ASSERT(tv->ne[3] == 1 && (tv->type == GGML_TYPE_F32 || tv->type == GGML_TYPE_F16));
++            for (int64_t i2 = 0; i2 < tv->ne[2]; ++i2) for (int64_t i1 = 0; i1 < tv->ne[1]; ++i1) for (int64_t i0 = 0; i0 < tv->ne[0]; ++i0) {
++                const float x = -1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0));
++                uint8_t * dstp = buf.data() + off + i0*tv->nb[0] + i1*tv->nb[1] + i2*tv->nb[2];
++                if (tv->type == GGML_TYPE_F32) {
++                    memcpy(dstp, &x, sizeof(float));
++                } else {
++                    const ggml_fp16_t hx = ggml_fp32_to_fp16(x);
++                    memcpy(dstp, &hx, sizeof(hx));
++                }
++            }
++            ggml_backend_tensor_set(base, buf.data(), 0, buf.size());
++        };
++        if (strcmp(t->name, "q") == 0) {
++            fill_view(t, 0);
++        } else if (strcmp(t->name, "k") == 0) {
++            fill_view(t, 1);
++        } else if (strcmp(t->name, "v") == 0) {
++            fill_view(t, 2);
++        } else if (strcmp(t->name, "pk") == 0) {
++            std::vector<int32_t> d(n_kv);
++            for (int64_t j = 0; j < n_kv; ++j) d[j] = kpos(j);
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int32_t));
++        } else if (strcmp(t->name, "pq") == 0) {
++            std::vector<int32_t> d(n_q);
++            for (int64_t i = 0; i < n_q; ++i) d[i] = qpos(i);
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int32_t));
++        } else if (strcmp(t->name, "cf") == 0) {
++            // a key group's class, as llama_kv_cache::set_input_port_pos writes it:
++            // 1 consecutive and none empty, 2 every cell empty, 0 anything else
++            std::vector<int8_t> d((n_kv + 15) / 16);
++            for (int64_t g = 0; g < (int64_t) d.size(); ++g) {
++                const int64_t lo = g*16, hi = std::min((g + 1)*16, n_kv);
++                bool lin = true, empty = true;
++                for (int64_t j = lo; j < hi; ++j) {
++                    empty = empty && kpos(j) < 0;
++                    lin   = lin && kpos(j) >= 0 && (j == lo || kpos(j) == kpos(j - 1) + 1);
++                }
++                d[g] = lin ? 1 : (empty ? 2 : 0);
++            }
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int8_t));
++        } else if (strcmp(t->name, "rf") == 0) {
++            std::vector<int8_t> d((n_q + 7) / 8, 1);   // the rows are consecutive
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int8_t));
++        } else if (strcmp(t->name, "m") == 0) {
++            std::vector<ggml_fp16_t> d(n_kv * n_q);
++            for (int64_t i = 0; i < n_q; ++i) for (int64_t j = 0; j < n_kv; ++j) {
++                const int32_t dist = qpos(i) - kpos(j);
++                const bool vis = kpos(j) >= 0 && dist >= 0 && (window == 0 || dist < window);
++                d[i*n_kv + j] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
++            }
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(ggml_fp16_t));
++        } else if (strcmp(t->name, "bi") == 0) {
++            std::vector<int32_t> d(n_kv * n_q);
++            for (int64_t i = 0; i < n_q; ++i) for (int64_t j = 0; j < n_kv; ++j) {
++                const int32_t dist = qpos(i) - kpos(j);
++                d[i*n_kv + j] = kpos(j) < 0 || dist < 0 ? (int32_t) (n_bins - 1) : (dist < n_bins - 1 ? dist : (int32_t) (n_bins - 1));
++            }
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int32_t));
++        } else if (strcmp(t->name, "bt") == 0) {
++            std::vector<float> d(ggml_nelements(t));
++            for (int64_t r = 0; r < n_q; ++r) for (int64_t h = 0; h < n_head; ++h) for (int64_t b = 0; b < n_bins; ++b) {
++                if (port == 1) {
++                    d[(r*n_head + h)*n_bins + b] = biasv(b, h, r);                    // [bin, head, row]: the bias
++                } else {
++                    d[(r*n_bins + b)*n_head + h] = biasv(b, h, r) - sinkv(h, r);      // [head, bin, row]: the sink folded in
++                }
++            }
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(float));
++        } else if (strcmp(t->name, "sq") == 0) {
++            std::vector<float> d(n_head * n_q);
++            for (int64_t r = 0; r < n_q; ++r) for (int64_t h = 0; h < n_head; ++h) d[r*n_head + h] = sinkv(h, r);
++            ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(float));
++        } else if (strcmp(t->name, "s") == 0) {
++            // the per-head sink: zero. The port reads src[18]; the twin's sink is in its table
++            std::vector<float> z(ggml_nelements(t), 0.0f);
++            ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
++        } else if (t->view_src == nullptr) {
++            // anything else: the base of a view above (overwritten through the view, which
++            // comes after it), the output, or the harness's sentinels, which it compares
++            init_tensor_uniform(t);
++        }
++    }
++
      void initialize_tensors(ggml_context * ctx) override {
          for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
--            if (strcmp(t->name, "s") == 0) {
-+            if (port && (strcmp(t->name, "pk") == 0 || strcmp(t->name, "pq") == 0 || strcmp(t->name, "cf") == 0 ||
-+                         strcmp(t->name, "rf") == 0 || strcmp(t->name, "m") == 0 || strcmp(t->name, "bi") == 0)) {
-+                // 0199: positions and everything derived from them, so the CPU's mask+bias path and
-+                // the port's positions agree: the first n_used = kv - n_empty cells hold positions
-+                // 0..n_used-1 (a rotated ring when wrap: the seam sits 8 keys into a 32-key block
-+                // for wrap 1, 24 keys into it for wrap 2, so it breaks the block's first or second
-+                // group), the rest are empty (-1); queries at n_used-nq .. n_used-1 (the chunk at
-+                // the end of its keys)
-+                const int64_t n_kv = kv, n_q = nb * nr23[1], n_used = kv - n_empty;
-+                const int64_t shift = wrap == 0 ? 0 : n_used/2 + (wrap == 1 ? 24 : 8);
-+                auto kpos = [&](int64_t j) -> int32_t {
-+                    return (int32_t) (j >= n_used ? -1 : (j + shift) % n_used);
-+                };
-+                auto qpos = [&](int64_t i) -> int32_t { return (int32_t) (n_used - n_q + i); };
-+                if (strcmp(t->name, "pk") == 0) {
-+                    std::vector<int32_t> d(n_kv);
-+                    for (int64_t j = 0; j < n_kv; ++j) d[j] = kpos(j);
-+                    ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int32_t));
-+                } else if (strcmp(t->name, "pq") == 0) {
-+                    std::vector<int32_t> d(n_q);
-+                    for (int64_t i = 0; i < n_q; ++i) d[i] = qpos(i);
-+                    ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int32_t));
-+                } else if (strcmp(t->name, "cf") == 0) {
-+                    // a key group's class, as llama_kv_cache::set_input_port_pos writes it:
-+                    // 1 consecutive and none empty, 2 every cell empty, 0 anything else
-+                    std::vector<int8_t> d((n_kv + 15) / 16);
-+                    for (int64_t g = 0; g < (int64_t) d.size(); ++g) {
-+                        const int64_t lo = g*16, hi = std::min((g + 1)*16, n_kv);
-+                        bool lin = true, empty = true;
-+                        for (int64_t j = lo; j < hi; ++j) {
-+                            empty = empty && kpos(j) < 0;
-+                            lin   = lin && kpos(j) >= 0 && (j == lo || kpos(j) == kpos(j - 1) + 1);
-+                        }
-+                        d[g] = lin ? 1 : (empty ? 2 : 0);
-+                    }
-+                    ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int8_t));
-+                } else if (strcmp(t->name, "rf") == 0) {
-+                    std::vector<int8_t> d((n_q + 7) / 8, 1);   // the rows are consecutive
-+                    ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int8_t));
-+                } else if (strcmp(t->name, "m") == 0) {
-+                    std::vector<ggml_fp16_t> d(n_kv * n_q);
-+                    for (int64_t i = 0; i < n_q; ++i) for (int64_t j = 0; j < n_kv; ++j) {
-+                        const int32_t dist = qpos(i) - kpos(j);
-+                        const bool vis = kpos(j) >= 0 && dist >= 0 && (window == 0 || dist < window);
-+                        d[i*n_kv + j] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
-+                    }
-+                    ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(ggml_fp16_t));
-+                } else { // bi
-+                    std::vector<int32_t> d(n_kv * n_q);
-+                    for (int64_t i = 0; i < n_q; ++i) for (int64_t j = 0; j < n_kv; ++j) {
-+                        const int32_t dist = qpos(i) - kpos(j);
-+                        d[i*n_kv + j] = kpos(j) < 0 || dist < 0 ? (int32_t) (n_bins - 1) : (dist < n_bins - 1 ? dist : (int32_t) (n_bins - 1));
-+                    }
-+                    ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(int32_t));
-+                }
-+            } else if (port && strcmp(t->name, "bt") == 0) {
-+                // 0199: the port's table [n_bins, n_head, rows]; the last bin is the pad bin and
-+                // zero, as the model's is (ggml_pad adds it): a key at or past the extent has no bias
-+                init_tensor_uniform(t, -4.0f, 4.0f);
-+                std::vector<float> d(ggml_nelements(t));
-+                ggml_backend_tensor_get(t, d.data(), 0, d.size() * sizeof(float));
-+                for (size_t r = n_bins - 1; r < d.size(); r += n_bins) d[r] = 0.0f;
-+                ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(float));
-+            } else if (strcmp(t->name, "s") == 0) {
++            if (port) {
++                init_port_tensor(t);
++                continue;
++            }
+             if (strcmp(t->name, "s") == 0) {
                  if (sinks_zeros) {
                      std::vector<float> z(ggml_nelements(t), 0.0f);
-                     ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
-@@ -9622,6 +9727,10 @@ struct test_flash_attn_ext : public test_case {
-                     data[i] = (i % 997 == 996) ? (int32_t) n_bins : (int32_t) ((key + 5*row) % n_bins);
-                 }
-                 ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
-+            } else if (strcmp(t->name, "sq") == 0) {
-+                // a sink logit that weighs like a tenth of a row's keys, so that a dropped or
-+                // misplaced sink (the red case 2) moves the answer past the tolerance
-+                init_tensor_uniform(t, 3.0f, 6.0f);
-             } else if (strcmp(t->name, "m") == 0) {
-                 if (n_kv_max > 0) {
-                     init_tensor_kq_mask_sparse(t, n_kv_max);
-@@ -13907,6 +14016,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13907,6 +14078,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 16448, 128, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true, 1025));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 24, {1, 8}, 1024, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
  
@@ -200,30 +254,116 @@ index a128fff..ffd6168 100644
 +        }) {
 +        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
 +            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
-+            true, (int32_t) c[2], (int32_t) c[3], c[4]));
++            1, (int32_t) c[2], (int32_t) c[3], c[4]));
++    }
++    // 0199: the twins (port=2) of the first two cases: the same data for today's indexed-bias
++    // kernels, in the model's layout and in a contiguous one with a kv view
++    for (auto c : std::vector<std::array<int64_t, 5>>{ { 1536, 512, 2, 1024, 0 }, { 4096, 512, 0, 0, 2560 } }) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++            2, (int32_t) c[2], (int32_t) c[3], c[4]));
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025, false,
++            2, (int32_t) c[2], (int32_t) c[3], c[4]));
 +    }
 +
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -14256,6 +14391,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14256,6 +14463,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                              kvt.first, kvt.second));
          }
      }
 +    // 0199: the port arm's shapes (GGML_OPENCL_FA_PORT=1; window 1024, 24 query heads on 8,
-+    // head 128, 1025 bins, the model's layout), and the same shapes as today's indexed-bias
-+    // call (port=0), so one perf run times both arms; then the export's global shape
++    // head 128, 1025 bins, the model's layout) and, like for like, their twins (port=2: the
++    // same q/k/v, positions, mask and bins for today's indexed-bias kernels, the knob off) in
++    // the model's layout and in a contiguous one with a kv view; then the export's global shape
 +    for (auto c : std::vector<std::array<int64_t, 2>>{ { 1536, 512 }, { 2048, 2048 }, { 3072, 2048 } }) {
++        for (int32_t port : { 1, 2 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++                GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++                port, 0, 1024, 0));
++        }
 +        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
-+            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
-+            true, 0, 1024, 0));
-+        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
-+            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
++            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025, false,
++            2, 0, 1024, 0));
 +    }
-+    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 4096, 512, true, true, 0, 0,
-+        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
-+        true, 0, 0, 2560));
++    for (int32_t port : { 1, 2 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 4096, 512, true, true, 0, 0,
++            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++            port, 0, 0, 2560));
++    }
 +
      // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
      // 27B's geometry (head size 256, 24 query heads on 4)
      for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
+@@ -15077,8 +15304,69 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
+     return n_fail == 0;
+ }
+ 
++// 0199: GGML_TEST_FA_PORT_TWINS=1: a port case (port=1) and its twins (port=2, both layouts)
++// must build the same mask and compute the same attention on the given backend - the CPU,
++// which reads either table layout and either sink. It proves the like-for-like perf pairs
++// are the same problem, not that any kernel is right.
++static bool test_fa_port_twins(ggml_backend_t backend) {
++    auto run = [&](test_flash_attn_ext & tc, std::vector<float> & out, std::vector<uint8_t> & mask) {
++        ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++        ggml_context * ctx = ggml_init(params);
++        ggml_tensor * o = tc.build_graph(ctx);
++        ggml_cgraph * gf = ggml_new_graph(ctx);
++        ggml_build_forward_expand(gf, o);
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++        GGML_ASSERT(buf != nullptr);
++        tc.initialize_tensors(ctx);
++        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++        out.resize(ggml_nelements(o));
++        ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
++        ggml_tensor * m = ggml_get_tensor(ctx, "m");
++        mask.resize(ggml_nbytes(m));
++        ggml_backend_tensor_get(m, mask.data(), 0, mask.size());
++        ggml_backend_buffer_free(buf);
++        ggml_free(ctx);
++    };
++    int n_fail = 0;
++    for (auto c : std::vector<std::array<int64_t, 5>>{
++            { 1536, 512, 0, 1024, 0 }, { 2048, 2048, 0, 1024, 0 }, { 3072, 2048, 0, 1024, 0 },
++            { 4096, 512, 0, 0, 2560 }, { 1536, 512, 2, 1024, 0 }, { 160, 12, 0, 0, 60 } }) {
++        std::vector<float> out[3];
++        std::vector<uint8_t> mask[3];
++        for (int i = 0; i < 3; ++i) {
++            const bool model_layout = i < 2;
++            test_flash_attn_ext tc(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
++                                   model_layout ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3},
++                                   !model_layout, false, 0, true, 1025, false,
++                                   i == 0 ? 1 : 2, (int32_t) c[2], (int32_t) c[3], c[4]);
++            run(tc, out[i], mask[i]);
++        }
++        for (int i = 1; i < 3; ++i) {
++            double num = 0.0, den = 0.0;
++            for (size_t e = 0; e < out[0].size(); ++e) {
++                const double d = (double) out[i][e] - out[0][e];
++                num += d*d; den += (double) out[0][e]*out[0][e];
++            }
++            const bool same_mask = mask[i] == mask[0];
++            const double nmse = den > 0.0 ? num/den : 1.0;
++            // the same attention up to rounding: the twin's bins carry bias - sink (magnitude
++            // ~10 against the port's ~4), and the CPU kernel rounds scores through f16
++            const bool ok = same_mask && out[i].size() == out[0].size() && nmse < 1e-5;
++            printf("  twin kv=%lld nb=%lld wrap=%lld window=%lld n_empty=%lld %s: mask %s, nmse %.3g vs the port case: %s\n",
++                   (long long) c[0], (long long) c[1], (long long) c[2], (long long) c[3], (long long) c[4],
++                   i == 1 ? "model layout" : "contiguous, kv view", same_mask ? "identical" : "DIFFERS", nmse, ok ? "OK" : "FAIL");
++            n_fail += !ok;
++        }
++    }
++    printf("  port twins: %s\n", n_fail ? "FAIL" : "OK");
++    return n_fail == 0;
++}
++
+ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
+                          printer * output_printer, const char * test_file_path, int parallel_workers) {
++    if (getenv("GGML_TEST_FA_PORT_TWINS") != nullptr) {
++        return test_fa_port_twins(backend);
++    }
+     auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
+         if (params_filter == nullptr) {
+             return;

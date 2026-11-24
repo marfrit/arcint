@@ -40,9 +40,9 @@ build.
 include set the block needs (the reference's own `xpu/csrc/inkling2_ops.sycl:12-16`)
 and the wrapper afterwards. The check, run 2026-11-24:
 
-    sed -n '45,190p' fa_kern.sycl > <tmp>/a
-    sed -n '509,654p' <ref>/xpu/csrc/inkling2_ops.sycl > <tmp>/b
-    diff <tmp>/a <tmp>/b    # identical
+    sed -n '45,190p' fa_kern.sycl > a.txt
+    sed -n '509,654p' <ref>/xpu/csrc/inkling2_ops.sycl > b.txt
+    diff a.txt b.txt      # identical
 
 `fa_ref::launch` is the reference's launch (lines 655-671) with the torch tensor
 calls replaced by the pointers those tensors' `data_ptr()` returned; the
@@ -62,6 +62,7 @@ initializer order, `qtiles`/`qgroups`/`n`/`wg` arithmetic and
 | `fa_port_gate.h` | a copy of the port's pure gate (the llama tree's `ggml/src/ggml-opencl/fa_port_gate.h`, patch 0198), so the test beside it builds from this directory |
 | `port_gate_test.cpp` | the gate's CPU unit test, fed the model's graph export lines; red with `-DFA_PORT_GATE_RED` |
 | `port_abi_check.py` | the kernel's parameter list against the launch's `clSetKernelArg` sequence, no device |
+| `isa_phases.py` | the key-block loop of a kernel's IGC `.asm` dump cut into phases, with instruction counts a phase |
 | `port_kernel_model.py` | the kernel's key-block loop a lane at a time against a direct softmax, with three reds, no device |
 | `port_arithmetic_check.py` | the first session's check of the bias run read (still the kernel's) and of a sink epilogue the kernel no longer has (the model above covers the sink) |
 | `out/` | build products; git-ignored |
@@ -144,7 +145,7 @@ host program, the bounds check and the oracle were right (checksum 494.011836).
 -spirv-allow-unknown-intrinsics=llvm.genx. …`. Running those two steps on the
 same source reproduces the image `icpx` itself embeds, **byte for byte**:
 
-    icpx's own dump:  <tmp>/…/host_main-…-7997a3.spv   28,320 B  sha256 fd8af4a93e08f59941f3e5e2cb334803382b8f1977b6f0e179549b985c2360ab
+    icpx's own dump:  <icpx temp dir>/host_main-….spv 28,320 B  sha256 fd8af4a93e08f59941f3e5e2cb334803382b8f1977b6f0e179549b985c2360ab
     build-spirv.sh:   out/fa_kern.precise.spv          28,320 B  sha256 fd8af4a93e08f59941f3e5e2cb334803382b8f1977b6f0e179549b985c2360ab
 
 (the dump is `icpx -fsycl -fsycl-targets=spir64 -fp-model=precise -O2
@@ -1098,6 +1099,8 @@ not the kernel: the device run is still the proof.
 | `GGML_OPENCL_FA_PORT_QHOIST` | 1 at 256, 0 at 128 | Q held in registers a tile |
 | `GGML_OPENCL_FA_PORT_QF32` | = QHOIST | Q read from the op's f32 rows, no prepass |
 | `GGML_OPENCL_FA_PORT_SKIP` | 1 | `0` walks every key block |
+| `GGML_OPENCL_FA_PORT_UNIFORM` | 1 | `0` leaves the tile ids lane-varying (round 1's form) |
+| `GGML_OPENCL_FA_PORT_PROBE` | - | `nobias`: a timing probe with wrong answers, no table read |
 | `GGML_OPENCL_FA_PORT_QTW` | 1 | adjacent query tiles a work-group (the reference's server runs 4) |
 | `GGML_OPENCL_FA_PORT_RED` | - | `1` K/V one key row up, `2` the sink's term dropped: both must FAIL |
 | `GGML_OPENCL_BOUNDS` | off | every buffer of the launch against its allocation, abort past it |
@@ -1130,6 +1133,8 @@ nothing); `port_abi_check.py` 42 positions, 0 failures.
 
 ## Prediction before the card run (inference) {#prediction2}
 
+**Refuted by the card by 1.5-1.8x: see §round2, which also says why.** Kept as written.
+
 Written before any card run of this code. The oracle's time is proportional to
 the key blocks its tiles visit (`code`: 33.25 blocks a tile inside a 1,024
 window; `measured-here`, the oracle window: 533 / 1,457 / 1,909 us over 51k / 153k / 204k
@@ -1160,6 +1165,8 @@ candidate for the inline-vISA rule; the ISA dump decides.
 
 ## The card commands, in order {#commands2}
 
+**Superseded by §commands3** (the twins replace the `port=0` rows; more knobs).
+
 `T` is `<build>/bin/test-backend-ops`, the build a fresh pin + `apply-series.sh`
 (write-tree in the commit message), kernels embedded. `P1` is the single case's
 filter, `"kv=1536,nb=512,.*port=1"`.
@@ -1187,3 +1194,155 @@ filter, `"kv=1536,nb=512,.*port=1"`.
 
 The perf mode's time is the op's graph (the launch and, at 128 GRF or with
 QF32=0, the prepass); the oracle's is device time of one launch.
+
+# 1a, round 2: the card's verdict, the review, and where the time is {#round2}
+
+## The card (measured-here, B60, the applied series of the first second-session commit)
+
+The single case under the bounds check: TAKEN, OK. The suite: every port case
+that ran OK, 0 FAIL over all FLASH_ATTN_EXT cases. Knob off: the port cases not
+supported. RED=1 failed every case; **RED=2 failed only 3 of 7**: the sink in
+[3, 6] left the window case at NMSE about 4.8e-4 against the 5e-4 tolerance, so
+that red was too weak. Provisional op perf (the host was loaded, the rows are not
+valid as numbers), us at 256 / 128 GRF: q512 × kv1536 923 / 1,039; q2048 ×
+kv2048 2,660 / 2,612; q2048 × kv3072 3,659 / 3,360, against the oracle's 533 /
+1,457 / 1,909 at 256. **The prediction of §prediction2 was wrong by 1.5-1.8×**,
+and 256 GRF gave the port nothing where it gives the oracle 16-38 %.
+
+## What the review asked for, and what was done
+
+- RED=2: the sink logit is now in [6, 8] (about a seventh of a row's weight).
+- A non-causal or non-standard-window graph: the port's graph is built only with
+  `cparams.causal_attn` and `LLAMA_SWA_TYPE_STANDARD` (0194), and the setter's
+  comment in `ggml.h` states that attaching positions asserts that mask.
+- The mask value is scaled by LOG2E like the bias (it was added unscaled; 0 in
+  every graph we build).
+- A too-large `QTW` is clamped to the device's work-group with a DOWNGRADE line;
+  an unaligned placed K/V offset is refused in `supports_op` (the launch's abort
+  stays as the last line of defence, for a tensor placed after that question).
+- The gate test has the 8 / 9 row boundary and dst / position / row-class bends:
+  red rc 1 (6 × `refuse layout`), green rc 0, 18 ACCEPT, 150 refusals.
+- The port's tensor fill is one deterministic function of the logical index.
+  It first left the harness's sentinel tensors unfilled (a NaN in a leaf on the
+  CPU run of three small cases); they are filled again.
+
+## Like for like: the twins
+
+The perf list's `port=0` rows of the first commit were window 0 with other data.
+They are replaced by **twins** (`port=2`): the same q / k / v, positions, mask and
+bins as the port case, the table as today's kernels read it (`[n_head, n_bins,
+rows]`, bias − sink in every bin, a zero sink - the model's own knob-off form),
+in the model's layout and in a contiguous one with a kv view. `GGML_TEST_FA_PORT_TWINS=1
+test-backend-ops -b CPU -o FLASH_ATTN_EXT` builds a port case and both twins for
+six shapes and compares (`measured-here`, the recipe host): **the mask bytes are
+identical in all 12 pairs, the outputs agree to NMSE 8e-7 … 1.5e-6** (the CPU
+kernel rounds scores through f16, and the twin's bins are bias − sink).
+
+## Why 256 GRF helps fa::Kern and not the port: the ISA, block by block {#isa}
+
+`isa_phases.py` cuts each kernel's key-block loop by its own landmarks (first K
+block load, 16th DPAS, first V block load, 32nd DPAS). Static counts from IGC's
+dump, bmg-g21 (`measured-here`, no device); ours from the offline gate's dump,
+the oracle's from `ocloc -spirv_input` on `out/fa_kern.precise.spv`, with and
+without `-doubleGRF`. Both arms of a branch are counted, so our score pass is an
+upper bound (it holds the general path and the linear path; a block takes one).
+
+| kernel, one 32-key block | insts | DPAS | 2D loads | other loads | stores | sync | math | mov | mul | cmp / sel | branches |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| fa::Kern, 256 GRF | 1,359 | 32 | 32 | 20 | 0 | 57 | 9 | 564 | 99 | 248 | 42 |
+| fa::Kern, 128 GRF | 2,088 | 32 | 32 | **192** | **94** | 122 | 9 | 889 | 97 | 276 | 42 |
+| port, 256 GRF, round 1 (ids lane-varying) | 2,032 | 32 | 32 | 72 | 0 | 142 | 24 | 364 | 163 | 518 | 249 |
+| port, 256 GRF, now (ids uniform) | 1,790 | 32 | 33 | 73 | 0 | 75 | 24 | 390 | 134 | 525 | 145 |
+| port, 256 GRF, no-bias probe | 1,179 | 32 | 33 | 23 | 0 | 59 | 24 | 307 | 122 | 326 | 115 |
+
+By phase (fa::Kern 256 / port now): S = Q Kᵀ 165 / 74; score pass 578 / 1,224
+static, of which the linear path a block takes is about half; softmax + P V
+416 / 315.
+
+Three findings.
+
+1. **fa::Kern's 128-GRF build spills inside the block loop: 172 fill loads and 94
+   spill stores a block**, on top of its 48 real loads. 256 GRF removes them all.
+   That is its 16-38 %. The port's 128 build spills too (scratch 2,048 B now,
+   8,192 B before), but its 256 build had no such traffic to lose.
+2. **The port's tile ids were lane-varying values.** `get_global_id(2)` and
+   `get_local_id(1)` come from the lane payload, so every index, every `if` on a
+   group class and the key loop itself were SIMD-16 control flow (169 join / 70
+   goto) and every "scalar" load a 16-lane gather of one address. A
+   `sub_group_broadcast` of lane 0 makes them uniform (`PORT_UNIFORM`, default
+   on; `GGML_OPENCL_FA_PORT_UNIFORM=0` is the A/B): 32 join / 32 goto remain, the
+   per-row table and mask bases leave the loop. A real defect, worth a few
+   percent by the counts - not the factor.
+3. **The counts do not explain the factor at all**: the port executes about as
+   many instructions and as many sends a block as fa::Kern at 256. What differs
+   is the bytes behind one phase, **the bias read**. Our table is f32 `[rows, 24,
+   1,025]`: 4.1 kB a (row, head), each read once a call - 50 MB at q512, 201 MB at
+   q2048 × kv3072. fa::Kern's is bf16, half of that. The operator's own
+   measurement prices the reference's table at 319 / 627 / 843 us (with the
+   table minus without), i.e. about 80-120 GB/s; twice the bytes at that rate is
+   +320 / +630 / +840 us on the oracle's 533 / 1,457 / 1,909, and the card showed
+   +390 / +1,200 / +1,750 (`inference` from two `measured-here` sets, the second
+   one not valid as numbers). The walk is bound by the table's bytes, which no
+   register mode changes.
+
+So the named phase is the bias read, and it is not a loop the inline-vISA rule
+could tighten: it is memory traffic. `GGML_OPENCL_FA_PORT_PROBE=nobias` builds the
+kernel without any table read (wrong answers, named in the TAKEN line); its time
+against the full kernel's is the table's cost a call, measured instead of
+inferred.
+
+## The decision this puts to the operator (not taken here)
+
+The table is a rank-16 product: `table = pad(attn_rel_bias)[16 × 1,025] · R[16 ×
+24 × rows]`. The reference materialises it (in bf16) and reads it; so do we (in
+f32, written by a MUL_MAT that is itself 201 MB of traffic a layer call). The
+kernel does not need it: a group's 16 biases for 8 rows are one more DPAS - the
+a operand the tile's `R` (8 rows × 16), the b operand a transposed 2D block read
+of 16 consecutive rows of the bin-reversed bias matrix (33 kB in all, cache
+resident; the read's clamp gives the zero pad bin for far keys). That removes the
+table's bytes from the attention *and* the MUL_MAT that writes them. It is a
+deviation from the reference's mechanism, so it is asked, not done: the price of
+keeping the table is what the no-bias probe measures; the price of the factored
+form is f16 bias factors (the answer-level bar judges it), a CPU path for the op
+that computes the same 16-term dot, and a general-path fallback (a gather a term)
+for the one or two non-linear groups a tile meets. A half-width table instead
+(f16) only pays if the MUL_MAT writes it directly; a cast would move more bytes
+than it saves.
+
+## Prediction for the next window (inference)
+
+us a call at 256 GRF, the uniform ids in, the table unchanged: **q512 × kv1536
+780-920, q2048 × kv2048 2,250-2,650, q2048 × kv3072 3,100-3,650** (a few percent
+under the provisional rows; 128 GRF within 10 % of 256). With the no-bias probe:
+**480-620 / 1,300-1,700 / 1,700-2,250**, i.e. at the oracle's level with its
+table. If the probe lands there, finding 3 holds and the factored bias is the
+lever; if the probe stays near the full kernel, the bytes are not the cause and
+the score pass's ISA is the next thing to read.
+
+## The card commands, in order {#commands3}
+
+`T` = `<build>/bin/test-backend-ops`, `D` the OpenCL device; the build is a fresh
+pin + `apply-series.sh` (the write-tree is in the commit message).
+
+    # 1. the single case under the bounds check: 1 case, OK, the TAKEN line
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 T -b D -o FLASH_ATTN_EXT -p "kv=1536,nb=512,.*port=1"
+    # 2. the suite, knob on: 0 FAIL, the ten port=1 cases and the four port=2 twins RUN
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 T -b D -o FLASH_ATTN_EXT
+    #    knob off: the port=1 cases not supported (reason=knob-off), the port=2 twins run on today's kernels
+    T -b D -o FLASH_ATTN_EXT
+    # 3. the reds: each must FAIL every port=1 case
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_RED=1 T -b D -o FLASH_ATTN_EXT -p "port=1"
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_RED=2 T -b D -o FLASH_ATTN_EXT -p "port=1"
+    # 4. perf on a quiet host, both register modes, then today's kernels on the twins
+    for g in 256 128; do GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_GRF=$g T perf -b D -o FLASH_ATTN_EXT -p "n_bins=1025.*port=1"; done
+    T perf -b D -o FLASH_ATTN_EXT -p "n_bins=1025.*port=2"
+    # 5. the probe that prices the table (wrong answers by design; perf only)
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_PROBE=nobias T perf -b D -o FLASH_ATTN_EXT -p "n_bins=1025.*port=1"
+    # 6. one run each: the varying ids, four tiles a work-group
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_UNIFORM=0 T perf -b D -o FLASH_ATTN_EXT -p "n_bins=1025.*port=1"
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_QTW=4     T perf -b D -o FLASH_ATTN_EXT -p "n_bins=1025.*port=1"
+
+The offline gate on this kernel (`measured-here`, no device): 256 GRF `ocloc 7/7
+variants` (default, prepass, no-skip, the two reds, varying ids, the no-bias
+probe), each `grf 256 simd 16 scratch 0`; 128 GRF `ocloc 0/1`, `scratch 2048`.
+CPU: `-p "port=[12]"` 14/14; `port_abi_check.py` 42 / 42.

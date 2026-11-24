@@ -300,10 +300,10 @@ index 4546729..658f613 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 5fec3cb..aa9ed9c 100644
+index 5fec3cb..217a335 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -380,27 +380,60 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -380,27 +380,64 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          const int64_t n_stream = (is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3];
          const int64_t n_kv     = rel_pos->ne[0];
  
@@ -333,7 +333,11 @@ index 5fec3cb..aa9ed9c 100644
 +            const char * e = getenv("GGML_OPENCL_FA_PORT");
 +            return e != nullptr && atoi(e) != 0;
 +        }();
-+        const bool port_on = port_env && cparams.flash_attn && n_tokens > 8 && n_stream == 1;
++        // The port decides visibility by compares (key position <= query position, and
++        // inside the window): that is a causal mask and the standard sliding window, so any
++        // other attention keeps today's graph.
++        const bool port_on = port_env && cparams.flash_attn && cparams.causal_attn &&
++                             hparams.swa_type == LLAMA_SWA_TYPE_STANDARD && n_tokens > 8 && n_stream == 1;
 +        if (!port_on) {
 +            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
 +            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));

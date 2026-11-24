@@ -118,7 +118,7 @@ index 0000000..93b2b09
 +#endif
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..06e389e 100644
+index f84ca33..02e38ac 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -8,6 +8,7 @@
@@ -145,11 +145,11 @@ index f84ca33..06e389e 100644
 +    cl_kernel kernel_fa_port = nullptr, kernel_fa_port_q16 = nullptr;
 +    cl_program program_fa_port = nullptr;
 +    bool fa_port_tried = false;
-+    int  fa_port_grf = 0, fa_port_qhoist = 0, fa_port_qf32 = 0, fa_port_skip = 1;
++    int  fa_port_grf = 0, fa_port_qhoist = 0, fa_port_qf32 = 0, fa_port_skip = 1, fa_port_uniform = 1, fa_port_nobias = 0;
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
      // 0106: the build options of the head-256 prompt kernels, so that the
      // head-512 builds made on first use match them (sub-group, sub-groups a
-@@ -13086,6 +13093,131 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+@@ -13086,6 +13093,150 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
      return true;
  }
  
@@ -247,6 +247,23 @@ index f84ca33..06e389e 100644
 +    if (!skip) {
 +        opts += " -DGB_NO_SKIP";
 +    }
++    // GGML_OPENCL_FA_PORT_UNIFORM=0: the tile's ids as lane-varying values (the A/B of the
++    // broadcast that makes the kernel's indices and branches scalar)
++    int uniform = 1;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_UNIFORM")) {
++        uniform = atoi(e) != 0 ? 1 : 0;
++    }
++    opts += uniform ? " -DPORT_UNIFORM=1" : " -DPORT_UNIFORM=0";
++    // GGML_OPENCL_FA_PORT_PROBE=nobias: a timing probe with WRONG answers - the kernel
++    // never reads the bias table. Its time against the full kernel's is what the
++    // table's bytes cost a call. The TAKEN line names it.
++    int nobias = 0;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_PROBE")) {
++        nobias = strcmp(e, "nobias") == 0 ? 1 : 0;
++    }
++    if (nobias) {
++        opts += " -DGB_NO_BIAS";
++    }
 +    // the red cases: GGML_OPENCL_FA_PORT_RED=1 shifts every K/V read one key row up,
 +    // =2 drops the sink's term; both must FAIL the port's test cases
 +    if (const char * red = getenv("GGML_OPENCL_FA_PORT_RED")) {
@@ -275,13 +292,15 @@ index f84ca33..06e389e 100644
 +    backend_ctx->fa_port_qhoist = qhoist;
 +    backend_ctx->fa_port_qf32 = qf32;
 +    backend_ctx->fa_port_skip = skip;
++    backend_ctx->fa_port_uniform = uniform;
++    backend_ctx->fa_port_nobias = nobias;
 +    return k;
 +}
 +
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -13633,6 +13765,30 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13633,6 +13784,40 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
              // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
              // the prompt kernels have no bias yet, so those shapes go to ggml
@@ -300,6 +319,16 @@ index f84ca33..06e389e 100644
 +                    ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "not-built");
 +                    return false;
 +                }
++                // the 2D block reads want each kv head's base 64-byte aligned. The gate has
++                // the strides, the view offset and the backend's alignment; where K/V are
++                // already placed, the placed offset is checked here too
++                for (const ggml_tensor * kvt : { op->src[1], op->src[2] }) {
++                    const ggml_tensor_extra_cl * e = (const ggml_tensor_extra_cl *) kvt->extra;
++                    if (e != nullptr && (e->offset + kvt->view_offs) % 64 != 0) {
++                        ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "kv-base-unaligned");
++                        return false;
++                    }
++                }
 +                return true;
 +            }
 +            if (ggml_flash_attn_ext_has_indexed_bias(op) && op->src[GGML_FA_SRC_SINK_Q] != nullptr) {
@@ -312,7 +341,7 @@ index f84ca33..06e389e 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26474,6 +26630,170 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26474,6 +26659,178 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
@@ -328,8 +357,17 @@ index f84ca33..06e389e 100644
 +            GGML_ABORT("op=FLASH_ATTN port: a call supports_op accepted is refused at launch");
 +        }
 +        const int G = n_head / n_head_kv;
++        // GGML_OPENCL_FA_PORT_QTW: adjacent query tiles a work-group (the reference's server
++        // runs 4), clamped to what the device's work-group holds; one tile always fits
++        size_t wg_limit = 0;
++        CL_CHECK(clGetKernelWorkGroupInfo(kp, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg_limit, &wg_limit, nullptr));
 +        static const char * qtw_env = getenv("GGML_OPENCL_FA_PORT_QTW");
-+        const int qtw = qtw_env != nullptr ? std::max(1, atoi(qtw_env)) : 1;   // the reference's server runs 4
++        int qtw = qtw_env != nullptr ? std::max(1, atoi(qtw_env)) : 1;
++        if ((size_t) 16 * G * qtw > wg_limit) {
++            const int fit = std::max(1, (int) (wg_limit / ((size_t) 16 * G)));
++            ggml_cl_downgrade("op=FLASH_ATTN port=qtw-clamped reason=%s from=%d to=%d", "work-group", qtw, fit);
++            qtw = fit;
++        }
 +        const int ntiles = CEIL_DIV(n_q, 8), ngroups = CEIL_DIV(ntiles, qtw);
 +        const int window = ggml_get_op_params_i32(dst, GGML_FA_PARAM_WINDOW);
 +        // the key blocks a tile visits are decided in the kernel, a block at a time, from
@@ -400,19 +438,18 @@ index f84ca33..06e389e 100644
 +        ggml_cl_bounds("op=FLASH_ATTN port", "cflag", bcf, ocf + (size_t)((n_kv + 15) / 16));
 +        ggml_cl_bounds("op=FLASH_ATTN port", "rflag", brf, orf + (size_t)((rows + 7) / 8));
 +
-+        size_t wg_limit = 0;
-+        CL_CHECK(clGetKernelWorkGroupInfo(kp, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg_limit, &wg_limit, nullptr));
-+        if ((size_t) 16 * G * qtw > wg_limit) {
++        if ((size_t) 16 * G > wg_limit) {
 +            ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "no-fit");
-+            GGML_ABORT("op=FLASH_ATTN port: GGML_OPENCL_FA_PORT_QTW makes a work-group the device cannot hold");
++            GGML_ABORT("op=FLASH_ATTN port: one tile's work-group does not fit the device");
 +        }
 +
 +        {
 +            static std::once_flag taken;
 +            std::call_once(taken, [&] {
-+                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=%d qhoist=%d qf32=%d skip=%d qtw=%d\n",
++                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=%d qhoist=%d qf32=%d skip=%d uniform=%d qtw=%d%s\n",
 +                              backend_ctx->fa_port_grf, backend_ctx->fa_port_qhoist, backend_ctx->fa_port_qf32,
-+                              backend_ctx->fa_port_skip, qtw);
++                              backend_ctx->fa_port_skip, backend_ctx->fa_port_uniform, qtw,
++                              backend_ctx->fa_port_nobias ? " probe=nobias-WRONG-ANSWERS" : "");
 +            });
 +        }
 +
@@ -485,10 +522,10 @@ index f84ca33..06e389e 100644
                            kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 new file mode 100644
-index 0000000..9d08e6a
+index 0000000..e6d7b93
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,356 @@
 +#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroups : enable
 +#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
@@ -543,7 +580,9 @@ index 0000000..9d08e6a
 +// shifts every K/V read one key row up, so the scores are another token's and
 +// the answers differ (the 2D block read clamps at the surface height, so a
 +// shifted row is an answer difference, not a fault); GB_SKIP_SINK drops the
-+// sink's term from the denominator.
++// sink's term from the denominator. GB_NO_BIAS (GGML_OPENCL_FA_PORT_PROBE=nobias)
++// is a timing probe, not a red case: the table is never read, so the difference
++// to the full kernel is what the table's bytes cost.
 +
 +#ifndef QR
 +#define QR 8
@@ -563,6 +602,9 @@ index 0000000..9d08e6a
 +#endif
 +#ifndef PORT_QF32
 +#define PORT_QF32 0
++#endif
++#ifndef PORT_UNIFORM
++#define PORT_UNIFORM 1
 +#endif
 +#if PORT_QF32 && !PORT_QHOIST
 +#error "PORT_QF32 needs PORT_QHOIST: the f32 rows are converted once a tile"
@@ -615,13 +657,22 @@ index 0000000..9d08e6a
 +        int kv_lo, int kv_hi, int window, float scale_log2)
 +{
 +    const int lane = get_sub_group_local_id();
++    // z and g are the same in all 16 lanes of a sub-group, but an id read from the lane
++    // payload is a varying value to the compiler: every index, branch and loop below would
++    // then be SIMD-16 control flow, every scalar load a 16-lane gather of one address.
++    // The broadcast of lane 0 makes them uniform (PORT_UNIFORM=0: the varying form, the A/B).
++#if PORT_UNIFORM
++    const int z    = sub_group_broadcast((int) get_global_id(2), 0u);
++    const int g    = sub_group_broadcast((int) get_local_id(1), 0u);
++#else
 +    const int z    = get_global_id(2);
++    const int g    = get_local_id(1);
++#endif
 +    const int qti  = z % qtw, unit = z / qtw;
 +    const int kvh  = unit / ngroups, grp = unit % ngroups;
 +    const int qt   = grp * qtw + qti;
 +    const int q0   = qt * QR;
 +    if (q0 >= n_q) return;
-+    const int g    = get_local_id(1);
 +    const int head = kvh * (n_head / hkv) + g;
 +
 +    // Q is the op's f32 Q (PORT_QF32) or the f16 scratch [head][row][D]; either way q_nb1 is
@@ -644,13 +695,16 @@ index 0000000..9d08e6a
 +
 +    // the tile's rows: position, table row and mask row (a row past n_q repeats the last one
 +    // and is never live), and the online softmax state with the sink as the initial (m, l)
-+    int   qpr[QR];
-+    float m[QR], l[QR];
++    int    qpr[QR];
++    size_t trow[QR], mrow[QR];
++    float  m[QR], l[QR];
 +    _Pragma("unroll")
 +    for (int r = 0; r < QR; ++r) {
 +        const bool live = r < nrow;
 +        const int  row  = min(q0 + r, n_q - 1);
-+        qpr[r] = qps[row];
++        qpr[r]  = qps[row];
++        trow[r] = ((size_t) row * n_head + head) * n_bins;       // where the row has its bins
++        mrow[r] = (size_t) row * (mask_nb1 / sizeof(half));     // where the row has its mask
 +        const float s2 = LOG2E * sk[(size_t) row * n_head + head];
 +        m[r] = live ? s2 : M_INIT;
 +        l[r] = (live && lane == 0) ? SINK_L : 0.f;
@@ -733,7 +787,6 @@ index 0000000..9d08e6a
 +            const float sv8[QR] = { s[gb].s0, s[gb].s1, s[gb].s2, s[gb].s3, s[gb].s4, s[gb].s5, s[gb].s6, s[gb].s7 };
 +            _Pragma("unroll")
 +            for (int r = 0; r < QR; ++r) {
-+                const int  row = min(q0 + r, n_q - 1);
 +                const int  d   = qpr[r] - kpl;
 +                bool  vis;
 +                float mv = 0.f;
@@ -742,14 +795,14 @@ index 0000000..9d08e6a
 +                } else {
 +                    // the general path: the mask decides (empty cells, other sequences, a seam).
 +                    // -inf (by its bits: the build is finite-math) and the f16 lowest hide a cell,
-+                    // any other value is added after the scale, as the reference adds the mask
-+                    const ushort mu = as_ushort(mb[(size_t) row * (mask_nb1 / sizeof(half)) + kk]);
++                    // any other value is added to the score (natural-log units, like the bias)
++                    const ushort mu = as_ushort(mb[mrow[r] + kk]);
 +                    const bool hidden = (mu & 0x7C00) == 0x7C00 || mu == 0xFBFF;
 +                    mv  = hidden ? 0.f : (float) as_half(mu);
 +                    vis = r < nrow && live && !hidden;
 +                }
 +                float bv = 0.f;
-+                const size_t trow = ((size_t) row * n_head + head) * n_bins;
++#ifndef GB_NO_BIAS    // the timing probe: no table read at all (the answers are wrong)
 +                if (glin[gb]) {
 +                    // the run: this row's distance to the group's first key is d0 (lane-uniform),
 +                    // lane j's is d0 - j. With d0 in [15, n_bins-1] the 16 bins d0-15 .. d0 are one
@@ -759,18 +812,19 @@ index 0000000..9d08e6a
 +                    if (d0 - 15 < n_bins - 1) {
 +                        if (d0 >= 15 && d0 <= n_bins - 1) {
 +                            const float tv = as_float(intel_sub_group_block_read(
-+                                (global const uint *) (tb + trow + (d0 - 15))));
++                                (global const uint *) (tb + trow[r] + (d0 - 15))));
 +                            bv = intel_sub_group_shuffle(tv, (uint) (15 - lane));
 +                        } else {
 +                            const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);
-+                            bv = tb[trow + bin];
++                            bv = tb[trow[r] + bin];
 +                        }
 +                    }
 +                } else {
 +                    const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);
-+                    bv = tb[trow + bin];
++                    bv = tb[trow[r] + bin];
 +                }
-+                sc[gb][r] = vis ? sv8[r] * scale_log2 + mv + LOG2E * bv : M_INIT;
++#endif
++                sc[gb][r] = vis ? sv8[r] * scale_log2 + LOG2E * (mv + bv) : M_INIT;
 +            }
 +        }
 +

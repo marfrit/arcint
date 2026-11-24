@@ -185,6 +185,14 @@ int main(int argc, char ** argv) {
             { call_t m = c; m.softcap = 30.0f;                    expect(file, l.no, "  a logit softcap", m, false, "softcap"); }
             { call_t m = c; m.window = -1;                        expect(file, l.no, "  window -1", m, false, "window"); }
             { call_t m = c; m.cflag = contiguous(T_I8, n_kv / 16 - 1, 1, 1, 1); expect(file, l.no, "  short key classes", m, false, "flags"); }
+            { call_t m = c; m.dst.nb[1] = 1024;                   expect(file, l.no, "  dst head stride 1024", m, false, "dst"); }
+            { call_t m = c; m.dst.ne[1] = n_head / 3;             expect(file, l.no, "  dst of 8 heads", m, false, "dst"); }
+            { call_t m = c; m.kpos.type = GGML_TYPE_F32;          expect(file, l.no, "  f32 key positions", m, false, "positions"); }
+            { call_t m = c; m.qpos = contiguous(T_I32, rows - 1, 1, 1, 4); expect(file, l.no, "  short row positions", m, false, "positions"); }
+            { call_t m = c; m.rflag = contiguous(T_I8, (rows + 7) / 8 - 1, 1, 1, 1); expect(file, l.no, "  short row classes", m, false, "flags"); }
+            // the row boundary: 8 rows keep today's kernels, 9 are the port's
+            { call_t m = c; m.q.ne[1] = 8;                        expect(file, l.no, "  8 query rows", m, false, "decode"); }
+            { call_t m = c; m.q.ne[1] = 9;                        expect(file, l.no, "  9 query rows", m, true, ""); }
             // the contiguous layout is served too
             { call_t m = c;
               m.q = contiguous(T_F32, 128, rows, n_head, 4);
