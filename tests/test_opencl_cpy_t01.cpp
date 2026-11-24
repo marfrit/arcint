@@ -1,10 +1,10 @@
 // 0187's eligibility, host-side: the pure predicate against the real strides of the two copies
 // the card's profile joined. Derived from the graph code, not guessed:
 //  - src/models/inkling2.cpp:386 makes table = mul_mat(pad(attn_rel_bias), Rcur) = [1025, 24, T]
-//    contiguous (nb 4, 4*1025, 4*1025*24); line 391's ggml_cont(ggml_permute(table, 1, 0, 2, 3))
+//    contiguous (nb 4, 4*1025, 4*1025*24); line 390's ggml_cont(ggml_permute(table, 1, 0, 2, 3))
 //    leaves the source view [24, 1025, T] with nb {4*1025, 4, 4*1025*24, ...} and a contiguous
 //    destination [24, 1025, T] (nb {4, 96, 98,400, ...}).
-//  - mix() line 221 ggml_cont(ggml_transpose(states)) of the stack view [2304, k, T]
+//  - mix() line 219 ggml_cont(ggml_transpose(states)) of the stack view [2304, k, T]
 //    (nb1 2304*4, nb2 9,216*slots): the transpose view is [k, 2304, T] with nb
 //    {9,216, 4, 9,216*slots, ...}, destination contiguous [k, 2304, T].
 // The test also asserts the negatives: a contiguous source, a source whose slow step is not one

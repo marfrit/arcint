@@ -2,6 +2,7 @@
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-cpy-t01.h b/ggml/src/ggml-opencl/ggml-opencl-cpy-t01.h
 new file mode 100644
+index 0000000..2d64648
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-cpy-t01.h
 @@ -0,0 +1,50 @@
@@ -56,6 +57,7 @@ new file mode 100644
 +
 +#endif // GGML_OPENCL_CPY_T01_H
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 71d61fd..11ce300 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -12,6 +12,7 @@
@@ -74,7 +76,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
      cl_kernel kernel_cpy_f32_f32_run = nullptr;   // a run of narrow strided copies, one launch
      cl_kernel kernel_cpy_f32_i32 = nullptr, kernel_cpy_i32_f32 = nullptr;   // the casts
      cl_kernel kernel_cpy_f32_f32_flat = nullptr;
-@@ -2308,8 +2310,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2303,8 +2305,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
  #endif
          const bool no_cpy_pack = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X;
  
@@ -88,7 +90,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
          CL_CHECK((backend_ctx->kernel_cpy_f16_f16 = clCreateKernel(prog, "kernel_cpy_f16_f16", &err), err));
          CL_CHECK((backend_ctx->kernel_cpy_f16_f32 = clCreateKernel(prog, "kernel_cpy_f16_f32", &err), err));
-@@ -2318,6 +2324,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -2313,6 +2319,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
          if (!no_cpy_pack) {
              CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(prog, "kernel_cpy_f32_f32_pack", &err), err));
          }
@@ -97,7 +99,7 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
          {   // optional: without it ggml_cl_cpy keeps the row-mapped kernel
              cl_int err_flat = CL_SUCCESS;
              cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err_flat);
-@@ -40489,6 +40497,78 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
+@@ -40353,6 +40361,78 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
          return;
      }
  
@@ -177,12 +179,13 @@ diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-op
  
      switch (src0t) {
 diff --git a/ggml/src/ggml-opencl/kernels/cpy.cl b/ggml/src/ggml-opencl/kernels/cpy.cl
+index e71994f..3ae623f 100644
 --- a/ggml/src/ggml-opencl/kernels/cpy.cl
 +++ b/ggml/src/ggml-opencl/kernels/cpy.cl
-@@ -242,6 +242,53 @@ kernel void kernel_cpy_f32_f32_pack(
-         dst_data[i00] = src[0];
-     }
+@@ -244,6 +244,53 @@ kernel void kernel_cpy_f32_f32_pack(
  }
+ #endif // GGML_CL_NO_CPY_PACK
+ 
 +// 0187: a (0,1)-swapped copy - the source's fastest dimension is dim 1 and the destination's is
 +// dim 0 - as a tiled transpose through local memory: reads coalesced over dim 1 (the source's
 +// fastest), writes coalesced over dim 0 (the destination's). A work-group is a 16 x 16 tile of
@@ -230,10 +233,11 @@ diff --git a/ggml/src/ggml-opencl/kernels/cpy.cl b/ggml/src/ggml-opencl/kernels/
 +    }
 +}
 +
- #endif // GGML_CL_NO_CPY_PACK
- 
  // One launch for a run of K narrow strided copies that share their source and
+ // destination layouts and differ only in the byte offset: the recurrent-state
+ // rollback snapshots. One work item per (channel, seq) row writes all K windows.
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 444b36f..16ebe21 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -3506,6 +3506,18 @@ struct test_cont : public test_case {
@@ -255,7 +259,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
  // GGML_OP_ADD
  // GGML_OP_SUB
  // GGML_OP_MUL
-@@ -11061,6 +11073,17 @@ static const ggml_type other_types[] = {
+@@ -11038,6 +11050,17 @@ static const ggml_type other_types[] = {
  // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      std::vector<std::unique_ptr<test_case>> test_cases;
@@ -273,7 +277,7 @@ diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
      std::default_random_engine rng(0);
  
      // unary ops
-@@ -14631,6 +14654,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14569,6 +14592,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
  
      // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
      test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
