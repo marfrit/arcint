@@ -10228,3 +10228,175 @@ for ub in 512 1024 2048; do
   done
 done
 ```
+
+**Card result 2, the causes named (2026-11-24; `code`, and `measured-here` on the recipe host
+for the replays - no card run is behind this paragraph).** Both failures of card result 2 have
+a named line, and neither is one of the two defects named above. The retractions first, on the
+record:
+
+- *"Named defect #2" above is retracted.* A norm weight seen through `reshape_2d` was never the
+  problem: a view shares its parent's extra and the offset is `extra->offset + view_offs`, as
+  for every other source of every op. The `nw-view` refusal, the dispatch's assert and the
+  withheld fold are gone again.
+- *The fault paragraph's inference is retracted* ("the compute buffer's per-token tensors,
+  equals the folded norm calls' count"). The fold had no part in the fault, and withholding it
+  would not have stopped it: the faulting read is on a path that never folds.
+- "Named defect #1" (the local-slot alias) stands as a real race and its fix is kept; as its
+  own text says, it explains neither card failure.
+
+**The page fault: `src/models/inkling2.cpp`, the loop model's `message()`** (the lambda at
+the top of `build_layer`; the line `ggml_cont(ggml_view_2d(messages, n_embd, n_tokens,
+messages->nb[2], ctrl*messages->nb[1]))`). Inkling 2 Mini is the loop model
+(`inkling2-loop.cpp`): from the second pass on, every core layer gets `messages = mix(bank,
+bank_out, loop.msg_query, bank_stack)` - a mix over the previous pass's bank store (2 rows:
+one block and cur) with four query columns, one a controller. That call is eligible (k 1,
+nq 4), so with the knob on `mix()` returned the arm's dst, `[n_embd, n_tokens, 4]`, and
+`message()` went on reading it with the chain's layout, `[n_embd, 4, n_tokens]`: a row step of
+`messages->nb[2]`, which on the arm's dst is `n_embd * n_tokens * 4` = **4,718,592 bytes** at
+ub 512 - one 2,304-float row (three pages) at the start of each `[2304, 512]` slab, 512 rows
+far, in a tensor that ends after four. The copy kernel behind the `ggml_cont` read them: reads
+only, one row a group, gaps of 0x480000, exactly the kernel log's fit. `ggml_view_2d` did not
+object because it checks a view's contiguous size, not its strides. The attention call site
+had been given the arm's layout (`took ? ... : ...`); `message()` had not, and the device-free
+test and the op cases covered nq 1 and 3 on the 5-row store only - the export's nq 4 call on
+the 2-row bank store (`node_3060`, `node_3064`) was in neither.
+
+The fix (0204, 0206): every reader of a mix result's columns goes through one function,
+`inkling2_mix_column`, which returns `ggml_depth_mix_column` (a contiguous view, column `c` at
+`c * nb[2]`) for the arm's dst and the chain's strided view plus `ggml_cont` otherwise - the
+expression the graph always had, so the knob unset is today's graph node for node. Both
+branches assert `ggml_view_within_src` (new in ggml.h: a view's furthest byte, strides and
+offset included, against its source), so a wrong layout aborts at graph build with no device
+involved.
+
+The replay (`tests/test_depth_mix.cpp`, `measured-here` on the recipe host): the loop's
+message path at the export's ub 512 shapes on the CPU backend. `arcint-depth-mix
+fault-before` computes the old read: `SEGV ... caused by a READ memory access` in
+`ggml_compute_forward_dup_bytes` under ASan, signal 11 without it. `fault-after` computes the
+fixed read: clean, the four columns equal to the op's. In the unit run the same shapes are
+checked without computing: the old view's row step is asserted to be `2304 * T * 4` and the
+view to leave its source (12 views over the three ubatch sizes), red first against a reach
+check that passes everything (12 failures).
+
+**The three folded-norm op failures: `depth_mix.cl` never added the norm weight's offset.**
+The kernel adjusted `blk`, `cur`, `qry` and `dst` by their offsets and not `nw`: the dispatch
+passed `offn` and the kernel read the weights from the start of their buffer - in
+test-backend-ops, whatever tensor the buffer begins with, hence ERR ~2 on every `with_norm`
+case and none elsewhere; in the model, the start of the weights' buffer. One line: `nw = nw +
+offn`. The handed-over host port could not see it because it gave every argument its own
+buffer at offset 0.
+
+**What now tests it** (`tests/test_depth_mix.cpp` in this repository, a `unit` ctest of the
+recipe; all `measured-here` on the recipe host, device-free):
+
+1. *The rule on the export's lines.* `tests/depth_mix_export_lines.inc` holds 69 lines of the
+   exported graph verbatim (23 a ubatch size: the states' `RMS_NORM` lines `node_91`,
+   `node_1108`, `node_2118`, `node_8944` on the 5-row store and `node_3060` on the bank's 2-row
+   store, at T and at 1; the `MUL_MAT` lines `node_95` .. `node_9639` that pair states with 1,
+   3 and 4 query columns; the two `CPY` lines of cur into a store row; the two `CONT` lines of
+   a chain column read). The 39 prefill calls they describe are built with the model's
+   constructors, compared with the lines' ne and nb, and must be accepted: k 1..4 with nq 1
+   and 3, the nq 1 calls again with a view-backed norm weight, and the bank's k 1, nq 4. The
+   15 decode lines and ten out-of-scope variants must be refused, each by its reason. Red
+   first, on every run: the handed-over rule (`nw-view`) fails exactly the 12 folded calls, a
+   rule that accepts everything fails 25 checks.
+2. *The launch plan.* `ggml_depth_mix_plan_make` (pure; the dispatch binds its strides, counts,
+   local size and bounds from it) on every call: each argument's reach equals its tensor.
+3. *The kernel's own text.* `depth_mix.cl` is compiled as C++ into the test (256 lanes as
+   threads, `barrier()` a real barrier, the local memory shared) and run at the plan's
+   arguments with every source at its own non-zero offset of one buffer, as on the backend,
+   against the CPU op: nmse 2e-15 .. 2e-14 on the 13 calls of ub 512 and 4 of ub 2048. The red
+   build of the same text (`-DDEPTH_MIX_RED_NW`, the offset dropped again) must not match and
+   does not (nmse > 100 on all five folded calls).
+4. *The fault's read*, as above.
+
+`test-backend-ops` (0207) now has the exported shapes only, 45 cases: a ubatch size (512,
+1024, 2048) has the 5-row store's k 1..4 at nq 1, nq 1 with the folded norm, and nq 3; the
+2-row bank store's k 1 at nq 4; and two `cols` cases that add the columns' readers as the
+model has them (a column view, an RMS norm, summed) on the bank's four columns and on a
+full-attention layer's three. The case string is
+`DEPTH_MIX(n_slot=..,k=..,nt=..,nq=..,with_norm=..,cols=..)`.
+
+**The fold is back, with its own switch.** `GGML_OPENCL_DEPTH_MIX=1` folds the output norm
+where the chain norms one mixed column with one weight and no controller sits between (an SWA
+layer's attention in the prelude and the first pass, the ffn mix without messages, the output
+mix). `GGML_OPENCL_DEPTH_MIX=nofold` takes the arm and leaves every norm a node: the card
+bisect of the fold against the mix.
+
+**Bounds.** The arm's five buffers are checked before every launch, always (the plan's reach
+plus the tensor's offset against `CL_MEM_SIZE`); a violation aborts with the buffer's name.
+`GGML_OPENCL_BOUNDS=1` adds the other arms' checks to the same run. Note what this check does
+not see and never could have: the fault was a *different* node's launch (the copy of a bad
+view), which is why the view is now refused where it is built.
+
+**Offline gate** (`measured-here`, ocloc 26.27.1, bmg-g21, the backend's options plus
+`-cl-intel-256-GRF-per-thread`): base, `DEPTH_MIX_RED` and `DEPTH_MIX_RED_NW` compile, each
+`grf 256 simd 32 slm 1024 scratch 0 stack_calls -`, no ISA call, no retry dump: `ocloc 3/3
+variants`.
+
+**Prediction, revised before any card run of this revision (`inference`).** The earlier
+120-160 ms a pass priced the bytes at the reference's rate and nothing else. The kernel also
+passes 15 barriers a work-group at k 4, nq 1 (two reduction rounds of seven, one before), 23
+with the fold, and a 256-lane group at SIMD32 is 8 hardware threads. Assumed, not measured:
+~80 groups in flight at 256 GRF (640 threads), so a 512-token call is ~6.4 waves, and a group
+at 25-45 us (the loads, ~200 flops a lane, the barriers at 1-2 us each):
+
+| ubatch | us a call (k 4, nq 1) | ms a pass (~960 / 480 / 240 calls) | against |
+|---|---|---|---|
+| 512 | 150-300 | 145-290 | the chain 765 (699 with 0187), the reference 399 |
+| 1024 | 300-600 | 145-290 | |
+| 2048 | 600-1200 | 145-290 | |
+
+pp4096 at ub 512, from the measured rows: 0187 on, 768.8 t/s is 5.33 s a pass, less 409-554 ms
+= **833-858 t/s**; 0187 off, 719.7 t/s is 5.69 s, less 475-620 ms = 785-808 t/s. Not priced
+and on top (`inference`): the states' `rms_norm`, the cur copy, the column copies and, with the
+fold, one `rms_norm` and one `mul` a folded call. What would falsify it: `test-backend-ops
+perf` above 300 us a call at `n_slot=5,k=4,nt=512,nq=1`; above ~415 us a call the arm is
+behind the reference and the barriers are the first suspect (the two-pass form without the
+register array, or the reduction in one round, is then the next step - and the place where an
+inline-vISA reduction would be judged, from the ISA dump and that measured gap, not before).
+
+**Card commands for this revision, in order** (the B60; `<dev>` the card's backend name as
+test-backend-ops lists it; every step stops the sequence if it fails):
+
+```
+# 0. the arm's op cases are found at all: must list 45 cases, none "not supported"
+GGML_OPENCL_DEPTH_MIX=1 test-backend-ops support -b <dev> -o DEPTH_MIX
+# 1. ONE model-shaped case, bounds on: the loop's messages with their readers
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> \
+  -o "DEPTH_MIX(n_slot=2,k=1,nt=512,nq=4,with_norm=0,cols=1)"
+#    then one folded case
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> \
+  -o "DEPTH_MIX(n_slot=5,k=4,nt=512,nq=1,with_norm=1,cols=0)"
+# 2. the suite: 45 cases, 0 FAIL
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> -o DEPTH_MIX
+# 3. the reds: every case must FAIL; then only the 12 with_norm=1 cases must FAIL
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED \
+  test-backend-ops test -b <dev> -o DEPTH_MIX
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED_NW \
+  test-backend-ops test -b <dev> -o DEPTH_MIX
+# 4. the model, bounds on, one short pass first (-p 512 -r 1), then pp4096: one TAKEN line,
+#    a stats line a graph with calls == nodes > 0, no "DOWNGRADE ... op=DEPTH_MIX", and the
+#    kernel log clean (no fault, no CAT error) before anything else is run
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_STATS=1 \
+GGML_OPENCL_CPY_TRANSPOSE=1 GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 \
+  llama-bench -m <Inkling IQ4_NL> -fa 1 -p 512 -n 0 -b 4096 -ub 512 -r 1 2>&1 | \
+  grep -E "depth_mix:|DOWNGRADE|reaches"
+#    (repeat with -p 4096)
+# 5. the answer-level bar: llama-perplexity's KL against the knob-off arm's logits on the same
+#    card and window (-b 512 so the prefill path runs), then the same with =nofold if it moves
+# 6. op perf, the prediction's check
+GGML_OPENCL_DEPTH_MIX=1 test-backend-ops perf -b <dev> -o DEPTH_MIX
+# 7. pp4096, 0187 on, the arm off / on, ub 512 / 1024 / 2048
+for ub in 512 1024 2048; do
+  for dm in 0 1; do
+    GGML_OPENCL_DEPTH_MIX=$dm GGML_OPENCL_CPY_TRANSPOSE=1 \
+    GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 \
+      llama-bench -m <Inkling IQ4_NL> -fa 1 -p 4096 -n 0 -b 4096 -ub $ub -r 3
+  done
+done
+```
+
+The command list further up (written for the previous revision) is superseded by this one: its
+`-p 'k=2 nt=512 nq=1'` matches no case (the params string is comma-separated, and has
+`n_slot` and `cols` now), and its model run read no bounds or stats line.

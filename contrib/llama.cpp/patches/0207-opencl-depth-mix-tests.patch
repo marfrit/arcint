@@ -1,37 +1,54 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a128fff..99d4c01 100644
+index 95f9623..3ef67f5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6869,6 +6869,59 @@ struct test_norm_clip : public test_case {
+@@ -6881,6 +6881,87 @@ struct test_norm_clip : public test_case {
      }
  };
  
-+// 0207: Inkling 2 Mini's depth mix at the shapes its prefill graph hands it: k = 1..4
-+// block rows (2..5 states with cur, the exported graph's k), 512 and 2048 tokens, nq 1
-+// (an SWA layer, the ffn, the output) and nq 3 (a full-attention layer), with and
-+// without the folded output norm. The block rows are a view_3d of a [2304, 5, tokens]
-+// store, so the strides are the graph's: a state's row step 2304 floats (9216 bytes),
-+// a token's slab step 5 * 2304 floats (46080 bytes).
++// 0207: Inkling 2 Mini's depth mix at the shapes its prefill graph hands it, read off the
++// exported graph (test-export-graph-ops, c 4096, fa on, ub 512/1024/2048). The lines that
++// fix each shape, by node name:
++//   node_91 / node_1108 / node_2118 / node_8944 (RMS_NORM): the states view of the main
++//     block store, [2304, 2..5, T] at nb[1] 9216, nb[2] 46080 - a 5-row store, k = 1..4;
++//   node_3060 (RMS_NORM): the loop model's bank store, [2304, 2, T] at nb[2] 18432 - a
++//     2-row store, k = 1;
++//   node_95 .. node_9639 (MUL_MAT states x queries): nq 1 and 3 on the main store, and
++//     node_3064: nq 4 (the loop's four messages) on the bank store;
++//   "leaf_26 (view) (copy of node_12 (reshaped))" (CPY): cur is [2304, T], nb[1] 9216.
++// The tensors are built with the constructors the model uses (a view_3d of the store, a
++// reshape_2d of a 1-D weight), so ne, nb and the view offsets are the graph's. The folded
++// norm is the model's too: a 1-D weight through reshape_2d, on the nq 1 calls.
++// `cols` adds the readers of the result's columns as the model has them (a contiguous
++// view a column, then an RMS norm): the loop's message() and the full-attention inputs.
 +struct test_depth_mix : public test_case {
++    const int64_t n_slot;  // the store's rows: 5 (the main store) or 2 (the loop's bank)
 +    const int64_t k;       // block rows
 +    const int64_t nt;      // tokens
 +    const int64_t nq;      // query columns
 +    const bool with_norm;
++    const bool cols;
 +
 +    std::string vars() override {
-+        return VARS_TO_STR4(k, nt, nq, with_norm);
++        return VARS_TO_STR6(n_slot, k, nt, nq, with_norm, cols);
 +    }
 +
-+    test_depth_mix(int64_t k = 4, int64_t nt = 512, int64_t nq = 1, bool with_norm = false)
-+        : k(k), nt(nt), nq(nq), with_norm(with_norm) {}
++    // the `cols` cases end in the columns' readers: they stay under -o DEPTH_MIX
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "DEPTH_MIX";
++    }
++
++    test_depth_mix(int64_t n_slot = 5, int64_t k = 4, int64_t nt = 512, int64_t nq = 1, bool with_norm = false, bool cols = false)
++        : n_slot(n_slot), k(k), nt(nt), nq(nq), with_norm(with_norm), cols(cols) {}
 +
 +    ggml_tensor * build_graph(ggml_context * ctx) override {
 +        const int64_t n_embd = 2304;
-+        const int64_t n_slot = 5;   // 24 physical blocks at attn_res_block_size 6: 4 block rows + cur
 +
 +        ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_slot, nt);
 +        ggml_set_name(stack, "stack");
 +
++        // mix(): the k block rows end one row before the store's last (cur's row in the chain)
 +        ggml_tensor * blocks = ggml_view_3d(ctx, stack, n_embd, k, nt,
 +                stack->nb[1], stack->nb[2], (size_t) ((n_slot - 1) - k)*stack->nb[1]);
 +        ggml_set_name(blocks, "blocks");
@@ -55,6 +72,17 @@ index a128fff..99d4c01 100644
 +        ggml_tensor * out = ggml_depth_mix(ctx, blocks, cur, q, nw, 1e-6f, 1e-5f, 1.0f/sqrtf((float) n_embd));
 +        ggml_set_name(out, "out");
 +
++        if (cols) {
++            // every column read as the model reads it, normed, and summed into one result
++            ggml_tensor * acc = nullptr;
++            for (int64_t c = 0; c < nq; ++c) {
++                ggml_tensor * col = ggml_rms_norm(ctx, ggml_depth_mix_column(ctx, out, c), 1e-6f);
++                acc = acc ? ggml_add(ctx, acc, col) : col;
++            }
++            ggml_set_name(acc, "cols");
++            return acc;
++        }
++
 +        return out;
 +    }
 +};
@@ -62,32 +90,37 @@ index a128fff..99d4c01 100644
  // GGML_OP_FLOOR
  struct test_floor : public test_case {
      const ggml_type type;
-@@ -13051,6 +13104,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13074,6 +13155,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_norm_clip({13, 3, 5, 1}, true));
      test_cases.emplace_back(new test_norm_clip({7, 5, 2, 2}, false, 8.0f));
  
-+    // Inkling 2 Mini's depth mix: k 1..4 block rows (2..5 states, the exported graph's),
-+    // both ubatch sizes, an SWA layer's one column and a full-attention layer's three
-+    for (int64_t k : {1, 2, 3, 4}) {
-+        for (int64_t nt : {512, 2048}) {
-+            test_cases.emplace_back(new test_depth_mix(k, nt, 1, false));
-+            test_cases.emplace_back(new test_depth_mix(k, nt, 3, false));
++    // Inkling 2 Mini's depth mix at the exported graph's shapes (the struct's comment names
++    // the lines): the main store's k 1..4 with nq 1 and 3, the nq 1 calls with the folded
++    // norm, and the loop's bank store (2 rows, k 1) with its four message columns
++    for (int64_t nt : {512, 1024, 2048}) {
++        for (int64_t k : {1, 2, 3, 4}) {
++            test_cases.emplace_back(new test_depth_mix(5, k, nt, 1, false));
++            test_cases.emplace_back(new test_depth_mix(5, k, nt, 1, true));
++            test_cases.emplace_back(new test_depth_mix(5, k, nt, 3, false));
 +        }
++        test_cases.emplace_back(new test_depth_mix(2, 1, nt, 4, false));
++        // the columns' readers: the loop's messages and a full-attention layer's inputs
++        test_cases.emplace_back(new test_depth_mix(2, 1, nt, 4, false, true));
++        test_cases.emplace_back(new test_depth_mix(5, 4, nt, 3, false, true));
 +    }
-+    // the folded output norm is withheld: its card cases failed (ERR ~2) and the model
-+    // never takes it, so the suite carries no with_norm case
 +
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
-@@ -14227,6 +14291,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14250,6 +14346,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  
 +    // Inkling 2 Mini's depth mix as one launch a call - the shape it replaced is 8 nodes
 +    for (int64_t k : {1, 4}) {
 +        for (int64_t nt : {512, 2048}) {
-+            test_cases.emplace_back(new test_depth_mix(k, nt, 1, false));
++            test_cases.emplace_back(new test_depth_mix(5, k, nt, 1, false));
++            test_cases.emplace_back(new test_depth_mix(5, k, nt, 1, true));
 +        }
 +    }
 +

@@ -8,7 +8,9 @@
 //   ASAN_OPTIONS=detect_leaks=0 ./port <tokens> <nq> <k> <with_norm>
 // Recorded (all clean, OOB 0, fp32 agreement with the CPU op): 512 1 1 0/1, 512 3 3 0/1,
 // 2048 1 4 1, 512 3 1 0. It is the evidence that the strides are not the card fault's cause;
-// it cannot see a weight's storage through a view, which is why that path is withheld.
+// it gives every argument its own buffer at offset 0, so it could not see the defect the card
+// showed (the kernel never added the norm weight's offset). Superseded by the replay of the
+// kernel's own text in tests/test_depth_mix.cpp; kept as the record of the alias check.
 // faithful host port of kernels/depth_mix.cl on the model's real strides: the same
 // phases, the same local-memory layout, per-lane registers kept between phases, and a
 // range check on every global access (ASan on the buffers is available but the checks

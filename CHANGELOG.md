@@ -67,6 +67,24 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   graph is today's node for node, decode and every other model untouched; `DEPTH_MIX` leaves a `DOWNGRADE` line with its
   reason, one fixed `TAKEN` line marks the first taken call, `GGML_OPENCL_DEPTH_MIX_STATS=1` counts the graph's calls, and
   every launch is bounded under `GGML_OPENCL_BOUNDS=1`.
+- **The depth mix's two card failures, named and fixed** (patches 0204-0207, still opt-in `GGML_OPENCL_DEPTH_MIX=1`;
+  `code`, and `measured-here` on the recipe host for the replays - no card run of this revision yet). *The page fault*
+  was not in the arm's kernel: Inkling 2 Mini is the loop model, its cross-pass `messages` are a mix result (the bank
+  store, k 1, four query columns), the arm took that call, and `build_layer`'s `message()` read the arm's
+  `[n_embd, n_tokens, 4]` dst with the chain's `[n_embd, 4, n_tokens]` strides - a row step of 4,718,592 bytes at ub 512,
+  one row at the start of each `[2304, 512]` slab, in a tensor four slabs long; the copy behind it read past the buffer.
+  Every reader of a mix result's columns now goes through one function that knows both layouts and asserts the view
+  stays inside its source (`ggml_view_within_src`, new). *The three folded-norm op failures* were one missing line:
+  `depth_mix.cl` never added the norm weight's offset. The entry above's second "named defect" (a norm weight through a
+  view) and its reading of the fault are **retracted**; the fold is back (`=nofold` keeps the norms nodes, for a card
+  bisect), the `nw-view` refusal is gone. New device-free test `depth-mix` in the recipe's unit set: the rule on 69
+  lines of the exported graph (39 prefill calls accepted, the decode lines and ten variants refused, red first against
+  the handed-over rule and an accept-all rule), the launch plan the dispatch binds from, `depth_mix.cl`'s own text run
+  on host threads against the CPU op (nmse <= 2e-14; the red build without the offset > 100), and the fault's read
+  (flagged before, clean after; `fault-before` crashes with a READ in the copy under ASan). The op cases are the
+  exported shapes only (45), with the bank's four columns and their readers. The prediction is revised to 150-300 us a
+  call, 145-290 ms a pass against the chain's 765 and the reference's 399 (`inference`); card commands in
+  `contrib/llama.cpp/README.md`.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the

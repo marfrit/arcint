@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 8661cf4..edc6140 100644
+index 8661cf4..ef19e80 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -553,6 +553,7 @@ extern "C" {
@@ -10,7 +10,7 @@ index 8661cf4..edc6140 100644
          GGML_OP_CONV_TRANSPOSE_1D,
          GGML_OP_IM2COL,
          GGML_OP_IM2COL_BACK,
-@@ -1826,6 +1827,41 @@ extern "C" {
+@@ -1826,6 +1827,72 @@ extern "C" {
              float                 threshold,
              float                 eps);
  
@@ -48,6 +48,37 @@ index 8661cf4..edc6140 100644
 +    // the arm's switch: NULL (unset), "0" and "off" are off, any other value is on.
 +    // Opt-in: unset leaves the model's unfused chain and the dispatch as they are.
 +    GGML_API bool ggml_depth_mix_switch(const char * env_value);
++    // the folded output norm's switch: on with the arm, off at the value "nofold" (the
++    // norms stay nodes; a card bisect of the fold against the mix itself)
++    GGML_API bool ggml_depth_mix_fold_switch(const char * env_value);
++
++    // what a launch reads and writes, from the node alone (no device): the strides the
++    // kernel is handed and the furthest byte each argument reaches past its tensor's own
++    // offset. The OpenCL dispatch binds exactly these, and a host replay of the kernel
++    // takes the same struct, so the two cannot disagree.
++    struct ggml_depth_mix_plan {
++        int      ne0, k, nq, nt, has_nw;
++        uint64_t nb1, nb2;      // blocks: a state's row step, a token's slab step
++        uint64_t nbc1;          // cur: a token's row step
++        uint64_t nbq1;          // queries: a column's step (0 for one column)
++        uint64_t nbn1;          // norm_w: a column's step (0 for one column)
++        uint64_t nbd1, nbd2;    // dst: a token's row step, a column's block step
++        uint64_t reach_blocks, reach_cur, reach_queries, reach_norm_w, reach_dst;   // bytes
++        uint64_t local_floats;  // the work-group's local memory, in floats
++    };
++    GGML_API void ggml_depth_mix_plan_make(const struct ggml_tensor * dst, struct ggml_depth_mix_plan * plan);
++
++    // column `col` of a depth-mix result as [n_embd, n_tokens]: a contiguous view, no copy.
++    // The op's dst is [n_embd, n_tokens, nq] - NOT the unfused chain's [n_embd, nq, n_tokens],
++    // whose column is strided (row step nb[2], offset col*nb[1]) and copied. Reading the
++    // op's dst with the chain's strides steps a whole column block a token and leaves the
++    // tensor after nq rows: the card's page fault (README 0204-0207, card result 2).
++    GGML_API struct ggml_tensor * ggml_depth_mix_column(struct ggml_context * ctx, struct ggml_tensor * mixed, int64_t col);
++
++    // the furthest byte a view reaches in its source (view_offs included) against the
++    // source's size: true when every element lies inside. ggml_view_*d checks only the
++    // view's contiguous size, so a strided view can pass it and still leave its source.
++    GGML_API bool ggml_view_within_src(const struct ggml_tensor * view);
 +
      // in-place, returns view(a)
      GGML_API struct ggml_tensor * ggml_clamp_inplace(
@@ -232,7 +263,7 @@ index bfef2a8..1607712 100644
  void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9a57c18..ce9d594 100644
+index 9a57c18..ce82958 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1055,6 +1055,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -269,7 +300,7 @@ index 9a57c18..ce9d594 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4214,6 +4216,108 @@ struct ggml_tensor * ggml_norm_clip(
+@@ -4214,6 +4216,163 @@ struct ggml_tensor * ggml_norm_clip(
      return result;
  }
  
@@ -315,11 +346,6 @@ index 9a57c18..ce9d594 100644
 +    if (queries->nb[0] != sizeof(float) || (queries->ne[1] > 1 && queries->nb[1] < n_embd*sizeof(float))) {
 +        return "q-stride";   // one column is a 1-D weight, its row step is never read
 +    }
-+    if (norm_w != NULL && norm_w->view_src != NULL) {
-+        return "nw-view";   // a weight through a view's extra is not covered: the read is the
-+                            // parent's storage at the view's offset, one thing the model's own
-+                            // graph never needs once the norm stays a node
-+    }
 +    if (norm_w != NULL) {
 +        if (norm_w->ne[0] != n_embd || norm_w->ne[2] != 1 || norm_w->ne[3] != 1 ||
 +            (norm_w->ne[1] != 1 && norm_w->ne[1] != queries->ne[1])) {
@@ -340,6 +366,66 @@ index 9a57c18..ce9d594 100644
 +        return false;
 +    }
 +    return true;
++}
++
++bool ggml_depth_mix_fold_switch(const char * env_value) {
++    return ggml_depth_mix_switch(env_value) && strcmp(env_value, "nofold") != 0;
++}
++
++void ggml_depth_mix_plan_make(const struct ggml_tensor * dst, struct ggml_depth_mix_plan * plan) {
++    const struct ggml_tensor * blocks  = dst->src[0];
++    const struct ggml_tensor * cur     = dst->src[1];
++    const struct ggml_tensor * queries = dst->src[2];
++    const struct ggml_tensor * norm_w  = dst->src[3];
++
++    plan->ne0    = (int) blocks->ne[0];
++    plan->k      = (int) blocks->ne[1];     // the block rows; cur is the k+1'th state
++    plan->nq     = (int) queries->ne[1];
++    plan->nt     = (int) blocks->ne[2];
++    plan->has_nw = norm_w != NULL;
++
++    plan->nb1  = blocks->nb[1];
++    plan->nb2  = blocks->nb[2];
++    plan->nbc1 = cur->nb[1];
++    // one column is a 1-D weight seen through a reshape: its column step is never read
++    plan->nbq1 = queries->ne[1] > 1 ? queries->nb[1] : 0;
++    plan->nbn1 = norm_w != NULL && norm_w->ne[1] > 1 ? norm_w->nb[1] : 0;
++    plan->nbd1 = dst->nb[1];
++    plan->nbd2 = dst->nb[2];
++
++    const uint64_t row = (uint64_t) plan->ne0*sizeof(float);
++    plan->reach_blocks  = (uint64_t) (plan->k  - 1)*plan->nb1  + (uint64_t) (plan->nt - 1)*plan->nb2 + row;
++    plan->reach_cur     = (uint64_t) (plan->nt - 1)*plan->nbc1 + row;
++    plan->reach_queries = (uint64_t) (plan->nq - 1)*plan->nbq1 + row;
++    plan->reach_norm_w  = plan->has_nw ? (uint64_t) (plan->nq - 1)*plan->nbn1 + row : 0;
++    plan->reach_dst     = (uint64_t) (plan->nq - 1)*plan->nbd2 + (uint64_t) (plan->nt - 1)*plan->nbd1 + row;
++
++    // one float a lane for each reduced quantity: the first reduction's (k+1)*(1+nq), and the
++    // folded norm's nq past them (no slot shared between the two reductions)
++    plan->local_floats = (uint64_t) ((plan->k + 1)*(1 + plan->nq) + plan->nq)*256;
++}
++
++bool ggml_view_within_src(const struct ggml_tensor * view) {
++    const struct ggml_tensor * src = view->view_src;
++    if (src == NULL) {
++        return true;
++    }
++    if (ggml_nelements(view) == 0) {
++        return true;
++    }
++    size_t reach = view->view_offs + ggml_type_size(view->type);
++    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
++        reach += (size_t) (view->ne[i] - 1)*view->nb[i];
++    }
++    return reach <= ggml_nbytes(src);
++}
++
++struct ggml_tensor * ggml_depth_mix_column(struct ggml_context * ctx, struct ggml_tensor * mixed, int64_t col) {
++    GGML_ASSERT(mixed->op == GGML_OP_DEPTH_MIX);
++    GGML_ASSERT(col >= 0 && col < mixed->ne[2]);
++    struct ggml_tensor * view = ggml_view_2d(ctx, mixed, mixed->ne[0], mixed->ne[1], mixed->nb[1], (size_t) col*mixed->nb[2]);
++    GGML_ASSERT(ggml_view_within_src(view));
++    return view;
 +}
 +
 +bool ggml_depth_mix_eligible(const struct ggml_tensor * blocks, const struct ggml_tensor * cur,

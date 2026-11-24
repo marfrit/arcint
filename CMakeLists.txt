@@ -875,6 +875,17 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-opencl-cpy-t01 PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME opencl-cpy-t01 COMMAND arcint-opencl-cpy-t01)
     set_tests_properties(opencl-cpy-t01 PROPERTIES LABELS unit)
+    # patches 0204-0207's device-free cell: the depth mix's eligibility rule on the exported
+    # graph's lines (red first), the launch plan, depth_mix.cl itself replayed on host threads
+    # against the CPU op (and its red build), and the message read behind the card's page fault
+    add_executable(arcint-depth-mix tests/test_depth_mix.cpp)
+    target_link_libraries(arcint-depth-mix PRIVATE arcint_core)
+    target_include_directories(arcint-depth-mix PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/include"
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/kernels")
+    target_compile_options(arcint-depth-mix PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME depth-mix COMMAND arcint-depth-mix)
+    set_tests_properties(depth-mix PROPERTIES LABELS unit)
   endif()
 endif()
 
