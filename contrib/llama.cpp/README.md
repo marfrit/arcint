@@ -10507,3 +10507,36 @@ above. The series applies from the pin in byte order, 150 patches, applied tree
 `e564f5b5366b9f871bf74a0b5dfe7295c3476cbf`; the recipe result is in the commit that adds this
 paragraph. The knob-on exports are unchanged by this revision (the graph is the same; the
 op's arithmetic changed).
+
+**Where the CPU model difference comes from: the first node that differs** (`measured-here`,
+the recipe host, CPU, one 64-token prompt in one ubatch, every node's output dumped through
+llama's eval callback, knob off twice and knob on; tools in `contrib/llama.cpp/replay/`:
+`mix_node_dump.cpp`, `mix_node_cmp.py`). Knob off against knob off: 1,301 named nodes, none
+above nmse 1e-10 (the CPU is deterministic). Knob on against knob off:
+
+- the first arm mix (layer 0's ffn mix, k 1, nq 1, folded) has inputs bit-identical to the
+  chain run's (block row nmse 0, cur nmse 0);
+- its output, read as the activation of the first expert product, differs from the chain's by
+  nmse 8.6e-15 - a relative rms of 9.3e-8, under one float ulp (the router's logits from the same
+  activation: 2.5e-14);
+- **the first node above 1e-10 is `ffn_moe_gate_up-0`**, `MUL_MAT_ID`, `[2304, 8, 64]`, built by
+  `build_moe_ffn` (`src/llama-graph.cpp`, the `ggml_mul_mat_id` on the gate/up experts): nmse
+  2.5e-9 from an input at 8.6e-15, a factor of 2.9e5 at one node. `code`: the CPU kernel
+  (`ggml_compute_forward_mul_mat_id`, `ggml-cpu.c`) quantizes the activation to the weight
+  type's `vec_dot_type`, Q8_0 for IQ4_NL, so a sub-ulp change flips int8 steps;
+- from there the difference grows with depth: 5.5e-8 at `ffn_moe_out-0`, 5.7e-3 at `l_out-23`;
+- an unfolded arm mix checked in place (float64 chain arithmetic on the node's own dumped
+  inputs): 6e-15.
+
+So no node under the knob reads a wrong store row, a wrong stride or a wrong precision in this
+run; the op's output differs from the chain's at rounding level and the next quantized product
+amplifies it. That the amplification, and not something else, accounts for the 0.0015 nats is
+still `inference` until the noise control has run: knob off, every chain mix result the arm
+would replace moved one ulp up or down at random (`mix_noise_control.diff`, a test-only diff
+that is NOT in the series), three seeds, against the unperturbed chain on the same tokens,
+beside knob on (fold and nofold), on 381 and on 2,032 scored tokens. **Owed; not run yet.**
+
+The unit test also runs T = 256 now (the CPU check's batch; not an exported size): op and
+kernel text against the chain 2e-14 .. 8e-14 on six calls, the raw-state red 0.016 .. 0.64;
+the chain thresholds are 1e-11. Applied tree `c83de73e1fb7d15c44436481ec667d8280b5091c`
+(a comment in the dispatch); the recipe was last run on the previous tip.

@@ -11,7 +11,7 @@ index a1c914b..0311c94 100644
      cvt
      diag_mask_inf
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index df2ec85..f731d86 100644
+index df2ec85..1b02515 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -724,6 +724,13 @@ static std::mutex g_cl_downgrade_mu;
@@ -120,7 +120,7 @@ index df2ec85..f731d86 100644
          case GGML_OP_NORM_CLIP:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous_rows(op->src[0]) &&
-@@ -21520,6 +21584,151 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -21520,6 +21584,152 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -155,7 +155,8 @@ index df2ec85..f731d86 100644
 +        const std::string kernel_src = read_file("depth_mix.cl");
 +#endif
 +        // GGML_OPENCL_DEPTH_MIX_OPTS appends compiler options, the red case's route:
-+        // -DDEPTH_MIX_RED drops the softmax denominator in depth_mix.cl
++        // -DDEPTH_MIX_RED doubles the first state's weight in depth_mix.cl (every op case must fail);
++        // -DDEPTH_MIX_RED_RAW and -DDEPTH_MIX_RED_NW are the reds of the two defects named there
 +        const char * extra = getenv("GGML_OPENCL_DEPTH_MIX_OPTS");
 +        const std::string opts = backend_ctx->kernel_compile_opts + " -cl-intel-256-GRF-per-thread" +
 +                                 (extra != nullptr ? std::string(" ") + extra : std::string());
@@ -272,7 +273,7 @@ index df2ec85..f731d86 100644
  static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -33870,6 +34079,14 @@ static bool ggml_cl_bounds_on() {
+@@ -33870,6 +34080,14 @@ static bool ggml_cl_bounds_on() {
      }();
      return on;
  }
@@ -287,7 +288,7 @@ index df2ec85..f731d86 100644
  static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto) {
      if (!ggml_cl_bounds_on()) {
          return;
-@@ -42458,6 +42675,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -42458,6 +42676,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_norm_clip;
              break;

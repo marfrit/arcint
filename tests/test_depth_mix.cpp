@@ -561,7 +561,7 @@ void check_plan_and_replay(const call_shape & c, bool replay) {
             all_tokens[(size_t) t] = t;
         }
         const double e_op_chain = nmse_chain((const float *) dst->data, chain, all_tokens);
-        if (!(e_op_chain <= 1e-9)) {
+        if (!(e_op_chain <= 1e-11)) {
             printf("FAIL: the CPU op vs the model's chain, %s: nmse %.3g\n", what, e_op_chain);
             ++g_failures;
         }
@@ -592,7 +592,7 @@ void check_plan_and_replay(const call_shape & c, bool replay) {
             ++g_failures;
         }
         const double e_k_chain = nmse_chain(out.data(), chain, tokens);
-        if (!(e_k_chain <= 1e-9)) {
+        if (!(e_k_chain <= 1e-11)) {
             printf("FAIL: depth_mix.cl replay vs the model's chain, %s: nmse %.3g\n", what, e_k_chain);
             ++g_failures;
         }
@@ -747,6 +747,13 @@ int main(int argc, char ** argv) {
     for (const call_shape & c : production_calls()) {
         const bool replay = c.nt == 512 || (c.nt == 2048 && (c.k == 4 || c.n_slot == 2));
         check_plan_and_replay(c, replay);
+    }
+    // T = 256 is not an exported ubatch size; it is the batch of the CPU knob-on / knob-off
+    // model check (llama-perplexity -c 256 -b 256), so the op, the kernel text and the chain
+    // are compared there too
+    for (const call_shape & c : std::vector<call_shape>{ {5, 1, 256, 1, true}, {5, 4, 256, 1, false}, {5, 4, 256, 1, true},
+                                                         {5, 2, 256, 3, false}, {5, 4, 256, 3, false}, {2, 1, 256, 4, false} }) {
+        check_plan_and_replay(c, true);
     }
 
     if (g_failures != 0) {
