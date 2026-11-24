@@ -9862,3 +9862,35 @@ GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
 - Open: `llama-perplexity` does not print the once-a-process INFO line. The KL runs therefore do
   not themselves show the path was taken, although the `llama-bench` runs on the same binary and
   env do. Inkling's ub 512 logits arm (gate step (f) as written) was not run. Owed: a `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` perplexity run, or a per-call counter.
+
+## 0208-test-backend-ops-inkling-expert-projection-perf.patch
+
+The expert DOWN projection next to the fused GATE_UP as perf cases, so one card run compares them, plus
+one correctness case each so the CPU reference runs both. The shapes, strides and ids layout are the
+Inkling 2 Mini graph export's MUL_MAT_ID lines, named in the ub 512 / 1024 / 2048 exports:
+`ffn_moe_down-0` (IQ4_NL weights `[1152, 2304, 128]`, nb 18 / 648 / 1,492,992; a token's F32
+activations `[1152, 8, n]`, nb 4 / 4,608 / 36,864) and `ffn_moe_gate_up-0` (`[2304, 2304, 128]`,
+nb 18 / 1,296 / 2,985,984; gate and up fused, so b is one broadcast column, `[2304, 1, n]`, nb
+4 / 9,216 / 9,216). The ids are the constructor's own view: a token's 128-wide I32 row with the
+8 used columns, nb1 512. 128 experts, top-8, F32 activations, at 512, 1,024 and 2,048 tokens; 2,304
+rows both ways, K 1,152 for down and K 2,304 for gate/up. The routing is fixed (seed 20261124), each
+token's eight slots eight distinct experts over the 128, not the base case's random re-draw: per-expert
+pair counts 20..51 (mean 32) at 512, 46..91 (64) at 1,024, 100..166 (128) at 2,048, no expert empty.
+`test_mul_mat_id_routed` keeps the routing between perf iterations, so the two arms time the same work.
+
+Prediction before the card (inference): at 512 tokens the wide-tile per-visit figures of 0190 (26.46 ms
+gate/up, 13.56 ms down over 8 ub chunks) are 3,310 and 1,700 us a call; the narrow tile gives 3,915 and
+2,110. Down's narrow-to-wide difference is 0.41 ms a call, which is the 0.43 ms a call the 2026-11-24
+pass reading gives over 384 calls (165 ms); the int8 floor is about 0.11 ms a call. At 1,024 and 2,048
+the weights are re-read once a 512-column band, 2 and 4 times, so about 3.3 / 6.6 ms a call for down and
+6.5 / 12.9 for gate/up, before the empty-tile floor.
+
+Card commands, perf mode:
+```
+GGML_OPENCL_KQ_MM_ID_I8=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
+GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
+```
+
+CPU gate: `test-backend-ops -b CPU -o MUL_MAT_ID -p 'routed=1'` gives 2/2 OK (the two new correctness
+cases). The whole `-o MUL_MAT_ID` family did not finish here within a 30-minute cap (163 OK, 0 fail before
+the cap; the suite's large 512-expert cases dominate), so the full-family CPU row is open.
