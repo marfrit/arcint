@@ -47,9 +47,15 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   series). `GGML_OP_DEPTH_MIX` is the reference's `_mix_kernel` form in this tree's OpenCL: a token a work-group, fp32,
   the states read once into registers, the softmax and weighted sum on that copy, an output RMSNorm folded where the
   chain norms one mixed column with one weight (an SWA layer without messages, the ffn, the output); the store's last-row
-  cpy, the repeat and the per-column cont go with it. **No card row is claimed for these patches yet**: the plan, its
-  predicted numbers and the card command list are `contrib/llama.cpp/README.md`'s 0204-0207 section; the recipe build and
-  the device-free unit test (`test-depth-mix`, the eligibility rule on the graph's real strides) are green. Unset, the
+  cpy, the repeat and the per-column cont go with it. The first card run (`measured-here`, B60) showed the path
+  never running - every op case "not supported [OpenCL]", no TAKEN line, no DOWNGRADE line: `supports_op` had also
+  required each tensor's device storage, which is null there by design, so the node went to the CPU silently. The
+  decision is now types, shapes and strides only (the shared rule), device storage is the dispatch's assert, every
+  refusal logs a DOWNGRADE line and a graph that takes fewer nodes than it was handed says so at WARN; the device-free
+  test now reads that `supports_op` case as text and fails on a `->extra` or a missing refusal line, and its stride
+  literals are the exported graph's (store `[2304, 5, tokens]`, row step 9216, slab step 46080, k 1..4). **No speed row
+  is claimed for these patches yet**: the plan, the predicted numbers against both of 0187's baselines and the card
+  command list are `contrib/llama.cpp/README.md`'s 0204-0207 section. Unset, the
   graph is today's node for node, decode and every other model untouched; `DEPTH_MIX` leaves a `DOWNGRADE` line with its
   reason, one fixed `TAKEN` line marks the first taken call, `GGML_OPENCL_DEPTH_MIX_STATS=1` counts the graph's calls, and
   every launch is bounded under `GGML_OPENCL_BOUNDS=1`.

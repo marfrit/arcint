@@ -153,36 +153,47 @@ index 86397b1..c33bd28 100644
          ggml_tensor * convolve(
                  ggml_tensor * cur,
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index 33e79ea..2bc849b 100644
+index 33e79ea..956e4f7 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
-@@ -455,6 +455,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
+@@ -455,6 +455,12 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
      llama_build_and_test(test-alloc.cpp LINK ggml)
  endif()
  
 +# patch 0206: the depth-mix arm's rule (ggml_depth_mix_refuse / ggml_depth_mix_switch)
 +# on Inkling 2 Mini's own prefill strides, device-free
 +llama_build_and_test(test-depth-mix.cpp LINK ggml)
++target_compile_definitions(test-depth-mix PRIVATE
++    DEPTH_MIX_OPENCL_SRC="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
 +
  llama_build(test-export-graph-ops.cpp)
  if (TARGET gguf-model-data)
      target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
 diff --git a/tests/test-depth-mix.cpp b/tests/test-depth-mix.cpp
 new file mode 100644
-index 0000000..eb0cf88
+index 0000000..941e8d4
 --- /dev/null
 +++ b/tests/test-depth-mix.cpp
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,244 @@
 +// 0206: device-free tests for the depth-mix arm's rule (ggml_depth_mix_refuse /
 +// ggml_depth_mix_eligible) and its switch (ggml_depth_mix_switch).
 +//
 +// The tensors are Inkling 2 Mini's own prefill graph nodes, built with the same
 +// ggml constructors the model uses, at the sizes its GGUF carries:
-+//   n_embd 2304 (24 physical blocks, attn_res_block_size 4, so the block store
-+//   has (24 + 3)/4 + 1 = 7 rows), a 512- and a 2048-token ubatch, K 2..5 blocks,
-+//   nq 1 (an SWA layer's attn_res_query, ffn_res_query, output_res_query) and
-+//   nq 3 (a full-attention layer's attn_res_query), cur 2-D, the block rows a
-+//   view_3d of the store at the store's own strides.
++//   n_embd 2304 (24 physical blocks, attn_res_block_size 6, so the block store
++//   has (24 + 5)/6 + 1 = 5 rows), a 512- and a 2048-token ubatch, k 1..4 block
++//   rows (2..5 states with cur), nq 1 (an SWA layer's attn_res_query,
++//   ffn_res_query, output_res_query) and nq 3 (a full-attention layer's
++//   attn_res_query), cur 2-D, the block rows a view_3d of the store at the
++//   store's own strides.
++//
++// The stride literals are the exported graph's (test-export-graph-ops at c 4096,
++// fa on, ub 512/1024/2048; the graph lines' source tensors): the block store is
++// [2304, 5, tokens] with nb[1] 9216 and nb[2] 5 * 9216 = 46080, the states view
++// keeps them (2..5 rows, a token's slab step 46080, so at fewer rows the slab
++// step exceeds the states' extent), cur is [2304, tokens] with nb[1] 9216, the
++// query parent is [2304, nq] with nb[1] 9216 - all through the same constructors
++// the model calls.
 +//
 +// The strides are the graph's, not guesses: src/models/inkling2.cpp's
 +// res_stack_tensor makes [n_embd, n_slot, n_tokens] F32 and its mix() takes
@@ -198,6 +209,15 @@ index 0000000..eb0cf88
 +// query count) must each be refused by name: an eligible() that says yes to any
 +// of them fails this test.
 +//
++// Why this file did not catch the dispatch defect it now guards: it tests the
++// rule (shapes, types, strides) and the switch, all device-free; the defect lived
++// in the OpenCL backend's own decision, which additionally read
++// `op->src[i]->extra` - null in supports_op by design - so the op was refused
++// everywhere and the model's node went to the CPU silently, with no DOWNGRADE
++// line. The rule was right and the backend disagreed with it. The guard below
++// reads the supports_op case out of ggml-opencl.cpp and fails when it reads
++// `extra`, or when it has no refusal line: what a device cannot show, text can.
++//
 +// No GPU, no OpenCL runtime.
 +#include "ggml.h"
 +
@@ -205,6 +225,8 @@ index 0000000..eb0cf88
 +#include <cstdio>
 +#include <cstdlib>
 +#include <cstring>
++#include <fstream>
++#include <iterator>
 +#include <string>
 +#include <vector>
 +
@@ -219,7 +241,7 @@ index 0000000..eb0cf88
 +#define CHECK_REFUSED(why, want, what) CHECK(refused(why, want), what)
 +
 +static constexpr int64_t k_embd  = 2304;   // Inkling 2 Mini's width
-+static constexpr int64_t k_nslot = 7;      // the block store's rows: 6 blocks + cur
++static constexpr int64_t k_nslot = 5;      // the block store's rows: 4 blocks + cur (the exported graph)
 +
 +struct ctx_hold {
 +    ggml_context * ctx = nullptr;
@@ -266,20 +288,25 @@ index 0000000..eb0cf88
 +    {
 +        ctx_hold h;
 +        real_nodes r = build_real(h.ctx, 4, 512, 1, true);
-+        CHECK(r.stack->ne[0] == k_embd && r.stack->ne[1] == k_nslot && r.stack->ne[2] == 512, "the store is [2304, 7, 512]");
-+        CHECK(r.stack->nb[1] == k_embd*sizeof(float), "a state's row step is 2304 floats");
-+        CHECK(r.stack->nb[2] == k_nslot*k_embd*sizeof(float), "a token's slab step is 7 * 2304 floats");
++        CHECK(r.stack->ne[0] == k_embd && r.stack->ne[1] == k_nslot && r.stack->ne[2] == 512, "the store is [2304, 5, 512]");
++        CHECK(r.stack->nb[1] == k_embd*sizeof(float), "a state's row step is 2304 floats (9216 bytes)");
++        CHECK(r.stack->nb[2] == k_nslot*k_embd*sizeof(float), "a token's slab step is 5 * 2304 floats (46080 bytes)");
 +        CHECK(r.blocks->nb[1] == r.stack->nb[1] && r.blocks->nb[2] == r.stack->nb[2], "the block view keeps the store's strides");
 +        CHECK(r.blocks->nb[2] > (uint64_t) (r.blocks->ne[1]*r.blocks->nb[1]), "the slab step exceeds the states' extent");
 +        CHECK(r.cur->nb[1] == k_embd*sizeof(float), "cur is [n_embd, n_tokens], rows back to back");
 +    }
 +
-+    // ---- the model's shapes are eligible, at both ubatch sizes ----
++    // ---- the model's shapes are eligible, at both ubatch sizes: k 1..4 blocks ----
 +    for (int64_t nt : {512, 2048}) {
-+        for (int64_t k : {2, 3, 4, 5}) {
++        for (int64_t k : {1, 2, 3, 4}) {
++            // the states (k + 1 rows) fit the store's 5 rows and its 46080-byte slab step
++            CHECK(k + 1 <= k_nslot, "the store holds the states this call reads");
 +            ctx_hold h;
 +            for (int64_t nq : {1, 3}) {
 +                real_nodes r = build_real(h.ctx, k, nt, nq, nq == 1);
++                CHECK(r.blocks->nb[2] == 46080, "a token's slab step is 46080 bytes, the store's");
++                CHECK(r.blocks->nb[2] >= (uint64_t) (r.blocks->ne[1]*r.blocks->nb[1]) || r.blocks->ne[1] == 0,
++                      "the slab step covers the block rows");
 +                const char * why = ggml_depth_mix_refuse(r.blocks, r.cur, r.q, r.nw);
 +                if (why != nullptr) {
 +                    std::printf("FAIL: k=%d nt=%d nq=%d refused with %s\n", (int) k, (int) nt, (int) nq, why);
@@ -342,8 +369,12 @@ index 0000000..eb0cf88
 +    }
 +    {
 +        ctx_hold h;
-+        real_nodes r = build_real(h.ctx, 7, 512, 1, false);   // more blocks than the store has
-+        CHECK_REFUSED(ggml_depth_mix_refuse(r.blocks, r.cur, r.q, r.nw), "k", "k = 7 is refused as k");
++        // more block rows than the arm's bound: its own store of 7 rows so the view fits
++        ggml_tensor * st = ggml_new_tensor_3d(h.ctx, GGML_TYPE_F32, k_embd, 7, 512);
++        ggml_tensor * blk = ggml_view_3d(h.ctx, st, k_embd, 7, 512, st->nb[1], st->nb[2], 0);
++        ggml_tensor * cur = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F32, k_embd, 512);
++        ggml_tensor * q = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F32, k_embd, 1);
++        CHECK_REFUSED(ggml_depth_mix_refuse(blk, cur, q, nullptr), "k", "k = 7 is refused as k");
 +    }
 +    {
 +        ctx_hold h;
@@ -363,6 +394,23 @@ index 0000000..eb0cf88
 +    CHECK(!ggml_depth_mix_switch("off"), "off is off");
 +    CHECK(ggml_depth_mix_switch("1"), "1 is on");
 +    CHECK(ggml_depth_mix_switch("on"), "on is on");
++
++    // ---- the dispatch's decision is the rule's alone: no device storage in supports_op ----
++#ifdef DEPTH_MIX_OPENCL_SRC
++    {
++        std::ifstream f(DEPTH_MIX_OPENCL_SRC);
++        std::string src((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
++        const size_t a = src.find("case GGML_OP_DEPTH_MIX:");
++        const size_t b = src.find("case GGML_OP_", a + 22);
++        CHECK(a != std::string::npos && b != std::string::npos, "the supports_op case GGML_OP_DEPTH_MIX is found in ggml-opencl.cpp");
++        if (a != std::string::npos && b != std::string::npos) {
++            const std::string seg = src.substr(a, b - a);
++            CHECK(seg.find("->extra") == std::string::npos, "supports_op does not read a tensor's device storage");
++            CHECK(seg.find("ggml_depth_mix_refuse(") != std::string::npos, "supports_op decides through the rule");
++            CHECK(seg.find("ggml_cl_downgrade(") != std::string::npos, "a refused shape leaves a DOWNGRADE line");
++        }
++    }
++#endif
 +
 +    if (g_bad != 0) {
 +        std::printf("%d of the depth-mix rule's checks failed\n", g_bad);

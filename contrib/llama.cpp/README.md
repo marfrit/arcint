@@ -10030,7 +10030,13 @@ state/element loops are unrolled over their maxima with runtime guards, which ke
 register array's indices compile-time - a dynamic index would spill to scratch, the 0190
 lesson. `k` 1..6 and `nq` 1..4 bound the reduction's local buffer (35 KB at worst, sized at the
 launch), `T > 1` (decode stays with today's chain; the FUSE session's decode block is the other
-half of this chain).
+half of this chain). The offline gate (`ocloc` 26.27.1 + IGC 2.38.2, the B60 `bmg-g21`, the
+backend's options plus `-cl-intel-256-GRF-per-thread`, base and the red variant): both variants
+compile, `grf 256 simd 32 slm 1024 scratch 0 stack_calls -`, no ISA call, no retry dump - the
+register array stays in GRF (no spill), and 256 GRF is the program's ceiling, so occupancy is
+one work-group's worth; if the card's rate lands at the copies' rather than at the reference's,
+the fallback is the two-pass form (states read twice from global, no register array) that the
+same rule and kernel arguments allow (`inference`, not run).
 
 **Bytes and the rate the reference implies.** One state row of a 512-token chunk is
 2304 x 512 x 4 = 4.72 MB; at k=4 (5 states) a call reads 23.6 MB of states, 9.44 MB of query
@@ -10056,12 +10062,14 @@ what stands between 153 and 72 us a call. Said plainly: the arm beats 399 ms if 
 reference's bytes-per-second; it does not need to reach it to beat 765 ms.
 
 **What 0187 does and what remains of it.** 0187 (another session) speeds the transposed copy
-`kernel_cpy_f32_f32_pack`: an estimated 128-171 ms of the same 341 ms. The two gains must not be
-counted twice:
+`kernel_cpy_f32_f32_pack`. Its estimate was 128-171 ms of the same 341 ms; the card measured
+**1.24x** on this copy (441 -> 356 us at k=4, 66 ms of the 341, `measured-here`), so the depth
+mix's share of it is ~66 ms and the rest of 0187's estimate is elsewhere (see the card row
+below). The two gains must not be counted twice:
 
 | arm | `GGML_OPENCL_CPY_TRANSPOSE` unset | `=1` |
 |---|---|---|
-| knob off | 765 ms (today) | ~594-637 ms (0187's share taken) |
+| knob off | 765 ms (today) | ~699 ms (0187's measured 1.24x on this copy) |
 | knob on | 120-160 ms | 120-160 ms - unchanged |
 
 With the arm on, 0187's depth-mix target has nothing left: the [k, 2304, 512] cont of a
@@ -10102,6 +10110,61 @@ that must each be refused by name. `test-backend-ops`: Inkling's shapes, k 2..5,
 tokens, nq 1 and 3, with and without the folded norm, random data; the perf list has k 2, 4, 5
 at both sizes. Red option: `GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED` drops the softmax
 denominator in the kernel only (the CPU op stays right, so the op cases must fail).
+
+**Card result, 2026-11-24 (B60, the series cdd7db8d, `measured-here`): the path never ran.**
+`test-backend-ops -o DEPTH_MIX` printed `not supported [OpenCL]` for every case (0 of 0 executed;
+"2/2 backends passed" was two skips), the red therefore "passed" with 0 failures, and a
+`llama-bench pp4096` at ub 512 with `GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_DEPTH_MIX_STATS=1`
+printed no TAKEN line, no stats line and no DOWNGRADE line - the model's node went to the CPU
+silently. Cause (`code`, the applied tree's `supports_op`, `case GGML_OP_DEPTH_MIX`): it also
+required `op->src[i]->extra != nullptr` and `op->extra != nullptr`. `supports_op` is asked
+before any tensor is allocated (test-backend-ops, and the scheduler when it assigns nodes), so
+`extra` was always null: the op was refused everywhere. The rule was right; the dispatch
+disagreed with it behind an allocation-dependent test.
+
+The fix (0205, and 0206/0207 follow): the decision is `ggml_depth_mix_refuse` plus the dst
+layout and the knob - types, shapes and strides only, as the other ops do; device storage is
+the dispatch's invariant (an assert, not a condition). Every refusal logs a DOWNGRADE line
+(`switch-off`, the rule's reason, `dst-layout`, `not-built`), and a graph that hands the arm
+nodes and takes fewer of them logs `reason=not-taken nodes=N taken=T` at WARN once, so a
+silent fallback cannot happen again. `GGML_OPENCL_DEPTH_MIX_STATS=1` prints the graph's node
+and call counts.
+
+Why the device-free test missed it and what now guards it: `test-depth-mix` tested the rule
+and the switch, and the defect was in the backend's own additional condition - the two agreed
+on nothing a device-free harness could see. The test now reads the `supports_op` case out of
+`ggml-opencl.cpp` (`DEPTH_MIX_OPENCL_SRC`) and fails if that segment mentions `->extra`, if it
+does not decide through `ggml_depth_mix_refuse(`, or if it has no `ggml_cl_downgrade(` - the
+shape of the defect, checked as text.
+
+**The real graph's strides** (`measured-here` by the graph export, `inkling-ub{512,
+1024,2048}.txt`, `test-export-graph-ops` at c 4096, fa on; source tensors of the depth-mix
+lines, op 25 `RMS_NORM` into op 29 `MUL_MAT` and op 34 `CPY`): the block store is
+`[2304, 5, tokens]` - attn_res_block_size **6**, so `(24 + 5)/6 + 1 = 5` rows, not the 7 this
+README first assumed - with `nb[1]` 9216 and `nb[2]` 5 * 9216 = **46080**; the states view
+keeps them, 2..5 rows (k = 1..4 block rows, so the observed `k` range of the copies is the
+states' 2..5), and at fewer rows the token slab step exceeds the states' extent; `cur` is
+`[2304, tokens]` with `nb[1]` 9216; the query parent is `[2304, nq]` (nq 1 and 3) with
+`nb[1]` 9216. The rule accepts these (a slab step >= the rows' extent, the rows back to
+back), and `test-depth-mix` now builds exactly them - `[2304, 5, 512|2048]`, row step 9216,
+slab step 46080, k 1..4, nq 1 and 3 - and asserts the literals; the op case set is k 1..4
+(2..5 states) at 512 and 2048 tokens.
+
+**Against 0187, now measured** (`measured-here`, the operator's card row): 0187's tiled
+transpose takes the `[k, 2304, 512]` copies at **1.24x**, 441 -> 356 us at k=4, and pp4096
+at ub 512 from **719.7 to 768.8 t/s** (`I8=1 WIDE=1`). The two gains are not additive; the
+arm's prediction either way:
+
+| baseline | depth-mix parts, ms a pass | arm on, ms a pass | pp4096 ub 512 |
+|---|---|---|---|
+| 0187 off | 765 | 120-160 | 805-815 t/s (from 719.7: 5.69 s a pass, -605..-645 ms saved) |
+| 0187 on | ~699 (341 -> 275) | 120-160 | the same 805-815 - 0187's depth-mix share is subsumed |
+
+With the arm on, 0187's depth-mix target has nothing left in either baseline: the copy is not a
+node. What 0187 still takes and the arm does not touch stays as listed above (`:390`, `:394`).
+A correction to the earlier table's "0187 off/on" row: the off/on pair is 765 against ~699 (not
+594-637, which assumed all of 0187's 128-171 ms came from the depth mix; the measured 1.24x on
+this copy is 66 ms of it).
 
 **Card commands** (to run on the B60; `llama-bench` and the op cases need the arm's env):
 

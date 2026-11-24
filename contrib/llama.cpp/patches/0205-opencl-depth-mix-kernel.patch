@@ -11,7 +11,7 @@ index a1c914b..0311c94 100644
      cvt
      diag_mask_inf
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..16bcbe9 100644
+index f84ca33..1c873ad 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -723,6 +723,12 @@ static std::mutex g_cl_downgrade_mu;
@@ -62,7 +62,7 @@ index f84ca33..16bcbe9 100644
      // 0130d: the previous graph's pre/post pairs: their events are waited here, the frame's
      // first point that is not inside a dispatch
      if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)
-@@ -12693,6 +12713,17 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -12693,6 +12713,23 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                        backend_ctx->ngpt_fused, cgraph->n_nodes, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
      }
  
@@ -71,6 +71,12 @@ index f84ca33..16bcbe9 100644
 +            const char * e = getenv("GGML_OPENCL_DEPTH_MIX_STATS");
 +            return e != nullptr && atoi(e) != 0;
 +        }();
++        // a graph that hands the arm nodes and takes fewer of them is a refusal somewhere:
++        // said at WARN, once, even without the stats switch (a silent fallback is not allowed)
++        if (backend_ctx->depth_mix_calls_graph < backend_ctx->depth_mix_nodes_graph) {
++            ggml_cl_downgrade("op=DEPTH_MIX path=cpu reason=not-taken nodes=%d taken=%d",
++                              backend_ctx->depth_mix_nodes_graph, backend_ctx->depth_mix_calls_graph);
++        }
 +        if (stats_on) {
 +            GGML_LOG_INFO("depth_mix: graph nodes=%d calls=%d of %d\n",
 +                          backend_ctx->depth_mix_nodes_graph, backend_ctx->depth_mix_calls_graph, cgraph->n_nodes);
@@ -80,16 +86,20 @@ index f84ca33..16bcbe9 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -13294,6 +13325,33 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13294,6 +13331,32 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
          case GGML_OP_CLAMP:
              return op->src[0]->type == GGML_TYPE_F32;
 +        case GGML_OP_DEPTH_MIX: {
-+            // 0205: opt-in, and only the shapes ggml_depth_mix_eligible names. Unset, the
-+            // node does not exist on a model that does not emit it; a build with the knob off
-+            // keeps this dispatch exactly as it was. A shape the arm does not cover leaves a
-+            // DOWNGRADE line with the reason (once a key).
++            // 0205: opt-in, decided from types, shapes and strides only - supports_op is
++            // asked before any tensor is allocated (test-backend-ops) and again when the
++            // scheduler assigns nodes, where `extra` is still null; a decision that read it
++            // refused the op everywhere and the model's node went to the CPU silently
++            // (the card run of 0.5.1: 0 of every op case, no TAKEN line). Unset, the node
++            // does not exist on a model that does not emit it. Every refusal leaves a
++            // DOWNGRADE line with its reason, once a key.
 +            if (ggml_cl_depth_mix_on() == false) {
++                ggml_cl_downgrade("op=DEPTH_MIX path=cpu reason=switch-off");
 +                return false;
 +            }
 +            const char * why = ggml_depth_mix_refuse(op->src[0], op->src[1], op->src[2], op->src[3]);
@@ -101,20 +111,15 @@ index f84ca33..16bcbe9 100644
 +                ggml_cl_downgrade("op=DEPTH_MIX path=cpu reason=dst-layout");
 +                return false;
 +            }
-+            if (op->src[0]->extra == nullptr || op->src[1]->extra == nullptr ||
-+                op->src[2]->extra == nullptr || op->extra == nullptr ||
-+                (op->src[3] != nullptr && op->src[3]->extra == nullptr)) {
-+                return false;   // a tensor without device storage runs nowhere else either
-+            }
 +            if (ggml_cl_depth_mix_kernel(backend_ctx) == nullptr) {
-+                return false;   // the DOWNGRADE "not-built" is logged at the build
++                return false;   // the builder logged the DOWNGRADE "not-built"
 +            }
 +            return true;
 +        }
          case GGML_OP_NORM_CLIP:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous_rows(op->src[0]) &&
-@@ -21512,6 +21570,153 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -21512,6 +21575,158 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -168,6 +173,11 @@ index f84ca33..16bcbe9 100644
 +
 +static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks, const ggml_tensor * cur, ggml_tensor * dst) {
 +    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    // supports_op decides from shapes and strides alone; device storage is this call's
++    // invariant (the scheduler has allocated the node's inputs by now)
++    GGML_ASSERT(blocks->extra && cur->extra && dst->src[2]->extra && dst->extra);
++    GGML_ASSERT(dst->src[3] == nullptr || dst->src[3]->extra);
 +
 +    const ggml_tensor * queries = dst->src[2];
 +    const ggml_tensor * norm_w  = dst->src[3];
@@ -268,7 +278,7 @@ index f84ca33..16bcbe9 100644
  static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -42378,6 +42583,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -42378,6 +42593,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_norm_clip;
              break;
