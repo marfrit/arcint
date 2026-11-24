@@ -399,7 +399,11 @@ struct AbiRow { std::string type; int bytes; };
 static std::vector<AbiRow> read_abi(const std::string& p, std::string& entry_name) {
     std::vector<AbiRow> rows;
     FILE* f = std::fopen(p.c_str(), "r");
-    if (!f) { std::fprintf(stderr, "cannot open ABI file %s: %s\n", p.c_str(), std::strerror(errno)); std::exit(1); }
+    if (!f) {
+        // --abi is optional; a missing file must not stop a run
+        std::fprintf(stderr, "note: no ABI file at %s (optional; build-spirv.sh writes out/abi.txt)\n", p.c_str());
+        return rows;
+    }
     char line[512];
     while (std::fgets(line, sizeof line, f)) {
         if (line[0] == '#') continue;
@@ -418,6 +422,16 @@ static std::vector<AbiRow> read_abi(const std::string& p, std::string& entry_nam
         }
     }
     std::fclose(f);
+    if (rows.empty()) {
+        // The two files a build can leave behind: the machine twin `abi.txt` (rows
+        // "arg<TAB>i<TAB>type<TAB>bytes") and the SPIR-V dump / human table that is not
+        // one. Say which, and how to regenerate, instead of failing on a count of 0.
+        std::fprintf(stderr,
+            "note: %s names no arguments - it is not build-spirv.sh's machine twin "
+            "(abi.txt: \"arg<TAB>index<TAB>type<TAB>bytes\" rows). Regenerate with "
+            "bash build-spirv.sh <outdir> and point --abi at <outdir>/abi.txt, "
+            "or drop --abi: the ABI is then not asserted.\n", p.c_str());
+    }
     return rows;
 }
 
@@ -676,7 +690,7 @@ int main(int argc, char** argv) {
         std::string abi_entry;
         std::vector<AbiRow> abi = read_abi(abi_path, abi_entry);
         std::printf("\nabi file: %zu argument(s), entry point %s\n", abi.size(), abi_entry.c_str());
-        if ((int)abi.size() != nargs) {
+        if (!abi.empty() && (int)abi.size() != nargs) {
             std::fprintf(stderr, "the abi file names %zu arguments; this host sets %d\n", abi.size(), nargs);
             return 9;
         }
@@ -1011,7 +1025,10 @@ int main(int argc, char** argv) {
             Compare cmp = compare_out(out, c.ref.o, sh.lq);
             std::printf("comparison: max abs error %.6g, max row relative L2 %.6g, mean row KL %.6g nats (%d rows, %d NaN)\n",
                         cmp.max_abs, cmp.max_rel, cmp.mean_kl, cmp.nrows, cmp.nnan);
-            std::printf("  (row KL = the row's 128 output components as a simplex; the kernel returns no attention weights)\n");
+            std::printf("  (row KL = the row's 128 output components normalised to a simplex - NOT a quality\n"
+                "   number: it says nothing about the model's answer, it is not comparable across\n"
+                "   shapes. Quality is the campaign's answer-level KL; here max abs error and row\n"
+                "   relative L2 are the comparison)\n");
             if (m.is_reference_flags) {
                 const bool ok = cmp.max_abs <= ref_tol_abs && cmp.mean_kl <= ref_tol_kl && cmp.nnan == 0;
                 std::printf("tolerance (reference-flags module): max abs <= %.3g, mean row KL <= %.3g -> %s\n",

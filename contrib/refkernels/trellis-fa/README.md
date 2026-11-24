@@ -630,7 +630,12 @@ What that will settle, and what it may fail on:
 - `max abs error`: elementwise over all `Lq·Hq·D` outputs, against the f32
   oracle. The kernel writes f32, so this is the kernel's own error.
 - `mean row KL`: **the row's 128 output components, each normalised to a
-  simplex**, KL(oracle row ‖ kernel row) averaged over `Lq·Hq` rows. The kernel
+  simplex**, KL(oracle row ‖ kernel row) averaged over `Lq·Hq` rows. **This is
+  not a quality number**: it normalises a raw output row into a simplex, it says
+  nothing about the model's answer, and it is not comparable across shapes (49-68
+  nats at the 2048 shapes is that artefact, not a distance). Quality is the
+  campaign's answer-level KL on real logits; here the comparison is max abs error
+  and row relative L2. The kernel
   writes `o` only and no attention weights, so a KL over keys is not observable
   from its output; this is the row's shape and it is labelled that way in the
   output. The operator-level KL gate for the port is a different measurement on
@@ -691,6 +696,35 @@ review). The code is four patches on our llama pin, `contrib/llama.cpp/patches/`
 | `0199-flash-attn-port-tests` | `test-backend-ops` cases at the three perf shapes and Inkling's real ones (SWA 1024, global 1025, wrapped ring 1024 and 1088, the pad bin), positions/flags and the mask/bins derived from them, and the red procedure |
 
 `GGML_OPENCL_FA_PORT` unset (or `0`) = the dispatch exactly as it was.
+
+## The bar is the oracle (the oracle window, measured-here)
+
+The reference arm ran (the oracle window, B60 at 165 W, `measured-here`, local only - no
+binary in the repo or the product): `fa::Kern` compiled ahead of time by ocloc
+26.27.1 from `out/fa_kern.{ref,precise}.spv` (`-spirv_input -device bmg-g21`,
+`"-vc-codegen -cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required"`,
+with and without `-doubleGRF`), loaded by `fa_ref_host` with
+`clCreateProgramWithBinary`; device time from `clGetEventProfilingInfo`, median of
+20 launches:
+
+| shape | fa::Kern SYCL / L0 (coordinator) | oracle 128 GRF (default; 2,112 B scratch) | oracle 256 GRF (`-doubleGRF`; no scratch) | today's kernel |
+|---|---|---|---|---|
+| q2048 × kv3072 | 2,473-3,500 | 2,271 | **1,909** | 12,583 |
+| q2048 × kv2048 | 1,828 | 1,795 | **1,457** | 9,938 |
+| q512 × kv1536 | 856 | 863 | **533** | 2,293 |
+
+Max abs error against the CPU oracle 4.3e-4, row relative L2 ≤ 3.4e-4, 0 NaN; the
+ref and the precise binaries time the same. So 256 GRF is 16-38 % faster despite
+half the threads a core, and **the port's bar is the 256 oracle: 1,909 / 1,457 /
+533 us**. `-doubleGRF` is thus the default by measurement, not by the spill alone.
+
+Two corrections that run forced, both in `fa_ref_host`'s README below: its "mean
+row KL" normalises a raw 128-component output row to a simplex and is **not a
+quality number** (49-68 nats at the 2048 shapes says nothing about quality; the
+comparison's numbers are max abs error and row relative L2, and quality is the
+campaign's answer-level KL). And `--abi` needed no file: `out/abi.txt` is a
+SPIR-V dump the parser reads as zero arguments - the parser now says which of the
+two files it got and how to regenerate it.
 
 ## The targets, written before any card run
 
@@ -815,6 +849,43 @@ zero), the per-token logit rides at `src[18]`, and the port uses it as the
 initial `(m, l)`. The CPU reads `src[18]` when present, so a call the port declines
 still gets the per-token sink in the CPU fallback. The env is read once per
 process (a `getenv` in the model's graph builder, static-initialised).
+
+### The layout rule: the strides the kernel indexes {#layout}
+
+The card's first port run (the first card window, B60) declined every call:
+`DOWNGRADE src=opencl op=FLASH_ATTN port=declined reason=layout`. The gate had
+asked for `ggml_is_contiguous(q/k/v)`; the model's FLASH_ATTN_EXT inputs are
+**permuted views** - from the export (`inkling-ub512.txt` lines 222 /
+223): q `[128, Lq, 24]` nb `[4, 12288, 512]` (row pitch nb1, head stride nb2), K/V
+`[128, n_kv, 8]` nb `[2, 2048, 256]`. Those are exactly the strides the kernel
+indexes, so the rule is now the stride terms with the kernel line that uses each:
+
+| term | rule | kernel / prepass |
+|---|---|---|
+| q nb[1] (row pitch) | ≥ D·4, % 32 == 0 | `flash_attn_q_to_f16` reads `head·nb[2] + row·nb[1]`, 8 floats a `vload8` |
+| q nb[2] (head stride) | ≥ D·4, % 32 == 0 | same |
+| k/v nb[1] (kv row pitch) | ≥ D·2, % 16 == 0 | the 2D block read's pitch (`KREAD`/`VREAD`), surface `(D·2-1, n_kv-1, nb[1]-1)` |
+| k/v nb[2] (kv head stride) | ≥ D·2, % 64 == 0 | the read's base `kvh·nb[2]` |
+| mask nb[1] | ≥ n_kv·2 | `row·nb[1] + key` |
+| table nb[0..2] | 4, n_bins·4, n_head·n_bins·4 | `((row·n_head+head)·n_bins+bin)` |
+| sink nb[0..1] | 4, n_head·4 | `row·n_head+head` |
+| dst nb[1/nb[2] | ≥ D·4 each | head stride / row stride of the store |
+
+The gate is one pure function (`ggml/src/ggml-opencl/fa_port_gate.h`, no cl_ call,
+no backend state) and a CPU test feeds it the export's own lines:
+`port_gate_test.cpp` reads `inkling-ub{512,1024,2048}.txt`, takes each
+FLASH_ATTN_EXT line's q/k/v/mask **ne and nb** from the line, the table from the
+MUL_MAT line that produces `[1025, n_head, rows]` (line 216 in each file), and
+synthesizes only what the patched graph adds. It is red-proven: with the old
+contiguity rule the prefill lines (222/223) are refused `layout`; with the stride
+rules they are accepted and the decode lines (220/221, dst ne2 = 1) stay refused
+`decode`.
+
+Q is f32 in the op and f16 in the kernel: the dispatch now runs
+`flash_attn_q_to_f16` once a call (scale 1.0 - the kernel applies `scale_log2`
+itself) into a `[head][row][D]` scratch, so the kernel's Q surface has row pitch
+D·2 and head stride n_q·D·2. That also closes a real type mismatch the handover
+had overlooked.
 
 ### The offline gate, run on the committed kernel {#gate}
 

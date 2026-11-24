@@ -10,11 +10,109 @@ index a1c914b..63a481f 100644
      flash_attn_gqa_dpas
      sub
      sum_rows
+diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
+new file mode 100644
+index 0000000..8f900ec
+--- /dev/null
++++ b/ggml/src/ggml-opencl/fa_port_gate.h
+@@ -0,0 +1,84 @@
++// fa_port_gate.h — the port arm's eligibility, as one pure function (no OpenCL call, no
++// backend state), so a CPU test can feed it a graph export.
++//
++// The rules exist because of what flash_attn_port.cl indexes, and each is named with the
++// kernel line it protects:
++//   q: read by flash_attn_q_to_f16 (the prepass), head*nb[2] + row*nb[1], 8 floats a vload8
++//      - nb[1] the row pitch, nb[2] the head stride, both byte strides;
++//   k/v: the 2D block reads, surface (D*2-1, n_kv-1, nb[1]-1), base + kvh*nb[2];
++//   mask: row * nb[1] + key;
++//   table: ((row*n_head + head) * n_bins + bin) - nb[1] == n_bins*4, nb[2] == n_head*n_bins*4;
++//   sink: row*n_head + head (sinks_q);
++//   positions and flags: element i.
++// 0198's first form asked for contiguity and declined every real call: the model's
++// FLASH_ATTN_EXT inputs are permuted views (q nb1 12288 / nb2 512, K/V nb1 2048 / nb2 256),
++// so the rules are the strides the kernel indexes, not a contiguous order.
++#ifndef FA_PORT_GATE_H
++#define FA_PORT_GATE_H
++
++#include <ggml.h>
++#include <stdint.h>
++#include <string.h>
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++// 1 accept, 0 refuse with *why set. Pure: the tensors' type/ne/nb and the op's scalars only.
++static inline int fa_port_gate_why(
++        const struct ggml_tensor * q, const struct ggml_tensor * k, const struct ggml_tensor * v,
++        const struct ggml_tensor * mask, const struct ggml_tensor * dst,
++        const struct ggml_tensor * table, const struct ggml_tensor * indices,
++        const struct ggml_tensor * sinks_q,
++        const struct ggml_tensor * kpos, const struct ggml_tensor * qpos,
++        const struct ggml_tensor * cflag, const struct ggml_tensor * rflag,
++        int64_t n_bias_sources, int is_intel, int paged, int has_bias,
++        float max_bias, float logit_softcap, int32_t window,
++        const char ** why_out) {
++#define REFUSE(r) do { *why_out = (r); return 0; } while (0)
++    if (!has_bias || table == NULL || indices == NULL) REFUSE("no-bias");
++    if (!is_intel) REFUSE("device");
++    if (paged) REFUSE("paged");
++    if (kpos == NULL || qpos == NULL || cflag == NULL || rflag == NULL) REFUSE("no-positions");
++    if (sinks_q == NULL) REFUSE("no-sinks");
++    if (q->ne[3] != 1 || k->ne[3] != 1) REFUSE("streams");
++    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) REFUSE("kv-type");
++    if (q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) REFUSE("head");
++    if (q->ne[1] < 9) REFUSE("decode");          // n_q <= 8 keeps 0143's split kernels
++    if (mask == NULL || mask->type != GGML_TYPE_F16 || mask->ne[3] != 1) REFUSE("mask");
++    if (max_bias != 0.0f) REFUSE("alibi");
++    if (logit_softcap != 0.0f) REFUSE("softcap");
++    if (window < 0) REFUSE("window");
++
++    const int64_t rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1];
++    if (rows < 1 || n_head % k->ne[2] != 0) REFUSE("shape");
++    if (mask->ne[0] < n_kv || mask->ne[1] < rows) REFUSE("mask");
++    if (dst == NULL || dst->type != GGML_TYPE_F32 || dst->ne[0] != v->ne[0] ||
++        dst->ne[1] != n_head || dst->ne[2] < rows) REFUSE("dst");
++
++    // 0198's original rule: a contiguous order. Red-proven by port_gate_test.cpp on the
++    // export's prefill lines - the model's tensors are permuted views.
++    const int64_t q_elem = (int64_t) q->nb[0];
++    const int64_t k_elem = (int64_t) k->nb[0];
++    const int64_t v_elem = (int64_t) v->nb[0];
++    if (q->nb[1] != q->ne[0]*q_elem || q->nb[2] != q->ne[1]*q->nb[1] ||
++        k->nb[1] != k->ne[0]*k_elem || k->nb[2] != k->ne[1]*k->nb[1] ||
++        v->nb[1] != v->ne[0]*v_elem || v->nb[2] != v->ne[1]*v->nb[1]) REFUSE("layout");
++
++    if (sinks_q->type != GGML_TYPE_F32 || sinks_q->ne[0] != n_head || sinks_q->ne[1] < rows ||
++        sinks_q->ne[2] != 1) REFUSE("sinks");
++    if (table->type != GGML_TYPE_F32 || table->ne[0] <= 0 || table->ne[1] != n_head ||
++        table->ne[2] < rows || table->ne[3] != 1) REFUSE("bias-table");
++    if (indices->type != GGML_TYPE_I32 || indices->ne[0] < n_kv || indices->ne[1] < rows) REFUSE("bias-indices");
++    if (kpos->type != GGML_TYPE_I32 || qpos->type != GGML_TYPE_I32 ||
++        kpos->ne[0] < n_kv || qpos->ne[0] < rows) REFUSE("positions");
++    if (cflag->type != GGML_TYPE_I8 || rflag->type != GGML_TYPE_I8 ||
++        cflag->ne[0] < (n_kv + 15) / 16 || rflag->ne[0] < (rows + 7) / 8) REFUSE("flags");
++    (void) n_bias_sources;
++#undef REFUSE
++    return 1;
++}
++#if defined(__cplusplus)
++}
++#endif
++#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..3a9ff19 100644
+index f84ca33..9726496 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -722,6 +722,7 @@ struct ggml_cl_kq_act {
+@@ -8,6 +8,7 @@
+ #endif
+ 
+ #include "ggml-opencl.h"
++#include "fa_port_gate.h"   // 0198: the port arm's eligibility, a pure function (CPU-testable)
+ #include "ggml-opencl-planes.h"   // 0022 / 0116: the planar layout, device-free
+ #include "ggml-backend.h"
+ #include "ggml-impl.h"
+@@ -722,6 +723,7 @@ struct ggml_cl_kq_act {
  static std::mutex g_cl_downgrade_mu;
  static std::map<std::string, uint64_t> g_cl_downgrades;
  
@@ -22,7 +120,7 @@ index f84ca33..3a9ff19 100644
  static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
  static void ggml_cl_downgrade(const char * fmt, ...) {
      char buf[256];
-@@ -1497,6 +1498,10 @@ struct ggml_backend_opencl_context {
+@@ -1497,6 +1499,10 @@ struct ggml_backend_opencl_context {
      // flash_attn_dpas2.cl (Xe2): K/V by 2D block reads, Q as f16 re-read a tile
      cl_kernel kernel_fa_dpas2_dk[3] = {}, kernel_fa_dpas2_carry_dk[3] = {}, kernel_fa_q_to_f16_dk[3] = {};
      cl_kernel kernel_fa_mask_cls = nullptr;       // the mask by 8 x 32 blocks (flash_attn_dpas2.cl)
@@ -33,7 +131,7 @@ index f84ca33..3a9ff19 100644
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
      // 0106: the build options of the head-256 prompt kernels, so that the
      // head-512 builds made on first use match them (sub-group, sub-groups a
-@@ -13086,6 +13091,117 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+@@ -13086,6 +13092,97 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
      return true;
  }
  
@@ -58,38 +156,18 @@ index f84ca33..3a9ff19 100644
 +    const ggml_tensor * bi = op->src[GGML_FA_SRC_BIAS_IDX];
 +    const ggml_tensor * kp = op->src[GGML_FA_SRC_KPOS], * qp = op->src[GGML_FA_SRC_QPOS];
 +    const ggml_tensor * cf = op->src[GGML_FA_SRC_CFLAG], * rf = op->src[GGML_FA_SRC_RFLAG];
-+    const ggml_tensor * sinks = op->src[GGML_FA_SRC_SINK_Q];   // 0193: the port's per-query sink
-+
-+    if (!ggml_flash_attn_ext_has_indexed_bias(op) || bt == nullptr || bi == nullptr) { *why = "no-bias"; return false; }
-+    if (backend_ctx->gpu_family != INTEL) { *why = "device"; return false; }
-+    if (kp == nullptr || qp == nullptr || cf == nullptr || rf == nullptr) { *why = "no-positions"; return false; }
-+    if (op->src[GGML_FA_SRC_PAGES] || op->src[GGML_FA_SRC_PLAN] || op->src[GGML_FA_SRC_TAG]) { *why = "paged"; return false; }
-+    if (q->ne[3] != 1 || k->ne[3] != 1) { *why = "streams"; return false; }
-+    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) { *why = "kv-type"; return false; }
-+    if (q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) { *why = "head"; return false; }
-+    if (q->ne[1] < 9) { *why = "decode"; return false; }   // n_q <= 8 keeps 0143's split kernels
-+    if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v)) { *why = "layout"; return false; }
-+    if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] || mask->ne[3] != 1) { *why = "mask"; return false; }
-+
-+    const int64_t rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1];
-+    if (sinks == nullptr || sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
-+        sinks->ne[0] != n_head || sinks->ne[1] < rows || sinks->ne[2] != 1) { *why = "sinks"; return false; }
-+    if (bt->type != GGML_TYPE_F32 || !ggml_is_contiguous(bt) ||
-+        bt->ne[0] <= 0 || bt->ne[1] != n_head || bt->ne[2] < rows || bt->ne[3] != 1) { *why = "bias-table"; return false; }
-+    if (bi->type != GGML_TYPE_I32 || !ggml_is_contiguous(bi) || !ggml_is_matrix(bi) ||
-+        bi->ne[0] < n_kv || bi->ne[1] < rows) { *why = "bias-indices"; return false; }
-+    if (kp->type != GGML_TYPE_I32 || qp->type != GGML_TYPE_I32 || !ggml_is_contiguous(kp) || !ggml_is_contiguous(qp) ||
-+        kp->ne[0] < n_kv || qp->ne[0] < rows) { *why = "positions"; return false; }
-+    if (cf->type != GGML_TYPE_I8 || rf->type != GGML_TYPE_I8 || !ggml_is_contiguous(cf) || !ggml_is_contiguous(rf) ||
-+        cf->ne[0] < (n_kv + 15) / 16 || rf->ne[0] < (rows + 7) / 8) { *why = "flags"; return false; }
++    const ggml_tensor * sinks = op->src[GGML_FA_SRC_SINK_Q];
 +
 +    float max_bias = 0.0f, softcap = 0.0f;
 +    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
 +    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
-+    if (max_bias != 0.0f) { *why = "alibi"; return false; }
-+    if (softcap != 0.0f) { *why = "softcap"; return false; }
-+    if (ggml_get_op_params_i32(op, GGML_FA_PARAM_WINDOW) < 0) { *why = "window"; return false; }
-+    return true;
++
++    const int paged = op->src[GGML_FA_SRC_PAGES] != nullptr || op->src[GGML_FA_SRC_PLAN] != nullptr ||
++                      op->src[GGML_FA_SRC_TAG] != nullptr;
++    return fa_port_gate_why(q, k, v, mask, op, bt, bi, sinks, kp, qp, cf, rf,
++                            2, backend_ctx->gpu_family == INTEL, paged,
++                            ggml_flash_attn_ext_has_indexed_bias(op) != 0 ? 1 : 0,
++                            max_bias, softcap, ggml_get_op_params_i32(op, GGML_FA_PARAM_WINDOW), why) != 0;
 +}
 +
 +// built once a device, on the first call the gate lets through
@@ -151,7 +229,7 @@ index f84ca33..3a9ff19 100644
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -13633,6 +13749,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13633,6 +13730,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
              // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
              // the prompt kernels have no bias yet, so those shapes go to ggml
@@ -172,7 +250,7 @@ index f84ca33..3a9ff19 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26474,6 +26604,121 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26474,6 +26585,156 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
@@ -200,6 +278,40 @@ index f84ca33..3a9ff19 100644
 +            kv_lo = std::max(0, n_kv - n_q - window + 1);
 +        }
 +        const int rows = (int) q->ne[1];
++
++        // Q to f16 once a call, [head][row][D] contiguous: flash_attn_q_to_f16 (the prepass
++        // the DPAS arms use), scale 1.0 - the port kernel applies scale_log2 itself. The
++        // kernel's Q surface then has row pitch D*2 and head stride n_q*D*2.
++        load_cl_kernels(backend_ctx);
++        cl_kernel kq16 = backend_ctx->kernel_fa_q_to_f16_dk[d_head_q == 256 ? 0 : 1];
++        if (kq16 == nullptr) { ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "no-q16"); return; }
++        ggml_cl_buffer & q16buf = backend_ctx->scratch_buffer("fa_port_q16");
++        q16buf.allocate(backend_ctx->context, (size_t) rows * n_head * d_head_q * sizeof(cl_half));
++        cl_mem q16 = q16buf.buffer;
++        const cl_ulong q16_nb1 = (cl_ulong) d_head_q * sizeof(cl_half);
++        const cl_ulong q16_nb2 = q16_nb1 * rows;
++        {
++            ggml_tensor_extra_cl * eq = (ggml_tensor_extra_cl *) q->extra;
++            const cl_ulong src_off = eq->offset + q->view_offs;
++            const cl_mem src_buf = eq->data_device;
++            const cl_ulong src_nb1 = q->nb[1], src_nb2 = q->nb[2];
++            const cl_ulong zero = 0;
++            const float one = 1.0f;
++            int a = 0;
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_mem),   &src_buf));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_ulong), &src_off));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_ulong), &src_nb1));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_ulong), &src_nb2));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_ulong), &zero));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(float),    &one));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(int),      &n_q));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(int),      &n_head));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_mem),   &q16));
++            size_t lws16[3] = { (size_t) d_head_q / 8, 4, 1 };
++            size_t gws16[3] = { (size_t) d_head_q / 8, (size_t) CEIL_DIV(n_q, 4) * 4, (size_t) n_head };
++            backend_ctx->enqueue_ndrange_kernel(kq16, 3, gws16, lws16, dst);
++        }
++        ggml_cl_bounds("op=FLASH_ATTN port", "q16", q16, (size_t) rows * n_head * d_head_q * sizeof(cl_half));
 +
 +        // every buffer the launch touches, against its allocation, before any enqueue
 +        auto argbuf = [](const ggml_tensor * t, cl_mem * m, cl_ulong * off) {
@@ -241,12 +353,13 @@ index f84ca33..3a9ff19 100644
 +            return;
 +        }
 +
++        const cl_ulong zero16 = 0;
 +        float scale_log2 = 1.4426950408889634f * scale;
 +        int a = 0;
-+        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bq));
-+        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oq));
-+        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &q->nb[1]));
-+        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &q_nb2p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &q16));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &zero16));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &q16_nb1));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &q16_nb2));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bk));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ok));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &k_nb1p));
