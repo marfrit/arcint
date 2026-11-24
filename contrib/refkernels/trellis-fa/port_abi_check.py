@@ -30,7 +30,7 @@ for chunk in m.group(1).split(","):
 print(f"kernel parameters: {len(params)}")
 
 # --- the host's argument sequence for this kernel ---
-s = host.index("cl_kernel kp = ggml_cl_port_gate")
+s = host.index("cl_kernel kp = backend_ctx->kernel_fa_port;")
 seg = host[s:host.index("backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);", s)]
 args = re.findall(r"clSetKernelArg\(kp, a\+\+, sizeof\((?:cl_[a-z]+|int|float)\)\s*,\s*&([^)]+)\)", seg)
 print(f"host clSetKernelArg calls: {len(args)}")

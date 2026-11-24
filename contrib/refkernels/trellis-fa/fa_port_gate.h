@@ -100,6 +100,88 @@ static inline int fa_port_gate_why(
 #undef REFUSE
     return 1;
 }
+
+// ---- the op-level forms: everything below reads the op itself, so supports_op, the launch
+// ---- and a CPU test ask the same question of the same tensor ----
+
+// the op's slots and params the port reads (ggml-impl.h's GGML_FA_SRC_* / GGML_FA_PARAM_*;
+// repeated here so this header needs ggml.h only, and checked against them where both are seen)
+enum {
+    FA_PORT_SRC_PAGES = 5, FA_PORT_SRC_TAG = 8, FA_PORT_SRC_PLAN = 11,
+    FA_PORT_SRC_TABLE = 12, FA_PORT_SRC_IDX = 13, FA_PORT_SRC_KPOS = 14, FA_PORT_SRC_QPOS = 15,
+    FA_PORT_SRC_CFLAG = 16, FA_PORT_SRC_RFLAG = 17, FA_PORT_SRC_SINK_Q = 18,
+    FA_PORT_PARAM_BIAS_FLAG = 15, FA_PORT_PARAM_WINDOW = 16,
+};
+#ifdef GGML_FA_SRC_SINK_Q
+#if GGML_FA_SRC_PAGES != 5 || GGML_FA_SRC_TAG != 8 || GGML_FA_SRC_PLAN != 11 || GGML_FA_SRC_BIAS_TABLE != 12 || \
+    GGML_FA_SRC_BIAS_IDX != 13 || GGML_FA_SRC_KPOS != 14 || GGML_FA_SRC_QPOS != 15 || GGML_FA_SRC_CFLAG != 16 || \
+    GGML_FA_SRC_RFLAG != 17 || GGML_FA_SRC_SINK_Q != 18 || GGML_FA_PARAM_BIAS_FLAG != 15 || GGML_FA_PARAM_WINDOW != 16
+#error "fa_port_gate.h's slots are not ggml-impl.h's"
+#endif
+#endif
+
+static inline int fa_port_op_paged(const struct ggml_tensor * op) {
+    return op->src[FA_PORT_SRC_PAGES] != NULL || op->src[FA_PORT_SRC_PLAN] != NULL || op->src[FA_PORT_SRC_TAG] != NULL;
+}
+
+// a call carries the port's sources: an indexed bias and the per-query sinks. Such a call is
+// the port's or nobody's - no other kernel reads its table or its sink.
+static inline int fa_port_carries(const struct ggml_tensor * op) {
+    int32_t flag;
+    memcpy(&flag, (const char *) op->op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
+    return flag != 0 && op->src[FA_PORT_SRC_SINK_Q] != NULL;
+}
+
+// THE gate, on the op: supports_op and the launch both call this and nothing else of their own
+static inline int fa_port_gate_op(const struct ggml_tensor * op, size_t buf_align, size_t wg_max, int is_intel,
+                                  const char ** why_out) {
+    int32_t flag, window;
+    float max_bias, softcap;
+    memcpy(&flag,     (const char *) op->op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
+    memcpy(&window,   (const char *) op->op_params + FA_PORT_PARAM_WINDOW * sizeof(int32_t), sizeof window);
+    memcpy(&max_bias, (const char *) op->op_params + 1 * sizeof(float), sizeof max_bias);
+    memcpy(&softcap,  (const char *) op->op_params + 2 * sizeof(float), sizeof softcap);
+    return fa_port_gate_why(op->src[0], op->src[1], op->src[2], op->src[3], op,
+                            op->src[FA_PORT_SRC_TABLE], op->src[FA_PORT_SRC_IDX], op->src[FA_PORT_SRC_SINK_Q],
+                            op->src[FA_PORT_SRC_KPOS], op->src[FA_PORT_SRC_QPOS],
+                            op->src[FA_PORT_SRC_CFLAG], op->src[FA_PORT_SRC_RFLAG],
+                            buf_align, wg_max, is_intel, fa_port_op_paged(op), flag != 0,
+                            max_bias, softcap, window, why_out);
+}
+
+// The dispatch's block split of a 9 to 64-row call (rows are independent for the kernels it
+// feeds: it re-enters the dispatch with stack copies of the op, 8 rows each). The predicate
+// is here so that the dispatch and the routing test below share it.
+static inline int fa_row_blocks_split(int64_t n_q, int64_t n_batch, int is_intel, int q_is_f32, int mask_ok,
+                                      int paged, int gqa_wide, int rb_on) {
+    return rb_on && !paged && !gqa_wide && is_intel && n_q > 8 && n_q <= 64 && n_batch == 1 && q_is_f32 && mask_ok;
+}
+
+// The query rows of the op the port's launch is handed. port_first = the dispatch takes a
+// call that carries the port's sources before any other branch (what it does). port_first
+// = 0 is the order it had before: the block split ran first, and a 9 to 64-row port call
+// reached the port as blocks of at most 8 rows that still carried its sources - the launch's
+// gate then said "decode" for a call supports_op had accepted, and aborted (the card: the
+// 1088 x 64 case; 20 and 12 rows the same way).
+static inline int64_t fa_port_launch_rows(const struct ggml_tensor * op, int port_first, int is_intel, int gqa_wide, int rb_on) {
+    const struct ggml_tensor * q = op->src[0], * mask = op->src[3];
+    const int64_t n_q = q->ne[1];
+    if (port_first) return n_q;
+    return fa_row_blocks_split(n_q, q->ne[3], is_intel, q->type == GGML_TYPE_F32, mask != NULL && mask->ne[2] == 1,
+                               fa_port_op_paged(op), gqa_wide, rb_on) ? (n_q < 8 ? n_q : 8) : n_q;
+}
+
+// The launch-time decision for an op supports_op was asked about: the same gate, on the op as
+// the launch receives it. With port_first it is the op itself, so the two cannot differ.
+static inline int fa_port_gate_at_launch(const struct ggml_tensor * op, int port_first, int gqa_wide, int rb_on,
+                                         size_t buf_align, size_t wg_max, int is_intel, const char ** why_out) {
+    const int64_t rows = fa_port_launch_rows(op, port_first, is_intel, gqa_wide, rb_on);
+    if (rows == op->src[0]->ne[1]) return fa_port_gate_op(op, buf_align, wg_max, is_intel, why_out);
+    struct ggml_tensor qv = *op->src[0], dv = *op;      // a block, as the split builds it
+    qv.ne[1] = rows; dv.ne[2] = rows; dv.src[0] = &qv;
+    return fa_port_gate_op(&dv, buf_align, wg_max, is_intel, why_out);
+}
+
 #if defined(__cplusplus)
 }
 #endif

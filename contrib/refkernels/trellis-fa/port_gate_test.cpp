@@ -198,6 +198,30 @@ int main(int argc, char ** argv) {
             // the row boundary: 8 rows keep today's kernels, 9 are the port's
             { call_t m = c; m.q.ne[1] = 8;                        expect(file, l.no, "  8 query rows", m, false, "decode"); }
             { call_t m = c; m.q.ne[1] = 9;                        expect(file, l.no, "  9 query rows", m, true, ""); }
+            // the op-level gate (what supports_op and the launch both call) is the same verdict,
+            // and the routing: a 64-row call of this layout reaches the launch whole when the
+            // port is taken first, and as 8-row blocks ("decode") in the dispatch order before
+            {
+                call_t m = c; m.q.ne[1] = 64;
+                struct ggml_tensor op = m.dst;
+                op.ne[2] = 64;
+                op.src[0] = &m.q; op.src[1] = &m.k; op.src[2] = &m.v; op.src[3] = &m.mask;
+                op.src[FA_PORT_SRC_TABLE] = &m.table; op.src[FA_PORT_SRC_IDX] = &m.indices; op.src[FA_PORT_SRC_SINK_Q] = &m.sinks;
+                op.src[FA_PORT_SRC_KPOS] = &m.kpos; op.src[FA_PORT_SRC_QPOS] = &m.qpos;
+                op.src[FA_PORT_SRC_CFLAG] = &m.cflag; op.src[FA_PORT_SRC_RFLAG] = &m.rflag;
+                const int32_t one = 1;
+                memcpy((char *) op.op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), &one, sizeof one);
+                memcpy((char *) op.op_params + FA_PORT_PARAM_WINDOW * sizeof(int32_t), &m.window, sizeof m.window);
+                const char * w0 = "", * w1 = "", * w2 = "";
+                const int sup  = fa_port_gate_op(&op, m.align, m.wg_max, 1, &w0);
+                const int now  = fa_port_gate_at_launch(&op, 1, 0, 1, m.align, m.wg_max, 1, &w1);
+                const int then = fa_port_gate_at_launch(&op, 0, 0, 1, m.align, m.wg_max, 1, &w2);
+                const bool good = fa_port_carries(&op) && sup && now && !then && strcmp(w2, "decode") == 0;
+                printf("  %s line %d   64 rows: supports_op %s, launch %s; the old order: %s%s%s\n", file, l.no,
+                       sup ? "ACCEPT" : w0, now ? "ACCEPT" : w1, then ? "ACCEPT" : "refuse ", then ? "" : w2,
+                       good ? "" : "   <-- FAIL");
+                if (!good) ++fails;
+            }
             // the contiguous layout is served too
             { call_t m = c;
               m.q = contiguous(T_F32, 128, rows, n_head, 4);

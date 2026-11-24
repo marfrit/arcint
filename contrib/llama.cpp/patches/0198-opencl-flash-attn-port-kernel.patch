@@ -12,10 +12,10 @@ index a1c914b..63a481f 100644
      sum_rows
 diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
 new file mode 100644
-index 0000000..eb20346
+index 0000000..673211a
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/fa_port_gate.h
-@@ -0,0 +1,106 @@
+@@ -0,0 +1,188 @@
 +// fa_port_gate.h - the port arm's eligibility, as one pure function (no OpenCL call, no
 +// backend state), so a CPU test can feed it a graph export's own lines.
 +//
@@ -118,12 +118,94 @@ index 0000000..eb20346
 +#undef REFUSE
 +    return 1;
 +}
++
++// ---- the op-level forms: everything below reads the op itself, so supports_op, the launch
++// ---- and a CPU test ask the same question of the same tensor ----
++
++// the op's slots and params the port reads (ggml-impl.h's GGML_FA_SRC_* / GGML_FA_PARAM_*;
++// repeated here so this header needs ggml.h only, and checked against them where both are seen)
++enum {
++    FA_PORT_SRC_PAGES = 5, FA_PORT_SRC_TAG = 8, FA_PORT_SRC_PLAN = 11,
++    FA_PORT_SRC_TABLE = 12, FA_PORT_SRC_IDX = 13, FA_PORT_SRC_KPOS = 14, FA_PORT_SRC_QPOS = 15,
++    FA_PORT_SRC_CFLAG = 16, FA_PORT_SRC_RFLAG = 17, FA_PORT_SRC_SINK_Q = 18,
++    FA_PORT_PARAM_BIAS_FLAG = 15, FA_PORT_PARAM_WINDOW = 16,
++};
++#ifdef GGML_FA_SRC_SINK_Q
++#if GGML_FA_SRC_PAGES != 5 || GGML_FA_SRC_TAG != 8 || GGML_FA_SRC_PLAN != 11 || GGML_FA_SRC_BIAS_TABLE != 12 || \
++    GGML_FA_SRC_BIAS_IDX != 13 || GGML_FA_SRC_KPOS != 14 || GGML_FA_SRC_QPOS != 15 || GGML_FA_SRC_CFLAG != 16 || \
++    GGML_FA_SRC_RFLAG != 17 || GGML_FA_SRC_SINK_Q != 18 || GGML_FA_PARAM_BIAS_FLAG != 15 || GGML_FA_PARAM_WINDOW != 16
++#error "fa_port_gate.h's slots are not ggml-impl.h's"
++#endif
++#endif
++
++static inline int fa_port_op_paged(const struct ggml_tensor * op) {
++    return op->src[FA_PORT_SRC_PAGES] != NULL || op->src[FA_PORT_SRC_PLAN] != NULL || op->src[FA_PORT_SRC_TAG] != NULL;
++}
++
++// a call carries the port's sources: an indexed bias and the per-query sinks. Such a call is
++// the port's or nobody's - no other kernel reads its table or its sink.
++static inline int fa_port_carries(const struct ggml_tensor * op) {
++    int32_t flag;
++    memcpy(&flag, (const char *) op->op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
++    return flag != 0 && op->src[FA_PORT_SRC_SINK_Q] != NULL;
++}
++
++// THE gate, on the op: supports_op and the launch both call this and nothing else of their own
++static inline int fa_port_gate_op(const struct ggml_tensor * op, size_t buf_align, size_t wg_max, int is_intel,
++                                  const char ** why_out) {
++    int32_t flag, window;
++    float max_bias, softcap;
++    memcpy(&flag,     (const char *) op->op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
++    memcpy(&window,   (const char *) op->op_params + FA_PORT_PARAM_WINDOW * sizeof(int32_t), sizeof window);
++    memcpy(&max_bias, (const char *) op->op_params + 1 * sizeof(float), sizeof max_bias);
++    memcpy(&softcap,  (const char *) op->op_params + 2 * sizeof(float), sizeof softcap);
++    return fa_port_gate_why(op->src[0], op->src[1], op->src[2], op->src[3], op,
++                            op->src[FA_PORT_SRC_TABLE], op->src[FA_PORT_SRC_IDX], op->src[FA_PORT_SRC_SINK_Q],
++                            op->src[FA_PORT_SRC_KPOS], op->src[FA_PORT_SRC_QPOS],
++                            op->src[FA_PORT_SRC_CFLAG], op->src[FA_PORT_SRC_RFLAG],
++                            buf_align, wg_max, is_intel, fa_port_op_paged(op), flag != 0,
++                            max_bias, softcap, window, why_out);
++}
++
++// The dispatch's block split of a 9 to 64-row call (rows are independent for the kernels it
++// feeds: it re-enters the dispatch with stack copies of the op, 8 rows each). The predicate
++// is here so that the dispatch and the routing test below share it.
++static inline int fa_row_blocks_split(int64_t n_q, int64_t n_batch, int is_intel, int q_is_f32, int mask_ok,
++                                      int paged, int gqa_wide, int rb_on) {
++    return rb_on && !paged && !gqa_wide && is_intel && n_q > 8 && n_q <= 64 && n_batch == 1 && q_is_f32 && mask_ok;
++}
++
++// The query rows of the op the port's launch is handed. port_first = the dispatch takes a
++// call that carries the port's sources before any other branch (what it does). port_first
++// = 0 is the order it had before: the block split ran first, and a 9 to 64-row port call
++// reached the port as blocks of at most 8 rows that still carried its sources - the launch's
++// gate then said "decode" for a call supports_op had accepted, and aborted (the card: the
++// 1088 x 64 case; 20 and 12 rows the same way).
++static inline int64_t fa_port_launch_rows(const struct ggml_tensor * op, int port_first, int is_intel, int gqa_wide, int rb_on) {
++    const struct ggml_tensor * q = op->src[0], * mask = op->src[3];
++    const int64_t n_q = q->ne[1];
++    if (port_first) return n_q;
++    return fa_row_blocks_split(n_q, q->ne[3], is_intel, q->type == GGML_TYPE_F32, mask != NULL && mask->ne[2] == 1,
++                               fa_port_op_paged(op), gqa_wide, rb_on) ? (n_q < 8 ? n_q : 8) : n_q;
++}
++
++// The launch-time decision for an op supports_op was asked about: the same gate, on the op as
++// the launch receives it. With port_first it is the op itself, so the two cannot differ.
++static inline int fa_port_gate_at_launch(const struct ggml_tensor * op, int port_first, int gqa_wide, int rb_on,
++                                         size_t buf_align, size_t wg_max, int is_intel, const char ** why_out) {
++    const int64_t rows = fa_port_launch_rows(op, port_first, is_intel, gqa_wide, rb_on);
++    if (rows == op->src[0]->ne[1]) return fa_port_gate_op(op, buf_align, wg_max, is_intel, why_out);
++    struct ggml_tensor qv = *op->src[0], dv = *op;      // a block, as the split builds it
++    qv.ne[1] = rows; dv.ne[2] = rows; dv.src[0] = &qv;
++    return fa_port_gate_op(&dv, buf_align, wg_max, is_intel, why_out);
++}
++
 +#if defined(__cplusplus)
 +}
 +#endif
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index df2ec85..9a8b374 100644
+index df2ec85..b0dddd4 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -8,6 +8,7 @@
@@ -154,7 +236,7 @@ index df2ec85..9a8b374 100644
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
      // 0106: the build options of the head-256 prompt kernels, so that the
      // head-512 builds made on first use match them (sub-group, sub-groups a
-@@ -13094,6 +13101,152 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+@@ -13094,6 +13101,155 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
      return true;
  }
  
@@ -174,26 +256,29 @@ index df2ec85..9a8b374 100644
 +// model attaches them to a prompt batch only) and that its gate covers; anything else
 +// carrying them is declined with a reason, never served by a kernel that would read it
 +// another way. The rules are fa_port_gate.h's pure function; this is only its argument list.
-+static bool ggml_cl_port_gate(ggml_backend_opencl_context * backend_ctx, const struct ggml_tensor * op, const char ** why) {
-+    const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
-+    const ggml_tensor * mask = op->src[3];
-+    const ggml_tensor * bt = op->src[GGML_FA_SRC_BIAS_TABLE];
-+    const ggml_tensor * bi = op->src[GGML_FA_SRC_BIAS_IDX];
-+    const ggml_tensor * kp = op->src[GGML_FA_SRC_KPOS], * qp = op->src[GGML_FA_SRC_QPOS];
-+    const ggml_tensor * cf = op->src[GGML_FA_SRC_CFLAG], * rf = op->src[GGML_FA_SRC_RFLAG];
-+    const ggml_tensor * sinks = op->src[GGML_FA_SRC_SINK_Q];
++static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx);
 +
-+    float max_bias = 0.0f, softcap = 0.0f;
-+    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
-+    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
-+
-+    const int paged = op->src[GGML_FA_SRC_PAGES] != nullptr || op->src[GGML_FA_SRC_PLAN] != nullptr ||
-+                      op->src[GGML_FA_SRC_TAG] != nullptr;
-+    return fa_port_gate_why(q, k, v, mask, op, bt, bi, sinks, kp, qp, cf, rf,
-+                            backend_ctx->alignment, backend_ctx->max_workgroup_size,
-+                            backend_ctx->gpu_family == INTEL, paged,
-+                            ggml_flash_attn_ext_has_indexed_bias(op) != 0 ? 1 : 0,
-+                            max_bias, softcap, ggml_get_op_params_i32(op, GGML_FA_PARAM_WINDOW), why) != 0;
++// THE decision whether the port serves an op that carries its sources. supports_op and the
++// launch both call this, and neither has a rule of its own: the pure gate on the op
++// (fa_port_gate.h), then what only the device knows - the kernel is built, and one tile's
++// work-group fits it.
++static bool ggml_cl_port_decide(ggml_backend_opencl_context * backend_ctx, const struct ggml_tensor * op, const char ** why) {
++    if (!fa_port_gate_op(op, (size_t) backend_ctx->alignment, backend_ctx->max_workgroup_size,
++                         backend_ctx->gpu_family == INTEL, why)) {
++        return false;
++    }
++    cl_kernel kport = ggml_cl_port_kernel(backend_ctx);
++    if (kport == nullptr || backend_ctx->kernel_fa_port_q16 == nullptr) {
++        *why = "not-built";
++        return false;
++    }
++    size_t wg = 0;
++    CL_CHECK(clGetKernelWorkGroupInfo(kport, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
++    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) > wg) {
++        *why = "no-fit";
++        return false;
++    }
++    return true;
 +}
 +
 +// built once a device, on the first call the gate lets through
@@ -307,35 +392,20 @@ index df2ec85..9a8b374 100644
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -13641,6 +13794,41 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13641,6 +13797,26 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
              // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
              // the prompt kernels have no bias yet, so those shapes go to ggml
-+            if (ggml_cl_port_on() && ggml_flash_attn_ext_has_indexed_bias(op) &&
-+                op->src[GGML_FA_SRC_SINK_Q] != nullptr) {
++            if (ggml_cl_port_on() && fa_port_carries(op)) {
 +                // 0198: the port arm serves the calls that carry its sources (the model's
-+                // prompt batches under the knob) and only what its gate covers. A call
-+                // without them (a decode step, any other graph) and every call with the
-+                // knob unset take 0143/0144's dispatch below, untouched.
++                // prompt batches under the knob) and only what ggml_cl_port_decide accepts -
++                // the same function the launch asserts. A call without them (a decode step,
++                // any other graph) and every call with the knob unset take 0143/0144's
++                // dispatch below, untouched.
 +                const char * why = nullptr;
-+                if (!ggml_cl_port_gate(backend_ctx, op, &why)) {
++                if (!ggml_cl_port_decide(backend_ctx, op, &why)) {
 +                    ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", why);
 +                    return false;
-+                }
-+                if (ggml_cl_port_kernel(backend_ctx) == nullptr) {
-+                    ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "not-built");
-+                    return false;
-+                }
-+                // one tile's work-group (16 lanes a head of the kv head's group) against what
-+                // this kernel is granted: asked here, where a refusal is still a refusal
-+                {
-+                    cl_kernel kport = backend_ctx->kernel_fa_port;
-+                    size_t wg = 0;
-+                    CL_CHECK(clGetKernelWorkGroupInfo(kport, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
-+                    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) > wg) {
-+                        ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "no-fit");
-+                        return false;
-+                    }
 +                }
 +                return true;
 +            }
@@ -349,21 +419,29 @@ index df2ec85..9a8b374 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26482,6 +26670,174 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
-         max_bias == 0.0f && logit_softcap == 0.0f &&
-         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
-         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
-+    // 0198: the port arm, after trellis-serve's fa::Kern. GGML_OPENCL_FA_PORT=1,
-+    // an indexed bias and the port's sources; supports_op accepted exactly what the
-+    // gate accepts, so reaching this with a refusal would be a dispatch bug, not a shape.
-+    if (ggml_cl_port_on() && ggml_flash_attn_ext_has_indexed_bias(dst) && dst->src[GGML_FA_SRC_SINK_Q] != nullptr) {
+@@ -26014,6 +26190,182 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+     // the clReleaseMemObject -38 abort of window 280 (the 2-layer case's SoA host store)
+ }
+ 
++// 0198: the port arm's launch, after trellis-serve's fa::Kern. The dispatch calls it first
++// for a call that carries the port's sources, before any other branch: every earlier branch
++// (the block split of a 9 to 64-row call, above all) would hand it another op than the one
++// supports_op was asked about. It decides nothing: ggml_cl_port_decide accepted this op.
++static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
++    const int n_q = (int) q->ne[1], n_kv = (int) k->ne[1], d_head_q = (int) q->ne[0];
++    const int n_head = (int) q->ne[2], n_head_kv = (int) k->ne[2];
++    const cl_ulong mask_nb1 = mask->nb[1];
++    const float scale = ((const float *) dst->op_params)[0];
++    {
 +        const char * why = nullptr;
-+        cl_kernel kp = ggml_cl_port_gate(backend_ctx, dst, &why) ? ggml_cl_port_kernel(backend_ctx) : nullptr;
-+        cl_kernel kq16 = backend_ctx->kernel_fa_port_q16;
-+        if (kp == nullptr || kq16 == nullptr) {
-+            ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", why ? why : "not-built");
-+            GGML_ABORT("op=FLASH_ATTN port: a call supports_op accepted is refused at launch");
++        if (!ggml_cl_port_decide(backend_ctx, dst, &why)) {
++            GGML_LOG_ERROR("op=FLASH_ATTN port: supports_op and the launch disagree (reason=%s)\n", why ? why : "?");
++            GGML_ABORT("op=FLASH_ATTN port: the launch was handed an op supports_op did not accept");
 +        }
++        cl_kernel kp = backend_ctx->kernel_fa_port;
++        cl_kernel kq16 = backend_ctx->kernel_fa_port_q16;
 +        const int G = n_head / n_head_kv;
 +        // GGML_OPENCL_FA_PORT_QTW: adjacent query tiles a work-group (the reference's server
 +        // runs 4), clamped to what the device's work-group holds; one tile always fits
@@ -518,8 +596,41 @@ index df2ec85..9a8b374 100644
 +        size_t lws[3] = { 16, (size_t) G, (size_t) qtw };
 +        size_t gws[3] = { 16, (size_t) G, (size_t) n_head_kv * ngroups * qtw };
 +        backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
++    }
++}
++
+ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
+     const ggml_tensor * v = dst->src[2];
+     const ggml_tensor * mask = dst->src[3];
+@@ -26033,6 +26385,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
++    // 0198: a call that carries the port's sources is the port's, first and whole
++    // (fa_port_gate.h: fa_port_launch_rows says what an earlier branch would make of it)
++    if (ggml_cl_port_on() && fa_port_carries(dst)) {
++        ggml_cl_flash_attn_port(backend, dst);
 +        return;
 +    }
++
+     // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
+ 
+     const int n_q = q->ne[1];
+@@ -26277,8 +26636,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     {
+         static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
+         static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
+-        if (rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
+-            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
++        if (fa_row_blocks_split(n_q, n_batch, backend_ctx->gpu_family == INTEL, q->type == GGML_TYPE_F32,
++                                mask != nullptr && mask->ne[2] == 1, kv_pages != nullptr, gqa_wide, rb_on)) {
+             for (int r0 = 0; r0 < n_q; r0 += 8) {
+                 const int nr = std::min(8, n_q - r0);
+                 ggml_tensor qv = *q, dv = *dst, mv;
+@@ -26482,6 +26841,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
 +
      if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok && !gqa_wide) {
          ggml_cl_downgrade("op=FLASH_ATTN head=%d kv=%s n_q=9+ path=f32_f16 reason=%s", (int) d_head_q, ggml_type_name(k->type),

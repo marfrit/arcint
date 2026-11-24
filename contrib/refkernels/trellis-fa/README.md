@@ -1749,3 +1749,48 @@ three changes below; **the kernel as it stands here has not run on a card.**
 
 Expected against the round-2 kernel: the same times within the run-to-run
 spread (the pad read is 8 loads a tile), the same answers.
+
+## The card's abort on the short cases, and one decision for both sides {#route}
+
+The card (measured-here, the card host, B60) aborted the suite at the eighth
+port case, 1,088 keys × 64 rows: `port=declined reason=decode`, then "a call
+supports_op accepted is refused at launch". The same abort ended the earlier
+suite runs, so the cases after it (1,040 × 20, 160 × 12, the pad pair, the twins)
+had never run on a card.
+
+**Cause** (`code`, `ggml-opencl.cpp`, `ggml_cl_flash_attn`): the dispatch splits a
+9 to 64-row call into blocks of 8 and re-enters itself with stack copies of the
+op (the row blocks of the verify path), and that branch sat ahead of the port's.
+A short port call therefore reached the port as 8-row blocks that still carried
+its sources; the launch ran the gate a second time on a block and got `decode`
+for an op `supports_op` had accepted whole. (A block would also have been wrong
+to serve: its table, sink and positions were not cut with it.)
+
+**Fix.** One function, `ggml_cl_port_decide` (the pure gate on the op, then the
+kernel and its work-group), is all `supports_op` asks and all the launch
+asserts. The dispatch takes a call that carries the port's sources first, before
+any other branch, and hands the whole op to `ggml_cl_flash_attn_port`. The split's
+predicate is a pure function in `fa_port_gate.h`, shared with the test.
+
+**The test, red first** (`measured-here`, the recipe host, no device):
+`GGML_TEST_FA_PORT_DECISIONS=1 test-backend-ops -b CPU -o FLASH_ATTN_EXT` puts
+every port eval case's op through the `supports_op` decision and the launch-time
+decision (the same gate, on the op as the launch is handed it).
+With `GGML_TEST_FA_PORT_ROUTE_RED=1` (the dispatch order before the fix): rc 1,
+four cases FAIL - 1,088 × 64, 1,040 × 20, 160 × 12 and the pad case 2,200 × 24,
+each `supports_op ACCEPT | launch refuse decode`. Without it: rc 0, all eleven
+agree. The gate test on the export's lines shows the same on the model's layout
+at 64 rows. It also asserts the case counts a window must see:
+
+| class | cases | knob on | knob unset |
+|---|---|---|---|
+| `port=1` | 11 | RUN 11, not supported 0 | RUN 0, not supported 11 |
+| of them `pad_bias=2.5` | 1 | RUN 1 | not supported 1 |
+| `port=2` (twins, today's kernels) | 5 | RUN 5 | RUN 5 |
+| of them `pad_bias=2.5` | 1 | RUN 1 | RUN 1 |
+
+The twins run on today's indexed-bias dispatch; a "not supported" there is that
+dispatch declining its own shape, to be reported as such. Also on this tree: the
+gate test red rc 1 / green rc 0 (30 ACCEPT, 180 refusals), the offline gate at
+256 GRF `ocloc 8/8 variants` with scratch 0, the twins on the CPU 14 pairs OK,
+`-p "port=[12]"` 16/16. Not run: any of it on a device.
