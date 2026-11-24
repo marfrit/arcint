@@ -771,6 +771,14 @@ unset or wide-off build, and the port must not change decode.
 
 ## What the code is believed to do, and what is owed
 
+The port's call ABI is checked without a device: `port_abi_check.py` parses the
+kernel's 42-parameter list out of `flash_attn_port.cl` and the launch's 42
+`clSetKernelArg` expressions out of `ggml-opencl.cpp`, and compares each position
+against the expression that parameter must receive (a head stride, a row pitch,
+an offset, a scalar). It caught a real defect before any card run: a duplicated
+V head-stride argument had shifted the whole tail of the argument list. Run
+against the patched series tree, 42 positions, 0 failures.
+
 The port's two arithmetic tricks are also checked without a device:
 `port_arithmetic_check.py` (this directory) runs 25,000 checks with 0 failures —
 (1) the bias run read (one sub-group block read at `(d0-15)` plus the lane

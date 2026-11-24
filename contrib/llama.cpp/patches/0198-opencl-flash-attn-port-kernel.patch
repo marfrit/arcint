@@ -11,7 +11,7 @@ index a1c914b..63a481f 100644
      sub
      sum_rows
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..13c7b14 100644
+index f84ca33..afbd8d2 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -722,6 +722,7 @@ struct ggml_cl_kq_act {
@@ -163,7 +163,7 @@ index f84ca33..13c7b14 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26474,6 +26595,122 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26474,6 +26595,121 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
@@ -246,7 +246,6 @@ index f84ca33..13c7b14 100644
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ov));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v_nb1p));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v_nb2p));
-+        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v->nb[2]));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bo));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oo));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &dst->nb[1]));
