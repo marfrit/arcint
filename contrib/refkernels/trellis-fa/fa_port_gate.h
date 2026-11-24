@@ -169,13 +169,15 @@ static inline int fa_port_gate_op(const struct ggml_tensor * op, size_t buf_alig
 // table its own way - asking supports_op cannot tell that backend from one that serves the
 // port, because the unaware "yes" is the hazard. So a backend DECLARES that it reads the
 // port's sources, by answering this name through its registry's get_proc_address (any
-// non-null pointer); supports_op then decides each op as before. No backend is named here.
-// dev == NULL is a layer on the CPU, whose kernel reads both table layouts and src[18]: the
-// CPU-only run keeps the port's graph. guard = 0 is the form before this rule (every
-// device gets the sources): the unit test's red.
+// non-null pointer); supports_op then decides each op as before. No backend is named here,
+// and absent means refused: a backend without the name (another GPU backend, a remote one,
+// an older build of this one), a layer on the CPU, a layer with no device - each gets
+// today's graph. So a CPU-only run with the knob set builds the graph it builds without it.
+// guard = 0 is the form before this rule (every layer gets the sources): the tests' red.
 #define FA_PORT_CAPABILITY_PROC "ggml_backend_flash_attn_port_sources"
 static inline int fa_port_layer_attaches(ggml_backend_dev_t dev, int guard) {
-    if (dev == NULL || !guard) return 1;
+    if (!guard) return 1;
+    if (dev == NULL) return 0;
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     return reg != NULL && ggml_backend_reg_get_proc_address(reg, FA_PORT_CAPABILITY_PROC) != NULL;
 }

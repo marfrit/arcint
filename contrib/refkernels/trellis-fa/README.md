@@ -1862,15 +1862,17 @@ wider refusal, a cached query); the kernel file is the one that ran.
   `ggml_backend_flash_attn_port_sources` through its registry's
   `get_proc_address` (`fa_port_gate.h`, `fa_port_layer_attaches`). No backend
   is named. `supports_op` alone cannot be that test: an unaware backend's "yes"
-  is the hazard. A layer on the CPU keeps the port's graph (the CPU's kernel
-  reads both table layouts and `src[18]`), so a CPU-only run with the knob is
-  unchanged. Any other layer gets today's graph and one
-  `DOWNGRADE src=llama op=FLASH_ATTN port=off reason=layer-backend` line.
+  is the hazard. Absent means refused: another GPU backend, a remote one, an
+  older build, and a layer on the CPU all get today's graph and one
+  `DOWNGRADE src=llama op=FLASH_ATTN port=off reason=layer-backend` line, so a
+  CPU-only run with the knob set is the run without it (§guard-tests). The
+  CPU's kernel still reads the port's table and `src[18]`: it serves an op the
+  OpenCL gate declines on a layer that is the port's.
   Red first (`measured-here`, the recipe host): `GGML_TEST_FA_PORT_GUARD=1
   test-backend-ops -b CPU -o FLASH_ATTN_EXT` with mock registries;
   with `GGML_TEST_FA_PORT_GUARD_RED=1` (the form before the guard) the unaware
   GPU backend gets the sources ATTACHED and the test fails; green: not attached
-  for it, attached for a declaring backend and for the CPU.
+  for it and for a layer with no device, attached for a declaring backend.
 - **The knob-off graph has no tensor of the port's.** The eight position and
   class inputs are created only with the knob set; unset, the graph is today's
   node for node.
@@ -1883,3 +1885,50 @@ wider refusal, a cached query); the kernel file is the one that ran.
   CHANGELOG entry and in `contrib/llama.cpp/README.md`.
 - **The reference** is listed in `THIRD_PARTY.md` (it was claimed above and
   missing at this branch's base).
+
+## The layer guard, tested {#guard-tests}
+
+Absent means refused, for every layer: the port's graph is built only where the
+layer's backend declares the port's sources. The first form of the guard exempted
+a layer without a device; that exemption is gone (a CPU layer's device is a
+device whose registry declares nothing, so it never had the port's graph under
+the guard anyway, and now no case is argued instead of tested).
+
+1. **Default absent = refused, on the real graph builder.**
+   `guard_check.sh <bin dir> <model> <text> <out dir>` runs the model's own graph
+   builder (llama-perplexity, Inkling 2 Mini, batches of 64 rows: the port's
+   shape) three times on the CPU - a backend that does not declare the port's
+   sources, as an RPC, SYCL, Vulkan or CUDA layer or an older OpenCL build would
+   not: the knob unset, the knob set, and the knob set with
+   `GGML_OPENCL_FA_PORT_RED=5` (the form before the guard). `GGML_OPENCL_FA_PORT_TRACE=1`
+   logs each layer's decision. Result (`measured-here`, the recipe
+   host, the full Inkling 2 Mini GGUF, not a tiny model: none exists for this
+   architecture): with the knob, **0 of 48 prompt-batch layers** carry the
+   port's sources and the DOWNGRADE line is printed; with the red, **48 of 48**
+   do. The guard is what keeps them off. (The DOWNGRADE line is printed on the
+   first few graph builds, not once: a context's first builds run with the log
+   off, and a once-only line was lost there - found by this check.)
+   The mock-registry test (`GGML_TEST_FA_PORT_GUARD=1`) is the same rule on stand-in
+   devices: red rc 1 (the undeclaring backend ATTACHED), green rc 0.
+2. **The CPU run with the knob is the run without it.** In the same check the
+   knob-set run's logits are compared with the knob-unset run's by
+   llama-perplexity's own KL statistics. The saved logits are
+   quantised, so a run against itself does not read as KL 0; the check therefore
+   runs the knob-unset model twice (`ctrl`) and requires the knob-set run's whole
+   statistics block to be `ctrl`'s line for line. Result: 40 lines identical
+   (mean KL 0.000002 ± 0.000001 in both). For contrast the red run, where the CPU
+   serves the port's graph, reads mean KL 0.007141 ± 0.001134, top p 98.82 %
+   against base: inside the answer bar, and not the same run - which is why the
+   CPU's layers get today's graph rather than an argued exemption.
+3. **The mixed case** (some layers on OpenCL, the rest on the CPU). Each layer
+   decides for itself (`model.dev_layer(il)`), and a layer that is not the port's
+   references none of the port's tensors: its op has no positions, classes or
+   per-query sink, and its table is today's folded one. The position and class
+   inputs are shared among the port's layers only (one set a KV cache). This host
+   has no OpenCL device, so the mixed graph is **not run here**; the same script
+   with a layer count runs it on a card host and prints the per-layer table:
+
+       guard_check.sh <bin dir> <model> <text> <out dir> 12
+
+   It passes when no layer on the CPU carries the port's sources; the layers on
+   the card must show `sources=attached`.

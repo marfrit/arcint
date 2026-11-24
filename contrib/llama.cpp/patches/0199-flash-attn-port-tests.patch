@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 95f9623..b7c240d 100644
+index 95f9623..3f414a5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -19,6 +19,8 @@
@@ -318,7 +318,7 @@ index 95f9623..b7c240d 100644
      // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
      // 27B's geometry (head size 256, 24 query heads on 4)
      for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-@@ -15105,8 +15346,182 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
+@@ -15105,8 +15346,183 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
      return n_fail == 0;
  }
  
@@ -395,7 +395,8 @@ index 95f9623..b7c240d 100644
 +// graph (fa_port_gate.h: fa_port_layer_attaches). Mock registries stand for the backends:
 +// a GPU backend that knows nothing of the port (it answers no capability name - and would
 +// say "supported" to any indexed-bias FLASH_ATTN_EXT, reading the table its own way), one
-+// that declares the capability, and the CPU (no device). GGML_TEST_FA_PORT_GUARD_RED=1 asks
++// that declares the capability, and a layer with no device (absent means refused, the CPU
++// included: its registry answers no such name either). GGML_TEST_FA_PORT_GUARD_RED=1 asks
 +// in the form before the guard: the unaware backend then gets the sources, and the test fails.
 +static bool test_fa_port_guard() {
 +    const bool red = getenv("GGML_TEST_FA_PORT_GUARD_RED") != nullptr;
@@ -416,7 +417,7 @@ index 95f9623..b7c240d 100644
 +    struct { const char * what; ggml_backend_dev_t dev; int want; } rows[] = {
 +        { "a GPU backend that does not declare the port's sources", &dev_unaware, 0 },
 +        { "a backend that declares them",                           &dev_port,    1 },
-+        { "a layer on the CPU (no device)",                         nullptr,      1 },
++        { "a layer with no device",                                 nullptr,      0 },
 +    };
 +    int n_fail = 0;
 +    for (auto & r : rows) {
