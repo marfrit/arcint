@@ -1,0 +1,287 @@
+0187: a copy whose source has dim 1 as its fastest dimension and dim 0 as the destination's - ggml_cont(ggml_permute(t, 1, 0, ...)), Inkling's bias-table copy - runs as a 16x16 tiled transpose through local memory behind GGML_OPENCL_CPY_TRANSPOSE (default off), reads coalesced over the source's fastest dimension and writes coalesced over the destination's, bounds both buffers under GGML_OPENCL_BOUNDS, hides its eligibility behind a pure function so a host test can check a graph node's real strides, and has a red that breaks the 1,025-bin edge.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-cpy-t01.h b/ggml/src/ggml-opencl/ggml-opencl-cpy-t01.h
+new file mode 100644
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-cpy-t01.h
+@@ -0,0 +1,50 @@
++// 0187: the eligibility of a F32 copy for kernel_cpy_f32_f32_t01 - a (0,1)-swapped copy whose
++// source has dim 1 as its fastest dimension and whose destination is contiguous. Pure: no cl_
++// calls and no device, so a unit test can feed it a graph node's real strides on the CPU host.
++//
++// The kernel indexes `src + gz*s_nb2 + dim0*s_nb0 + dim1*s_nb1` for a token slab and writes
++// `dst + gz*d_nb2 + dim1*d_nb1 + dim0*4`, so the form it serves is:
++//   - the source's slow (dim 0) step is one full row of the fast (dim 1) axis, `ne[1]*4`;
++//   - the source's fast (dim 1) step is one float;
++//   - the source's token stride (dim 2) covers the token slab, `>= ne[0]*ne[1]*4`;
++//   - the source's dim-3 stride steps by the dim-2 count;
++//   - the destination is contiguous.
++// A plain contiguous source (nb[0] == 4) and a merely strided-rows source fail it.
++#ifndef GGML_OPENCL_CPY_T01_H
++#define GGML_OPENCL_CPY_T01_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++static inline bool ggml_cl_cpy_t01_eligible(
++        int      ts0,                    // the source's tensor type, GGML_TYPE_F32 == 0
++        int      ts1,                    // the destination's tensor type
++        const int64_t * ne0,             // the source's four dimensions
++        const size_t  * nb0,             // the source's four byte strides
++        const int64_t * ne1,             // the destination's four dimensions
++        const size_t  * nb1) {           // the destination's four byte strides
++    const size_t esz = sizeof(float);
++    if (ts0 != 0 || ts1 != 0) {
++        return false;                    // F32 x F32 only
++    }
++    for (int i = 0; i < 4; ++i) {
++        if (ne0[i] != ne1[i]) {
++            return false;                // the kernel copies one shape, strides differ
++        }
++    }
++    // the destination contiguous: the kernel writes it as gz*d_nb2 + bin*d_nb1 + dim0*4
++    if (nb1[0] != esz || nb1[1] != (size_t) ne1[0] * esz ||
++        nb1[2] != nb1[1] * (size_t) ne1[1] || nb1[3] != nb1[2] * (size_t) ne1[2]) {
++        return false;
++    }
++    // the source: dim 1 fastest, dim 0 one fast row long, the token slab covered
++    if (nb0[1] != esz || nb0[0] != (size_t) ne0[1] * esz) {
++        return false;
++    }
++    if (nb0[2] < (size_t) ne0[0] * (size_t) ne0[1] * esz || nb0[3] != nb0[2] * (size_t) ne0[2]) {
++        return false;
++    }
++    return true;
++}
++
++#endif // GGML_OPENCL_CPY_T01_H
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -12,6 +12,7 @@
+ #include "ggml-backend.h"
+ #include "ggml-impl.h"
+ #include "ggml-opencl-fa-paged.h"
++#include "ggml-opencl-cpy-t01.h"
+ #include <cstdarg>
+ #include <cstdio>
+ #include "ggml-backend-impl.h"
+@@ -1107,6 +1108,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_rope_apply_f32;   // the fused precomputed-RoPE op (GGML_OP_ROPE_APPLY)
+     cl_kernel kernel_cpy_f16_f16, kernel_cpy_f16_f32, kernel_cpy_f32_f16, kernel_cpy_f32_f32, kernel_cpy_i32_i32;
+     cl_kernel kernel_cpy_f32_f32_pack = nullptr;
++    cl_kernel kernel_cpy_f32_f32_t01 = nullptr;   // 0187: a (0,1)-swapped f32 copy, tiled transpose
+     cl_kernel kernel_cpy_f32_f32_run = nullptr;   // a run of narrow strided copies, one launch
+     cl_kernel kernel_cpy_f32_i32 = nullptr, kernel_cpy_i32_f32 = nullptr;   // the casts
+     cl_kernel kernel_cpy_f32_f32_flat = nullptr;
+@@ -2308,8 +2310,12 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+ #endif
+         const bool no_cpy_pack = backend_ctx->adreno_gen == ADRENO_GPU_GEN::A6X;
+ 
++        // 0187: the red case is a build option, so the transpose kernel's edge guard can be broken
++        // without touching the default build (GGML_OPENCL_CPY_TRANSPOSE_RED=1)
++        static const char * ct_red = getenv("GGML_OPENCL_CPY_TRANSPOSE_RED");
++        const std::string ct_red_opt = (ct_red != nullptr && atoi(ct_red) != 0) ? " -DCPY_T_RED" : "";
+         cl_program prog = build_program_from_source(backend_ctx, kernel_src.c_str(),
+-            no_cpy_pack ? compile_opts + " -DGGML_CL_NO_CPY_PACK" : compile_opts);
++            no_cpy_pack ? compile_opts + " -DGGML_CL_NO_CPY_PACK" + ct_red_opt : compile_opts + ct_red_opt);
+ 
+         CL_CHECK((backend_ctx->kernel_cpy_f16_f16 = clCreateKernel(prog, "kernel_cpy_f16_f16", &err), err));
+         CL_CHECK((backend_ctx->kernel_cpy_f16_f32 = clCreateKernel(prog, "kernel_cpy_f16_f32", &err), err));
+@@ -2318,6 +2324,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         if (!no_cpy_pack) {
+             CL_CHECK((backend_ctx->kernel_cpy_f32_f32_pack = clCreateKernel(prog, "kernel_cpy_f32_f32_pack", &err), err));
+         }
++        // 0187: the tiled transpose is outside GGML_CL_NO_CPY_PACK, so every device has it
++        CL_CHECK((backend_ctx->kernel_cpy_f32_f32_t01 = clCreateKernel(prog, "kernel_cpy_f32_f32_t01", &err), err));
+         {   // optional: without it ggml_cl_cpy keeps the row-mapped kernel
+             cl_int err_flat = CL_SUCCESS;
+             cl_kernel k = clCreateKernel(prog, "kernel_cpy_f32_f32_flat", &err_flat);
+@@ -40489,6 +40497,78 @@ static void ggml_cl_cpy(ggml_backend_t backend, const ggml_tensor * src0, const
+         return;
+     }
+ 
++    // 0187: GGML_OPENCL_CPY_TRANSPOSE=1 takes a copy whose source has dim 1 as its fastest
++    // dimension and dim 0 as the destination's - a (0,1) swap, what ggml_cont(ggml_permute(t,
++    // 1, 0, ...)) builds - as a tiled transpose through local memory: reads coalesced over the
++    // source's fastest dimension, writes coalesced over the destination's. Unset, the pack kernel
++    // takes it exactly as before. The strides are checked for the form the kernel indexes.
++    {
++        static const char * ct_env = getenv("GGML_OPENCL_CPY_TRANSPOSE");
++        const bool ct_on = ct_env != nullptr && atoi(ct_env) != 0;
++        const cl_kernel kt = backend_ctx->kernel_cpy_f32_f32_t01;
++        // the kernel indexes one token's slab as a stamp: src + gz*s_nb2 + dim0*s_nb0 + dim1*s_nb1,
++        // so the token stride must be the slab's float count (ne00*ne01, whatever the source's
++        // internal strides) and the dim-3 stride must step by the dim-2 count. The earlier form
++        // (nb02 == nb10*ne00, nb03 == nb02*ne01) is false for every real source - cp39's finding.
++        // the eligibility is a pure function (no cl_ calls) so a host unit test can feed it a
++        // graph node's real strides; the kernel's own index form is what it checks
++        const int64_t ct_ne0[4] = { ne00, ne01, ne02, ne03 };
++        const int64_t ct_ne1[4] = { ne10, ne11, ne12, ne13 };
++        const size_t  ct_nb0[4] = { (size_t) nb00, (size_t) nb01, (size_t) nb02, (size_t) nb03 };
++        const size_t  ct_nb1[4] = { (size_t) nb10, (size_t) nb11, (size_t) nb12, (size_t) nb13 };
++        const bool ct_src = ggml_cl_cpy_t01_eligible((int) src0t, (int) src1t, ct_ne0, ct_nb0, ct_ne1, ct_nb1);
++        static const char * ct_dbg = getenv("GGML_OPENCL_CPY_TRANSPOSE_DEBUG");
++        if (ct_on && ct_dbg != nullptr && atoi(ct_dbg) != 0 && !ct_src) {
++            // which predicate term failed, so a card run shows why the path was not taken
++            GGML_LOG_WARN("0187 cpy-transpose rejected: types %d/%d same_shape %d dst_contig %d "
++                          "nb00==ne01*4 %d nb01==4 %d nb02>=ne00*ne01*4 %d nb03==nb02*ne02 %d "
++                          "(ne=[%d,%d,%d,%d] nb0=[%llu,%llu,%llu,%llu] nb1=[%llu,%llu,%llu,%llu]\n",
++                    src0t == GGML_TYPE_F32, src1t == GGML_TYPE_F32, ggml_are_same_shape(src0, src1),
++                    ggml_is_contiguous(src1), nb00 == (cl_ulong) ne01 * sizeof(float),
++                    nb01 == sizeof(float), nb02 >= (cl_ulong) ne00 * ne01 * sizeof(float),
++                    nb03 == nb02 * (cl_ulong) ne02,
++                    ne00, ne01, ne02, ne03, nb00, nb01, nb02, nb03, nb10, nb11, nb12, nb13);
++        }
++        if (ct_on && kt != nullptr && ct_src) {
++            static bool ct_logged = false;
++            if (!ct_logged) {
++                ct_logged = true;
++                // once a process: a card run shows the path was reached before any timing
++                GGML_LOG_INFO("0187 cpy-transpose taken ne=[%d,%d,%d,%d]\n", ne00, ne01, ne02, ne03);
++            }
++            const int d0 = ne00, d1 = ne01, d23 = (int) ((cl_ulong) ne02 * ne03);
++            // the furthest byte a (dim0, dim1, token) triple can reach on either side
++            const size_t s_end = (size_t) (offset0 + (cl_ulong) (d0 - 1) * nb00 +
++                (cl_ulong) (d1 - 1) * nb01 + (cl_ulong) (d23 - 1) * nb02 + sizeof(float));
++            const size_t d_end = (size_t) (offset1 + (cl_ulong) (d23 - 1) * nb12 +
++                (cl_ulong) (d1 - 1) * nb11 + (cl_ulong) (d0 - 1) * nb10 + sizeof(float));
++            if (ggml_cl_bounds_on()) {
++                ggml_cl_bounds("cpy-transpose", "src", extra0->data_device, s_end);
++                ggml_cl_bounds("cpy-transpose", "dst", extra1->data_device, d_end);
++            }
++            int a = 0;
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_mem),   &extra0->data_device));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &offset0));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_mem),   &extra1->data_device));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &offset1));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(int),      &d0));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(int),      &d1));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(int),      &d23));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &nb00));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &nb01));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &nb02));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &nb03));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &nb11));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &nb12));
++            CL_CHECK(clSetKernelArg(kt, a++, sizeof(cl_ulong), &nb13));
++            const int T = 16;
++            size_t gws[3] = { (size_t) CEIL_DIV(d1, T) * T, (size_t) CEIL_DIV(d0, T) * T, (size_t) d23 };
++            size_t lws[3] = { T, T, 1 };
++            backend_ctx->enqueue_ndrange_kernel(kt, 3, gws, lws, src1);
++            return;
++        }
++    }
++
+     cl_kernel kernel;
+ 
+     switch (src0t) {
+diff --git a/ggml/src/ggml-opencl/kernels/cpy.cl b/ggml/src/ggml-opencl/kernels/cpy.cl
+--- a/ggml/src/ggml-opencl/kernels/cpy.cl
++++ b/ggml/src/ggml-opencl/kernels/cpy.cl
+@@ -242,6 +242,53 @@ kernel void kernel_cpy_f32_f32_pack(
+         dst_data[i00] = src[0];
+     }
+ }
++// 0187: a (0,1)-swapped copy - the source's fastest dimension is dim 1 and the destination's is
++// dim 0 - as a tiled transpose through local memory: reads coalesced over dim 1 (the source's
++// fastest), writes coalesced over dim 0 (the destination's). A work-group is a 16 x 16 tile of
++// (dim 0, dim 1); `reqd_work_group_size` keeps the tile barrier's threads present, and a partial
++// tile on either edge (the bias table's 24 heads and 1,025 bins) is guarded per element.
++// GGML_OPENCL_CPY_TRANSPOSE=1 selects it; with the knob unset the pack kernel runs as before.
++#ifndef CPY_T_TILE
++#define CPY_T_TILE 16
++#endif
++__attribute__((reqd_work_group_size(CPY_T_TILE, CPY_T_TILE, 1)))
++kernel void kernel_cpy_f32_f32_t01(
++        global const char * src_void, ulong offset0,
++        global char * dst_void, ulong offsetd,
++        int d0, int d1, int d23,                  // dst dim0, dim1, dims 2*3 flattened
++        ulong s_nb0, ulong s_nb1, ulong s_nb2, ulong s_nb3,
++        ulong d_nb1, ulong d_nb2, ulong d_nb3) {
++    const int l0 = get_local_id(0);          // a dim-1 index while reading, dim 0 while writing
++    const int l1 = get_local_id(1);          // the other way round
++    const int gx = get_group_id(0);          // dim-1 tile
++    const int gy = get_group_id(1);          // dim-0 tile
++    const int gz = get_group_id(2);          // token (dims 2*3 flattened)
++    if (gz >= d23) {
++        return;
++    }
++    const int bin  = gx * CPY_T_TILE + l0;   // dim 1 (a row of the destination)
++    const int head = gy * CPY_T_TILE + l1;   // dim 0 (a column)
++    local float tile[CPY_T_TILE][CPY_T_TILE + 1];
++    float v = 0.0f;
++    if (bin < d1 && head < d0) {
++        v = *(global const float *)(src_void + offset0 + gz * s_nb2 + (ulong) head * s_nb0 + (ulong) bin * s_nb1);
++    }
++    tile[l1][l0] = v;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    // the transposed pairing: this thread writes the element the tile holds for
++    // (dim 0 = gx*T + l0, dim 1 = gy*T + l1), i.e. the writes coalesce over dim 0
++    const int bin_w  = gx * CPY_T_TILE + l1;
++    const int head_w = gy * CPY_T_TILE + l0;
++#ifdef CPY_T_RED
++    const bool ok_w = bin_w < d1 - 1 && head_w < d0;   // the red case: the last dim-1 edge is lost
++#else
++    const bool ok_w = bin_w < d1 && head_w < d0;
++#endif
++    if (ok_w) {
++        *(global float *)(dst_void + offsetd + gz * d_nb2 + (ulong) bin_w * d_nb1 + (ulong) head_w * sizeof(float)) = tile[l0][l1];
++    }
++}
++
+ #endif // GGML_CL_NO_CPY_PACK
+ 
+ // One launch for a run of K narrow strided copies that share their source and
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3506,6 +3506,18 @@ struct test_cont : public test_case {
+     }
+ };
+ 
++
++// 0187: a (0,1)-swap copy - the source's fastest dimension is dim 1, the destination's dim 0 -
++// through kernel_cpy_f32_f32_t01 when GGML_OPENCL_CPY_TRANSPOSE=1. Random (incompressible) data;
++// the eval list compares the destination against the CPU, and the line names the pattern.
++struct test_cont_t01 : public test_cont {
++    using test_cont::test_cont;
++
++    std::string vars() override {
++        return test_cont::vars() + ",data=random-uniform,checked=out-vs-cpu";
++    }
++};
++
+ // GGML_OP_ADD
+ // GGML_OP_SUB
+ // GGML_OP_MUL
+@@ -11061,6 +11073,17 @@ static const ggml_type other_types[] = {
+ // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
++    // 0187: the (0,1)-swap copies at the card's joined shapes, with partial tiles on both edges
++    // (24 heads and 1,025 bins are not multiples of the 16 tile), and one-token/one-head forms
++    for (int64_t T : {512, 2048}) {
++        test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {1025, 24, T, 1}, false, {1, 0, 2, 3}));
++    }
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {2304, 4, 512, 1}, false, {1, 0, 2, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {2304, 4, 512, 1}, false, {0, 2, 1, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {1025, 24, 1, 1}, false, {1, 0, 2, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {33, 17, 3, 1}, false, {1, 0, 2, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {1, 1025, 64, 1}, false, {1, 0, 2, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {24, 1025, 7, 1}, false, {1, 0, 2, 3}));
+     std::default_random_engine rng(0);
+ 
+     // unary ops
+@@ -14631,6 +14654,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
+     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
++    // 0187: the (0,1)-swap copies in perf mode: the three shapes the card's profile joined
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {1025, 24, 512, 1}, false, {1, 0, 2, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {1025, 24, 2048, 1}, false, {1, 0, 2, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {2304, 4, 512, 1}, false, {1, 0, 2, 3}));
++    test_cases.emplace_back(new test_cont_t01(GGML_TYPE_F32, {33, 17, 3, 1}, false, {1, 0, 2, 3}));
+ 
+     // Sparse flash attention (n_kv_max hint) decode across KV depths.
+     // Shapes: 576/512 DeepSeek MLA, 512/512 DeepSeek-V4/GLM-5.2, 256/256 gqa12 Qwen QSA.

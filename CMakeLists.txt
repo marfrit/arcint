@@ -867,6 +867,14 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_gqa_i8.py")
     set_tests_properties(fa-gqa-i8-gate PROPERTIES LABELS unit)
+    # patch 0187's eligibility: a host-side test of the pure predicate against the real strides of
+    # Inkling's bias-table copy and the depth mix's transpose (cp39: the card never took the path)
+    add_executable(arcint-opencl-cpy-t01 tests/test_opencl_cpy_t01.cpp)
+    target_include_directories(arcint-opencl-cpy-t01 PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl")
+    target_compile_options(arcint-opencl-cpy-t01 PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME opencl-cpy-t01 COMMAND arcint-opencl-cpy-t01)
+    set_tests_properties(opencl-cpy-t01 PROPERTIES LABELS unit)
   endif()
 endif()
 
