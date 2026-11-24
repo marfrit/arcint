@@ -1,0 +1,586 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index a1c914b..63a481f 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -272,6 +272,7 @@ set(GGML_OPENCL_KERNELS
+     gated_delta_net_intel
+     flash_attn_dpas
+     flash_attn_dpas2
++    flash_attn_port
+     flash_attn_gqa_dpas
+     sub
+     sum_rows
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index f84ca33..0141fa0 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -722,6 +722,7 @@ struct ggml_cl_kq_act {
+ static std::mutex g_cl_downgrade_mu;
+ static std::map<std::string, uint64_t> g_cl_downgrades;
+ 
++static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);   // 0198: defined below, used by the port arm
+ static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
+ static void ggml_cl_downgrade(const char * fmt, ...) {
+     char buf[256];
+@@ -1497,6 +1498,10 @@ struct ggml_backend_opencl_context {
+     // flash_attn_dpas2.cl (Xe2): K/V by 2D block reads, Q as f16 re-read a tile
+     cl_kernel kernel_fa_dpas2_dk[3] = {}, kernel_fa_dpas2_carry_dk[3] = {}, kernel_fa_q_to_f16_dk[3] = {};
+     cl_kernel kernel_fa_mask_cls = nullptr;       // the mask by 8 x 32 blocks (flash_attn_dpas2.cl)
++    // 0198: the port arm (flash_attn_port.cl, after trellis-serve's fa::Kern), GGML_OPENCL_FA_PORT=1
++    cl_kernel kernel_fa_port = nullptr;
++    cl_program program_fa_port = nullptr;
++    bool fa_port_tried = false;
+     int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
+     // 0106: the build options of the head-256 prompt kernels, so that the
+     // head-512 builds made on first use match them (sub-group, sub-groups a
+@@ -13086,6 +13091,104 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+     return true;
+ }
+ 
++// 0198: the port arm after trellis-serve's fa::Kern<128>. The kernel is
++// flash_attn_port.cl; the plan and the reference are in the arcint tree
++// (contrib/refkernels/trellis-fa/). GGML_OPENCL_FA_PORT=1 turns it on; unset,
++// every path below is exactly the dispatch it was (0191/0192's).
++static bool ggml_cl_port_on() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_OPENCL_FA_PORT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
++// The port covers exactly these shapes and layouts; anything else is declined
++// with a reason, never served by a kernel that would read it another way.
++static bool ggml_cl_port_gate(ggml_backend_opencl_context * backend_ctx, const struct ggml_tensor * op, const char ** why) {
++    const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
++    const ggml_tensor * mask = op->src[3];
++    const ggml_tensor * bt = op->src[GGML_FA_SRC_BIAS_TABLE];
++    const ggml_tensor * bi = op->src[GGML_FA_SRC_BIAS_IDX];
++    const ggml_tensor * kp = op->src[GGML_FA_SRC_KPOS], * qp = op->src[GGML_FA_SRC_QPOS];
++    const ggml_tensor * cf = op->src[GGML_FA_SRC_CFLAG], * rf = op->src[GGML_FA_SRC_RFLAG];
++    const ggml_tensor * sinks = op->src[GGML_FA_SRC_SINK_Q];   // 0193: the port's per-query sink
++
++    if (!ggml_flash_attn_ext_has_indexed_bias(op) || bt == nullptr || bi == nullptr) { *why = "no-bias"; return false; }
++    if (backend_ctx->gpu_family != INTEL) { *why = "device"; return false; }
++    if (kp == nullptr || qp == nullptr || cf == nullptr || rf == nullptr) { *why = "no-positions"; return false; }
++    if (op->src[GGML_FA_SRC_PAGES] || op->src[GGML_FA_SRC_PLAN] || op->src[GGML_FA_SRC_TAG]) { *why = "paged"; return false; }
++    if (q->ne[3] != 1 || k->ne[3] != 1) { *why = "streams"; return false; }
++    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) { *why = "kv-type"; return false; }
++    if (q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) { *why = "head"; return false; }
++    if (q->ne[1] < 9) { *why = "decode"; return false; }   // n_q <= 8 keeps 0143's split kernels
++    if (!ggml_is_contiguous(q) || !ggml_is_contiguous(k) || !ggml_is_contiguous(v)) { *why = "layout"; return false; }
++    if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] || mask->ne[3] != 1) { *why = "mask"; return false; }
++
++    const int64_t rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1];
++    if (rows % 8 != 0 && rows != q->ne[1] * q->ne[3]) { *why = "rows"; return false; }
++    if (sinks == nullptr || sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
++        sinks->ne[0] != n_head || sinks->ne[1] < rows || sinks->ne[2] != 1) { *why = "sinks"; return false; }
++    if (bt->type != GGML_TYPE_F32 || !ggml_is_contiguous(bt) ||
++        bt->ne[0] <= 0 || bt->ne[1] != n_head || bt->ne[2] < rows || bt->ne[3] != 1) { *why = "bias-table"; return false; }
++    if (bi->type != GGML_TYPE_I32 || !ggml_is_contiguous(bi) || !ggml_is_matrix(bi) ||
++        bi->ne[0] < n_kv || bi->ne[1] < rows) { *why = "bias-indices"; return false; }
++    if (kp->type != GGML_TYPE_I32 || qp->type != GGML_TYPE_I32 || !ggml_is_contiguous(kp) || !ggml_is_contiguous(qp) ||
++        kp->ne[0] < n_kv || qp->ne[0] < rows) { *why = "positions"; return false; }
++    if (cf->type != GGML_TYPE_I8 || rf->type != GGML_TYPE_I8 || !ggml_is_contiguous(cf) || !ggml_is_contiguous(rf) ||
++        cf->ne[0] < (n_kv + 15) / 16 || rf->ne[0] < (rows + 7) / 8) { *why = "flags"; return false; }
++
++    float max_bias = 0.0f, softcap = 0.0f;
++    memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
++    memcpy(&softcap,  (const float *) op->op_params + 2, sizeof(float));
++    if (max_bias != 0.0f) { *why = "alibi"; return false; }
++    if (softcap != 0.0f) { *why = "softcap"; return false; }
++    if (ggml_get_op_params_i32(op, GGML_FA_PARAM_WINDOW) < 0) { *why = "window"; return false; }
++    return true;
++}
++
++// built once a device, on the first call the gate lets through
++static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx) {
++    if (backend_ctx->kernel_fa_port != nullptr) return backend_ctx->kernel_fa_port;
++    if (backend_ctx->fa_port_tried) return nullptr;
++    backend_ctx->fa_port_tried = true;
++    if (backend_ctx->kernel_compile_opts.empty()) return nullptr;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++    const std::string src {
++        #include "flash_attn_port.cl.h"
++    };
++#else
++    const std::string src = read_file("flash_attn_port.cl");
++#endif
++    if (src.empty()) {
++        ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s", "source-missing");
++        return nullptr;
++    }
++    std::string opts = backend_ctx->kernel_compile_opts + " -DDKQ=128 -DBK=32";
++    // the red cases: GGML_OPENCL_FA_PORT_RED=1 reads a key past n_kv,
++    // =2 drops the sink, =3 forces the per-lane bias read (the run's shuffle off)
++    if (const char * red = getenv("GGML_OPENCL_FA_PORT_RED")) {
++        const int r = atoi(red);
++        if (r == 1) opts += " -DGB_PAD_KEYS_OFF=1";
++        if (r == 2) opts += " -DGB_SKIP_SINK";
++    }
++    cl_program p = build_program_from_source_optional(backend_ctx, src.c_str(), opts);
++    if (p == nullptr) {
++        ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s", "compile");
++        return nullptr;
++    }
++    cl_int err = CL_SUCCESS;
++    cl_kernel k = clCreateKernel(p, "kernel_flash_attn_port", &err);
++    if (err != CL_SUCCESS) {
++        CL_CHECK(clReleaseProgram(p));
++        ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s what=%s", "kernel", "kernel_flash_attn_port");
++        return nullptr;
++    }
++    backend_ctx->program_fa_port = p;
++    backend_ctx->kernel_fa_port = k;
++    return k;
++}
++
+ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
+     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
+@@ -13633,6 +13736,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
+             // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
+             // the prompt kernels have no bias yet, so those shapes go to ggml
++            if (ggml_cl_port_on() && ggml_flash_attn_ext_has_indexed_bias(op)) {
++                // 0198: the port arm serves only what its gate covers; unset knob,
++                // this branch is not taken and 0143/0144's dispatch is untouched
++                const char * why = nullptr;
++                if (!ggml_cl_port_gate(backend_ctx, op, &why)) {
++                    ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", why);
++                    return false;
++                }
++                if (ggml_cl_port_kernel(backend_ctx) == nullptr) {
++                    ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "not-built");
++                    return false;
++                }
++                return true;
++            }
+             if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+                 const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
+                 const ggml_tensor * mask = op->src[3];
+@@ -26474,6 +26591,118 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
++    // 0198: the port arm, after trellis-serve's fa::Kern. GGML_OPENCL_FA_PORT=1
++    // and an indexed bias; supports_op accepted exactly what the gate accepts, so
++    // reaching this with a gate refusal would be a dispatch bug, not a shape.
++    if (ggml_cl_port_on() && ggml_flash_attn_ext_has_indexed_bias(dst)) {
++        const char * why = nullptr;
++        cl_kernel kp = ggml_cl_port_gate(backend_ctx, dst, &why) ? ggml_cl_port_kernel(backend_ctx) : nullptr;
++        if (kp == nullptr) {
++            ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", why ? why : "not-built");
++            return;
++        }
++        const int G = n_head / n_head_kv;
++        static const char * qtw_env = getenv("GGML_OPENCL_FA_PORT_QTW");
++        const int qtw = qtw_env != nullptr ? std::max(1, atoi(qtw_env)) : 1;   // production runs 4 (SGL:39)
++        const int ntiles = CEIL_DIV(n_q, 8), ngroups = CEIL_DIV(ntiles, qtw);
++        const int window = ggml_get_op_params_i32(dst, GGML_FA_PARAM_WINDOW);
++        // the key blocks this call can visit. Without the hint the whole kv axis is
++        // walked (safe everywhere, slower); GGML_OPENCL_FA_PORT_HINT=1 takes the
++        // dense-contiguous prefill bounds, which a ring cache's graph must not set.
++        static const char * hint_env = getenv("GGML_OPENCL_FA_PORT_HINT");
++        int kv_lo = 0, kv_hi = n_kv;
++        if (hint_env != nullptr && atoi(hint_env) != 0 && window > 0) {
++            kv_lo = std::max(0, n_kv - n_q - window + 1);
++        }
++        const int rows = (int) q->ne[1];
++
++        // every buffer the launch touches, against its allocation, before any enqueue
++        auto argbuf = [](const ggml_tensor * t, cl_mem * m, cl_ulong * off) {
++            ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) t->extra;
++            *m = e->data_device;
++            *off = e->offset + t->view_offs;
++        };
++        cl_mem bq = nullptr, bk = nullptr, bv = nullptr, bo = nullptr, bm = nullptr, bs = nullptr, bt = nullptr,
++               bkp = nullptr, bqp = nullptr, bcf = nullptr, brf = nullptr;
++        cl_ulong oq = 0, ok = 0, ov = 0, oo = 0, om = 0, os = 0, ot = 0, okp = 0, oqp = 0, ocf = 0, orf = 0;
++        argbuf(q, &bq, &oq); argbuf(k, &bk, &ok); argbuf(v, &bv, &ov); argbuf(dst, &bo, &oo);
++        argbuf(mask, &bm, &om);
++        argbuf(dst->src[GGML_FA_SRC_SINK_Q], &bs, &os);
++        argbuf(dst->src[GGML_FA_SRC_BIAS_TABLE], &bt, &ot);
++        argbuf(dst->src[GGML_FA_SRC_KPOS], &bkp, &okp);
++        argbuf(dst->src[GGML_FA_SRC_QPOS], &bqp, &oqp);
++        argbuf(dst->src[GGML_FA_SRC_CFLAG], &bcf, &ocf);
++        argbuf(dst->src[GGML_FA_SRC_RFLAG], &brf, &orf);
++        const int   n_bins = (int) dst->src[GGML_FA_SRC_BIAS_TABLE]->ne[0];
++        const cl_ulong q_nb2p = q->nb[2], o_nb2p = dst->nb[2];
++        const cl_ulong k_nb1p = k->nb[1], v_nb1p = v->nb[1];
++        ggml_cl_bounds("op=FLASH_ATTN port", "q",  bq,  oq  + (size_t)(rows - 1) * q_nb2p + q->nb[1]);
++        ggml_cl_bounds("op=FLASH_ATTN port", "k",  bk,  ok  + (size_t)(n_kv - 1) * k_nb1p + k_nb1p);
++        ggml_cl_bounds("op=FLASH_ATTN port", "v",  bv,  ov  + (size_t)(n_kv - 1) * v_nb1p + v_nb1p);
++        ggml_cl_bounds("op=FLASH_ATTN port", "o",  bo,  oo  + (size_t)(rows - 1) * o_nb2p + (size_t)(n_head - 1) * dst->nb[1] + 128 * sizeof(float));
++        ggml_cl_bounds("op=FLASH_ATTN port", "mask", bm, om + (size_t)(rows - 1) * mask_nb1 + (size_t)n_kv * sizeof(cl_half));
++        ggml_cl_bounds("op=FLASH_ATTN port", "sink", bs, os + (size_t)rows * n_head * sizeof(float));
++        ggml_cl_bounds("op=FLASH_ATTN port", "table", bt, ot + (size_t)rows * n_head * n_bins * sizeof(float));
++        ggml_cl_bounds("op=FLASH_ATTN port", "kpos", bkp, okp + (size_t)n_kv * sizeof(int32_t));
++        ggml_cl_bounds("op=FLASH_ATTN port", "qpos", bqp, oqp + (size_t)rows * sizeof(int32_t));
++        ggml_cl_bounds("op=FLASH_ATTN port", "cflag", bcf, ocf + (size_t)((n_kv + 15) / 16));
++        ggml_cl_bounds("op=FLASH_ATTN port", "rflag", brf, orf + (size_t)((rows + 7) / 8));
++
++        size_t wg_limit = 0;
++        CL_CHECK(clGetKernelWorkGroupInfo(kp, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg_limit, &wg_limit, nullptr));
++        if ((size_t) 16 * G * qtw > wg_limit) {
++            ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "no-fit");
++            return;
++        }
++
++        float scale_log2 = 1.4426950408889634f * scale;
++        int a = 0;
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bq));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oq));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &q->nb[1]));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &q_nb2p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bk));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ok));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &k_nb1p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bv));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ov));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v_nb1p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bo));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oo));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &dst->nb[1]));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &o_nb2p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bm));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &om));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &mask_nb1));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bs));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &os));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bt));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ot));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_bins));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bkp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &okp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bqp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oqp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bcf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ocf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &brf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &orf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_q));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_kv));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_head));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_head_kv));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &qtw));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &ngroups));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &kv_lo));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &kv_hi));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &window));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(float),    &scale_log2));
++        size_t lws[3] = { 16, (size_t) G, (size_t) qtw };
++        size_t gws[3] = { 16, (size_t) G, (size_t) n_head_kv * ngroups * qtw };
++        backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
++        return;
++    }
++
+     if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok && !gqa_wide) {
+         ggml_cl_downgrade("op=FLASH_ATTN head=%d kv=%s n_q=9+ path=f32_f16 reason=%s", (int) d_head_q, ggml_type_name(k->type),
+                           kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+new file mode 100644
+index 0000000..b3292be
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+@@ -0,0 +1,300 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
++
++// Flash attention for a prompt after trellis-serve's fa::Kern<128> (the vendored
++// kernel and the port's plan are in the arcint tree:
++// contrib/refkernels/trellis-fa/). One sub-group (16 lanes) owns an (head,
++// 8-query-row) tile and walks 32-key blocks (QR 8, KT 16, KBT 2, NC D/16); the
++// work-group is G heads x QTW adjacent query tiles of one kv head, sharing keys.
++// What OpenCL forces (opencl-plan.md): a DPAS needs 16 lanes, so the 8 rows are
++// one sub-group's collaboration, not one work-item's private state; Q is
++// re-read a tile (128 GRF, as flash_attn_dpas2.cl does at head 256).
++//
++// Positions, not bins: qpos[n_q] and kpos[n_kv] (the host walks the pairs and
++// emits them: patch 0194), the window as a scalar, and one linearity flag a
++// 16-key group (keys consecutive, one sequence, no empty cell) and one a 8-row
++// group. dist = qpos - kpos; pad, future and window cells are compares, so a
++// fully linear tile reads no mask. Other groups take the general path: a mask
++// read and a clamped table read per key.
++//
++// The table is f32 [row, head, bin], bin-fastest and bin-reversed (patch 0194
++// reverses attn_rel_bias's columns), so a row's 16 consecutive bins - one key
++// group's distances, descending - are ascending addresses: one
++// intel_sub_group_block_read_us a row, lane = key, no shuffle. The producer pads
++// the reversed row by 15 bins, so a run at either end cannot overhang; the
++// clamped (pad) bin is dist >= extent.
++//
++// The sink is f32 [n_q, n_head], the initial (m, l), and the table carries the
++// bias only (the graph's ggml_sub no longer runs): the sink term enters l[0]
++// once after the reduction, not into every lane's partial sum.
++//
++// The red cases the build offers (-DGB_*): GB_PAD_KEYS_OFF=1 reads one key past
++// n_kv; GB_SKIP_SINK drops the sink term; GB_FORCE_OFF_END=1 reads the bias run
++// one bin past the row (the pad is then visible as an error).
++
++#ifndef QR
++#define QR 8
++#endif
++#ifndef BK
++#define BK 32
++#endif
++#define NKB (BK / 16)   // two 16-key groups a block
++#ifndef DKQ
++#define DKQ 128
++#endif
++#define NC (DKQ / 16)   // eight D chunks
++#define M_INIT (-3.0e38f)
++#define LOG2E 1.4426950408889634f
++
++#define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++#define QREAD(c, y) as_short8(__builtin_IB_subgroup_block_read_flat_u16_m8k16v1((long) qb, DKQ * 2 - 1, n_q - 1, qp - 1, (int2)(16 * (c), (y))))
++#define KREAD(c, y) as_int8(__builtin_IB_subgroup_block_read_flat_transpose_u32_k8((long) kb, DKQ * 2 - 1, n_kv - 1, kp - 1, (int2)(8 * (c), (y) + GB_PAD_KEYS_OFF)))
++#define VREAD(c, y) as_int8(__builtin_IB_subgroup_block_read_flat_transform_u16_k16((long) vb, DKQ * 2 - 1, n_kv - 1, kp - 1, (int2)(16 * (c), (y) + GB_PAD_KEYS_OFF)))
++
++// the reads flash_attn_dpas2.cl declares (its lines 70-87); the table's run
++// read is the sub-group block read of one uint a lane (cl_intel_subgroups)
++ushort8 __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(long base, int w, int h, int p, int2 c);
++uint8   __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(long base, int w, int h, int p, int2 c);
++uint8   __builtin_IB_subgroup_block_read_flat_transform_u16_k16(long base, int w, int h, int p, int2 c);
++uint    intel_sub_group_block_read(const global uint * p);
++
++#ifndef GB_PAD_KEYS_OFF
++#define GB_PAD_KEYS_OFF 0    // the red case's one-key read past n_kv
++#endif
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_flash_attn_port(
++        global const char * q, ulong q_offset, ulong q_nb1, ulong q_nb2,
++        global const char * k, ulong k_offset, ulong k_nb1,
++        global const char * v, ulong v_offset, ulong v_nb1,
++        global char * dst, ulong o_offset, ulong o_nb1, ulong o_nb2,
++        global const void * mask_void, ulong mask_offset, ulong mask_nb1,
++        global const float * sink, ulong sink_offset,
++        global const float * table, ulong table_offset, int n_bins,
++        global const int * kpos, ulong kpos_offset,
++        global const int * qpos, ulong qpos_offset,
++        global const char * cflag, ulong cflag_offset,
++        global const char * rflag, ulong rflag_offset,
++        int n_q, int n_kv, int n_head, int hkv, int qtw, int ngroups,
++        int kv_lo, int kv_hi, int window, float scale_log2)
++{
++    const int lane = get_sub_group_local_id();
++    const int z    = get_global_id(2);
++    const int qti  = z % qtw, unit = z / qtw;
++    const int kvh  = unit / ngroups, grp = unit % ngroups;
++    const int qt   = grp * qtw + qti;
++    const int q0   = qt * QR;
++    if (q0 >= n_q) return;
++    const int g    = get_local_id(1);
++    const int head = kvh * (n_head / hkv) + g;
++
++    const global half * qh = (global half *)((global const char *) q + q_offset);
++    const long qb = (long) qh;
++    const long kb = (long) (k + k_offset), vb = (long) (v + v_offset);
++    const global int * kps = (global const int *)((global const char *) kpos + kpos_offset);
++    const global int * qps = (global const int *)((global const char *) qpos + qpos_offset);
++    const global char * cfl = (global const char *)(cflag + cflag_offset);
++    const global char * rfl = (global const char *)(rflag + rflag_offset);
++
++    const int qp = (int) q_nb2, kp = (int) k_nb1;   // row pitches of the Q and K surfaces (bytes)
++    const bool rg_lin = rfl[q0 / QR] != 0;
++
++    float m[QR], l[QR], sinkv[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++        const bool live = q0 + r < n_q;
++        sinkv[r] = live ? LOG2E * sink[sink_offset / sizeof(float) + (size_t)(q0 + r) * n_head + head] : M_INIT;
++        m[r] = live ? sinkv[r] : M_INIT;
++        l[r] = 0.f;
++    }
++    float8 o[NC];
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) o[c] = (float8)(0.f);
++
++    for (int t0 = kv_lo; t0 < kv_hi; t0 += BK) {
++        const bool cg_lin = t0 / 16 < n_kv ? cfl[t0 / 16] != 0 : false;
++
++        float8 s[NKB];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) s[gb] = (float8)(0.f);
++        _Pragma("unroll")
++        for (int c = 0; c < NC; ++c) {
++            const short8 a = QREAD(c, q0);
++            s[0] = DPAS(a, KREAD(c, t0), s[0]);
++            s[1] = DPAS(a, KREAD(c, t0 + 16), s[1]);
++        }
++
++        // ---- score -> per-row components (a vector cannot be indexed by r) ----
++        float sc[NKB][QR];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            sc[gb][0] = s[gb].s0; sc[gb][1] = s[gb].s1; sc[gb][2] = s[gb].s2; sc[gb][3] = s[gb].s3;
++            sc[gb][4] = s[gb].s4; sc[gb][5] = s[gb].s5; sc[gb][6] = s[gb].s6; sc[gb][7] = s[gb].s7;
++        }
++
++        // ---- key state of this lane ----
++        int  key[NKB];
++        bool live[NKB], valid[NKB][QR];
++        float bias[NKB][QR];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            key[gb] = t0 + gb * 16 + lane;
++            live[gb] = key[gb] < n_kv;
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) {
++                const int d = qps[q0 + r] - kps[min(key[gb], n_kv - 1)];
++                valid[gb][r] = (q0 + r < n_q) && live[gb] && d >= 0 && (window == 0 || d < window);
++                bias[gb][r] = 0.f;
++            }
++        }
++
++        // ---- bias runs: a linear group reads one 16-bin run a row ----
++        // the run's start is (d0-15) for lane 0's distance d0, ascending with the
++        // lane; the lane whose key is at distance d0-j takes lane (15-j)'s value.
++        // d0 outside [15, n_bins-1] (recent keys, or past the extent) is scalar.
++        if (cg_lin) {
++            _Pragma("unroll")
++            for (int gb = 0; gb < NKB; ++gb) {
++                _Pragma("unroll")
++                for (int r = 0; r < QR; ++r) {
++                    if (q0 + r >= n_q) continue;
++                    const int d0 = qps[q0 + r] - kps[t0 + gb * 16];
++                    const int dmin = d0 - 15;   // the group's smallest distance
++                    if (dmin >= n_bins - 1) continue;   // every bin is the pad: zero bias
++                    if (d0 >= 15 && d0 <= n_bins - 1) {
++                        const size_t base = (size_t)((q0 + r) * n_head + head) * n_bins + (d0 - 15);
++                        const float tv = as_float(intel_sub_group_block_read((global const uint *)(table + table_offset / sizeof(float)) + base + lane));
++                        bias[gb][r] = intel_sub_group_shuffle(tv, 15 - lane);
++                    } else {
++                        // a mixed group at either end: the lane's own bin, clamped
++                        const int d = qps[q0 + r] - kps[key[gb]];
++                        const int bin = d >= n_bins - 1 ? n_bins - 1 : (d < 0 ? n_bins - 1 : d);
++                        bias[gb][r] = table[table_offset / sizeof(float) + (size_t)((q0 + r) * n_head + head) * n_bins + bin];
++                    }
++                }
++            }
++        } else {
++            _Pragma("unroll")
++            for (int gb = 0; gb < NKB; ++gb) {
++                if (!live[gb]) continue;
++                _Pragma("unroll")
++                for (int r = 0; r < QR; ++r) {
++                    if (!valid[gb][r]) continue;
++                    const int d = qps[q0 + r] - kps[key[gb]];
++                    const int bin = d >= n_bins - 1 ? n_bins - 1 : d;
++                    bias[gb][r] = table[table_offset / sizeof(float) + (size_t)((q0 + r) * n_head + head) * n_bins + bin];
++                }
++            }
++        }
++
++        // ---- mask (the general path) ----
++        if (!cg_lin || !rg_lin) {
++            const global half * mb = (global const half *)((global const char *) mask_void + mask_offset);
++            _Pragma("unroll")
++            for (int gb = 0; gb < NKB; ++gb) {
++                if (!live[gb]) continue;
++                _Pragma("unroll")
++                for (int r = 0; r < QR; ++r) {
++                    if (q0 + r >= n_q) continue;
++                    const half mh = mb[(q0 + r) * mask_nb1 / sizeof(half) + key[gb]];
++                    if (as_ushort(mh) == 0xFC00) valid[gb][r] = false;
++                    else if (valid[gb][r]) sc[gb][r] += (float) mh;
++                }
++            }
++        }
++
++        // ---- base-2 scores, bias folded in, invalid keys at M_INIT ----
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb)
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r)
++                sc[gb][r] = valid[gb][r] ? sc[gb][r] * scale_log2 + LOG2E * bias[gb][r] : M_INIT;
++
++        // ---- per-row max of this lane's two keys, then a sub-group max only when
++        //      the max moves (flash_attn_dpas2.cl:366-383) ----
++        float smax[QR], dmax = M_INIT;
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            smax[r] = fmax(sc[0][r], sc[1][r]);
++            dmax = fmax(dmax, smax[r] - m[r]);
++        }
++        int anyg = dmax > 0.f ? 1 : 0;
++        anyg |= intel_sub_group_shuffle_xor(anyg, 8);
++        anyg |= intel_sub_group_shuffle_xor(anyg, 4);
++        anyg |= intel_sub_group_shuffle_xor(anyg, 2);
++        anyg |= intel_sub_group_shuffle_xor(anyg, 1);
++        if (anyg) {
++            float cv[QR];
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) {
++                const float rowmax = sub_group_reduce_max(smax[r]);   // all lanes' keys of the row
++                const float nm = fmax(m[r], rowmax);
++                cv[r] = nm > m[r] ? native_exp2(m[r] - nm) : 1.f;
++                l[r] *= cv[r];
++                m[r] = nm;
++            }
++            // o[c] holds rows as components: one rescale a block, per component
++            const float8 cvv = (float8)(cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7]);
++            _Pragma("unroll")
++            for (int c = 0; c < NC; ++c) o[c] *= cvv;
++        }
++
++        // ---- p = exp2(s - m), f16 a lane, l the lane's partial sum ----
++        short8 pa[NKB];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            half ph[QR];
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) {
++                ph[r] = (half)(sc[gb][r] > 0.5f * M_INIT ? native_exp2(sc[gb][r] - m[r]) : 0.f);
++                l[r] += (float) ph[r];
++            }
++            pa[gb] = as_short8((half8)(ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6], ph[7]));
++        }
++
++        // ---- O += P V, lane = dim, components = rows ----
++        _Pragma("unroll")
++        for (int c = 0; c < NC; ++c) {
++            float8 acc = o[c];
++            _Pragma("unroll")
++            for (int gb = 0; gb < NKB; ++gb) acc = DPAS(pa[gb], VREAD(c, t0 + gb * 16), acc);
++            o[c] = acc;
++        }
++    }
++
++    // ---- the sink once, the reduction once, the store ----
++#ifndef GB_SKIP_SINK
++    float skterm[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) skterm[r] = 0.f;
++    if (lane == 0) {
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) if (q0 + r < n_q) skterm[r] = native_exp2(sinkv[r] - m[r]);
++    }
++#else
++    float skterm[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) skterm[r] = 0.f;   // the red case: the sink dropped
++#endif
++    float lv[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++        lv[r] = sub_group_reduce_add(l[r]) + skterm[r];
++        const float inv = lv[r] > 0.f ? 1.f / lv[r] : 0.f;
++        l[r] = inv;
++    }
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) {
++        const float ov[QR] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            if (q0 + r >= n_q) continue;
++            global float * orow = (global float *)(dst + o_offset + (size_t)(q0 + r) * o_nb2 + (size_t)head * o_nb1);
++            orow[c * 16 + lane] = ov[r] * l[r];
++        }
++    }
++}

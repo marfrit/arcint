@@ -1,0 +1,227 @@
+// ---------------------------------------------------------------------------
+// Vendored from trellis-serve, https://github.com/sybil-solutions/trellis-serve
+// commit 8f8e2fccf0c82c9715b774812f30d9d52f78a5fb, file xpu/csrc/inkling2_ops.sycl,
+// lines 509-654 (the `namespace fa` block: the ESIMD prefill attention kernel),
+// byte-for-byte, with nothing changed inside the block below this header. The
+// reference's launch site (`inkling2::prefill_attn`, lines 655-671 of the same
+// file) is reproduced as `fa_ref::launch` with the torch tensor calls replaced by
+// plain typed pointers; the arithmetic of the nd_range and work-group is the
+// reference's, unchanged.
+//
+// MIT License
+//
+// Copyright (c) 2026 0xSero
+//
+// Permission is hereby granted, free of charge, to any person obtaining a copy
+// of this software and associated documentation files (the "Software"), to deal
+// in the Software without restriction, including without limitation the rights
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+// copies of the Software, and to permit persons to whom the Software is
+// furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in all
+// copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+// SOFTWARE.
+// ---------------------------------------------------------------------------
+
+// The includes the vendored block needs: the reference's own includes for this
+// block are xpu/csrc/inkling2_ops.sycl:12-16 (sycl/sycl.hpp, esimd.hpp,
+// xmx/dpas.hpp, experimental/esimd/memory.hpp); <functional> covers std::plus
+// in the P reduction, <cstdint> uint16_t/uint32_t.
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <functional>
+#include <cstdint>
+
+// ---- prefill attention (ESIMD, DPAS), adapted from fa_esimd.h -------------------------------------------------------
+// fp16 q [Lq, Hq, D], k/v [Lk, Hk, D] (contiguous rows); query i at position qpos0 + i, key j at kpos0 + j.
+// Valid: kpos <= qpos, (window: qpos - kpos < window). Score (base 2) = log2e * (scale q.k + bias), bias = table[i, h, dist]
+// for dist < E (bf16 table [Lq, Hq, E]); per-query sink logit as the initial (m, l) = (sink, 1). Out fp32 [Lq, Hq, D].
+namespace fa {
+using namespace sycl::ext::intel::esimd;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+using fp16 = sycl::half;
+constexpr int QR = 8, KT = 16, KBT = 2, KB = KT * KBT;
+constexpr float LOG2E = 1.4426950408889634f, NEG = -1e30f;
+
+template <int D>
+struct Kern {
+    const fp16* q; const fp16* k; const fp16* v; float* o;
+    const uint16_t* table; const float* sink;
+    int Lq, Lk, Hq, Hk, G, qpos0, kpos0, window, E, QTW;
+    float scale_log2;
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        constexpr int NC = D / 16;
+        // work-group = G heads x QTW adjacent query tiles of one kv head (they stream the same keys: L1 sharing)
+        int id = it.get_global_id(0);
+        int g = id % G, t1 = id / G, qti = t1 % QTW, t2 = t1 / QTW, kvh = t2 % Hk, qt = (t2 / Hk) * QTW + qti;
+        int q0 = qt * QR;
+        if (q0 >= Lq) return;
+        int h = kvh * G + g;
+        simd<fp16, NC * QR * 16> Qc = 0;
+#pragma unroll
+        for (int r = 0; r < QR; ++r) {
+            if (q0 + r < Lq) {
+                simd<fp16, D> row = block_load<fp16, D>(q + ((size_t)(q0 + r) * Hq + h) * D);
+#pragma unroll
+                for (int c = 0; c < NC; ++c) Qc.template select<16, 1>((c * QR + r) * 16) = row.template select<16, 1>(c * 16);
+            }
+        }
+        simd<float, NC * QR * 16> O = 0.0f;
+        simd<float, QR> m, l;
+#pragma unroll
+        for (int r = 0; r < QR; ++r) {
+            const bool live = q0 + r < Lq;
+            m[r] = (sink && live) ? sink[(size_t)(q0 + r) * Hq + h] * LOG2E : NEG;
+            l[r] = (sink && live) ? 1.0f : 0.0f;
+        }
+        const int qmin = qpos0 + q0, qmax = qpos0 + (q0 + QR < Lq ? q0 + QR : Lq) - 1;
+        int hi = qmax - kpos0 + 1; if (hi > Lk) hi = Lk;
+        int lo = 0;
+        if (window > 0) { lo = qmin - window + 1 - kpos0; if (lo < 0) lo = 0; }
+        lo = lo / KB * KB;
+        const uint32_t* kb32 = reinterpret_cast<const uint32_t*>(k + (size_t)kvh * D);
+        const fp16* vbase = v + (size_t)kvh * D;
+        unsigned surfW = D * 2 - 1, surfH = (unsigned)Lk - 1, pitch = (unsigned)Hk * D * 2 - 1;
+        for (int kb0 = lo; kb0 < hi; kb0 += KB) {
+            simd<float, KBT * QR * KT> S;
+#pragma unroll
+            for (int t = 0; t < KBT; ++t) {
+                simd<float, QR * KT> acc = 0.0f;
+#pragma unroll
+                for (int c = 0; c < NC; ++c) {
+                    simd<uint32_t, 8 * KT> kt = xesimd::lsc_load_2d<uint32_t, 8, KT, 1, true, false,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(kb32, surfW, surfH, pitch, c * 8, kb0 + t * KT);
+                    acc = xmx::dpas<8, 8, float, float, fp16, fp16>(acc, kt.template bit_cast_view<fp16>().read(),
+                        simd<fp16, QR * 16>(Qc.template select<QR * 16, 1>(c * QR * 16)));
+                }
+                S.template select<QR * KT, 1>(t * QR * KT) = acc * scale_log2;
+            }
+            const int kpmin = kpos0 + kb0, kpmax = kpos0 + kb0 + KB - 1;
+            const bool need_mask = (kb0 + KB > Lk) || (kpmax > qmin) || (window > 0 && qmax - kpmin >= window);
+            const bool need_bias = table && (qmin - kpmax < E);
+            if (need_mask || need_bias) {
+                simd<int, KT> lane(0, 1);
+#pragma unroll
+                for (int t = 0; t < KBT; ++t)
+#pragma unroll
+                    for (int r = 0; r < QR; ++r) {
+                        simd<int, KT> kj = lane + (kb0 + t * KT);
+                        simd<int, KT> dist = (qpos0 + q0 + r) - (kj + kpos0);
+                        simd<float, KT> sv = S.template select<KT, 1>((t * QR + r) * KT);
+                        simd_mask<KT> bad = (kj >= Lk) | (dist < 0);
+                        if (window > 0) bad |= dist >= window;
+                        if (q0 + r >= Lq) bad = 1;
+                        if (need_bias) {
+                            simd_mask<KT> near = (dist < E) & !bad;
+                            simd<int, KT> dc = max(min(dist, simd<int, KT>(E - 1)), simd<int, KT>(0));
+                            simd<uint32_t, KT> off = simd<uint32_t, KT>(dc) * 2u + (uint32_t)((((size_t)(q0 + r < Lq ? q0 + r : 0) * Hq + h) * E) * 2);
+                            simd<uint16_t, KT> bb = gather<uint16_t, KT>(table, off, near);
+                            simd<uint32_t, KT> bw = simd<uint32_t, KT>(bb) << 16;
+                            simd<float, KT> bias = bw.template bit_cast_view<float>().read();
+                            sv.merge(sv + bias * LOG2E, near);
+                        }
+                        sv.merge(simd<float, KT>(NEG), bad);
+                        S.template select<KT, 1>((t * QR + r) * KT) = sv;
+                    }
+            }
+            simd<float, QR> mb;
+#pragma unroll
+            for (int r = 0; r < QR; ++r) {
+                simd<float, KT> mx = S.template select<KT, 1>(r * KT);
+#pragma unroll
+                for (int t = 1; t < KBT; ++t) mx = max(mx, simd<float, KT>(S.template select<KT, 1>((t * QR + r) * KT)));
+                mb[r] = hmax<float>(mx);
+            }
+            simd<float, QR> m_new = max(m, mb);
+            simd<float, QR> alpha = exp2(m - m_new);
+            simd<float, QR * KT> mrep = m_new.template replicate_vs_w_hs<QR, 1, KT, 0>(0);
+            simd<float, QR> rs = 0.0f;
+            simd<fp16, KBT * QR * KT> P;
+#pragma unroll
+            for (int t = 0; t < KBT; ++t) {
+                simd<float, QR * KT> sp = S.template select<QR * KT, 1>(t * QR * KT);
+                simd<float, QR * KT> p = exp2(sp - mrep);
+                p.merge(simd<float, QR * KT>(0.0f), sp <= NEG * 0.5f);
+#pragma unroll
+                for (int r = 0; r < QR; ++r) rs[r] += reduce<float>(simd<float, KT>(p.template select<KT, 1>(r * KT)), std::plus<>());
+                P.template select<QR * KT, 1>(t * QR * KT) = convert<fp16>(p);
+            }
+            l = l * alpha + rs;
+            m = m_new;
+            simd<float, QR * 16> arep = alpha.template replicate_vs_w_hs<QR, 1, 16, 0>(0);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                auto oc = O.template select<QR * 16, 1>(c * QR * 16);
+                simd<float, QR * 16> acc = simd<float, QR * 16>(oc) * arep;
+#pragma unroll
+                for (int t = 0; t < KBT; ++t) {
+                    simd<fp16, KT * 16> vt = xesimd::lsc_load_2d<fp16, 16, KT, 1, false, true,
+                        xesimd::cache_hint::cached, xesimd::cache_hint::cached>(vbase, surfW, surfH, pitch, c * 16, kb0 + t * KT);
+                    acc = xmx::dpas<8, 8, float, float, fp16, fp16>(acc, vt, simd<fp16, QR * 16>(P.template select<QR * KT, 1>(t * QR * KT)));
+                }
+                oc = acc;
+            }
+        }
+        simd<float, QR> inv;
+#pragma unroll
+        for (int r = 0; r < QR; ++r) { float lr = l[r]; inv[r] = lr > 0.f ? 1.0f / lr : 0.f; }
+#pragma unroll
+        for (int r = 0; r < QR; ++r) {
+            if (q0 + r >= Lq) break;
+            simd<float, D> row;
+            const float ir = inv[r];
+#pragma unroll
+            for (int c = 0; c < NC; ++c) row.template select<16, 1>(c * 16) = simd<float, 16>(O.template select<16, 1>((c * QR + r) * 16)) * ir;
+            block_store<float, D>(o + ((size_t)(q0 + r) * Hq + h) * D, row);
+        }
+    }
+};
+}  // namespace fa
+
+// ---- the launch site (xpu/csrc/inkling2_ops.sycl:655-671), torch calls removed ------
+// Every argument is the reference's, in the reference's order. translated: the
+// torch tensor calls become the pointers the tensors' data_ptr() returned, and
+// the shape checks become TORCH-free std::abort checks (off by default).
+namespace fa_ref {
+struct Args {
+    const sycl::half* q;  // [Lq, Hq, D] fp16, contiguous
+    const sycl::half* k;  // [Lk, Hk, D] fp16, contiguous
+    const sycl::half* v;  // [Lk, Hk, D] fp16, contiguous
+    float* o;             // [Lq, Hq, D] fp32
+    const uint16_t* table; // bf16 [Lq, Hq, E] or nullptr
+    const float* sink;    // fp32 [Lq, Hq] or nullptr
+    int Lq, Hq, Lk, Hk, qpos0, kpos0, window, qtw;
+    int E;                // table->size(2) in the reference, 0 without a table
+};
+
+// The reference builds `kern` inline in prefill_attn; this is the same
+// initialization, field for field, and the same launch geometry.
+inline void launch(sycl::queue& qu, const Args& a) {
+    fa::Kern<128> kern{a.q, a.k, a.v, a.o, a.table, a.sink,
+                       a.Lq, a.Lk, a.Hq, a.Hk, a.Hq / a.Hk,
+                       a.qpos0, a.kpos0, a.window, a.E, a.qtw,
+                       (float)(fa::LOG2E / sycl::sqrt(128.0))};
+    const int qtiles = (a.Lq + fa::QR - 1) / fa::QR;
+    const int qgroups = (qtiles + a.qtw - 1) / a.qtw;
+    const size_t n = (size_t)qgroups * a.qtw * a.Hq;
+    const int wg = (a.Hq / a.Hk) * a.qtw;
+    qu.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>(n, wg), kern); });
+}
+
+// Referenced so the instantiation is emitted even in a device-only compile; the
+// device compiler collects the kernel from the parallel_for above.
+[[maybe_unused]] inline void keep_alive() {
+    if (sizeof(fa::Kern<128>) == 0) abort();
+}
+}  // namespace fa_ref

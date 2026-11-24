@@ -1,0 +1,126 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 8661cf4..7719892 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -229,9 +229,16 @@
+ // source index beyond the array is undefined behaviour; the static_assert in
+ // ggml-impl.h keeps the two constants in step.
+ // 0140: 14, so the indexed bias table/indices at 12/13 fit beside the paged sources.
+-#define GGML_MAX_SRC            14
++// 0193: 20, so the port arm's positions and linearity flags at 14-17 and its
++// per-query-token sinks at 18 fit (19 is spare, keeping ggml_tensor's size a
++// multiple of GGML_MEM_ALIGN): the port kernel takes qpos/kpos, a flag a key and
++// a row group, and the sink a query token as the initial (m, l).
++#define GGML_MAX_SRC            20
+ #define GGML_MAX_N_THREADS      512
+-#define GGML_MAX_OP_PARAMS      64
++// 0193: 80, so the port arm's window fits at op_params i32 16 beside the paged
++// params (5-14) and the indexed-bias flag (15); the tensor's size stays a
++// multiple of GGML_MEM_ALIGN.
++#define GGML_MAX_OP_PARAMS      80
+ 
+ #ifndef GGML_MAX_NAME
+ #   define GGML_MAX_NAME        64
+@@ -2573,6 +2580,27 @@ extern "C" {
+             struct ggml_tensor * table,
+             struct ggml_tensor * indices);
+ 
++    // 0193: the port arm's positions. kpos [n_kv] I32, qpos [n_q] I32, cflag a 16-key group,
++    // rflag a 8-query-row group (I8, 1 = the group's rows are consecutive positions of one
++    // sequence with no empty cell), window from ggml_flash_attn_ext_set_window. Without them
++    // the port declines the call; the indexed-bias kernels ignore them.
++    GGML_API void ggml_flash_attn_ext_add_positions(
++            struct ggml_tensor * a,
++            struct ggml_tensor * kpos,
++            struct ggml_tensor * qpos,
++            struct ggml_tensor * cflag,
++            struct ggml_tensor * rflag);
++    GGML_API void ggml_flash_attn_ext_set_window(
++            struct ggml_tensor * a,
++            int32_t              window);
++
++    // 0193: the port arm's per-query-token sink logits, F32 [n_head, n_query*n_streams]
++    // (src[4]'s per-head sinks stay the contract of the other kernels). The port uses
++    // them as the initial (m, l); the indexed-bias kernels ignore them.
++    GGML_API void ggml_flash_attn_ext_add_query_sinks(
++            struct ggml_tensor * a,
++            struct ggml_tensor * sinks_q);
++
+     // Paged K/V: k and v hold a pool of pages of page_size rows ([n_embd, n_pool_rows, n_head_kv, 1]), and the attended
+     // sequence is pages->ne[0]*page_size rows long (the mask's ne[0]). pages (I32 [n_pages, n_tables]) holds page tables,
+     // of which row `table` is used (e.g. one table per layer in one input). In it, entry i >= 0 is the pool page that
+diff --git a/ggml/src/ggml-impl.h b/ggml/src/ggml-impl.h
+index 7c68b0c..74fede7 100644
+--- a/ggml/src/ggml-impl.h
++++ b/ggml/src/ggml-impl.h
+@@ -203,6 +203,12 @@ static void ggml_set_op_params_f32(struct ggml_tensor * tensor, uint32_t i, floa
+ #define GGML_FA_PARAM_BIAS_FLAG  15  // i32: 0 = no indexed bias, 1 = table and indices are set
+ #define GGML_FA_SRC_BIAS_TABLE   12  // F32 contiguous [n_head, n_bins, n_query*n_streams]
+ #define GGML_FA_SRC_BIAS_IDX     13  // I32 contiguous [n_kv, n_query*n_streams], values in [0, n_bins)
++#define GGML_FA_PARAM_WINDOW     16  // i32: the port arm's window (0 = global)
++#define GGML_FA_SRC_KPOS         14  // I32 [n_kv]: the position of each kv row
++#define GGML_FA_SRC_QPOS         15  // I32 [n_q]: the position of each query row
++#define GGML_FA_SRC_CFLAG        16  // I8 [ceil(n_kv/16)]: 1 = the group's keys are consecutive, one sequence, no empty cell
++#define GGML_FA_SRC_RFLAG        17  // I8 [ceil(n_q/8)]: 1 = the group's rows are consecutive
++#define GGML_FA_SRC_SINK_Q       18  // F32 [n_head, n_query*n_streams]: the port arm's per-query sink logits
+ // the sources live in ggml_tensor::src[GGML_MAX_SRC]; an index past it is UB (window 266)
+ #ifdef __cplusplus
+ static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
+@@ -210,12 +216,16 @@ static_assert(GGML_FA_SRC_BIAS_IDX < GGML_MAX_SRC, "GGML_MAX_SRC must hold the i
+ static_assert(GGML_FA_SRC_PLAN < GGML_FA_SRC_BIAS_TABLE, "an indexed bias source must not overwrite a paged FA source");
+ static_assert(GGML_FA_PARAM_BIAS_FLAG < GGML_MAX_OP_PARAMS/sizeof(int32_t), "op_params must hold the indexed bias flag");
+ static_assert(GGML_FA_PARAM_PAGES_ROW < GGML_FA_PARAM_BIAS_FLAG, "the indexed bias flag must not overwrite a paged FA param");
++static_assert(GGML_FA_SRC_SINK_Q < GGML_MAX_SRC, "GGML_MAX_SRC must hold the port arm's position, flag and sink sources");
++static_assert(GGML_FA_PARAM_WINDOW < GGML_MAX_OP_PARAMS/sizeof(int32_t), "op_params must hold the port arm's window");
+ #else
+ _Static_assert(GGML_FA_SRC_PLAN < GGML_MAX_SRC, "GGML_MAX_SRC must hold every paged FA source");
+ _Static_assert(GGML_FA_SRC_BIAS_IDX < GGML_MAX_SRC, "GGML_MAX_SRC must hold the indexed bias sources");
+ _Static_assert(GGML_FA_SRC_PLAN < GGML_FA_SRC_BIAS_TABLE, "an indexed bias source must not overwrite a paged FA source");
+ _Static_assert(GGML_FA_PARAM_BIAS_FLAG < GGML_MAX_OP_PARAMS/sizeof(int32_t), "op_params must hold the indexed bias flag");
+ _Static_assert(GGML_FA_PARAM_PAGES_ROW < GGML_FA_PARAM_BIAS_FLAG, "the indexed bias flag must not overwrite a paged FA param");
++_Static_assert(GGML_FA_SRC_SINK_Q < GGML_MAX_SRC, "GGML_MAX_SRC must hold the port arm's position, flag and sink sources");
++_Static_assert(GGML_FA_PARAM_WINDOW < GGML_MAX_OP_PARAMS/sizeof(int32_t), "op_params must hold the port arm's window");
+ #endif
+ 
+ static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9a57c18..37b9919 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5692,6 +5692,36 @@ bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
+     return ggml_get_op_params_i32(a, GGML_FA_PARAM_BIAS_FLAG) != 0;
+ }
+ 
++void ggml_flash_attn_ext_add_positions(
++        struct ggml_tensor * a,
++        struct ggml_tensor * kpos,
++        struct ggml_tensor * qpos,
++        struct ggml_tensor * cflag,
++        struct ggml_tensor * rflag) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT((kpos == NULL) == (qpos == NULL) && (cflag == NULL) == (rflag == NULL));
++    GGML_ASSERT(kpos == NULL || (cflag != NULL && rflag != NULL));
++
++    a->src[GGML_FA_SRC_KPOS]  = kpos;
++    a->src[GGML_FA_SRC_QPOS]  = qpos;
++    a->src[GGML_FA_SRC_CFLAG] = cflag;
++    a->src[GGML_FA_SRC_RFLAG] = rflag;
++}
++
++void ggml_flash_attn_ext_set_window(
++        struct ggml_tensor * a,
++        int32_t              window) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    ggml_set_op_params_i32(a, GGML_FA_PARAM_WINDOW, window);
++}
++
++void ggml_flash_attn_ext_add_query_sinks(
++        struct ggml_tensor * a,
++        struct ggml_tensor * sinks_q) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    a->src[GGML_FA_SRC_SINK_Q] = sinks_q;
++}
++
+ void ggml_flash_attn_ext_add_indexed_bias(
+         struct ggml_tensor * a,
+         struct ggml_tensor * table,
