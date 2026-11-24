@@ -738,7 +738,12 @@ unset or wide-off build, and the port must not change decode.
 
    It compiles `flash_attn_port.cl` for `bmg-g21` (= the B60's BMG-G21) with
    `-vc-codegen`, reads the disassembly and fails on any spill line or a GRF mode
-   other than the 128 the plan's arithmetic assumes. A 256-GRF arm
+   other than the 128 the plan's arithmetic assumes. `ocloc compile` with
+   `-device -input -output -options` is its documented CLI (`paper`); the
+   `ocloc disasm -input -dump` form and the "spill" wording in the ISA are not
+   verified here (no ocloc on the recipe host), so the first card run may need to
+   adjust the check's two greps - the compile and the 0-spill verdict are the
+   point, not the reader. A 256-GRF arm
    (`-cl-intel-256-GRF-per-thread`) is only a measured follow-up.
 
 3. The cases, on the card, with the port on:
