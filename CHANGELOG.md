@@ -53,9 +53,17 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   decision is now types, shapes and strides only (the shared rule), device storage is the dispatch's assert, every
   refusal logs a DOWNGRADE line and a graph that takes fewer nodes than it was handed says so at WARN; the device-free
   test now reads that `supports_op` case as text and fails on a `->extra` or a missing refusal line, and its stride
-  literals are the exported graph's (store `[2304, 5, tokens]`, row step 9216, slab step 46080, k 1..4). **No speed row
-  is claimed for these patches yet**: the plan, the predicted numbers against both of 0187's baselines and the card
-  command list are `contrib/llama.cpp/README.md`'s 0204-0207 section. Unset, the
+  literals are the exported graph's (store `[2304, 5, tokens]`, row step 9216, slab step 46080, k 1..4). The second card
+  run (`measured-here`, B60) executed the suite: 16/19 OK, the red 19/19 failing, and the 3 failures were exactly the
+  folded-norm cases (ERR ~2), while the model run page-faulted (446 read faults at a [2304,512]-slab spacing, ~57 slabs
+  - the folded calls' count). Two defects are named: the folded-norm path's local slots aliased the first reduction's
+  results (a sub-group race, fixed: the norm's quantities sit past them and the reduce takes a base offset), and a norm
+  weight through a `reshape_2d` view is storage this tree cannot verify on the host (now refused, `nw-view`). **The model
+  no longer folds the norm** - the norms stay the chain's nodes, and the op suite carries no `with_norm` case until that
+  path has its own card evidence - so the arm's taken path is the one the card proved 16/16, and the arm's bounds are
+  always on, aborting with the buffer's name instead of faulting. **No speed row is claimed for these patches yet**: the
+  plan, the predicted numbers against both of 0187's baselines and the card command list are
+  `contrib/llama.cpp/README.md`'s 0204-0207 section. Unset, the
   graph is today's node for node, decode and every other model untouched; `DEPTH_MIX` leaves a `DOWNGRADE` line with its
   reason, one fixed `TAKEN` line marks the first taken call, `GGML_OPENCL_DEPTH_MIX_STATS=1` counts the graph's calls, and
   every launch is bounded under `GGML_OPENCL_BOUNDS=1`.

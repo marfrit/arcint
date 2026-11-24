@@ -11,10 +11,10 @@ index a1c914b..0311c94 100644
      cvt
      diag_mask_inf
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..1c873ad 100644
+index f84ca33..1b63e1a 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -723,6 +723,12 @@ static std::mutex g_cl_downgrade_mu;
+@@ -723,6 +723,13 @@ static std::mutex g_cl_downgrade_mu;
  static std::map<std::string, uint64_t> g_cl_downgrades;
  
  static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
@@ -24,10 +24,11 @@ index f84ca33..1c873ad 100644
 +static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks, const ggml_tensor * cur, ggml_tensor * dst);
 +// 0178's bounds helper, defined below supports_op
 +static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);
++static void ggml_cl_bounds_always(const char * arm, const char * which, cl_mem buf, size_t upto);
  static void ggml_cl_downgrade(const char * fmt, ...) {
      char buf[256];
      va_list args;
-@@ -988,6 +994,7 @@ struct ggml_backend_opencl_context {
+@@ -988,6 +995,7 @@ struct ggml_backend_opencl_context {
      cl_program program_moe_add_id_glu;
      cl_program program_clamp;
      cl_program program_norm_clip;
@@ -35,7 +36,7 @@ index f84ca33..1c873ad 100644
      cl_program program_cvt;
      cl_program program_diag_mask_inf;
      cl_program program_gelu;
-@@ -1074,6 +1081,12 @@ struct ggml_backend_opencl_context {
+@@ -1074,6 +1082,12 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_fill_f16 = nullptr;
      cl_kernel kernel_clamp, kernel_clamp_nc;
      cl_kernel kernel_norm_clip_f32;
@@ -48,7 +49,7 @@ index f84ca33..1c873ad 100644
      cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
                kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
                kernel_geglu_erf_f16, kernel_geglu_quick_f16, kernel_situ_f32;
-@@ -12381,6 +12394,13 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
+@@ -12381,6 +12395,13 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
@@ -62,7 +63,7 @@ index f84ca33..1c873ad 100644
      // 0130d: the previous graph's pre/post pairs: their events are waited here, the frame's
      // first point that is not inside a dispatch
      if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)
-@@ -12693,6 +12713,23 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -12693,6 +12714,23 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                        backend_ctx->ngpt_fused, cgraph->n_nodes, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
      }
  
@@ -86,7 +87,7 @@ index f84ca33..1c873ad 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -13294,6 +13331,32 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13294,6 +13332,32 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
          case GGML_OP_CLAMP:
              return op->src[0]->type == GGML_TYPE_F32;
@@ -119,7 +120,7 @@ index f84ca33..1c873ad 100644
          case GGML_OP_NORM_CLIP:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous_rows(op->src[0]) &&
-@@ -21512,6 +21575,158 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -21512,6 +21576,162 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -207,26 +208,29 @@ index f84ca33..1c873ad 100644
 +    cl_ulong offn = 0, nbn1 = 0;
 +    int has_nw = 0;
 +    if (norm_w != nullptr) {
++        // a view-backed weight is refused by the rule, so norm_w here is the tensor itself
++        GGML_ASSERT(norm_w->view_src == nullptr);
 +        ggml_tensor_extra_cl * extran = (ggml_tensor_extra_cl *) norm_w->extra;
 +        nwb   = extran->data_device;
-+        offn  = extran->offset + norm_w->view_offs;
++        offn  = extran->offset;
 +        nbn1  = norm_w->ne[1] > 1 ? norm_w->nb[1] : 0;
 +        has_nw = 1;
 +    }
 +
 +    // the furthest byte each argument can reach from the global size and the strides handed
-+    // to the kernel, against its buffer (a view's offset included)
++    // to the kernel, against its buffer (a view's offset included). This one is ALWAYS on, not
++    // only under GGML_OPENCL_BOUNDS: the arm is new and a card fault is not a diagnosis
 +    {
 +        const size_t ub = (size_t) offb + (size_t) (k - 1)*blocks->nb[1] + (size_t) (nt - 1)*blocks->nb[2] + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
 +        const size_t uc = (size_t) offc + (size_t) (nt - 1)*cur->nb[1] + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
 +        const size_t uq = (size_t) offq + (size_t) (nq - 1)*nbq1 + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
 +        const size_t ud = (size_t) offd + (size_t) nq*dst->nb[2] - (size_t) dst->nb[2] + (size_t) (nt - 1)*dst->nb[1] + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
-+        ggml_cl_bounds("depth mix", "blocks", extrab->data_device, ub);
-+        ggml_cl_bounds("depth mix", "cur",    extrac->data_device, uc);
-+        ggml_cl_bounds("depth mix", "queries", extraq->data_device, uq);
-+        ggml_cl_bounds("depth mix", "dst",    extrad->data_device, ud);
++        ggml_cl_bounds_always("depth mix", "blocks", extrab->data_device, ub);
++        ggml_cl_bounds_always("depth mix", "cur",    extrac->data_device, uc);
++        ggml_cl_bounds_always("depth mix", "queries", extraq->data_device, uq);
++        ggml_cl_bounds_always("depth mix", "dst",    extrad->data_device, ud);
 +        if (norm_w != nullptr) {
-+            ggml_cl_bounds("depth mix", "norm_w", nwb, (size_t) offn + (size_t) (nq - 1)*nbn1 + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float));
++            ggml_cl_bounds_always("depth mix", "norm_w", nwb, (size_t) offn + (size_t) (nq - 1)*nbn1 + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float));
 +        }
 +    }
 +
@@ -257,9 +261,10 @@ index f84ca33..1c873ad 100644
 +    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(float),    &eps_states));
 +    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(float),    &eps_out));
 +    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(float),    &scale));
-+    // the partial sums: one float a lane for each reduced quantity, sized at the launch
++    // the partial sums: one float a lane for each reduced quantity; the first reduction's
++    // np = (k+1)*(1+nq) quantities, the folded norm's nq sit past them (no slot shared)
 +    const int np = (k + 1)*(1 + nq);
-+    CL_CHECK(clSetKernelArg(kernel, 24, (size_t) np*256*sizeof(float), nullptr));
++    CL_CHECK(clSetKernelArg(kernel, 24, (size_t) (np + nq)*256*sizeof(float), nullptr));
 +
 +    const size_t lsz = 256;
 +    size_t global_work_size[] = { (size_t) nt*lsz, 1, 1 };
@@ -278,7 +283,22 @@ index f84ca33..1c873ad 100644
  static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -42378,6 +42593,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -33862,6 +34082,14 @@ static bool ggml_cl_bounds_on() {
+     }();
+     return on;
+ }
++static void ggml_cl_bounds_always(const char * arm, const char * which, cl_mem buf, size_t upto) {
++    size_t size = 0;
++    CL_CHECK(clGetMemObjectInfo(buf, CL_MEM_SIZE, sizeof(size), &size, nullptr));
++    if (upto > size) {
++        GGML_LOG_ERROR("%s: %s reaches %zu bytes of a %zu byte buffer\n", arm, which, upto, size);
++        GGML_ABORT("%s: a launch past its buffer", arm);
++    }
++}
+ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto) {
+     if (!ggml_cl_bounds_on()) {
+         return;
+@@ -42378,6 +42606,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_norm_clip;
              break;
@@ -293,10 +313,10 @@ index f84ca33..1c873ad 100644
                  return false;
 diff --git a/ggml/src/ggml-opencl/kernels/depth_mix.cl b/ggml/src/ggml-opencl/kernels/depth_mix.cl
 new file mode 100644
-index 0000000..fcd3c6b
+index 0000000..293f966
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/depth_mix.cl
-@@ -0,0 +1,265 @@
+@@ -0,0 +1,266 @@
 +//------------------------------------------------------------------------------
 +// depth_mix
 +//------------------------------------------------------------------------------
@@ -324,15 +344,15 @@ index 0000000..fcd3c6b
 +
 +// reduce np partial sums held at red[p*DEPTH_MIX_LS + lane]; 8 sub-groups of 32 lanes
 +// take 8 quantities a round, a 5-step tree each. The result lands at red[p*DEPTH_MIX_LS].
-+static void depth_mix_reduce(local float * red, local float * tmp8, int np, int lane) {
++static void depth_mix_reduce(local float * red, local float * tmp8, int np, int off, int lane) {
 +    const int sub = lane / 32;
 +    const int sl  = lane % 32;
 +    for (int base = 0; base < np; base += 8) {
-+        const int p = base + sub;
++        const int p = base + sub;   // the quantities' index is off + p (below the off region)
 +        float v = 0.0f;
 +        if (p < np) {
 +            for (int j = sl; j < DEPTH_MIX_LS; j += 32) {
-+                v += red[p*DEPTH_MIX_LS + j];
++                v += red[(off + p)*DEPTH_MIX_LS + j];
 +            }
 +        }
 +        tmp8[sub*32 + sl] = v;
@@ -344,7 +364,7 @@ index 0000000..fcd3c6b
 +            barrier(CLK_LOCAL_MEM_FENCE);
 +        }
 +        if (sl == 0 && p < np) {
-+            red[p*DEPTH_MIX_LS] = tmp8[sub*32];
++            red[(off + p)*DEPTH_MIX_LS] = tmp8[sub*32];
 +        }
 +        barrier(CLK_LOCAL_MEM_FENCE);
 +    }
@@ -386,6 +406,7 @@ index 0000000..fcd3c6b
 +    const int lane = get_local_id(0);
 +    const int el   = ne0 / DEPTH_MIX_LS;
 +    const int ns   = k + 1;
++    const int np   = ns*(1 + nq);   // the first reduction's quantities; the norm's sit past them
 +
 +    local float tmp8[8*32];
 +
@@ -438,7 +459,7 @@ index 0000000..fcd3c6b
 +        }
 +    }
 +    barrier(CLK_LOCAL_MEM_FENCE);
-+    depth_mix_reduce(red, tmp8, ns*(1 + nq), lane);
++    depth_mix_reduce(red, tmp8, ns*(1 + nq), 0, lane);
 +
 +    // the weights: every lane computes them from the reduced values, they are lane-invariant
 +    float inv[DEPTH_MIX_STATE];
@@ -500,15 +521,15 @@ index 0000000..fcd3c6b
 +                        v += outv[q][i]*outv[q][i];
 +                    }
 +                }
-+                red[q*DEPTH_MIX_LS + lane] = v;
++                red[(np + q)*DEPTH_MIX_LS + lane] = v;   // np = ns * (1 + nq): the dot results' slots, not reused
 +            }
 +        }
 +        barrier(CLK_LOCAL_MEM_FENCE);
-+        depth_mix_reduce(red, tmp8, nq, lane);
++        depth_mix_reduce(red, tmp8, nq, np, lane);
 +        #pragma unroll
 +        for (int q = 0; q < DEPTH_MIX_Q; ++q) {
 +            if (q < nq) {
-+                const float onorm = rsqrt(red[q*DEPTH_MIX_LS] / (float) ne0 + eps_out);
++                const float onorm = rsqrt(red[(np + q)*DEPTH_MIX_LS] / (float) ne0 + eps_out);
 +                global const float * w = (global const float *)(nw + (ulong) q*nbn1);
 +                global float * o = (global float *)(dst + (ulong) q*nbd2 + (ulong) t*nbd1);
 +                #pragma unroll

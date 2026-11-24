@@ -1,5 +1,5 @@
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 5fec3cb..d5fbaa6 100644
+index 5fec3cb..9e14c9f 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
 @@ -1,6 +1,10 @@
@@ -13,7 +13,7 @@ index 5fec3cb..d5fbaa6 100644
  void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
      ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
      ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
-@@ -187,9 +191,27 @@ void llama_model_inkling2::graph::write_res_block(ggml_tensor * block, int j) {
+@@ -187,9 +191,29 @@ void llama_model_inkling2::graph::write_res_block(ggml_tensor * block, int j) {
          ggml_view_3d(ctx0, stack, n_embd, 1, n_tokens, stack->nb[1], stack->nb[2], (n_slot - 1 - j)*stack->nb[1])));
  }
  
@@ -34,15 +34,17 @@ index 5fec3cb..d5fbaa6 100644
 +
  // attention over the depth: mix the earlier block outputs and cur with learned queries
 +// knobs: GGML_OPENCL_DEPTH_MIX=1 emits one ggml_depth_mix for T > 1 where the shapes the
-+// graph hands it are eligible (ggml_depth_mix_refuse), and `norm_w` folds the output
-+// column's RMSNorm into it. Unset, the chain below is emitted node for node as today.
++// graph hands it are eligible (ggml_depth_mix_refuse). `norm_w` can fold an output
++// column's RMSNorm, but it is withheld: the model's weights are 1-D tensors and a folded
++// norm passing one through a view is refused (the card's norm op cases fail, README).
++// Unset, the chain below is emitted node for node as today.
  ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
 -        ggml_tensor * stack) {
 +        ggml_tensor * stack, ggml_tensor * norm_w) {
      if (!stack) {
          stack = res_stack_tensor();
      }
-@@ -198,6 +220,25 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+@@ -198,6 +222,25 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
      const int64_t n_block = (int64_t) blocks.size();
      GGML_ASSERT(n_block + 1 <= stack->ne[1]);
  
@@ -68,21 +70,16 @@ index 5fec3cb..d5fbaa6 100644
      // cur goes to the last row, the blocks are already in their rows from the block starts
      ggml_build_forward_expand(gf, ggml_cpy(ctx0,
          ggml_reshape_2d(ctx0, cur, n_embd, n_tokens),
-@@ -324,10 +365,23 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
- 
+@@ -325,9 +368,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
      // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
      ggml_tensor * inputs[3] = {cur, cur, cur};
-+    bool attn_norm_fused = false;
      if (layer.attn_res_query) {
--        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-+        // an SWA layer without messages norms the mixed column with one weight: the arm can
-+        // fold it. Full-attention layers have three weights (one per input), so they keep
-+        // their three norm nodes. A messages merge runs a controller between the mix and
-+        // the norm, so that path keeps its nodes too.
-+        const bool fuse_norm = !messages && is_swa;
-+        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query, nullptr, fuse_norm ? layer.attn_norm : nullptr);
++        // the arm's dst is [n_embd, n_tokens, nq], a column's token block contiguous; the
++        // chain's is [n_embd, nq, n_tokens], a column strided and copied here
++        // the folded norm is withheld (its card op cases fail, see the README): the norm
++        // stays a node, one per column, as the chain has it
+         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
 +        const bool took = mixed->op == GGML_OP_DEPTH_MIX;
-+        attn_norm_fused = took && fuse_norm;
          for (int j = 0; j < 3; ++j) {
 -            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
 +            const int64_t col = is_swa ? 0 : j;
@@ -94,51 +91,6 @@ index 5fec3cb..d5fbaa6 100644
          }
      }
  
-@@ -343,7 +397,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
-             inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
-         }
-     } else if (is_swa) {
--        inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
-+        if (!attn_norm_fused) {
-+            inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
-+        }
-         inputs[1] = inputs[2] = inputs[0];
-     } else {
-         inputs[0] = build_norm(inputs[0], layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il);
-@@ -419,11 +475,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
-     cb(ffn_inp, "ffn_inp", il);
- 
-     // MoE
--    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
-+    // the arm folds the ffn norm when no controller runs between the mix and it
-+    ggml_tensor * ffm = mix(blocks, cur, layer.ffn_res_query, nullptr, messages ? nullptr : layer.ffn_norm);
-+    cur = ggml_reshape_2d(ctx0, ffm, n_embd, n_tokens);
-     if (messages) {
-         cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
-     }
--    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
-+    if (messages || ffm->op != GGML_OP_DEPTH_MIX) {
-+        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
-+    }
- 
-     cur = build_moe_ffn(cur,
-             layer.ffn_gate_inp,
-@@ -453,8 +513,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
- }
- 
- void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
--    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
--    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-+    // the arm folds the output norm, as the reference's NORM variant does
-+    ggml_tensor * om = mix(blocks, cur, model.output_res_query, nullptr, model.output_norm);
-+    const bool fused = om->op == GGML_OP_DEPTH_MIX;
-+    cur = ggml_reshape_2d(ctx0, om, n_embd, n_tokens);
-+    if (!fused) {
-+        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
-+    }
- 
-     if (inp_out_ids) {
-         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
 diff --git a/src/models/models.h b/src/models/models.h
 index 86397b1..c33bd28 100644
 --- a/src/models/models.h
@@ -171,7 +123,7 @@ index 33e79ea..956e4f7 100644
      target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
 diff --git a/tests/test-depth-mix.cpp b/tests/test-depth-mix.cpp
 new file mode 100644
-index 0000000..941e8d4
+index 0000000..60c710b
 --- /dev/null
 +++ b/tests/test-depth-mix.cpp
 @@ -0,0 +1,244 @@
@@ -303,7 +255,7 @@ index 0000000..941e8d4
 +            CHECK(k + 1 <= k_nslot, "the store holds the states this call reads");
 +            ctx_hold h;
 +            for (int64_t nq : {1, 3}) {
-+                real_nodes r = build_real(h.ctx, k, nt, nq, nq == 1);
++                real_nodes r = build_real(h.ctx, k, nt, nq, false);   // the folded norm is withheld
 +                CHECK(r.blocks->nb[2] == 46080, "a token's slab step is 46080 bytes, the store's");
 +                CHECK(r.blocks->nb[2] >= (uint64_t) (r.blocks->ne[1]*r.blocks->nb[1]) || r.blocks->ne[1] == 0,
 +                      "the slab step covers the block rows");

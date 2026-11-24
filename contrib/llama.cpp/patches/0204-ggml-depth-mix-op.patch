@@ -232,7 +232,7 @@ index bfef2a8..1607712 100644
  void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9a57c18..086d8ea 100644
+index 9a57c18..ce9d594 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1055,6 +1055,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
@@ -269,7 +269,7 @@ index 9a57c18..086d8ea 100644
  
  static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
  
-@@ -4214,6 +4216,103 @@ struct ggml_tensor * ggml_norm_clip(
+@@ -4214,6 +4216,108 @@ struct ggml_tensor * ggml_norm_clip(
      return result;
  }
  
@@ -314,6 +314,11 @@ index 9a57c18..086d8ea 100644
 +    }
 +    if (queries->nb[0] != sizeof(float) || (queries->ne[1] > 1 && queries->nb[1] < n_embd*sizeof(float))) {
 +        return "q-stride";   // one column is a 1-D weight, its row step is never read
++    }
++    if (norm_w != NULL && norm_w->view_src != NULL) {
++        return "nw-view";   // a weight through a view's extra is not covered: the read is the
++                            // parent's storage at the view's offset, one thing the model's own
++                            // graph never needs once the norm stays a node
 +    }
 +    if (norm_w != NULL) {
 +        if (norm_w->ne[0] != n_embd || norm_w->ne[2] != 1 || norm_w->ne[3] != 1 ||

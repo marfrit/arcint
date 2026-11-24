@@ -10166,6 +10166,46 @@ A correction to the earlier table's "0187 off/on" row: the off/on pair is 765 ag
 594-637, which assumed all of 0187's 128-171 ms came from the depth mix; the measured 1.24x on
 this copy is 66 ms of it).
 
+**Card result 2, 2026-11-24 (mix-on-dev 475cebfb, applied series 4c8f94ba, B60, `measured-here`).**
+The fix ran: the suite executed 19 cases, 16 OK; the red failed 19 (good). **The 3 failures are
+exactly the folded-norm cases**, ERR ~2: `DEPTH_MIX(k=1,nt=512,nq=1,with_norm=1)` ERR 1.990,
+`(k=4,nt=2048,nq=1,with_norm=1)` 1.931, `(k=3,nt=512,nq=3,with_norm=1)` 2.010. Every case
+without the norm passes. The model run (`llama-bench pp4096 ub512`, knob on, `BOUNDS` unset)
+then caused a **GPU page fault** (`clWaitForEvents -14`, 446 fault responses, an engine reset, a
+devcoredump; the card recovered): all 446 are reads, one row each at the start of ~58 slabs
+4,718,592 bytes apart (`inference` from the operator's kernel-log fit) - a [2304, 512] f32 slab
+spacing, which is the compute buffer's per-token tensors (`dst`, `cur`) and equals the folded
+norm calls' count a chunk (~57).
+
+**Named defect #1 (code, fixed): the folded-norm path's local slots aliased the dot results.**
+The first reduction left its results at `red[p*LS]` for `p = 0..ns*(1+nq)-1`; the norm's partial
+sums were written at `red[q*LS + lane]`. For (k=1,nq=3) the norm partials [512..767] cover the
+dot result read at 512, for (k=2,nq=4) [768..1023] covers 768 - writes from one sub-group
+overwriting a result another sub-group may still read (a race; sub-groups do not run in
+lockstep). Verified as an interval overlap (`aliascheck`: 4 overlaps) and fixed by moving the
+norm's quantities past the first reduction's: `red[(np+q)*LS]` with `np = ns*(1+nq)`, the
+reduce taking a base `off`, the dynamic local sized `(np+nq)*256*4`; the same check now finds 0
+overlaps. This does **not** explain the three card failures (their (k,nq) do not overlap).
+
+**Named defect #2 (code, withheld): a norm weight through a view is not covered.** The model's
+norm weights are 1-D tensors, and the fold reached the op as a `reshape_2d` view, whose storage
+resolves through the parent's extra (the backend's own comment flags that path for weight
+tensors). Every folded-norm op case fails on the card while every no-norm case passes, and the
+fault's slab spacing/count matches the folded calls; a host replay of the kernel's index math on
+the graph's strides (`port3`: `blocks` rows + `cur` + `queries` + `dst`, ASan, every access
+range-checked) is clean and agrees with the CPU op to fp32 rounding, so the strides are not the
+fault's cause and the weight's storage is the one argument that replay cannot see. The rule now
+refuses `norm_w->view_src != nullptr` (`nw-view`), the dispatch asserts the weight is the tensor
+itself, and **the model no longer folds the norm**: the norms stay the chain's nodes, exactly as
+today (no behaviour change), and the op suite carries no `with_norm` case until the path has its
+own card evidence. The op's CPU reference and kernel keep the capability for a later patch.
+
+**The arm's bounds are now always on** (not only under `GGML_OPENCL_BOUNDS=1`): the five
+arguments (blocks, cur, queries, norm_w, dst) are checked against their buffers before the
+launch and a violation aborts with the buffer's name and the byte it would reach - a fault
+becomes a diagnosis. The op cases and the model run can therefore be run with `BOUNDS` unset and
+still name any past-buffer launch.
+
 **Card commands** (to run on the B60; `llama-bench` and the op cases need the arm's env):
 
 ```
