@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 8661cf4..ef19e80 100644
+index 8661cf4..389b04a 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -553,6 +553,7 @@ extern "C" {
@@ -10,7 +10,7 @@ index 8661cf4..ef19e80 100644
          GGML_OP_CONV_TRANSPOSE_1D,
          GGML_OP_IM2COL,
          GGML_OP_IM2COL_BACK,
-@@ -1826,6 +1827,72 @@ extern "C" {
+@@ -1826,6 +1827,73 @@ extern "C" {
              float                 threshold,
              float                 eps);
  
@@ -20,7 +20,8 @@ index 8661cf4..ef19e80 100644
 +    // norm_w [n_embd] (nq == 1) or [n_embd, nq] (fused output RMSNorm weights), or NULL.
 +    //   v_s = the k block rows and cur;  inv_s = 1/sqrt(mean(v_s^2) + eps_states)
 +    //   scores[q][s] = scale * inv_s * (queries[q] . v_s);  p = softmax_s(scores)
-+    //   out[q] = sum_s p[q][s] * v_s;  (norm_w: out[q] *= rsqrt(mean(out[q]^2) + eps_out) * norm_w)
++    //   out[q] = sum_s p[q][s] * inv_s * v_s - the normalized states are mixed, as the unfused chain
++    //   does;  (norm_w: out[q] *= rsqrt(mean(out[q]^2) + eps_out) * norm_w)
 +    // dst [n_embd, n_tokens, nq], contiguous, so a query column's token block is itself contiguous.
 +    GGML_API struct ggml_tensor * ggml_depth_mix(
 +            struct ggml_context * ctx,
@@ -35,7 +36,7 @@ index 8661cf4..ef19e80 100644
 +    // the pure shape/type/stride rule the model, the OpenCL dispatch and the CPU op share.
 +    // NULL when the four shapes are covered; otherwise a fixed reason for the DOWNGRADE line.
 +    // Reaching it is what the arm claims: n_embd a multiple of 256 (the kernel's lane width),
-+    // k 1..8 states, nq 1..8 columns, n_tokens > 1 (the arm is a prefill one).
++    // k 1..6 block rows (7 states with cur), nq 1..4 columns, n_tokens > 1 (the arm is a prefill one).
 +    GGML_API const char * ggml_depth_mix_refuse(const struct ggml_tensor * blocks,
 +                                                const struct ggml_tensor * cur,
 +                                                const struct ggml_tensor * queries,
@@ -110,10 +111,10 @@ index 6f7afd6..5d38340 100644
              {
                  n_tasks = MIN(n_threads, ggml_nrows(node->src[0]));
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 517eba9..95f4d95 100644
+index 517eba9..1931b4d 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -6482,6 +6482,136 @@ void ggml_compute_forward_norm_clip(
+@@ -6482,6 +6482,139 @@ void ggml_compute_forward_norm_clip(
      }
  }
  
@@ -202,9 +203,12 @@ index 517eba9..95f4d95 100644
 +                p[q*n_state + s] = e;
 +                tot += (ggml_float) e;
 +            }
++            // the weights on the raw rows: p times the state's own 1/rms - the chain mixes the
++            // NORMALIZED states (its rms_norm output feeds the score product and the weighted sum)
 +            const float dsum = (float) tot;
 +            for (int64_t s = 0; s < n_state; ++s) {
-+                p[q*n_state + s] = p[q*n_state + s] * 1.0f/dsum;
++                const float inv = 1.0f/sqrtf(ss[s]/(float) n_embd + eps_states);
++                p[q*n_state + s] = p[q*n_state + s] * 1.0f/dsum * inv;
 +            }
 +
 +            float * o = (float *) ((char *) dst->data + q*dst->nb[2] + t*dst->nb[1]);

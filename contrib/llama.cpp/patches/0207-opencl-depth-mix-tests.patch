@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 95f9623..3ef67f5 100644
+index 95f9623..826b746 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6881,6 +6881,87 @@ struct test_norm_clip : public test_case {
+@@ -6881,6 +6881,116 @@ struct test_norm_clip : public test_case {
      }
  };
  
@@ -41,6 +41,35 @@ index 95f9623..3ef67f5 100644
 +
 +    test_depth_mix(int64_t n_slot = 5, int64_t k = 4, int64_t nt = 512, int64_t nq = 1, bool with_norm = false, bool cols = false)
 +        : n_slot(n_slot), k(k), nt(nt), nq(nq), with_norm(with_norm), cols(cols) {}
++
++    // the store at a different scale a row and cur at a third, so each state's 1/rms matters:
++    // with equal scales a mix of raw states differs from the mix of normalized ones by a
++    // global factor only, which the folded norm hides
++    void initialize_tensors(ggml_context * ctx) override {
++        std::mt19937 gen(4201);
++        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "stack") == 0) {
++                std::vector<float> data((size_t) ggml_nelements(t));
++                size_t i = 0;
++                for (int64_t tok = 0; tok < t->ne[2]; ++tok) {
++                    for (int64_t row = 0; row < t->ne[1]; ++row) {
++                        const float amp = 0.25f*(float) (1 << (row % 5));   // 0.25 .. 4
++                        for (int64_t e = 0; e < t->ne[0]; ++e) {
++                            data[i++] = amp*dist(gen);
++                        }
++                    }
++                }
++                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
++            } else if (strcmp(t->name, "blocks") == 0) {
++                // a view of the store: its rows are set
++            } else if (strcmp(t->name, "cur") == 0) {
++                init_tensor_uniform(t, -3.0f, 3.0f);
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
 +
 +    ggml_tensor * build_graph(ggml_context * ctx) override {
 +        const int64_t n_embd = 2304;
@@ -90,7 +119,7 @@ index 95f9623..3ef67f5 100644
  // GGML_OP_FLOOR
  struct test_floor : public test_case {
      const ggml_type type;
-@@ -13074,6 +13155,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13074,6 +13184,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_norm_clip({13, 3, 5, 1}, true));
      test_cases.emplace_back(new test_norm_clip({7, 5, 2, 2}, false, 8.0f));
  
@@ -112,7 +141,7 @@ index 95f9623..3ef67f5 100644
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
-@@ -14250,6 +14346,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14250,6 +14375,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  

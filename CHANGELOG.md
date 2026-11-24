@@ -85,6 +85,17 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   exported shapes only (45), with the bank's four columns and their readers. The prediction is revised to 150-300 us a
   call, 145-290 ms a pass against the chain's 765 and the reference's 399 (`inference`); card commands in
   `contrib/llama.cpp/README.md`.
+- **The depth mix mixed raw states** (patches 0204, 0205, 0207; found by an independent code read, `code` and
+  `measured-here` on the recipe host). The chain and the reference mix the NORMALIZED states (the chain's `rms_norm`
+  output feeds the score product and the weighted sum; the reference's `pw = p / sum(p) * inv`); the kernel and the CPU
+  op weighted the raw rows by `p` alone - a per-state reweighting a following norm does not undo, and one the op cases
+  and the replay could not see, since both compared the op with its own CPU twin. The unit test now builds the model's
+  chain node for node on the exported shapes and compares the op with it, the states at different scales: the previous
+  revision fails 16 of 16 calls (nmse 0.0091 .. 0.64), the fix agrees to 2e-13. Knob on against knob off on the CPU
+  (llama-perplexity, 381 tokens): mean KL 0.0015 nats, same top p 98.95 % folded and 99.21 % with `=nofold`
+  (knob off twice: 0, 100 %) - the KL well inside the bar, the folded arm's top p at its 1-point edge on too few tokens
+  to decide; the card arm decides. `-DDEPTH_MIX_RED` now doubles one state's weight (every case must fail; the old red
+  was cancelled by the folded norm on 12 cases), `-DDEPTH_MIX_RED_RAW` is the red of this defect.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the

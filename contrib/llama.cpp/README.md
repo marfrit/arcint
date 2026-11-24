@@ -10427,3 +10427,83 @@ for ub in 512 1024 2048; do
     --test-file <knob-on export, ub $ub> -o DEPTH_MIX
 done
 ```
+
+**Review of the revision above, and a third defect it found (2026-11-24; `code`, and
+`measured-here` on the recipe host; still no card run).** An independent code read confirmed
+the fault's cause and the offset, and found what neither the op cases nor the replay could
+see, because both compared the op with its own CPU twin:
+
+**The op mixed RAW states; the chain and the reference mix NORMALIZED ones.** In the chain,
+`states = ggml_rms_norm(states)` overwrites the variable, so both products read the normalized
+states: the scores and the weighted sum. The reference's kernel says the same in one line,
+`pw = p / sum(p) * inv`. `depth_mix.cl` and the CPU op used each state's `1/rms` for the score
+and then accumulated `p[s] * v_s` on the raw rows. A norm after the mix hides a global scale,
+not this: it is a per-state reweighting. It was in every revision the card ran, and the
+card's 16 green op cases were green against the same arithmetic.
+
+- Red first (`measured-here`): the unit test now builds **the model's chain** node for node
+  (cpy, rms_norm, repeat, mul_mat, soft_max_ext, cont(transpose), mul_mat, and the column's
+  rms_norm and mul where the call folds) on the exported shapes, with the store's rows at
+  different scales (0.25 .. 4, cur at 3), and compares the op with it. Against the previous
+  revision's library and kernel text: 16 of 16 replayed calls fail on both, nmse 0.0091 to
+  0.64 (0.249 at k 1, nq 1; 0.0096 with the norm folded - the norm hides most of it at k 1, not
+  all).
+- The fix: the weights on the raw rows are `p / sum(p) * inv_s`, in the kernel (both branches)
+  and in the CPU op. Green: the CPU op against the chain over all tokens nmse 2e-14 .. 1e-13,
+  the kernel's text against the chain 7e-15 .. 2e-13, on the 13 calls of ub 512 and 4 of ub
+  2048. The red build `-DDEPTH_MIX_RED_RAW` (the weights without `inv_s`) is kept in the test
+  and must miss the chain: 0.0091 .. 0.68.
+- The op cases (0207) now set the store's rows and cur at those different scales too, so the
+  same red is visible on the card.
+
+**The knob-on model against the knob-off model on the CPU** (`measured-here`, the recipe host,
+no GPU: llama-perplexity, Inkling 2 Mini IQ4_NL, c 256, b 256, 3 chunks, 381 scored tokens,
+the knob-off logits as the base; the CPU backend serves the op with its reference):
+
+| arm | mean KL, nats | max KL | same top p | PPL (base 2.5907) |
+|---|---|---|---|---|
+| knob off again | 0.000000 | 0.000024 | 100.000 % | 2.5974* |
+| `GGML_OPENCL_DEPTH_MIX=1` | 0.001537 ± 0.000238 | 0.0596 | 98.950 ± 0.523 % | 2.5915 |
+| `=nofold` | 0.001549 ± 0.000219 | 0.0364 | 99.213 ± 0.453 % | 2.5877 |
+
+(* the tool's final estimate line of that run; its KL columns are the comparison.) The mean KL
+is a twentieth of the 0.03-nat bar. The top-p agreement of the folded arm is 1.05 points down
+on 381 tokens (4 tokens), which is AT the 1-point bar and inside its own ±0.52: this run does
+not decide that cell, a longer one on the card does (card step 5, both arms). The op agrees
+with the chain to 1e-7 relative a call in the unit test; that a difference of that size
+reaches 1.5e-3 nats at the logits through ~110 mix calls and the expert routing is
+`inference`, not measured. This check was not run on the raw-state revision, so its
+discrimination is not measured either; the chain comparison above is what failed that revision.
+
+**The reds, and which cases each must fail** (45 op cases; the unit test has the last two
+compiled in):
+
+| build option (`GGML_OPENCL_DEPTH_MIX_OPTS`) | what it breaks | must FAIL |
+|---|---|---|
+| `-DDEPTH_MIX_RED` | the first state's weight doubled: the mix's direction, not its scale | all 45 |
+| `-DDEPTH_MIX_RED_RAW` | the weights without `inv_s` (the third defect) | all 45 |
+| `-DDEPTH_MIX_RED_NW` | the norm weight's offset dropped (the second defect) | the 12 `with_norm=1` cases only |
+
+The previous `-DDEPTH_MIX_RED` (the softmax denominator dropped) is gone: it was a per-column
+scale, and on the 12 folded cases the norm cancelled it, so it could not fail them. Offline
+gate for the four builds: `ocloc 4/4 variants`, each `grf 256 simd 32 slm 1024 scratch 0`.
+
+**The knob is the model's, on every backend** (`code`). `GGML_OPENCL_DEPTH_MIX` is read by
+`src/models/inkling2.cpp`, not by the OpenCL backend alone: set, the graph carries
+`GGML_OP_DEPTH_MIX` whatever the backend. The CPU backend serves it with the reference (the
+table above is that), the OpenCL backend with the kernel, and any other GPU backend would send
+the node to the CPU. It is not gated to OpenCL because the CPU arm is the device-free
+model-level check.
+
+**Card step 3 above gains one line** (after the two reds there):
+
+```
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED_RAW \
+  test-backend-ops test -b <dev> -o DEPTH_MIX      # all 45 must FAIL
+```
+
+**State of this revision** (`measured-here`, the recipe host): supersedes the state paragraph
+above. The series applies from the pin in byte order, 150 patches, applied tree
+`e564f5b5366b9f871bf74a0b5dfe7295c3476cbf`; the recipe result is in the commit that adds this
+paragraph. The knob-on exports are unchanged by this revision (the graph is the same; the
+op's arithmetic changed).

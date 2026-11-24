@@ -1,5 +1,5 @@
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 5fec3cb..67fed01 100644
+index 5fec3cb..6d6175b 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
 @@ -1,6 +1,10 @@
@@ -13,11 +13,14 @@ index 5fec3cb..67fed01 100644
  void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
      ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
      ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
-@@ -187,9 +191,49 @@ void llama_model_inkling2::graph::write_res_block(ggml_tensor * block, int j) {
+@@ -187,9 +191,52 @@ void llama_model_inkling2::graph::write_res_block(ggml_tensor * block, int j) {
          ggml_view_3d(ctx0, stack, n_embd, 1, n_tokens, stack->nb[1], stack->nb[2], (n_slot - 1 - j)*stack->nb[1])));
  }
  
-+// the arm's switch, read once: unset leaves the chain and the dispatch exactly as they are
++// the arm's switch, read once: unset leaves the chain and the dispatch exactly as they are.
++// The name is the OpenCL arm's, but the emission is not gated to a backend: with it set the
++// graph carries GGML_OP_DEPTH_MIX on every backend, the CPU op serves it there (that is the
++// host's knob-on / knob-off logit check), and another GPU backend sends the node to the CPU.
 +static bool inkling2_depth_mix_on() {
 +    static const bool on = ggml_depth_mix_switch(getenv("GGML_OPENCL_DEPTH_MIX"));
 +    return on;
@@ -64,7 +67,7 @@ index 5fec3cb..67fed01 100644
      if (!stack) {
          stack = res_stack_tensor();
      }
-@@ -198,6 +242,25 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+@@ -198,6 +245,25 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
      const int64_t n_block = (int64_t) blocks.size();
      GGML_ASSERT(n_block + 1 <= stack->ne[1]);
  
@@ -90,7 +93,7 @@ index 5fec3cb..67fed01 100644
      // cur goes to the last row, the blocks are already in their rows from the block starts
      ggml_build_forward_expand(gf, ggml_cpy(ctx0,
          ggml_reshape_2d(ctx0, cur, n_embd, n_tokens),
-@@ -312,8 +375,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -312,8 +378,10 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
      const int64_t n_embd_k_gqa = n_embd_head*n_head_kv;
  
      // the message of controller ctrl, [n_embd, n_tokens]
@@ -102,7 +105,7 @@ index 5fec3cb..67fed01 100644
      };
  
      ggml_tensor * state   = recr->mctx->get_r_l(il);
-@@ -324,10 +389,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -324,10 +392,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
  
      // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
      ggml_tensor * inputs[3] = {cur, cur, cur};
@@ -122,7 +125,7 @@ index 5fec3cb..67fed01 100644
          }
      }
  
-@@ -343,7 +415,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -343,7 +418,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
              inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
          }
      } else if (is_swa) {
@@ -133,7 +136,7 @@ index 5fec3cb..67fed01 100644
          inputs[1] = inputs[2] = inputs[0];
      } else {
          inputs[0] = build_norm(inputs[0], layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il);
-@@ -419,11 +493,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -419,11 +496,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
      cb(ffn_inp, "ffn_inp", il);
  
      // MoE
@@ -151,7 +154,7 @@ index 5fec3cb..67fed01 100644
  
      cur = build_moe_ffn(cur,
              layer.ffn_gate_inp,
-@@ -453,8 +531,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -453,8 +534,12 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
  }
  
  void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {

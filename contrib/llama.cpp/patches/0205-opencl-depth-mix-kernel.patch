@@ -302,10 +302,10 @@ index df2ec85..f731d86 100644
                  return false;
 diff --git a/ggml/src/ggml-opencl/kernels/depth_mix.cl b/ggml/src/ggml-opencl/kernels/depth_mix.cl
 new file mode 100644
-index 0000000..01f115d
+index 0000000..bdebf46
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/depth_mix.cl
-@@ -0,0 +1,279 @@
+@@ -0,0 +1,309 @@
 +//------------------------------------------------------------------------------
 +// depth_mix
 +//------------------------------------------------------------------------------
@@ -319,7 +319,8 @@ index 0000000..01f115d
 +//   ss_s  sum of v_s^2 over n_embd, reduced over the work-group
 +//   inv_s 1 / sqrt(ss_s / n_embd + eps_states)
 +//   score[q][s] = scale * inv_s * (queries[q] . v_s), softmax over s
-+//   out[q]      = sum_s p[q][s] * v_s, and with norm_w: * 1/sqrt(mean(out^2) + eps_out) * norm_w[q]
++//   out[q]      = sum_s p[q][s] * inv_s * v_s (the NORMALIZED states are mixed, as the chain
++//                 and the reference do), and with norm_w: * 1/sqrt(mean(out^2) + eps_out) * norm_w[q]
 +//
 +// n_embd is a multiple of DEPTH_MIX_LS and at most DEPTH_MIX_LS * DEPTH_MIX_EL,
 +// so a lane holds DEPTH_MIX_EL floats of each state; the state and element loops
@@ -493,6 +494,25 @@ index 0000000..01f115d
 +                        tot += pw[s];
 +                    }
 +                }
++                // the weights on the RAW states: the softmax's p times the state's own 1/rms. The
++                // chain mixes the NORMALIZED states (its rms_norm output feeds both products) and
++                // so does the reference (pw = p / sum(p) * inv); without inv[s] this was a mix of
++                // raw states, which a following norm does not undo (a per-state reweighting)
++                #pragma unroll
++                for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                    if (s < ns) {
++#ifdef DEPTH_MIX_RED_RAW
++                        pw[s] = pw[s] / tot;            // the red case of that defect
++#else
++                        pw[s] = pw[s] / tot * inv[s];
++#endif
++                    }
++                }
++#ifdef DEPTH_MIX_RED
++                // the red case every op case must fail, folded norm or not: the first state's
++                // weight doubled changes the mix's direction, not its scale
++                pw[0] = pw[0] * 2.0f;
++#endif
 +                #pragma unroll
 +                for (int i = 0; i < DEPTH_MIX_EL; ++i) {
 +                    if (i < el) {
@@ -503,11 +523,7 @@ index 0000000..01f115d
 +                                o += pw[s]*x[s][i];
 +                            }
 +                        }
-+#ifdef DEPTH_MIX_RED
-+                        outv[q][i] = o;   // the red case: the softmax denominator dropped
-+#else
-+                        outv[q][i] = o / tot;
-+#endif
++                        outv[q][i] = o;
 +                    }
 +                }
 +            }
@@ -562,6 +578,25 @@ index 0000000..01f115d
 +                        tot += pw[s];
 +                    }
 +                }
++                // the weights on the RAW states: the softmax's p times the state's own 1/rms. The
++                // chain mixes the NORMALIZED states (its rms_norm output feeds both products) and
++                // so does the reference (pw = p / sum(p) * inv); without inv[s] this was a mix of
++                // raw states, which a following norm does not undo (a per-state reweighting)
++                #pragma unroll
++                for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                    if (s < ns) {
++#ifdef DEPTH_MIX_RED_RAW
++                        pw[s] = pw[s] / tot;            // the red case of that defect
++#else
++                        pw[s] = pw[s] / tot * inv[s];
++#endif
++                    }
++                }
++#ifdef DEPTH_MIX_RED
++                // the red case every op case must fail, folded norm or not: the first state's
++                // weight doubled changes the mix's direction, not its scale
++                pw[0] = pw[0] * 2.0f;
++#endif
 +                global float * o = (global float *)(dst + (ulong) q*nbd2 + (ulong) t*nbd1);
 +                #pragma unroll
 +                for (int i = 0; i < DEPTH_MIX_EL; ++i) {
@@ -573,12 +608,7 @@ index 0000000..01f115d
 +                                acc += pw[s]*x[s][i];
 +                            }
 +                        }
-+#ifdef DEPTH_MIX_RED
-+                        // the red case: the softmax denominator dropped (a test must fail)
 +                        o[lane + i*DEPTH_MIX_LS] = acc;
-+#else
-+                        o[lane + i*DEPTH_MIX_LS] = acc / tot;
-+#endif
 +                    }
 +                }
 +            }

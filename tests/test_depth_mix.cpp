@@ -22,6 +22,15 @@
 //     red build of the same text (DEPTH_MIX_RED_NW: the norm weight's offset dropped, the
 //     card's ERR ~2 on the three with_norm op cases) must NOT match.
 //
+//     The op is also compared with the CHAIN the model emits without it (cpy, rms_norm,
+//     repeat, mul_mat, soft_max_ext, cont(transpose), mul_mat, and the column's norm),
+//     built here node for node as src/models/inkling2.cpp's mix() builds it: the op's own
+//     CPU twin shares the op's arithmetic and cannot see a defect in it. The states carry
+//     different scales a row, so mixing raw states instead of normalized ones (the first
+//     revisions' defect: the weights lacked each state's 1/rms) is not a global scale the
+//     folded norm hides. Red: the kernel text built with DEPTH_MIX_RED_RAW must not match
+//     the chain.
+//
 //  4. the card's page fault, named: the loop model's message() read the arm's dst
 //     [n_embd, n_tokens, 4] with the chain's strides (row step nb[2] = n_embd*n_tokens*4
 //     bytes: one row at the start of every [2304, T] slab, 512 slabs, the tensor ends
@@ -82,6 +91,12 @@ using namespace host_cl;
 #include "depth_mix.cl"
 }
 #undef DEPTH_MIX_RED_NW
+#define DEPTH_MIX_RED_RAW 1
+namespace k_red_raw {
+using namespace host_cl;
+#include "depth_mix.cl"
+}
+#undef DEPTH_MIX_RED_RAW
 #undef kernel
 #undef global
 #undef local
@@ -383,6 +398,62 @@ void fill(ggml_tensor * t, float lo, float hi) {
     }
 }
 
+// the store with a different scale a row, so a state's 1/rms matters to the mix
+void fill_rows(ggml_tensor * t) {
+    float * d = (float *) t->data;
+    for (int64_t tok = 0; tok < t->ne[2]; ++tok) {
+        for (int64_t row = 0; row < t->ne[1]; ++row) {
+            const float amp = 0.25f*(float) (1 << (row % 5));   // 0.25 .. 4
+            for (int64_t i = 0; i < t->ne[0]; ++i) {
+                *d++ = amp*frand();
+            }
+        }
+    }
+}
+
+// the unfused chain of src/models/inkling2.cpp's mix(), node for node, and the norm the model
+// puts on a column (build_norm: rms_norm, then mul by the weight). Returns [n_embd, nq, T].
+ggml_tensor * build_chain(ggml_context * ctx, ggml_cgraph * gf, const nodes & r, int64_t n_slot, int64_t k, int64_t nq, int64_t nt,
+                          float eps_states, float eps_out, float scale) {
+    const int64_t n_embd = r.stack->ne[0];
+    ggml_tensor * stack = r.stack;
+    ggml_build_forward_expand(gf, ggml_cpy(ctx,
+        ggml_reshape_2d(ctx, r.cur, n_embd, nt),
+        ggml_view_3d(ctx, stack, n_embd, 1, nt, stack->nb[1], stack->nb[2], (size_t) (n_slot - 1)*stack->nb[1])));
+    ggml_tensor * states = ggml_view_3d(ctx, stack, n_embd, k + 1, nt, stack->nb[1], stack->nb[2],
+                                        (size_t) ((n_slot - 1) - k)*stack->nb[1]);
+    states = ggml_rms_norm(ctx, states, eps_states);
+    ggml_tensor * queries = ggml_repeat(ctx, r.q, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, nq, nt));
+    ggml_tensor * scores = ggml_mul_mat(ctx, states, queries);
+    scores = ggml_soft_max_ext(ctx, scores, nullptr, scale, 0.0f);
+    ggml_tensor * mixed = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), scores);
+    if (r.nw) {
+        // nq is 1 on the folded calls: [n_embd, 1, T] is the column
+        ggml_tensor * col = ggml_reshape_2d(ctx, mixed, n_embd, nt);
+        col = ggml_mul(ctx, ggml_rms_norm(ctx, col, eps_out), r.nw);
+        mixed = ggml_reshape_3d(ctx, col, n_embd, 1, nt);
+    }
+    ggml_build_forward_expand(gf, mixed);
+    return mixed;
+}
+
+// normalized squared error of `got` in the op's layout against the chain's [n_embd, nq, T]
+double nmse_chain(const float * got, const ggml_tensor * chain, const std::vector<int> & tokens) {
+    const int64_t n_embd = chain->ne[0], nq = chain->ne[1], nt = chain->ne[2];
+    double num = 0.0, den = 0.0;
+    for (int64_t q = 0; q < nq; ++q) {
+        for (int t : tokens) {
+            const float * a = got + ((size_t) q*nt + t)*n_embd;
+            const float * b = (const float *) chain->data + ((size_t) t*nq + q)*n_embd;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                num += ((double) a[i] - b[i])*((double) a[i] - b[i]);
+                den += (double) b[i]*b[i];
+            }
+        }
+    }
+    return den > 0.0 ? num/den : 1.0;
+}
+
 typedef void (*kernel_fn)(char *, uint64_t, uint64_t, uint64_t, char *, uint64_t, uint64_t, char *, uint64_t, uint64_t,
                           char *, uint64_t, uint64_t, int, char *, uint64_t, uint64_t, uint64_t, int, int, int,
                           float, float, float, float *);
@@ -441,7 +512,10 @@ void check_plan_and_replay(const call_shape & c, bool replay) {
     char what[160];
     snprintf(what, sizeof(what), "store %d rows, k %d, T %d, nq %d, norm %d", (int) c.n_slot, (int) c.k, (int) c.nt, (int) c.nq, (int) c.with_nw);
 
-    const size_t tensors = (size_t) 2304*4*(size_t) (c.n_slot*c.nt + c.nt + c.nq*c.nt + 2*c.nq + 16);
+    // the op's tensors and the chain's (normed states, their transposed copy, the repeated
+    // queries, the result, the norm's two)
+    const size_t tensors = (size_t) 2304*4*(size_t) (c.n_slot*c.nt + c.nt + c.nq*c.nt + 2*c.nq + 16 +
+                                                     3*(c.k + 1)*c.nt + 3*c.nq*c.nt + 4*c.nt);
     ggml_init_params p = { (replay ? tensors : 0) + (size_t) 8*1024*1024, nullptr, !replay };
     ggml_context * ctx = ggml_init(p);
 
@@ -468,8 +542,8 @@ void check_plan_and_replay(const call_shape & c, bool replay) {
 
     if (replay) {
         // ---- part 3: the kernel's text at the plan, against the CPU op ----
-        fill(r.stack, -1.0f, 1.0f);
-        fill(r.cur, -1.0f, 1.0f);
+        fill_rows(r.stack);
+        fill(r.cur, -3.0f, 3.0f);
         fill(r.q, -4.0f, 4.0f);
         if (r.nw) {
             fill(r.nw, 0.5f, 1.5f);
@@ -477,6 +551,20 @@ void check_plan_and_replay(const call_shape & c, bool replay) {
         ggml_cgraph * gf = ggml_new_graph(ctx);
         ggml_build_forward_expand(gf, dst);
         ggml_graph_compute_with_ctx(ctx, gf, 4);
+
+        // the chain the model emits without the arm, on the same tensors
+        ggml_cgraph * gc = ggml_new_graph(ctx);
+        ggml_tensor * chain = build_chain(ctx, gc, r, c.n_slot, c.k, c.nq, c.nt, eps_states, eps_out, scale);
+        ggml_graph_compute_with_ctx(ctx, gc, 4);
+        std::vector<int> all_tokens((size_t) c.nt);
+        for (int t = 0; t < (int) c.nt; ++t) {
+            all_tokens[(size_t) t] = t;
+        }
+        const double e_op_chain = nmse_chain((const float *) dst->data, chain, all_tokens);
+        if (!(e_op_chain <= 1e-9)) {
+            printf("FAIL: the CPU op vs the model's chain, %s: nmse %.3g\n", what, e_op_chain);
+            ++g_failures;
+        }
 
         const std::vector<int> tokens = { 0, 1, (int) c.nt/2 + 3, (int) c.nt - 1 };
         std::vector<float> out((size_t) ggml_nelements(dst), 0.0f);
@@ -502,6 +590,23 @@ void check_plan_and_replay(const call_shape & c, bool replay) {
         if (!(e <= 1e-9)) {
             printf("FAIL: depth_mix.cl replay vs the CPU op, %s: nmse %.3g\n", what, e);
             ++g_failures;
+        }
+        const double e_k_chain = nmse_chain(out.data(), chain, tokens);
+        if (!(e_k_chain <= 1e-9)) {
+            printf("FAIL: depth_mix.cl replay vs the model's chain, %s: nmse %.3g\n", what, e_k_chain);
+            ++g_failures;
+        }
+        {
+            // red: the weights without each state's 1/rms (the raw-state mix) must not match the chain
+            std::fill(out.begin(), out.end(), 0.0f);
+            L.fn = k_red_raw::kernel_depth_mix_f32;
+            run_groups(L, tokens);
+            const double er = nmse_chain(out.data(), chain, tokens);
+            if (!(er > 1e-3)) {
+                printf("FAIL: the red kernel (raw states mixed) still matches the chain, %s: nmse %.3g\n", what, er);
+                ++g_failures;
+            }
+            printf("chain %s: op %.2g, kernel %.2g, red (raw states) %.3g\n", what, e_op_chain, e_k_chain, er);
         }
 
         if (r.nw) {
