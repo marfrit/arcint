@@ -508,7 +508,7 @@ double nmse_tokens(const float * got, const ggml_tensor * dst, const std::vector
     return den > 0.0 ? num/den : 1.0;
 }
 
-void check_plan_and_replay(const call_shape & c, bool replay) {
+void check_plan_and_replay(const call_shape & c, bool replay, bool kernel = true) {
     char what[160];
     snprintf(what, sizeof(what), "store %d rows, k %d, T %d, nq %d, norm %d", (int) c.n_slot, (int) c.k, (int) c.nt, (int) c.nq, (int) c.with_nw);
 
@@ -566,6 +566,12 @@ void check_plan_and_replay(const call_shape & c, bool replay) {
             ++g_failures;
         }
 
+        if (!kernel) {
+            // the CPU op against the chain over all tokens is the whole check on this call
+            printf("chain %s: op %.2g\n", what, e_op_chain);
+            ggml_free(ctx);
+            return;
+        }
         const std::vector<int> tokens = { 0, 1, (int) c.nt/2 + 3, (int) c.nt - 1 };
         std::vector<float> out((size_t) ggml_nelements(dst), 0.0f);
         std::vector<float> red((size_t) plan.local_floats, 0.0f);
@@ -742,11 +748,12 @@ int main(int argc, char ** argv) {
     check_fault_shapes(ex, ggml_view_within_src, false);
     CHECK(run_fault(false) == 0, "the fixed message path returns the op's columns");
 
-    // ---- parts 2 and 3: the plan on every call, the kernel replay on ub 512's calls and
-    // three of ub 2048's ----
+    // ---- parts 2 and 3: the plan and the CPU op against the model's chain on EVERY exported
+    // call (the card's op cases compare the kernel with this CPU op, so each of them is tied
+    // to the chain here); the kernel text's replay on ub 512's calls and four of ub 2048's ----
     for (const call_shape & c : production_calls()) {
-        const bool replay = c.nt == 512 || (c.nt == 2048 && (c.k == 4 || c.n_slot == 2));
-        check_plan_and_replay(c, replay);
+        const bool kernel = c.nt == 512 || (c.nt == 2048 && (c.k == 4 || c.n_slot == 2));
+        check_plan_and_replay(c, true, kernel);
     }
     // T = 256 is not an exported ubatch size; it is the batch of the CPU knob-on / knob-off
     // model check (llama-perplexity -c 256 -b 256), so the op, the kernel text and the chain

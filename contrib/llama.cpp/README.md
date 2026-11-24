@@ -10564,3 +10564,31 @@ this CPU check can and cannot gate: any rounding change at these sites costs ~0.
 bar has to be read against a baseline arm's own spread on the card, as the bar says
 (comparative), not against a deterministic CPU base. Owed, after the card window: the nofold
 arm and noise seeds 2 and 3 on the same tokens.
+
+**The bars for the card window, stated before it** (the operator's rule, 2026-11-25).
+
+*Primary: the op level.* Every op case on the card against the model's chain, with a bound:
+
+- what is compared: `test-backend-ops` runs the op on the card and on the CPU and compares the
+  outputs (the 45 cases at the export's shapes, and the 12 lines a ubatch size of the knob-on
+  export through `--test-file`). The CPU op is tied to the CHAIN by the unit test, on the same
+  shapes: all 39 exported calls (13 a ubatch size at 512, 1024, 2048) and six at T = 256, the CPU
+  op against the chain built node for node over all tokens, nmse 2e-14 .. 1.1e-13
+  (`measured-here`, the recipe host), gated at 1e-11;
+- **the bound: nmse <= 1e-10 a case**, card against CPU op - now the cases' own tolerance
+  (`max_nmse_err`, in place of the tool's 1e-7), so a case above it prints FAIL with its ERR.
+  With the CPU op within 1.1e-13 of the chain, a passing case is within ~1.1e-10 of the chain;
+- why 1e-10 (`inference`): the kernel is the CPU op's arithmetic in fp32 with the device's
+  `exp` and `rsqrt` under fast-relaxed-math. Its own text on host threads reaches 7e-15 .. 2e-13
+  against the chain; a device `rsqrt` or `exp` off by a few ulp moves a score by ~1e-6 relative
+  and the output by ~1e-12. 1e-10 leaves a factor of 100 over that and is still a relative rms
+  of 1e-5. Every defect this arm has had sat far above: the raw-state mix 9e-3 .. 0.64 against
+  the chain, the dropped weight offset ERR ~2;
+- the reds, as in the table above: `-DDEPTH_MIX_RED` and `-DDEPTH_MIX_RED_RAW` must fail all 45
+  cases, `-DDEPTH_MIX_RED_NW` the 12 `with_norm=1` cases and no other;
+- a row worse than its bound fails the arm. No KL result rescues it.
+
+*Secondary: the answer level.* Knob on against knob off on the card, read comparatively: beside
+it the chain with the one-ulp noise control on the same tokens, or the card's own run-to-run
+arm. A ~2e-3 KL is what one ulp costs here, so this bar cannot see a defect of that size - which
+is why it is secondary.

@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 95f9623..826b746 100644
+index 95f9623..c716f28 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6881,6 +6881,116 @@ struct test_norm_clip : public test_case {
+@@ -6881,6 +6881,124 @@ struct test_norm_clip : public test_case {
      }
  };
  
@@ -31,6 +31,14 @@ index 95f9623..826b746 100644
 +
 +    std::string vars() override {
 +        return VARS_TO_STR6(n_slot, k, nt, nq, with_norm, cols);
++    }
++
++    // the bound of the card's op cases, stated before the card run (README 0204-0207): 1e-10,
++    // a thousand times tighter than the tool's 1e-7. The kernel's arithmetic is the CPU op's in
++    // fp32 with the device's exp and rsqrt; the worst of those priced at ~1e-12, and every
++    // defect this arm has had sat at 1e-2 or above
++    double max_nmse_err() override {
++        return 1e-10;
 +    }
 +
 +    // the `cols` cases end in the columns' readers: they stay under -o DEPTH_MIX
@@ -119,7 +127,7 @@ index 95f9623..826b746 100644
  // GGML_OP_FLOOR
  struct test_floor : public test_case {
      const ggml_type type;
-@@ -13074,6 +13184,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13074,6 +13192,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_norm_clip({13, 3, 5, 1}, true));
      test_cases.emplace_back(new test_norm_clip({7, 5, 2, 2}, false, 8.0f));
  
@@ -141,7 +149,7 @@ index 95f9623..826b746 100644
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
-@@ -14250,6 +14375,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14250,6 +14383,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  
