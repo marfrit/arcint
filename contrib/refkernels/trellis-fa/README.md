@@ -771,6 +771,16 @@ unset or wide-off build, and the port must not change decode.
 
 ## What the code is believed to do, and what is owed
 
+The port's two arithmetic tricks are also checked without a device:
+`port_arithmetic_check.py` (this directory) runs 25,000 checks with 0 failures —
+(1) the bias run read (one sub-group block read at `(d0-15)` plus the lane
+shuffle) against a direct per-bin read, for linear groups and at both clamped
+ends including the pad bin; (2) the sink accounting (a per-lane partial sum
+reduced once, the sink term added once) against the reference's `exp(sink - m)`
+in the denominator. Both checks carry a red variant that must be caught (no
+shuffle; the sink in every lane), and the script fails if either red is not
+caught. The `.spv`/SPIR-V tools are untouched by it.
+
 `code` here: the four patches were checked against a fresh tree of the pin plus
 the 145-patch series — `git apply --check` clean for all four, and that tree
 builds `ggml-opencl`, `llama-cli` and `test-backend-ops`; the `.cl` passes the
