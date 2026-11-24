@@ -1346,3 +1346,220 @@ The offline gate on this kernel (`measured-here`, no device): 256 GRF `ocloc 7/7
 variants` (default, prepass, no-skip, the two reds, varying ids, the no-bias
 probe), each `grf 256 simd 16 scratch 0`; 128 GRF `ocloc 0/1`, `scratch 2048`.
 CPU: `-p "port=[12]"` 14/14; `port_abi_check.py` 42 / 42.
+
+# 1a, round 3: the bias without a table - a design, no code {#round3}
+
+Design on paper. Nothing in this section is built; every number that is not
+marked `measured-here` is `inference`. The operator approved the direction
+(2026-11-24): leave the reference's mechanism where ours can be smarter.
+
+## What the card said (the third card window, measured-here, B60, clean host, the round-2 commit)
+
+Suite 7/7; RED=1 and RED=2 fail 7/7. us a call, window 1,024:
+
+| shape | port 256 GRF | port 128 GRF | today's kernel (the `port=2` twin) | oracle 256 | port, no-bias probe |
+|---|---|---|---|---|---|
+| q512 × kv1536 | 746 | 876 | 2,263 | 533 | **392** |
+| q2048 × kv2048 | 2,092 | 2,113 | 9,577 | 1,457 | **1,100** |
+| q2048 × kv3072 | 2,926 | 2,654 | 12,645 | 1,909 | **1,630** |
+
+The base loop is under the oracle with its table (392 / 1,100 / 1,630 against
+533 / 1,457 / 1,909), and the bias read costs 354 / 992 / 1,296 us: the whole gap,
+as round 2's finding 3 said. Round 2's prediction for the full kernel (780-920 /
+2,250-2,650 / 3,100-3,650) was 5-10 % high; its probe prediction (480-620 /
+1,300-1,700 / 1,700-2,250) was 15-25 % high.
+
+## 1. The bias as one more DPAS a key group (arm A, "factored")
+
+**The table is a rank-16 product** (`code`, `src/models/inkling2.cpp`, and the
+export's lines 91 / 92 and 216): `table = ggml_mul_mat(ggml_pad(attn_rel_bias),
+Rcur)`, with `attn_rel_bias` f32 `[16, 1024]` (a weight; line 216 is its PAD to
+`[16, 1025]`, nb `[4, 64, …]`) and `Rcur` f32 `[16, 24, rows]` (nb `[4, 64, 1536]`).
+So
+
+    bias(row, head, bin) = sum over i < 16 of  B[i, bin] * R[i, head, row],   B[., 1024] = 0
+
+and a 16-key group's biases for a tile's 8 rows are an 8 × 16 by 16 × 16 product:
+exactly the shape of the kernel's DPAS (`M` 8 rows, `K` 16, `N` 16 lanes = keys).
+
+**The a operand, `R` of the tile.** 8 rows × 16 halves, lane = factor `i`,
+component = row: the same form as a Q chunk. Read once a tile, hoisted like Q:
+one sub-group block read of 16 floats a row at `Rcur + (row·24 + head)·64 B`
+(8 reads a tile, 512 B), converted to f16 in registers. 4 registers.
+
+**The b operand, `B` for the group's 16 keys.** A transposed 2D block read, as
+`KREAD`: 16 surface rows × 16 halves, lane = key. A linear group's keys have
+distances `d0, d0-1, …, d0-15` (ascending key = descending bin), so the surface is
+**the bias matrix bin-reversed**: f16, 32 B a row, row `y` holds bin `1024 - y`,
+and the group reads rows `y0 = 1024 - d0` onwards. The surface carries 16 zero
+rows in front and 16 rows behind (1,057 rows, 33.8 kB a layer), and the kernel
+clamps `y0` to `[-16, 1025]`: a group wholly at or past the extent lands in zero
+rows, one straddling it gets zeros for its far keys and bins for its near ones, a
+group reaching into the future reads rows whose lanes the compare already hides.
+No reliance on the hardware's edge clamp, and **no branch**: the three-way
+`d0` test of today's score pass goes away.
+
+**Where the surface comes from.** The graph hands the kernel the *weight*
+`attn_rel_bias` itself; the backend builds the reversed f16 surface once a
+weight (a cache keyed by the weight tensor, built by a 16 k-element kernel on
+first use, bounds-checked like every other buffer). 24 layers × 33.8 kB = 0.8 MB.
+
+**The DPAS.** One a group, two a 32-key block, on top of the 32 there are (+6 %),
+and two more 2D loads against sixteen table block reads and their shuffles
+removed. Its result must enter the score as `LOG2E · bias` beside
+`scale_log2 · (q·k)`. Two forms; the first is the design, the second the fallback:
+
+- *into S's accumulator*: `R` is pre-scaled once a tile by `1 / scale` (`√128`
+  = 11.3), so `acc = R'·B + Σ q·k` and `score = scale_log2 · acc`. No extra
+  accumulator, no extra multiply.
+- *a separate accumulator*: 8 registers a group, live until the score pass, one
+  `mad` a (row, group). Used if the pre-scale's rounding fails the bar below.
+
+**The general path** (a group that is not class 1, or rows that are not linear:
+a ring seam, a part-filled group): distances are not a run, so the bias is the
+16-term dot a key, `Σ_i R[r][i] · B[bin(lane)][i]`: 16 gathers of a half a row,
+128 a group. One or two groups a tile take it; priced at about the cost of one
+ordinary block a tile (a few percent), counted on the card with the wrap cases.
+
+**Registers, 256 / 128 GRF.** Added: `R` 4, the `B` read 8 (transient, as a K
+read). Removed: the table run's temporaries and the shuffle. At 256 the kernel
+has room (the gate decides: scratch must stay 0). At 128 it spills today (2,048
+B) and will still; 128 stays selectable and unshipped. What changes the 128 / 256
+picture is not registers: with the table's bytes gone the walk is no longer
+memory-bound on a per-(row, head) stream, so the two modes should separate the
+way the oracle's do, in favour of 256.
+
+## 2. The sink
+
+Today's graph (knob off) folds the sink logit `t(row, head)` into the table:
+every bin, **the pad bin included**, holds `b - t`, and the op's sink is zero.
+A row's attention is then
+
+    p_j = exp(s_j + b_j - t) / (1 + Σ_k exp(s_k + b_k - t))        (b = 0 past the extent)
+
+Multiply numerator and denominator by `exp(t)`:
+
+    p_j = exp(s_j + b_j) / (exp(t) + Σ_k exp(s_k + b_k))
+
+which is a softmax over the keys with the bias only, plus one extra term
+`exp(t)` in the denominator. The kernel has exactly that since round 1: `m`
+starts at `LOG2E · t`, `l` starts at 1 in lane 0, and every key's score is
+`scale·q·k + b`. The pad bin needs no value: a far key's bias is 0 in the
+unfolded form, which is what `b - t` with `b = 0` is in the folded one. So the
+factored arm changes nothing about the sink: `t` stays `src[18]` (`sinks_tok`,
+f32 `[24, rows]`, the MUL_MAT that produces it stays in the graph), and the
+factors carry the bias alone. The sink cannot ride as a seventeenth factor (the
+DPAS's `K` is 16 and all 16 are used). The card's RED=2 (the sink's term dropped)
+stays the red for it.
+
+## 3. Exactness against the table path
+
+Not bit-exact, and it cannot be: the table path multiplies f32 by f32 in the
+MUL_MAT; a DPAS multiplies f16 by f16 (exact in f32: 11 × 11 bits) and sums in
+f32. The operands are what is rounded:
+
+- `B` to f16 once: relative 2⁻¹¹ a factor value;
+- `R` (or `R / scale`) to f16 once a tile: relative 2⁻¹¹;
+- so `|Δbias| ≤ 2⁻¹⁰ · Σ_i |R_i| · |B_i|` for a (row, head, key), plus f32
+  summation rounding (≤ 16 ulp of the largest term; with the shared accumulator,
+  of the score). For a bias of a few nats made of terms of like size that is at
+  most about 1e-2 nats and typically (errors uncorrelated) about 1e-3.
+- **The pad bin and everything past the extent is exact**: the surface's zero
+  rows give `Σ R_i · 0 = 0`, the table path's value. The 1,025-bin edge is the
+  group straddling `d = 1023 | 1024`: lanes at `d ≤ 1023` read their bin's row,
+  lanes at `d ≥ 1024` read a zero row, by the row index alone.
+- For comparison, both paths already round `p` to f16 before `P·V` (a logit
+  error of about 5e-4), and the table path on the conformant arm below rounds the
+  *bias* to bf16 or f16.
+
+**KL expectation.** A per-key logit perturbation of standard deviation σ moves a
+row's attention by KL ≈ σ²/2: 5e-7 nats at σ = 1e-3. Carried through 24 layers
+to the output this is far inside the bar (≤ 0.03 nats worse than the baseline
+arm's mean KL, argmax agreement down ≤ 1 point); the expectation is a mean KL
+difference below the card's own floor (0.136 nats per forward on the B60), i.e.
+not resolvable. The bar is judged on the card, on the same window, against
+today's arm.
+
+## 4. The producer
+
+With the knob off the graph is today's, byte for byte. With it on (a prompt
+batch: flash attention, causal, standard window, more than 8 rows, one stream):
+
+| node | today (knob off) | port, round 2 | **arm A** |
+|---|---|---|---|
+| `ggml_pad(attn_rel_bias)` | yes | yes | **no** |
+| `table = ggml_mul_mat(…, Rcur)`, `[1025, 24, rows]` f32: 50 MB written at 512 rows, 201 MB at 2,048 | yes | yes | **no** |
+| `ggml_sub(table, sink)` | yes | no | no |
+| `ggml_cont(ggml_permute(table))` (a second copy of the table) | yes | no | no |
+| `Rcur`, `sinks_tok`, the positions and classes | yes | yes | yes |
+
+That is the rest of what the coordinator's profile calls P1 (about 320 ms a
+pass, `measured-here`, theirs): the table is not written at all. The op carries,
+instead of `src[12]` (the table): `R` = `Rcur` as it is (f32 `[16, 24, rows]`,
+nb `[4, 64, 1536]`, no copy) and `B` = the weight `attn_rel_bias` (f32
+`[16, 1024]`); two new source slots and a flag in `op_params`, with the static
+asserts 0193 already has for its own. `src[13]` (the bins) stays for the CPU.
+The CPU's kernel computes the same 16-term dot from the same two sources (bin
+from `src[13]`, 0 at the pad bin), so a declined call and the op's CPU reference
+are the same attention; it is slow (16 multiplies a visible key) and it is the
+fallback, not a serving path. The gate gets two rules more (`R`: f32, `ne0` 16,
+nb0 4, a row's 16 floats contiguous; `B`: f32 `[16, ≥ 16]`, a weight), fed the
+export's lines 91 / 92 (`Rcur` as the MUL_MAT's second source) and 216 (the
+weight as the PAD's source), red first as before.
+
+## 5. The conformant arm beside it (arm B, "table16")
+
+The reference's mechanism at the reference's width: a materialised table of
+half-width values `[rows][head][bins]`, read a run of 16 a (row, group).
+
+- **Producer.** The graph is arm A's: the same `R` and `B`, no table MUL_MAT. The
+  port writes the table itself, once a call, into a scratch: one kernel, `table16
+  [row][head][bin] = Σ_i B[i, bin] · R[i, head, row]`, f32 arithmetic, stored at
+  half width. 25 MB at 512 rows, 100 MB at 2,048 (against 50 / 201 MB f32 written
+  by today's MUL_MAT). So both arms run on the same graph and the same cases, and
+  the knob picks: `GGML_OPENCL_FA_PORT_BIAS=factored|table16` (and `table32` = the
+  round-2 form, kept one release as the A/B).
+- **Width.** bf16 is the reference's literal format (8 significand bits:
+  `|Δb| ≤ 2⁻⁹·|b|`, about 8e-3 nats at |b| = 4); f16 is the same bytes with 11
+  bits (`2⁻¹²·|b|`, 1e-3 nats). The design builds f16 and keeps bf16 as a
+  define, so "conformant in format" and "conformant in mechanism" can both be
+  timed; they read the same number of bytes.
+- **Kernel.** Round 2's run read with a 16-half block (32 B) and the shuffle;
+  the three-way `d0` test stays.
+- **Exactness.** The sum is the MUL_MAT's (f32), then one rounding of the
+  result: a bound on the bias itself, not on its terms. The pad bin is exactly
+  0. Against the table32 path the only difference is that rounding.
+
+## 6. Tests
+
+| | arm A (factored) | arm B (table16) |
+|---|---|---|
+| gate (pure, CPU, export lines) | lines 222 / 223 with `R` from line 91 / 92 and `B` from line 216 ACCEPT; bends: `R` with `ne0` 8, a strided `R`, `B` of another type; red: the rule set of round 2, which has no factor sources, must refuse | the same sources; nothing more |
+| red on the card (must FAIL) | `RED=3`: the `B` read one surface row off (every bias a bin off); and the no-bias probe as a *test* run must FAIL | `RED=3`: the run read one bin off |
+| port cases (CPU reference = the factored CPU kernel) | the ten of round 2, plus: distances straddling the extent inside one group (`d0` = 1,024 … 1,039), a group wholly past it, a seam group and a mixed group (the general path's dot), `R` values at ±1e3 (the pre-scale) | the same cases |
+| twin identity on the CPU | factored case against its table twin (the table built in f32 from the same factors): mask bytes identical, NMSE at the CPU's f16 floor (≤ 1e-5), **pad-bin rows compared exactly** | the same |
+| bounds (`GGML_OPENCL_BOUNDS=1`) | `R`, the reversed surface with its 32 pad rows, every `y0` after the clamp | the table16 scratch |
+| offline gate | 256 GRF N/N with scratch 0; the general path present | as round 2 |
+| the model | KL against today's arm on the same card and window at ub 512 and ub 1024 (the bar of §3); **ub 1: the graph is today's, the logits must be bit-identical to the knob-off run** (a tripwire that the port touches no decode step); the needle; the acceptance task | the same |
+| speed | op perf at both register modes, the twins, and pp t/s at ub 512 / 1024 / 2048 on the standing arm | the same |
+
+**Prediction (inference), us a call at 256 GRF, window 1,024.** Arm A is the
+no-bias probe plus two DPAS and two 2D loads on a block's 32 + 32 (+6 %) plus the
+general path's group; arm B is the probe plus half the measured bias read, and
+its producer launch is priced separately because it replaces a MUL_MAT that the
+op timing never held.
+
+| shape | probe (`measured-here`) | **arm A** | **arm B, the op** | arm B's table launch | oracle 256 |
+|---|---|---|---|---|---|
+| q512 × kv1536 | 392 | **410-460** | 560-640 | +150-300 | 533 |
+| q2048 × kv2048 | 1,100 | **1,150-1,290** | 1,580-1,760 | +600-1,200 | 1,457 |
+| q2048 × kv3072 | 1,630 | **1,700-1,900** | 2,250-2,500 | +600-1,200 | 1,909 |
+
+128 GRF: arm A 10-25 % above its 256 column (the spill, Q re-read). ms a pass
+(20 window layers and 4 global, pp4096), arm A at 256: **about 12 at ub 512,
+21 at ub 1024, 48 at ub 2048**, and beside that the graph loses the table's
+MUL_MAT (and, against the knob-off graph, the sub and the copy).
+
+If arm A lands above 1.25 × the probe, the general path or the pre-scale's
+separate accumulator is the first suspect, and the ISA of the score pass (now a
+few dozen instructions a group) the first thing to read.
