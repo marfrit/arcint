@@ -73,7 +73,14 @@ Line numbers in `flash_attn_dpas2.cl` here refer to the reviewed revision
    i.e. `half(bv)` where the mask adds nothing. An f32 table read keeps the f32
    value and adds it in f32 before the same f16 rounding of `p`/`m`; a bf16 table
    would keep 8 mantissa bits. Either way a KL arm against today's kernel is owed.
-8. **No GRF mode is requested.** `REF:671` submits with no properties and
+8. **No GRF mode is requested, and 256 is the measured default.** The gate
+   (ocloc 26.27.1, IGC 2.38.2, bmg-g21) measured both kernels: our port spills
+   8,192 B at 128 GRF and is 0 at 256 (3/3 variants, no calls, no retry); the
+   reference, compiled from its own SPIR-V, spills 2,112 B at IGC's default 128
+   and is 0 with `-doubleGRF`. So the 256 GRF default is evidence, not taste: the
+   8-row tile with O and the DPAS operands does not fit 128, and the reference's
+   measured times are a spilling build. The cost is occupancy (256 halves the
+   threads a core). Originally: `REF:671` submits with no properties and
    `build_inkling2.sh:7-10` passes no GRF flag, while `exl3_ops.sycl:121,634`
    request `grf_size<256>` for their kernels; our card build also passed none, so
    the measured 2,500-3,500 µs are the **default** mode, `inferred` 128 GRF

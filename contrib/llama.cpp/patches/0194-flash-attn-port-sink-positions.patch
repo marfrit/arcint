@@ -1,8 +1,27 @@
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 517eba9..9024294 100644
+index 517eba9..5b253b0 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
-@@ -9205,12 +9205,21 @@ static inline float ggml_flash_attn_ext_get_indexed_bias(const ggml_tensor * dst
+@@ -9197,6 +9197,18 @@ void ggml_compute_forward_top_k(
+ }
+ 
+ // the indexed bias of a GGML_OP_FLASH_ATTN_EXT: table[head, indices[key, query], query], 0.0f when there is none
++// 0194: the sink logit. src[18] (GGML_FA_SRC_SINK_Q, [n_head, rows]) holds the per-query
++// token logit the port arm uses as its initial (m, l); src[4]'s per-head sink is the
++// contract of the kernels that only have one value a head.
++static inline float ggml_flash_attn_ext_get_sink(const ggml_tensor * dst, int64_t query, int64_t head) {
++    const ggml_tensor * sq = dst->src[GGML_FA_SRC_SINK_Q];
++    if (sq) {
++        return ((const float *)((const char *) sq->data + query*sq->nb[1]))[head];
++    }
++    const ggml_tensor * s = dst->src[4];
++    return s ? ((const float *) s->data)[head] : 0.0f;
++}
++
+ static inline float ggml_flash_attn_ext_get_indexed_bias(const ggml_tensor * dst, int64_t query, int64_t head, int64_t key) {
+     const ggml_tensor * table   = dst->src[GGML_FA_SRC_BIAS_TABLE];
+     const ggml_tensor * indices = dst->src[GGML_FA_SRC_BIAS_IDX];
+@@ -9205,12 +9217,21 @@ static inline float ggml_flash_attn_ext_get_indexed_bias(const ggml_tensor * dst
          return 0.0f;
      }
  
@@ -27,6 +46,34 @@ index 517eba9..9024294 100644
  }
  
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+@@ -9417,9 +9438,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+             }
+         }
+ 
+-        // sinks - apply only on the first kv-chunk
+-        if (sinks && ic_start == 0) {
+-            const float s = ((float *)((char *) sinks->data))[h];
++        // sinks - apply only on the first kv-chunk; src[18]'s per-query logit, else src[4]'s a head
++        if ((sinks || dst->src[GGML_FA_SRC_SINK_Q]) && ic_start == 0) {
++            const float s = ggml_flash_attn_ext_get_sink(dst, query, h);
+ 
+             float ms = 1.0f;
+             float vs = 1.0f;
+@@ -9716,11 +9737,10 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
+             simd_gemm(VKQ32, KQ, V32, Q_TILE_SZ, KV_TILE_SZ, DV);
+         }
+ 
+-        // sinks (apply only to valid rows in the tile)
+-        if (sinks) {
+-            const float s = ((float *)((char *) sinks->data))[h];
+-
++        // sinks (apply only to valid rows in the tile): src[18]'s per-query logit, else src[4]'s a head
++        if (sinks || dst->src[GGML_FA_SRC_SINK_Q]) {
+             for (int tq = 0; tq < tile_rows; tq++) {
++                const float s = ggml_flash_attn_ext_get_sink(dst, iq3*neq1 + iq1 + tq, h);
+                 float ms = 1.0f;
+                 float vs = 1.0f;
+ 
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
 index 358f614..2400367 100644
 --- a/src/llama-graph.cpp
@@ -196,10 +243,17 @@ index 4546729..8d7fc23 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 5fec3cb..39dc40c 100644
+index 5fec3cb..1ea6046 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -385,10 +385,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -380,15 +380,25 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+         const int64_t n_stream = (is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3];
+         const int64_t n_kv     = rel_pos->ne[0];
+ 
+-        ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
++        ggml_tensor * sinks_tok = build_lora_mm(layer.attn_sink_proj, inputs[0]);   // [n_head, n_tokens]: the per-token logit
++        ggml_tensor * sinks = sinks_tok;
+ 
          // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
          ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
  
@@ -207,25 +261,33 @@ index 5fec3cb..39dc40c 100644
 -        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
 -        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 -
-+        // 0194: the sink is NOT folded into the table: it is the initial (m, l) of the
-+        // port kernel, and the graph's earlier sub made every bin carry -sink, so the
-+        // pad bin was not zero and a far-key skip lost the sink (review finding 1).
-+        // The table stays bin-fastest, [n_bins, n_head, rows], what ggml_mul_mat emits;
-+        // the previous permute+cont was only for the dense gather.
++        // 0194: with the port off the graph is exactly today's: the sink is folded into every
++        // bin (the model's exp(s-t)/(1+sum exp(s-t)) identity) and the op gets a zero sink.
++        // With GGML_OPENCL_FA_PORT=1 the sink is unfolded - the table is bias only (the pad
++        // bin is then zero) and the logit is the port's initial (m, l) at src[18] -, because
++        // the port's far-key skip must not lose the sink (review finding 1).
++        static const bool port_on = [] {
++            const char * e = getenv("GGML_OPENCL_FA_PORT");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (!port_on) {
++            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
++            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
++        }
          ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
          kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
          kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-@@ -402,6 +403,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -402,6 +412,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                  nullptr, nullptr, nullptr,
                  Qcur, Kcur, Vcur, kq_b, sinks, table, rel_pos, 1.0f/sqrtf(n_embd_head), il);
  
 +        // 0194: the port arm's inputs: the positions and linearity flags the kv-cache
 +        // walk fills, the per-query sink logits, and the window (0 on a global layer).
-+        {
++        if (port_on) {
 +            const bool swa = is_swa;
-+            // sinks is [n_head, n_tokens] with the head fastest, the layout the port
++            // sinks_tok is [n_head, n_tokens] with the head fastest, the layout the port
 +            // kernel reads (sink[row*n_head + head]); no permute, no copy
-+            ggml_flash_attn_ext_add_query_sinks(cur, sinks);
++            ggml_flash_attn_ext_add_query_sinks(cur, sinks_tok);
 +            ggml_flash_attn_ext_add_positions(cur,
 +                    swa ? inp->self_pos_k_swa : inp->self_pos_k,
 +                    swa ? inp->self_pos_q_swa : inp->self_pos_q,

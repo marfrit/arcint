@@ -30,7 +30,11 @@ src="$tree/ggml/src/ggml-opencl/kernels/flash_attn_port.cl"
 bin="$out/flash_attn_port.$dev.bin"
 # -vc-codegen is required for an ESIMD image (exl3xpu issue #1 §1-2: without it
 # IGC's VLD path splits the module and rejects a helper without the VC decoration)
+# 256 GRF is the backend's default here (README §GRF): at 128 the kernel spills
+# 8,192 B. OCLOC_GRF=128 checks the alternative arm, which must fail on spread.
+grf="${OCLOC_GRF:-256}"
 opts="-DDKQ=128 -DBK=32 -vc-codegen -cl-fp32-correctly-rounded-divide-sqrt -ze-opt-greater-than-4GB-buffer-required"
+[ "$grf" = 256 ] && opts="$opts -cl-intel-256-GRF-per-thread"
 
 echo "ocloc compile: $src -> $bin (device $dev)"
 ocloc compile -device "$dev" -input "$src" -output "$bin" -options "$opts" || {
@@ -53,7 +57,8 @@ echo "GRF mode: ${grf}   SIMD: ${calls}   spill lines: ${spill}"
 grep -q "kernel_flash_attn_port" "$asm" && echo "kernel present: kernel_flash_attn_port" || {
     echo "ocloc-check: kernel_flash_attn_port not in the disassembly" >&2; exit 6; }
 
-# the target: 128 GRF and 0 spill lines. A 256 variant is a measured arm only.
+# the target: 256 GRF (the default) and 0 spill lines; OCLOC_GRF=128 is the arm
+# the gate measured at 8,192 B of scratch, so it is a comparison, not a default.
 if [ "$spill" != "0" ]; then
     echo "ocloc-check: $spill spill line(s): the 128-GRF plan does not hold this kernel as written" >&2
     echo "  (carry the 256-GRF arm next: add -cl-intel-256-GRF-per-thread and re-run this check)" >&2

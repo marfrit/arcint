@@ -11,7 +11,7 @@ index a1c914b..63a481f 100644
      sub
      sum_rows
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..afbd8d2 100644
+index f84ca33..3a9ff19 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -722,6 +722,7 @@ struct ggml_cl_kq_act {
@@ -33,7 +33,7 @@ index f84ca33..afbd8d2 100644
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
      // 0106: the build options of the head-256 prompt kernels, so that the
      // head-512 builds made on first use match them (sub-group, sub-groups a
-@@ -13086,6 +13091,108 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+@@ -13086,6 +13091,117 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
      return true;
  }
  
@@ -110,9 +110,18 @@ index f84ca33..afbd8d2 100644
 +        return nullptr;
 +    }
 +    std::string opts = backend_ctx->kernel_compile_opts + " -DDKQ=128 -DBK=32";
-+    // the 128-GRF default; GGML_OPENCL_FA_PORT_GRF=256 is the measured follow-up arm
-+    // (it halves the threads a core: exl3_ops.sycl:176, CL:5341)
-+    if (const char * grf = getenv("GGML_OPENCL_FA_PORT_GRF"); grf != nullptr && atoi(grf) >= 256) {
++    // 0198: 256 GRF is the default. Measured by the offline gate (ocloc 26.27.1,
++    // bmg-g21, this kernel): 128 GRF spills 8,192 B, 256 GRF is 0 B, no calls, no
++    // retry. The reference fa::Kern is the same: compiled from its own SPIR-V by
++    // the same IGC it spills 2,112 B at 128 and is 0 at 256 (-doubleGRF), so its
++    // measured times are a spilling build and the 8-row tile with O and the DPAS
++    // operands does not fit 128. The cost is thread occupancy: 256 halves the
++    // threads a core (640 against 1,280 on the B60, exl3_ops.sycl:176, CL:5341).
++    // GGML_OPENCL_FA_PORT_GRF=128 builds the measured alternative; the gate says
++    // it spills, so it is not a default.
++    if (const char * grf = getenv("GGML_OPENCL_FA_PORT_GRF"); grf != nullptr && atoi(grf) < 256) {
++        // the caller asked for the 128 arm: no flag (IGC's default for the .cl path)
++    } else {
 +        opts += " -cl-intel-256-GRF-per-thread";
 +    }
 +    // the red cases: GGML_OPENCL_FA_PORT_RED=1 reads a key past n_kv,
@@ -142,7 +151,7 @@ index f84ca33..afbd8d2 100644
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -13633,6 +13740,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13633,6 +13749,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
              // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
              // the prompt kernels have no bias yet, so those shapes go to ggml
@@ -163,7 +172,7 @@ index f84ca33..afbd8d2 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26474,6 +26595,121 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26474,6 +26604,121 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
@@ -287,13 +296,12 @@ index f84ca33..afbd8d2 100644
                            kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 new file mode 100644
-index 0000000..e160116
+index 0000000..3b301cf
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
-@@ -0,0 +1,305 @@
+@@ -0,0 +1,244 @@
 +#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroups : enable
-+#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
 +#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
@@ -350,11 +358,11 @@ index 0000000..e160116
 +#define VREAD(c, y) as_int8(__builtin_IB_subgroup_block_read_flat_transform_u16_k16((long) vb, DKQ * 2 - 1, n_kv - 1, kp - 1, (int2)(16 * (c), (y) + GB_PAD_KEYS_OFF)))
 +
 +// the reads flash_attn_dpas2.cl declares (its lines 70-87); the table's run
-+// read is the sub-group block read of one uint a lane (cl_intel_subgroups)
++// read is cl_intel_subgroups' intel_sub_group_block_read (one uint a lane), a
++// builtin: declared nowhere, the extension pragma above is all it needs
 +ushort8 __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(long base, int w, int h, int p, int2 c);
 +uint8   __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(long base, int w, int h, int p, int2 c);
 +uint8   __builtin_IB_subgroup_block_read_flat_transform_u16_k16(long base, int w, int h, int p, int2 c);
-+uint    intel_sub_group_block_read(const global uint * p);
 +
 +#ifndef GB_PAD_KEYS_OFF
 +#define GB_PAD_KEYS_OFF 0    // the red case: every key read one row up
@@ -425,119 +433,59 @@ index 0000000..e160116
 +        }
 +
 +        // ---- score -> per-row components (a vector cannot be indexed by r) ----
++        // One array, sc[NKB][QR] (16 floats a lane); the mask value and the bias are
++        // folded in here, immediately - no bias/mval arrays, which is what held
++        // registers at the 128-GRF cap. Every row is validity, mask, bias and score
++        // in one pass, then the max.
 +        float sc[NKB][QR];
 +        _Pragma("unroll")
 +        for (int gb = 0; gb < NKB; ++gb) {
-+            sc[gb][0] = s[gb].s0; sc[gb][1] = s[gb].s1; sc[gb][2] = s[gb].s2; sc[gb][3] = s[gb].s3;
-+            sc[gb][4] = s[gb].s4; sc[gb][5] = s[gb].s5; sc[gb][6] = s[gb].s6; sc[gb][7] = s[gb].s7;
-+        }
-+
-+        // ---- key state of this lane ----
-+        int  key[NKB];
-+        bool live[NKB], valid[NKB][QR];
-+        float bias[NKB][QR], mval[NKB][QR];
-+        _Pragma("unroll")
-+        for (int gb = 0; gb < NKB; ++gb) {
-+            key[gb] = t0 + gb * 16 + lane;
-+            live[gb] = key[gb] < n_kv;
++            const int kk = min(t0 + gb * 16 + lane, n_kv - 1);
++            const bool live = t0 + gb * 16 + lane < n_kv;
++            const int kps_this = kps[kk];
++            const int kg = t0 + gb * 16;                  // the group's first key
++            const global half * mb = (global const half *)((global const char *) mask_void + mask_offset);
++            const float sv8[QR] = { s[gb].s0, s[gb].s1, s[gb].s2, s[gb].s3, s[gb].s4, s[gb].s5, s[gb].s6, s[gb].s7 };
 +            _Pragma("unroll")
 +            for (int r = 0; r < QR; ++r) {
-+                const int d = qps[q0 + r] - kps[min(key[gb], n_kv - 1)];
-+                valid[gb][r] = (q0 + r < n_q) && live[gb] && d >= 0 && (window == 0 || d < window);
-+                bias[gb][r] = 0.f;
-+                mval[gb][r] = 0.f;
-+            }
-+        }
-+
-+        // ---- bias runs: a linear group reads one 16-bin run a row ----
-+        // the run's start is (d0-15) for lane 0's distance d0, ascending with the
-+        // lane; the lane whose key is at distance d0-j takes lane (15-j)'s value.
-+        // d0 outside [15, n_bins-1] (recent keys, or past the extent) is scalar.
-+        if (cg_lin) {
-+            _Pragma("unroll")
-+            for (int gb = 0; gb < NKB; ++gb) {
-+                _Pragma("unroll")
-+                for (int r = 0; r < QR; ++r) {
-+                    if (q0 + r >= n_q) continue;
-+                    const int d0 = qps[q0 + r] - kps[min(t0 + gb * 16, n_kv - 1)];
-+                    const int dmin = d0 - 15;   // the group's smallest distance
-+                    if (dmin >= n_bins - 1) continue;   // every bin is the pad: zero bias
-+                    if (d0 >= 15 && d0 <= n_bins - 1) {
-+                        const size_t base = (size_t)((q0 + r) * n_head + head) * n_bins + (d0 - 15);
-+                        const float tv = as_float(intel_sub_group_block_read((global const uint *)(table + table_offset / sizeof(float)) + base + lane));
-+                        bias[gb][r] = intel_sub_group_shuffle(tv, 15 - lane);
-+                    } else {
-+                        // a mixed group at either end: the lane's own bin, clamped
-+                        const int d = qps[q0 + r] - kps[key[gb]];
-+                        const int bin = d >= n_bins - 1 ? n_bins - 1 : (d < 0 ? n_bins - 1 : d);
-+                        bias[gb][r] = table[table_offset / sizeof(float) + (size_t)((q0 + r) * n_head + head) * n_bins + bin];
++                const bool live_row = q0 + r < n_q;
++                const int d = qps[q0 + r] - kps_this;
++                bool v = live_row && live && d >= 0 && (window == 0 || d < window);
++                float mv = 0.f;
++                if ((!cg_lin || !rg_lin) && live && live_row) {
++                    const half mh = mb[(q0 + r) * mask_nb1 / sizeof(half) + min(t0 + gb * 16 + lane, n_kv - 1)];
++                    if (as_ushort(mh) == 0xFC00) {
++                        v = false;
++                    } else if (v) {
++                        mv = (float) mh;      // after the scale, as the reference adds the mask
 +                    }
 +                }
-+            }
-+        } else {
-+            _Pragma("unroll")
-+            for (int gb = 0; gb < NKB; ++gb) {
-+                if (!live[gb]) continue;
-+                _Pragma("unroll")
-+                for (int r = 0; r < QR; ++r) {
-+                    if (!valid[gb][r]) continue;
-+                    const int d = qps[q0 + r] - kps[key[gb]];
-+                    const int bin = d >= n_bins - 1 ? n_bins - 1 : d;
-+                    bias[gb][r] = table[table_offset / sizeof(float) + (size_t)((q0 + r) * n_head + head) * n_bins + bin];
++                float bv = 0.f;
++                if (v) {
++                    if (cg_lin) {
++                        // the run: 16 distances d0-15 .. d0, d0 = this row's distance to the
++                        // group's first key (lane-uniform). Inside [15, n_bins-1] the run is
++                        // one block read at (d0-15) and the lane whose key has d0-j takes
++                        // lane 15-j's value; outside it, or all-pad, the scalar path.
++                        const int d0 = qps[q0 + r] - kps[min(kg, n_kv - 1)];
++                        if (d0 - (16 - 1) < n_bins - 1) {
++                            if (d0 >= 16 - 1 && d0 <= n_bins - 1) {
++                                const size_t base = (size_t)((q0 + r) * n_head + head) * n_bins + (d0 - 15);
++                                const float tv = as_float(intel_sub_group_block_read(
++                                    (global const uint *)(table + table_offset / sizeof(float)) + base + lane));
++                                bv = intel_sub_group_shuffle(tv, (uint) (15 - lane));
++                            } else {
++                                const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);
++                                bv = table[table_offset / sizeof(float) + (size_t)((q0 + r) * n_head + head) * n_bins + bin];
++                            }
++                        }
++                    } else {
++                        const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);
++                        bv = table[table_offset / sizeof(float) + (size_t)((q0 + r) * n_head + head) * n_bins + bin];
++                    }
 +                }
++                sc[gb][r] = v ? sv8[r] * scale_log2 + mv + LOG2E * bv : M_INIT;
 +            }
-+        }
-+
-+        // ---- mask (the general path) ----
-+        if (!cg_lin || !rg_lin) {
-+            const global half * mb = (global const half *)((global const char *) mask_void + mask_offset);
-+            _Pragma("unroll")
-+            for (int gb = 0; gb < NKB; ++gb) {
-+                if (!live[gb]) continue;
-+                _Pragma("unroll")
-+                for (int r = 0; r < QR; ++r) {
-+                    if (q0 + r >= n_q) continue;
-+                    const half mh = mb[(q0 + r) * mask_nb1 / sizeof(half) + key[gb]];
-+                    if (as_ushort(mh) == 0xFC00) valid[gb][r] = false;
-+                    else if (valid[gb][r]) mval[gb][r] = (float) mh;   // added after the scale, as the reference does
-+                }
-+            }
-+        }
-+
-+        // ---- base-2 scores, bias folded in, invalid keys at M_INIT ----
-+        _Pragma("unroll")
-+        for (int gb = 0; gb < NKB; ++gb)
-+            _Pragma("unroll")
-+            for (int r = 0; r < QR; ++r)
-+                sc[gb][r] = valid[gb][r] ? sc[gb][r] * scale_log2 + mval[gb][r] + LOG2E * bias[gb][r] : M_INIT;
-+
-+        // ---- per-row max of this lane's two keys, then a sub-group max only when
-+        //      the max moves (flash_attn_dpas2.cl:366-383) ----
-+        float smax[QR], dmax = M_INIT;
-+        _Pragma("unroll")
-+        for (int r = 0; r < QR; ++r) {
-+            smax[r] = fmax(sc[0][r], sc[1][r]);
-+            dmax = fmax(dmax, smax[r] - m[r]);
-+        }
-+        int anyg = dmax > 0.f ? 1 : 0;
-+        anyg |= intel_sub_group_shuffle_xor(anyg, 8);
-+        anyg |= intel_sub_group_shuffle_xor(anyg, 4);
-+        anyg |= intel_sub_group_shuffle_xor(anyg, 2);
-+        anyg |= intel_sub_group_shuffle_xor(anyg, 1);
-+        if (anyg) {
-+            float cv[QR];
-+            _Pragma("unroll")
-+            for (int r = 0; r < QR; ++r) {
-+                const float rowmax = sub_group_reduce_max(smax[r]);   // all lanes' keys of the row
-+                const float nm = fmax(m[r], rowmax);
-+                cv[r] = nm > m[r] ? native_exp2(m[r] - nm) : 1.f;
-+                l[r] *= cv[r];
-+                m[r] = nm;
-+            }
-+            // o[c] holds rows as components: one rescale a block, per component
-+            const float8 cvv = (float8)(cv[0], cv[1], cv[2], cv[3], cv[4], cv[5], cv[6], cv[7]);
-+            _Pragma("unroll")
-+            for (int c = 0; c < NC; ++c) o[c] *= cvv;
 +        }
 +
 +        // ---- p = exp2(s - m), f16 a lane, l the lane's partial sum ----

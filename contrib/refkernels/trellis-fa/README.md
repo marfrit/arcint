@@ -737,8 +737,9 @@ unset or wide-off build, and the port must not change decode.
        bash contrib/refkernels/trellis-fa/ocloc-check.sh <llama-tree>
 
    It compiles `flash_attn_port.cl` for `bmg-g21` (= the B60's BMG-G21) with
-   `-vc-codegen`, reads the disassembly and fails on any spill line or a GRF mode
-   other than the 128 the plan's arithmetic assumes. `ocloc compile` with
+   `-vc-codegen` and `-cl-intel-256-GRF-per-thread` (the backend's default, §GRF),
+   reads the disassembly and fails on any spill line; `OCLOC_GRF=128` checks the
+   128 arm, which must fail on scratch. `ocloc compile` with
    `-device -input -output -options` is its documented CLI (`paper`); the
    `ocloc disasm -input -dump` form and the "spill" wording in the ISA are not
    verified here (no ocloc on the recipe host), so the first card run may need to
@@ -803,6 +804,39 @@ defect first: `ggml_flash_attn_ext_add_indexed_bias` asserted upstream's
 `[n_head, n_bins, rows]` only and aborted on the port's `[n_bins, n_head, rows]`;
 the setter now accepts both, with `rows` at dim 2 in either order. It does not
 compare the port against anything - the device is the other half.
+
+### The sink folded or unfolded: the knob decides {#sink}
+
+With `GGML_OPENCL_FA_PORT` unset the Inkling graph is exactly today's: the sink
+logit is folded into every table bin (the model's `exp(s-t)/(1+sum exp(s-t))`
+identity), the op gets a zero per-head sink, and the table is bin-fastest. With
+the knob on the graph unfolds it: the table is bias only (the pad bin is then
+zero), the per-token logit rides at `src[18]`, and the port uses it as the
+initial `(m, l)`. The CPU reads `src[18]` when present, so a call the port declines
+still gets the per-token sink in the CPU fallback. The env is read once per
+process (a `getenv` in the model's graph builder, static-initialised).
+
+### GRF: 256 is the default, measured {#GRF}
+
+The offline gate (`ocloc` 26.27.1 with IGC 2.38.2, `bmg-g21`, the backend's
+options; `ocl-gate.sh`) on this kernel, three variants (base,
+`GB_PAD_KEYS_OFF=1`, `GB_SKIP_SINK`):
+
+    flash_attn_port: grf 128 simd 16 scratch 8192  -> 0/3 variants (FAIL: spill)
+    flash_attn_port: grf 256 simd 16 scratch 0     -> 3/3 variants (PASS, no calls, no retry)
+
+And the reference's own kernel, compiled from its exact SPIR-V by the same IGC
+(`ocloc compile -spirv_input -device bmg-g21 fa_kern.precise.spv`):
+
+    fa::Kern: grf_count 128, simd_size 1, scratch 2112 B (IGC's default; it spills)
+    fa::Kern, -doubleGRF: grf_count 256, no scratch entry (0)
+
+So the reference's measured 2,500-3,500 / 1,828 / 856 us came from a **spilling**
+build, and the 8-row tile with its O accumulator and DPAS operands does not fit
+128 GRF. The port defaults to 256 (`-cl-intel-256-GRF-per-thread`); the cost is
+thread occupancy, 256 halves the threads a core (640 against 1,280 on the B60,
+`exl3_ops.sycl:176`, `CL:5341`). `GGML_OPENCL_FA_PORT_GRF=128` builds the
+measured alternative, which the gate reports as spilling.
 
 `code` here: the four patches were checked against a fresh tree of the pin plus
 the 145-patch series — `git apply --check` clean for all four, and that tree
