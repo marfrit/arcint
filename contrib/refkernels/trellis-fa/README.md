@@ -1788,11 +1788,14 @@ at 64 rows. It also asserts the case counts a window must see:
 |---|---|---|---|
 | `port=1` | 11 | RUN 11, not supported 0 | RUN 0, not supported 11 |
 | of them `pad_bias=2.5` | 1 | RUN 1 | not supported 1 |
-| `port=2` (twins, today's kernels) | 5 | RUN 5 | RUN 5 |
-| of them `pad_bias=2.5` | 1 | RUN 1 | RUN 1 |
+| `port=2`, `pad_bias=0` (twins, today's kernels) | 4 | RUN 4 | RUN 4 |
+| `port=2`, `pad_bias=2.5` (the pad's twin) | 1 | not supported 1 | not supported 1 |
 
-The twins run on today's indexed-bias dispatch; a "not supported" there is that
-dispatch declining its own shape, to be reported as such. Also on this tree: the
+The twins run on today's indexed-bias dispatch. The pad's twin (2,200 keys × 24
+rows) does not: that dispatch declines an indexed bias on 9 to 64 rows
+(`reason=row-blocks`), and the card (`measured-here`, the card host) reports it
+not supported: 4 twins run. An earlier form of this table said 5; it was wrong.
+On the CPU the pad's twin is still shown to be the pad case's attention. Also on this tree: the
 gate test red rc 1 / green rc 0 (30 ACCEPT, 180 refusals), the offline gate at
 256 GRF `ocloc 8/8 variants` with scratch 0, the twins on the CPU 14 pairs OK,
 `-p "port=[12]"` 16/16. Not run: any of it on a device.
@@ -1848,3 +1851,35 @@ wider refusal, a cached query); the kernel file is the one that ran.
    work-group limit is asked at that build and kept in the context. Every call
    after the first, at `supports_op` or at the launch, reads two fields, so a
    device's first answer is its answer for the process.
+
+## The final review's points {#final}
+
+- **Which layers get the port's graph.** With the knob set and a GPU backend
+  that knows the indexed bias but not the port's sources, the model would have
+  handed it the port's table (`[n_bins, n_head, rows]`, the bias only) to read
+  as its own. The model now builds the port's graph only for a layer whose
+  backend **declares** that it reads the port's sources: it answers the name
+  `ggml_backend_flash_attn_port_sources` through its registry's
+  `get_proc_address` (`fa_port_gate.h`, `fa_port_layer_attaches`). No backend
+  is named. `supports_op` alone cannot be that test: an unaware backend's "yes"
+  is the hazard. A layer on the CPU keeps the port's graph (the CPU's kernel
+  reads both table layouts and `src[18]`), so a CPU-only run with the knob is
+  unchanged. Any other layer gets today's graph and one
+  `DOWNGRADE src=llama op=FLASH_ATTN port=off reason=layer-backend` line.
+  Red first (`measured-here`, the recipe host): `GGML_TEST_FA_PORT_GUARD=1
+  test-backend-ops -b CPU -o FLASH_ATTN_EXT` with mock registries;
+  with `GGML_TEST_FA_PORT_GUARD_RED=1` (the form before the guard) the unaware
+  GPU backend gets the sources ATTACHED and the test fails; green: not attached
+  for it, attached for a declaring backend and for the CPU.
+- **The knob-off graph has no tensor of the port's.** The eight position and
+  class inputs are created only with the knob set; unset, the graph is today's
+  node for node.
+- **The launch** runs the decision before it reads any tensor of the op.
+- **The gate test's inputs** are in the repository:
+  `fixtures/inkling-ub{512,1024,2048}.txt`, the graph exports (test-export-graph-ops
+  on the CPU, context 4,096, flash attention on) the test reads by line number.
+- **The struct growth**: `GGML_MAX_SRC` 14 → 20 and `GGML_MAX_OP_PARAMS` 64 →
+  80 add 64 bytes to every tensor, with the knob or without; it is in the
+  CHANGELOG entry and in `contrib/llama.cpp/README.md`.
+- **The reference** is listed in `THIRD_PARTY.md` (it was claimed above and
+  missing at this branch's base).

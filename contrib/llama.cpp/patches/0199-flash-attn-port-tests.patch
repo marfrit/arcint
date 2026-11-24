@@ -1,16 +1,17 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 95f9623..7c7c1d7 100644
+index 95f9623..b7c240d 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -19,6 +19,7 @@
+@@ -19,6 +19,8 @@
  #include "ggml-alloc.h"
  #include "ggml-backend.h"
  #include "ggml-cpp.h"
 +#include "../ggml/src/ggml-opencl/fa_port_gate.h"   // 0199: the port arm's gate and routing, pure (no OpenCL)
++#include "../ggml/src/ggml-backend-impl.h"          // 0199: the registry structs, for the guard test's mock backends
  
  #include <algorithm>
  #include <atomic>
-@@ -468,6 +469,11 @@ static std::string var_to_str(ggml_scale_mode mode) {
+@@ -468,6 +470,11 @@ static std::string var_to_str(ggml_scale_mode mode) {
  #define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
  #define VARS_TO_STR19(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VAR_TO_STR(a) + "," + VARS_TO_STR18(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
  #define VARS_TO_STR20(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t) VAR_TO_STR(a) + "," + VARS_TO_STR19(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)
@@ -22,7 +23,7 @@ index 95f9623..7c7c1d7 100644
  
  // accept FLT_MAX as infinity
  static bool isinf_or_max(float f) {
-@@ -9511,8 +9517,26 @@ struct test_flash_attn_ext : public test_case {
+@@ -9511,8 +9518,26 @@ struct test_flash_attn_ext : public test_case {
      const int64_t n_bins; // table->ne[1]; 0 when bias is off
      const bool sinks_zeros; // fill the sinks with zeros, as the model with a folded-in sink logit does
  
@@ -50,7 +51,7 @@ index 95f9623..7c7c1d7 100644
      }
  
      double max_nmse_err() override {
-@@ -9530,10 +9554,11 @@ struct test_flash_attn_ext : public test_case {
+@@ -9530,10 +9555,11 @@ struct test_flash_attn_ext : public test_case {
                          bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                          ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
                          bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
@@ -64,7 +65,7 @@ index 95f9623..7c7c1d7 100644
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
-@@ -9595,7 +9620,9 @@ struct test_flash_attn_ext : public test_case {
+@@ -9595,7 +9621,9 @@ struct test_flash_attn_ext : public test_case {
          ggml_tensor * bi = nullptr;
          if (bias) {
              // one row of bins per head, one query (a row of all streams, flattened in stream order) per column
@@ -75,7 +76,7 @@ index 95f9623..7c7c1d7 100644
              ggml_set_name(bt, "bt");
              bi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, q->ne[1]*q->ne[3]);
              ggml_set_name(bi, "bi");
-@@ -9605,14 +9632,163 @@ struct test_flash_attn_ext : public test_case {
+@@ -9605,14 +9633,163 @@ struct test_flash_attn_ext : public test_case {
          ggml_flash_attn_ext_add_sinks(out, s);
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_flash_attn_ext_add_indexed_bias(out, bt, bi);
@@ -239,7 +240,7 @@ index 95f9623..7c7c1d7 100644
              if (strcmp(t->name, "s") == 0) {
                  if (sinks_zeros) {
                      std::vector<float> z(ggml_nelements(t), 0.0f);
-@@ -13930,6 +14106,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13930,6 +14107,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 16448, 128, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true, 1025));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 24, {1, 8}, 1024, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
  
@@ -290,7 +291,7 @@ index 95f9623..7c7c1d7 100644
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -14279,6 +14499,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14279,6 +14500,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                              kvt.first, kvt.second));
          }
      }
@@ -317,7 +318,7 @@ index 95f9623..7c7c1d7 100644
      // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
      // 27B's geometry (head size 256, 24 query heads on 4)
      for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-@@ -15105,8 +15345,141 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
+@@ -15105,8 +15346,182 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
      return n_fail == 0;
  }
  
@@ -329,13 +330,14 @@ index 95f9623..7c7c1d7 100644
 +//   port=1, pad_bias=0 (the port's cases)     10 | RUN 10, not supported 0   | RUN 0, not supported 10
 +//   port=1, pad_bias=2.5 (the pad case)        1 | RUN 1                     | not supported 1
 +//   port=2, pad_bias=0 (the twins)             4 | RUN 4                     | RUN 4
-+//   port=2, pad_bias=2.5 (the pad's twin)      1 | RUN 1                     | RUN 1
++//   port=2, pad_bias=2.5 (the pad's twin)      1 | not supported 1           | not supported 1
 +//
-+// The port=1 rows are the port's contract (the card: 11 run with the knob, 0 not supported,
-+// the pad case among them; 11 not supported without it). The port=2 rows are today's
-+// indexed-bias dispatch on the same data, whatever the knob: a "not supported" there is
-+// that dispatch declining a shape of its own, to be reported as such. The first form of
-+// this table gave the twins as one row of 5; the card's count of 4 is the pad_bias=0 row.
++// The port=1 rows are the port's contract. The port=2 rows are today's indexed-bias
++// dispatch on the same data, whatever the knob. The pad's twin is 2,200 keys x 24 rows, and
++// today's dispatch declines an indexed bias on 9 to 64 rows (reason=row-blocks: its row
++// blocks would cut the rows without cutting the table), so it is "not supported" on the
++// card, as measured there: 4 twins run. Its CPU run still proves the twin is the same
++// attention as the pad case (GGML_TEST_FA_PORT_TWINS=1).
 +static const int FA_PORT_EVAL_PORT1     = 11;
 +static const int FA_PORT_EVAL_PORT1_PAD = 1;
 +static const int FA_PORT_EVAL_PORT2     = 5;       // 4 with pad_bias=0 and the pad's twin
@@ -387,6 +389,43 @@ index 95f9623..7c7c1d7 100644
 +           counts ? "as the table says" : "FAIL, the table above is stale");
 +    printf("  port decisions%s: %s\n", red ? " (the old dispatch order)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
 +    return n_fail == 0 && counts;
++}
++
++// 0199: GGML_TEST_FA_PORT_GUARD=1 (no device needed): which layer backends get the port's
++// graph (fa_port_gate.h: fa_port_layer_attaches). Mock registries stand for the backends:
++// a GPU backend that knows nothing of the port (it answers no capability name - and would
++// say "supported" to any indexed-bias FLASH_ATTN_EXT, reading the table its own way), one
++// that declares the capability, and the CPU (no device). GGML_TEST_FA_PORT_GUARD_RED=1 asks
++// in the form before the guard: the unaware backend then gets the sources, and the test fails.
++static bool test_fa_port_guard() {
++    const bool red = getenv("GGML_TEST_FA_PORT_GUARD_RED") != nullptr;
++    struct mock {
++        static const char * name(ggml_backend_reg_t) { return "mock"; }
++        static size_t count(ggml_backend_reg_t) { return 1; }
++        static ggml_backend_dev_t dev(ggml_backend_reg_t, size_t) { return nullptr; }
++        static void * proc_none(ggml_backend_reg_t, const char *) { return nullptr; }
++        static void * proc_port(ggml_backend_reg_t, const char * n) {
++            static int declares = 1;
++            return strcmp(n, FA_PORT_CAPABILITY_PROC) == 0 ? (void *) &declares : nullptr;
++        }
++    };
++    ggml_backend_reg reg_unaware = { GGML_BACKEND_API_VERSION, { mock::name, mock::count, mock::dev, mock::proc_none }, nullptr };
++    ggml_backend_reg reg_port    = { GGML_BACKEND_API_VERSION, { mock::name, mock::count, mock::dev, mock::proc_port }, nullptr };
++    ggml_backend_device dev_unaware = {}; dev_unaware.reg = &reg_unaware;
++    ggml_backend_device dev_port    = {}; dev_port.reg    = &reg_port;
++    struct { const char * what; ggml_backend_dev_t dev; int want; } rows[] = {
++        { "a GPU backend that does not declare the port's sources", &dev_unaware, 0 },
++        { "a backend that declares them",                           &dev_port,    1 },
++        { "a layer on the CPU (no device)",                         nullptr,      1 },
++    };
++    int n_fail = 0;
++    for (auto & r : rows) {
++        const int got = fa_port_layer_attaches(r.dev, red ? 0 : 1);
++        printf("  %s: the port's sources %s: %s\n", r.what, got ? "ATTACHED" : "not attached (today's graph)", got == r.want ? "OK" : "FAIL");
++        n_fail += got != r.want;
++    }
++    printf("  port guard%s: %s\n", red ? " (the form before the guard)" : "", n_fail ? "FAIL" : "OK");
++    return n_fail == 0;
 +}
 +
 +// 0199: GGML_TEST_FA_PORT_TWINS=1: a port case (port=1) and its twins (port=2, both layouts)
@@ -455,6 +494,9 @@ index 95f9623..7c7c1d7 100644
 +    }
 +    if (getenv("GGML_TEST_FA_PORT_DECISIONS") != nullptr) {
 +        return test_fa_port_decisions();
++    }
++    if (getenv("GGML_TEST_FA_PORT_GUARD") != nullptr) {
++        return test_fa_port_guard();
 +    }
      auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
          if (params_filter == nullptr) {

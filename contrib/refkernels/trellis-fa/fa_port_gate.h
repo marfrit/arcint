@@ -20,6 +20,7 @@
 #define FA_PORT_GATE_H
 
 #include <ggml.h>
+#include <ggml-backend.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -160,6 +161,23 @@ static inline int fa_port_gate_op(const struct ggml_tensor * op, size_t buf_alig
                             op->src[FA_PORT_SRC_CFLAG], op->src[FA_PORT_SRC_RFLAG],
                             buf_align, wg_max, is_intel, fa_port_op_paged(op), flag != 0,
                             max_bias, softcap, window, why_out);
+}
+
+// Which layer gets the port's graph. An op with the port's sources has a table of another
+// layout ([n_bins, n_head, rows], the bias only) and its sink at src[18]; a backend that
+// knows the indexed bias but not these sources would answer supports_op "yes" and read the
+// table its own way - asking supports_op cannot tell that backend from one that serves the
+// port, because the unaware "yes" is the hazard. So a backend DECLARES that it reads the
+// port's sources, by answering this name through its registry's get_proc_address (any
+// non-null pointer); supports_op then decides each op as before. No backend is named here.
+// dev == NULL is a layer on the CPU, whose kernel reads both table layouts and src[18]: the
+// CPU-only run keeps the port's graph. guard = 0 is the form before this rule (every
+// device gets the sources): the unit test's red.
+#define FA_PORT_CAPABILITY_PROC "ggml_backend_flash_attn_port_sources"
+static inline int fa_port_layer_attaches(ggml_backend_dev_t dev, int guard) {
+    if (dev == NULL || !guard) return 1;
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    return reg != NULL && ggml_backend_reg_get_proc_address(reg, FA_PORT_CAPABILITY_PROC) != NULL;
 }
 
 // The dispatch's block split of a 9 to 64-row call (rows are independent for the kernels it

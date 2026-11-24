@@ -23,7 +23,8 @@
 // and this test must fail on 222 / 223 with "layout" (the card's the first card window decline).
 //
 //   g++ -O2 -I <llama-tree>/ggml/include -I <llama-tree>/ggml/src/ggml-opencl port_gate_test.cpp -o port_gate_test
-//   ./port_gate_test inkling-ub512.txt inkling-ub1024.txt inkling-ub2048.txt
+//   ./port_gate_test fixtures/inkling-ub512.txt fixtures/inkling-ub1024.txt fixtures/inkling-ub2048.txt
+// (the fixtures are the model's graph exports: test-export-graph-ops on the CPU, context 4,096, flash attention on)
 #include "fa_port_gate.h"
 
 #include <cstdio>

@@ -9863,6 +9863,51 @@ GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
   not themselves show the path was taken, although the `llama-bench` runs on the same binary and
   env do. Inkling's ub 512 logits arm (gate step (f) as written) was not run. Owed: a `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` perplexity run, or a per-call counter.
 
+## 0193-flash-attn-port-op-sources.patch / 0194-flash-attn-port-sink-positions.patch / 0198-opencl-flash-attn-port-kernel.patch / 0199-flash-attn-port-tests.patch
+
+Inkling 2 Mini's prompt attention after trellis-serve's `fa::Kern<128>` (MIT; `THIRD_PARTY.md`), as an opt-in arm of the
+OpenCL backend: `GGML_OPENCL_FA_PORT=1`. Unset, the dispatch and the model's graph are what they were. The full record -
+the reference kernel, the plan, each card run, the reviews and the design of the next step - is
+`contrib/refkernels/trellis-fa/README.md`.
+
+- **0193** (`ggml.h`, `ggml-impl.h`, `ggml.c`): the op's new sources and their setters - `kpos` / `qpos` (I32), one class a
+  16-key group and one flag a 8-row group (I8), the per-query sink logits (F32 `[n_head, rows]`, src 18) and the window
+  (op param 16). `GGML_MAX_SRC` 14 -> 20 and `GGML_MAX_OP_PARAMS` 64 -> 80: **64 bytes more a tensor, with the knob or
+  without**. The indexed-bias setter accepts the table as `[n_bins, n_head, rows]` too.
+- **0194** (`ops.cpp`, `llama-graph.*`, `llama-kv-cache.*`, `inkling2.cpp`): for a prompt batch (flash attention, causal,
+  the standard window, more than 8 rows, one stream) on a layer whose backend declares the port's sources, the sink is
+  not folded into the table (the table is the bias only, bin-fastest as the MUL_MAT emits it) and rides as src 18; the
+  kv-cache walk fills the positions and classes; the sources are on the op before the backend's `supports_op` is asked.
+  The CPU's kernel reads both table layouts and the per-query sink. Any other graph is today's.
+- **0198** (`fa_port_gate.h`, `ggml-opencl.cpp`, `kernels/flash_attn_port.cl`): the gate as pure functions (the strides the
+  kernel indexes, the 2D block read's alignment, the work-group, the paged forms refused), one decision for `supports_op`
+  and the launch, the port taken first in the dispatch, a bounds check of every buffer under `GGML_OPENCL_BOUNDS=1`, a
+  DOWNGRADE line a refusal, one TAKEN line a process. The kernel: one sub-group a (head, 8-row) tile over 32-key blocks,
+  K/V by 2D block reads, a class a key group and a skip a block, the bias run as one block read and a shuffle, the pad
+  bin read once a tile, the online softmax with the sink as its initial state, Q held in registers at 256 GRF.
+- **0199** (`test-backend-ops.cpp`): the port's cases in the model's layout (the graph export's prompt lines), their twins
+  for the indexed-bias kernels of today on the same data, the pad case, the perf rows, and three device-free checks
+  (`GGML_TEST_FA_PORT_TWINS`, `_DECISIONS`, `_GUARD`), each with a red.
+
+Knobs: `GGML_OPENCL_FA_PORT` (the arm), `_GRF=128|256` (256), `_QHOIST`, `_QF32`, `_SKIP`, `_UNIFORM`, `_QTW`,
+`_RED=1|2|4` (each must fail), `_PROBE=nobias` (a timing probe with wrong answers).
+
+`measured-here`, the card host, B60 at 165 W. The op, us a call, window 1,024, 24 heads on 8, head 128, 1,025 bins:
+
+| shape | the port, 256 GRF | the kernel it replaces (the twin) |
+|---|---|---|
+| q512 x kv1536 | 746 | 2,263 |
+| q2048 x kv2048 | 2,092 | 9,577 |
+| q2048 x kv3072 | 2,926 | 12,645 |
+
+Inkling pp4096, t/s, the port off / on: 769.2 / 909.8 (ub 512), 816.0 / 973.9 (ub 1024), 763.9 / 980.8 (ub 2048), 749.5 /
+975.7 (ub 4096). Mean KL at ub 1024 against the CPU base 0.001917 -> 0.001965, top p 98.40 -> 98.47 %. The op suite is
+complete with the knob on (3,190 cases) and off (3,179); the reds fail every case they run; with the knob unset three
+models match the development build. Not through a release gate.
+
+Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
+(`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
+
 ## 0208-test-backend-ops-inkling-expert-projection-perf.patch
 
 The expert DOWN projection next to the fused GATE_UP as perf cases, so one card run compares them, plus

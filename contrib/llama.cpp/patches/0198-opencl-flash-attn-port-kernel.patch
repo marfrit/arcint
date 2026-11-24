@@ -12,10 +12,10 @@ index a1c914b..63a481f 100644
      sum_rows
 diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
 new file mode 100644
-index 0000000..460efe6
+index 0000000..05bbf35
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/fa_port_gate.h
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,219 @@
 +// fa_port_gate.h - the port arm's eligibility, as one pure function (no OpenCL call, no
 +// backend state), so a CPU test can feed it a graph export's own lines.
 +//
@@ -38,6 +38,7 @@ index 0000000..460efe6
 +#define FA_PORT_GATE_H
 +
 +#include <ggml.h>
++#include <ggml-backend.h>
 +#include <stdint.h>
 +#include <string.h>
 +
@@ -180,6 +181,23 @@ index 0000000..460efe6
 +                            max_bias, softcap, window, why_out);
 +}
 +
++// Which layer gets the port's graph. An op with the port's sources has a table of another
++// layout ([n_bins, n_head, rows], the bias only) and its sink at src[18]; a backend that
++// knows the indexed bias but not these sources would answer supports_op "yes" and read the
++// table its own way - asking supports_op cannot tell that backend from one that serves the
++// port, because the unaware "yes" is the hazard. So a backend DECLARES that it reads the
++// port's sources, by answering this name through its registry's get_proc_address (any
++// non-null pointer); supports_op then decides each op as before. No backend is named here.
++// dev == NULL is a layer on the CPU, whose kernel reads both table layouts and src[18]: the
++// CPU-only run keeps the port's graph. guard = 0 is the form before this rule (every
++// device gets the sources): the unit test's red.
++#define FA_PORT_CAPABILITY_PROC "ggml_backend_flash_attn_port_sources"
++static inline int fa_port_layer_attaches(ggml_backend_dev_t dev, int guard) {
++    if (dev == NULL || !guard) return 1;
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    return reg != NULL && ggml_backend_reg_get_proc_address(reg, FA_PORT_CAPABILITY_PROC) != NULL;
++}
++
 +// The dispatch's block split of a 9 to 64-row call (rows are independent for the kernels it
 +// feeds: it re-enters the dispatch with stack copies of the op, 8 rows each). The predicate
 +// is here so that the dispatch and the routing test below share it.
@@ -218,7 +236,7 @@ index 0000000..460efe6
 +#endif
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index df2ec85..faf666f 100644
+index df2ec85..239983e 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -8,6 +8,7 @@
@@ -438,7 +456,20 @@ index df2ec85..faf666f 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26014,6 +26196,191 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+@@ -18778,6 +18960,12 @@ static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q,
+ }
+ 
+ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, FA_PORT_CAPABILITY_PROC) == 0) {
++        // 0198: this backend reads the port arm's sources (fa_port_gate.h); the pointer is a
++        // declaration, not something to call
++        static const int declares = 1;
++        return (void *) &declares;
++    }
+     if (strcmp(name, "ggml_backend_opencl_topk_moe_sigmoid_fused_count") == 0) {
+         return (void *) ggml_backend_opencl_topk_moe_sigmoid_fused_count;
+     }
+@@ -26014,6 +26202,194 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
      // the clReleaseMemObject -38 abort of window 280 (the 2-layer case's SoA host store)
  }
  
@@ -449,11 +480,8 @@ index df2ec85..faf666f 100644
 +static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
 +    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
 +    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
-+    const int n_q = (int) q->ne[1], n_kv = (int) k->ne[1], d_head_q = (int) q->ne[0];
-+    const int n_head = (int) q->ne[2], n_head_kv = (int) k->ne[2];
-+    const cl_ulong mask_nb1 = mask->nb[1];
-+    const float scale = ((const float *) dst->op_params)[0];
 +    {
++        // first, before any tensor is read: the decision supports_op made, asserted
 +        const char * why = nullptr;
 +        if (!ggml_cl_port_decide(backend_ctx, dst, &why)) {
 +            // the op as the launch has it, so a disagreement can be read off the log
@@ -469,6 +497,12 @@ index df2ec85..faf666f 100644
 +            shape("kpos", dst->src[GGML_FA_SRC_KPOS]); shape("qpos", dst->src[GGML_FA_SRC_QPOS]);
 +            GGML_ABORT("op=FLASH_ATTN port: the launch was handed an op supports_op did not accept");
 +        }
++    }
++    const int n_q = (int) q->ne[1], n_kv = (int) k->ne[1], d_head_q = (int) q->ne[0];
++    const int n_head = (int) q->ne[2], n_head_kv = (int) k->ne[2];
++    const cl_ulong mask_nb1 = mask->nb[1];
++    const float scale = ((const float *) dst->op_params)[0];
++    {
 +        cl_kernel kp = backend_ctx->kernel_fa_port;
 +        cl_kernel kq16 = backend_ctx->kernel_fa_port_q16;
 +        const int G = n_head / n_head_kv;
@@ -630,7 +664,7 @@ index df2ec85..faf666f 100644
  static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
      const ggml_tensor * v = dst->src[2];
      const ggml_tensor * mask = dst->src[3];
-@@ -26033,6 +26400,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26033,6 +26409,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -644,7 +678,7 @@ index df2ec85..faf666f 100644
      // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
  
      const int n_q = q->ne[1];
-@@ -26277,6 +26651,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26277,6 +26660,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      {
          static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
          static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
@@ -657,7 +691,7 @@ index df2ec85..faf666f 100644
          if (rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
              q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
              for (int r0 = 0; r0 < n_q; r0 += 8) {
-@@ -26482,6 +26862,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26482,6 +26871,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));

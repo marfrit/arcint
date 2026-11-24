@@ -22,6 +22,20 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 Card-proven, not yet through a release gate. Each item names its card evidence (`measured-here`, B60 / B70 at 165 / 220 W caps).
 
+- **Inkling 2 Mini prompt attention after trellis-serve's `fa::Kern` (opt-in, `GGML_OPENCL_FA_PORT=1`; patches 0193,
+  0194, 0198, 0199).** One sub-group a (head, 8-row) tile over 32-key blocks, K/V read in place by 2D block reads, the
+  relative bias read as a run of 16 bins, the sink as the initial softmax state, and the keys a tile visits bounded a
+  block from the positions. For a prompt batch (more than 8 rows, causal, the standard window) on a layer whose backend
+  declares the port's sources; a decode step and every graph with the knob unset are today's. `measured-here`, the card
+  host, B60 at 165 W: the op at 746 / 2,092 / 2,926 us a call (q512 x kv1536, q2048 x kv2048, q2048 x kv3072) against
+  2,263 / 9,577 / 12,645 for the kernel it replaces; Inkling pp4096, port off / on, 769.2 / 909.8 t/s at ub 512, 816.0 /
+  973.9 at ub 1024, 763.9 / 980.8 at ub 2048, 749.5 / 975.7 at ub 4096 (+18.3, +19.4, +28.4, +30.2 %); mean KL at ub 1024
+  against the CPU base 0.001917 -> 0.001965, top p 98.40 -> 98.47 %; the op suite complete with the knob on and off;
+  with the knob unset three models match the development build. **Every tensor grows by 64 bytes**: `GGML_MAX_SRC`
+  14 -> 20 (the positions, group classes and per-query sinks at src 14-18) and `GGML_MAX_OP_PARAMS` 64 -> 80 (the
+  window), whatever the knob. The record, the reference kernel and the design of the next step are in
+  `contrib/refkernels/trellis-fa/README.md`; the reference is listed in `THIRD_PARTY.md`.
+
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
   three norm clips as one op (`GGML_OP_NORM_CLIP`). Inkling on the B60, three interleaved rounds: decode 36.59 -> 38.93 t/s
