@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 95f9623..ad4ad5b 100644
+index 95f9623..7c7c1d7 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -19,6 +19,7 @@
@@ -317,7 +317,7 @@ index 95f9623..ad4ad5b 100644
      // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
      // 27B's geometry (head size 256, 24 query heads on 4)
      for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-@@ -15105,8 +15345,139 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
+@@ -15105,8 +15345,141 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
      return n_fail == 0;
  }
  
@@ -325,18 +325,20 @@ index 95f9623..ad4ad5b 100644
 +// window can assert equality instead of reading "0 FAIL" (a case that never ran is not a
 +// pass). test_fa_port_decisions() checks these numbers against the case list itself.
 +//
-+//   class                              cases | GGML_OPENCL_FA_PORT=1        | knob unset
-+//   port=1 (the port's cases)             11 | RUN 11, not supported 0      | RUN 0, not supported 11
-+//     of them pad_bias=2.5 (the pad case)  1 | RUN 1                        | not supported 1
-+//   port=2 (the twins, today's kernels)    5 | RUN 5, not supported 0      | RUN 5, not supported 0
-+//     of them pad_bias=2.5                 1 | RUN 1                        | RUN 1
++//   class                                  cases | GGML_OPENCL_FA_PORT=1     | knob unset
++//   port=1, pad_bias=0 (the port's cases)     10 | RUN 10, not supported 0   | RUN 0, not supported 10
++//   port=1, pad_bias=2.5 (the pad case)        1 | RUN 1                     | not supported 1
++//   port=2, pad_bias=0 (the twins)             4 | RUN 4                     | RUN 4
++//   port=2, pad_bias=2.5 (the pad's twin)      1 | RUN 1                     | RUN 1
 +//
-+// The port=1 rows are the port's contract. The port=2 rows are today's indexed-bias
-+// dispatch on the same data: a "not supported" there is that dispatch declining a shape
-+// of its own, to be reported as such.
++// The port=1 rows are the port's contract (the card: 11 run with the knob, 0 not supported,
++// the pad case among them; 11 not supported without it). The port=2 rows are today's
++// indexed-bias dispatch on the same data, whatever the knob: a "not supported" there is
++// that dispatch declining a shape of its own, to be reported as such. The first form of
++// this table gave the twins as one row of 5; the card's count of 4 is the pad_bias=0 row.
 +static const int FA_PORT_EVAL_PORT1     = 11;
 +static const int FA_PORT_EVAL_PORT1_PAD = 1;
-+static const int FA_PORT_EVAL_PORT2     = 5;
++static const int FA_PORT_EVAL_PORT2     = 5;       // 4 with pad_bias=0 and the pad's twin
 +static const int FA_PORT_EVAL_PORT2_PAD = 1;
 +
 +static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();

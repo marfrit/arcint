@@ -1692,9 +1692,11 @@ off / on):
 
 Answer level, ub 1024 against the CPU base: mean KL 0.001917 (off) → 0.001965
 (on), top p 98.40 → 98.47: inside the bar (≤ 0.03 nats worse, top p down ≤ 1
-point). ub 1: identical (the port's graph needs more than 8 rows). The TAKEN line
-was printed. Those runs were on the branch before this rebase and before the
-three changes below; **the kernel as it stands here has not run on a card.**
+point). A ub 1 run is identical with the knob on and off, which is **no evidence
+for the port**: its graph needs more than 8 rows, so at ub 1 the port serves
+nothing. The evidence is ub 1024 and the op suite. The TAKEN line was printed.
+Those runs were on the branch before this rebase; the runs on this tree are in
+§card-final below.
 
 ## The should-fixes of the round-2 review
 
@@ -1794,3 +1796,55 @@ dispatch declining its own shape, to be reported as such. Also on this tree: the
 gate test red rc 1 / green rc 0 (30 ACCEPT, 180 refusals), the offline gate at
 256 GRF `ocloc 8/8 variants` with scratch 0, the twins on the CPU 14 pairs OK,
 `-p "port=[12]"` 16/16. Not run: any of it on a device.
+
+## The card on the rebased tree, and the narrow review's three lows {#card-final}
+
+**What ran** (measured-here, the card host, B60 at its 165 W cap, the tree with
+the port taken first and patch 0187 on both arms):
+
+- The op suite completes with the knob on (3,190 of 3,190) and off (3,179 of
+  3,179). The port's eleven cases run with the knob and are "not supported"
+  without it; the pad case runs; the four `pad_bias=0` twins run. RED=1 fails
+  11 of 11, RED=2 11 of 11, RED=4 the pad case.
+- Knob unset against the development build, on three models: pp inside the
+  run-to-run spread, KL 0, top p 100 %: the knob-off dispatch is today's.
+- Op times as the round-2 kernel's: the pad read costs nothing measurable.
+- The model, pp4096, t/s, the port off / on:
+
+  | ub | off | on | |
+  |---|---|---|---|
+  | 512 | 769.2 | 909.8 | +18.3 % |
+  | 1024 | 816.0 | 973.9 | +19.4 % |
+  | 2048 | 763.9 | 980.8 | +28.4 % |
+  | 4096 | 749.5 | 975.7 | +30.2 % |
+
+  (The off arm is faster than in the first model run above because 0187 is in
+  it; the on arm is the same.)
+- Answer level, ub 1024 against the CPU base: mean KL 0.001917 (off) → 0.001965
+  (on), top p 98.40 → 98.47 %: inside the bar. ub 1 does not exercise the port.
+
+The changes below came after that run and are host-side only (a log line, a
+wider refusal, a cached query); the kernel file is the one that ran.
+
+**The three lows of the narrow review.**
+
+1. *The launch abort printed only the reason.* It now logs the type, `ne`, `nb`
+   and view offset of q, k, v, mask, dst, the table, the sinks and the positions
+   before it aborts.
+2. *`fa_port_op_paged` looked at three of the paged form's seven source slots.*
+   It now refuses an op that names any of them (the page table, its plan and tag,
+   the ring K/V, the host K/V; `reason=paged`): the port reads K/V in place from
+   `src[1]` / `src[2]` and nothing else. Red first (`measured-here`, the recipe
+   host): the gate test built with `-DFA_PORT_GATE_RED_PAGED` (the three-slot
+   form) fails on slots 6, 7, 9 and 10 of each prompt line; green refuses all
+   seven.
+3. *`ggml_cl_port_decide` builds the kernel lazily and asked the work-group a
+   call.* Not moved to device init: this backend builds its kernels on first use
+   throughout, and an init-time build would compile the port for every process
+   that sets the knob whether or not a port call ever arrives. Instead the
+   reason it is harmless is made true by construction and written at the
+   function: the kernel is built at most once a device (a failure is remembered
+   like a success), from one source with options read once a process, and its
+   work-group limit is asked at that build and kept in the context. Every call
+   after the first, at `supports_op` or at the launch, reads two fields, so a
+   device's first answer is its answer for the process.

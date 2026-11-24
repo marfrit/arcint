@@ -107,21 +107,34 @@ static inline int fa_port_gate_why(
 // the op's slots and params the port reads (ggml-impl.h's GGML_FA_SRC_* / GGML_FA_PARAM_*;
 // repeated here so this header needs ggml.h only, and checked against them where both are seen)
 enum {
-    FA_PORT_SRC_PAGES = 5, FA_PORT_SRC_TAG = 8, FA_PORT_SRC_PLAN = 11,
+    FA_PORT_SRC_PAGES = 5, FA_PORT_SRC_RING_K = 6, FA_PORT_SRC_RING_V = 7, FA_PORT_SRC_TAG = 8,
+    FA_PORT_SRC_HOST_K = 9, FA_PORT_SRC_HOST_V = 10, FA_PORT_SRC_PLAN = 11,
     FA_PORT_SRC_TABLE = 12, FA_PORT_SRC_IDX = 13, FA_PORT_SRC_KPOS = 14, FA_PORT_SRC_QPOS = 15,
     FA_PORT_SRC_CFLAG = 16, FA_PORT_SRC_RFLAG = 17, FA_PORT_SRC_SINK_Q = 18,
     FA_PORT_PARAM_BIAS_FLAG = 15, FA_PORT_PARAM_WINDOW = 16,
 };
 #ifdef GGML_FA_SRC_SINK_Q
-#if GGML_FA_SRC_PAGES != 5 || GGML_FA_SRC_TAG != 8 || GGML_FA_SRC_PLAN != 11 || GGML_FA_SRC_BIAS_TABLE != 12 || \
+#if GGML_FA_SRC_PAGES != 5 || GGML_FA_SRC_RING_K != 6 || GGML_FA_SRC_RING_V != 7 || GGML_FA_SRC_TAG != 8 || \
+    GGML_FA_SRC_HOST_K != 9 || GGML_FA_SRC_HOST_V != 10 || GGML_FA_SRC_PLAN != 11 || GGML_FA_SRC_BIAS_TABLE != 12 || \
     GGML_FA_SRC_BIAS_IDX != 13 || GGML_FA_SRC_KPOS != 14 || GGML_FA_SRC_QPOS != 15 || GGML_FA_SRC_CFLAG != 16 || \
     GGML_FA_SRC_RFLAG != 17 || GGML_FA_SRC_SINK_Q != 18 || GGML_FA_PARAM_BIAS_FLAG != 15 || GGML_FA_PARAM_WINDOW != 16
 #error "fa_port_gate.h's slots are not ggml-impl.h's"
 #endif
 #endif
 
+// any source of the paged K/V forms: the page table, its plan and tag, and the ring and
+// host stores they read from. The port reads K/V in place from src[1] / src[2] only, so an
+// op that names any of them is not the port's. (FA_PORT_GATE_RED_PAGED: the first form,
+// which looked at three of the seven slots - the unit test's red run.)
 static inline int fa_port_op_paged(const struct ggml_tensor * op) {
+#ifdef FA_PORT_GATE_RED_PAGED
     return op->src[FA_PORT_SRC_PAGES] != NULL || op->src[FA_PORT_SRC_PLAN] != NULL || op->src[FA_PORT_SRC_TAG] != NULL;
+#else
+    for (int i = FA_PORT_SRC_PAGES; i <= FA_PORT_SRC_PLAN; ++i) {
+        if (op->src[i] != NULL) return 1;
+    }
+    return 0;
+#endif
 }
 
 // a call carries the port's sources: an indexed bias and the per-query sinks. Such a call is

@@ -12,10 +12,10 @@ index a1c914b..63a481f 100644
      sum_rows
 diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
 new file mode 100644
-index 0000000..673211a
+index 0000000..460efe6
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/fa_port_gate.h
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,201 @@
 +// fa_port_gate.h - the port arm's eligibility, as one pure function (no OpenCL call, no
 +// backend state), so a CPU test can feed it a graph export's own lines.
 +//
@@ -125,21 +125,34 @@ index 0000000..673211a
 +// the op's slots and params the port reads (ggml-impl.h's GGML_FA_SRC_* / GGML_FA_PARAM_*;
 +// repeated here so this header needs ggml.h only, and checked against them where both are seen)
 +enum {
-+    FA_PORT_SRC_PAGES = 5, FA_PORT_SRC_TAG = 8, FA_PORT_SRC_PLAN = 11,
++    FA_PORT_SRC_PAGES = 5, FA_PORT_SRC_RING_K = 6, FA_PORT_SRC_RING_V = 7, FA_PORT_SRC_TAG = 8,
++    FA_PORT_SRC_HOST_K = 9, FA_PORT_SRC_HOST_V = 10, FA_PORT_SRC_PLAN = 11,
 +    FA_PORT_SRC_TABLE = 12, FA_PORT_SRC_IDX = 13, FA_PORT_SRC_KPOS = 14, FA_PORT_SRC_QPOS = 15,
 +    FA_PORT_SRC_CFLAG = 16, FA_PORT_SRC_RFLAG = 17, FA_PORT_SRC_SINK_Q = 18,
 +    FA_PORT_PARAM_BIAS_FLAG = 15, FA_PORT_PARAM_WINDOW = 16,
 +};
 +#ifdef GGML_FA_SRC_SINK_Q
-+#if GGML_FA_SRC_PAGES != 5 || GGML_FA_SRC_TAG != 8 || GGML_FA_SRC_PLAN != 11 || GGML_FA_SRC_BIAS_TABLE != 12 || \
++#if GGML_FA_SRC_PAGES != 5 || GGML_FA_SRC_RING_K != 6 || GGML_FA_SRC_RING_V != 7 || GGML_FA_SRC_TAG != 8 || \
++    GGML_FA_SRC_HOST_K != 9 || GGML_FA_SRC_HOST_V != 10 || GGML_FA_SRC_PLAN != 11 || GGML_FA_SRC_BIAS_TABLE != 12 || \
 +    GGML_FA_SRC_BIAS_IDX != 13 || GGML_FA_SRC_KPOS != 14 || GGML_FA_SRC_QPOS != 15 || GGML_FA_SRC_CFLAG != 16 || \
 +    GGML_FA_SRC_RFLAG != 17 || GGML_FA_SRC_SINK_Q != 18 || GGML_FA_PARAM_BIAS_FLAG != 15 || GGML_FA_PARAM_WINDOW != 16
 +#error "fa_port_gate.h's slots are not ggml-impl.h's"
 +#endif
 +#endif
 +
++// any source of the paged K/V forms: the page table, its plan and tag, and the ring and
++// host stores they read from. The port reads K/V in place from src[1] / src[2] only, so an
++// op that names any of them is not the port's. (FA_PORT_GATE_RED_PAGED: the first form,
++// which looked at three of the seven slots - the unit test's red run.)
 +static inline int fa_port_op_paged(const struct ggml_tensor * op) {
++#ifdef FA_PORT_GATE_RED_PAGED
 +    return op->src[FA_PORT_SRC_PAGES] != NULL || op->src[FA_PORT_SRC_PLAN] != NULL || op->src[FA_PORT_SRC_TAG] != NULL;
++#else
++    for (int i = FA_PORT_SRC_PAGES; i <= FA_PORT_SRC_PLAN; ++i) {
++        if (op->src[i] != NULL) return 1;
++    }
++    return 0;
++#endif
 +}
 +
 +// a call carries the port's sources: an indexed bias and the per-query sinks. Such a call is
@@ -205,7 +218,7 @@ index 0000000..673211a
 +#endif
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index df2ec85..a232d9c 100644
+index df2ec85..faf666f 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -8,6 +8,7 @@
@@ -224,7 +237,7 @@ index df2ec85..a232d9c 100644
  static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
  static void ggml_cl_downgrade(const char * fmt, ...) {
      char buf[256];
-@@ -1499,6 +1501,11 @@ struct ggml_backend_opencl_context {
+@@ -1499,6 +1501,12 @@ struct ggml_backend_opencl_context {
      // flash_attn_dpas2.cl (Xe2): K/V by 2D block reads, Q as f16 re-read a tile
      cl_kernel kernel_fa_dpas2_dk[3] = {}, kernel_fa_dpas2_carry_dk[3] = {}, kernel_fa_q_to_f16_dk[3] = {};
      cl_kernel kernel_fa_mask_cls = nullptr;       // the mask by 8 x 32 blocks (flash_attn_dpas2.cl)
@@ -233,10 +246,11 @@ index df2ec85..a232d9c 100644
 +    cl_program program_fa_port = nullptr;
 +    bool fa_port_tried = false;
 +    int  fa_port_grf = 0, fa_port_qhoist = 0, fa_port_qf32 = 0, fa_port_skip = 1, fa_port_uniform = 1, fa_port_nobias = 0;
++    size_t fa_port_wg = 0;   // the port kernel's work-group limit, asked once when it is built
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
      // 0106: the build options of the head-256 prompt kernels, so that the
      // head-512 builds made on first use match them (sub-group, sub-groups a
-@@ -13094,6 +13101,155 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+@@ -13094,6 +13102,160 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
      return true;
  }
  
@@ -260,21 +274,23 @@ index df2ec85..a232d9c 100644
 +
 +// THE decision whether the port serves an op that carries its sources. supports_op and the
 +// launch both call this, and neither has a rule of its own: the pure gate on the op
-+// (fa_port_gate.h), then what only the device knows - the kernel is built, and one tile's
-+// work-group fits it.
++// (fa_port_gate.h), then the two facts only the device has - the kernel is built, and one
++// tile's work-group fits it.
++// Those two are not pure, and are the same answer every time: the kernel is built at most
++// once a device (ggml_cl_port_kernel remembers a failure as well as a success), from one
++// source with options read once a process, and its work-group limit is asked at that build
++// and kept. The first call pays the compile; every later call, at supports_op or at the
++// launch, reads the two fields. A device's first answer is its answer for the process.
 +static bool ggml_cl_port_decide(ggml_backend_opencl_context * backend_ctx, const struct ggml_tensor * op, const char ** why) {
 +    if (!fa_port_gate_op(op, (size_t) backend_ctx->alignment, backend_ctx->max_workgroup_size,
 +                         backend_ctx->gpu_family == INTEL, why)) {
 +        return false;
 +    }
-+    cl_kernel kport = ggml_cl_port_kernel(backend_ctx);
-+    if (kport == nullptr || backend_ctx->kernel_fa_port_q16 == nullptr) {
++    if (ggml_cl_port_kernel(backend_ctx) == nullptr || backend_ctx->kernel_fa_port_q16 == nullptr) {
 +        *why = "not-built";
 +        return false;
 +    }
-+    size_t wg = 0;
-+    CL_CHECK(clGetKernelWorkGroupInfo(kport, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
-+    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) > wg) {
++    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) > backend_ctx->fa_port_wg) {
 +        *why = "no-fit";
 +        return false;
 +    }
@@ -377,6 +393,9 @@ index df2ec85..a232d9c 100644
 +        ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s what=%s", "kernel", "kernel_flash_attn_port");
 +        return nullptr;
 +    }
++    size_t wg = 0;
++    CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
++    backend_ctx->fa_port_wg = wg;
 +    backend_ctx->program_fa_port = p;
 +    backend_ctx->kernel_fa_port = k;
 +    backend_ctx->kernel_fa_port_q16 = k16;
@@ -392,7 +411,7 @@ index df2ec85..a232d9c 100644
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -13641,6 +13797,26 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13641,6 +13803,26 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
              // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
              // the prompt kernels have no bias yet, so those shapes go to ggml
@@ -419,7 +438,7 @@ index df2ec85..a232d9c 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26014,6 +26190,182 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+@@ -26014,6 +26196,191 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
      // the clReleaseMemObject -38 abort of window 280 (the 2-layer case's SoA host store)
  }
  
@@ -437,7 +456,17 @@ index df2ec85..a232d9c 100644
 +    {
 +        const char * why = nullptr;
 +        if (!ggml_cl_port_decide(backend_ctx, dst, &why)) {
++            // the op as the launch has it, so a disagreement can be read off the log
++            auto shape = [](const char * name, const ggml_tensor * t) {
++                if (t == nullptr) { GGML_LOG_ERROR("  %s: (null)\n", name); return; }
++                GGML_LOG_ERROR("  %s: %s ne [%lld, %lld, %lld, %lld] nb [%zu, %zu, %zu, %zu] view_offs %zu\n", name, ggml_type_name(t->type),
++                               (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                               t->nb[0], t->nb[1], t->nb[2], t->nb[3], t->view_offs);
++            };
 +            GGML_LOG_ERROR("op=FLASH_ATTN port: supports_op and the launch disagree (reason=%s)\n", why ? why : "?");
++            shape("q", q); shape("k", k); shape("v", v); shape("mask", mask); shape("dst", dst);
++            shape("table", dst->src[GGML_FA_SRC_BIAS_TABLE]); shape("sinks_q", dst->src[GGML_FA_SRC_SINK_Q]);
++            shape("kpos", dst->src[GGML_FA_SRC_KPOS]); shape("qpos", dst->src[GGML_FA_SRC_QPOS]);
 +            GGML_ABORT("op=FLASH_ATTN port: the launch was handed an op supports_op did not accept");
 +        }
 +        cl_kernel kp = backend_ctx->kernel_fa_port;
@@ -445,8 +474,7 @@ index df2ec85..a232d9c 100644
 +        const int G = n_head / n_head_kv;
 +        // GGML_OPENCL_FA_PORT_QTW: adjacent query tiles a work-group (the reference's server
 +        // runs 4), clamped to what the device's work-group holds; one tile always fits
-+        size_t wg_limit = 0;
-+        CL_CHECK(clGetKernelWorkGroupInfo(kp, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg_limit, &wg_limit, nullptr));
++        const size_t wg_limit = backend_ctx->fa_port_wg;   // asked once, when the kernel was built
 +        static const char * qtw_env = getenv("GGML_OPENCL_FA_PORT_QTW");
 +        int qtw = qtw_env != nullptr ? std::max(1, atoi(qtw_env)) : 1;
 +        if ((size_t) 16 * G * qtw > wg_limit) {
@@ -602,7 +630,7 @@ index df2ec85..a232d9c 100644
  static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
      const ggml_tensor * v = dst->src[2];
      const ggml_tensor * mask = dst->src[3];
-@@ -26033,6 +26385,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26033,6 +26400,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
  
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
  
@@ -616,7 +644,7 @@ index df2ec85..a232d9c 100644
      // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
  
      const int n_q = q->ne[1];
-@@ -26277,6 +26636,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26277,6 +26651,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      {
          static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
          static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
@@ -629,7 +657,7 @@ index df2ec85..a232d9c 100644
          if (rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
              q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
              for (int r0 = 0; r0 < n_q; r0 += 8) {
-@@ -26482,6 +26847,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26482,6 +26862,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));

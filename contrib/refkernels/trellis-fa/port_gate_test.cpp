@@ -221,6 +221,17 @@ int main(int argc, char ** argv) {
                        sup ? "ACCEPT" : w0, now ? "ACCEPT" : w1, then ? "ACCEPT" : "refuse ", then ? "" : w2,
                        good ? "" : "   <-- FAIL");
                 if (!good) ++fails;
+                // a paged form's source in any of its seven slots is not the port's op
+                for (int slot = FA_PORT_SRC_PAGES; slot <= FA_PORT_SRC_PLAN; ++slot) {
+                    struct ggml_tensor pg = op;
+                    pg.src[slot] = &m.kpos;      // any tensor: the slot being named is the fact
+                    const char * wp = "";
+                    const int acc = fa_port_gate_op(&pg, m.align, m.wg_max, 1, &wp);
+                    const bool refused = !acc && strcmp(wp, "paged") == 0;
+                    printf("  %s line %d   a paged source in slot %d: %s%s%s\n", file, l.no, slot,
+                           acc ? "ACCEPT" : "refuse ", acc ? "" : wp, refused ? "" : "   <-- FAIL, expected refuse paged");
+                    if (!refused) ++fails;
+                }
             }
             // the contiguous layout is served too
             { call_t m = c;
