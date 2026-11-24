@@ -84,7 +84,7 @@ index 7c68b0c..74fede7 100644
  
  static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9a57c18..37b9919 100644
+index 9a57c18..104df9f 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -5692,6 +5692,36 @@ bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
@@ -124,3 +124,22 @@ index 9a57c18..37b9919 100644
  void ggml_flash_attn_ext_add_indexed_bias(
          struct ggml_tensor * a,
          struct ggml_tensor * table,
+@@ -5714,8 +5744,16 @@ void ggml_flash_attn_ext_add_indexed_bias(
+     GGML_ASSERT(mask && mask->ne[0] == ggml_flash_attn_ext_n_kv(a));
+     GGML_ASSERT(mask->ne[1] == q->ne[1]);
+     GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
+-    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
+-    GGML_ASSERT(table->ne[0] == q->ne[2] && table->ne[1] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
++    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table) && table->ne[3] == 1);
++    // 0193: two layouts are accepted. Upstream PR 32740's [n_head, n_bins, rows] and the
++    // port's [n_bins, n_head, rows] (a row's bins contiguous, what ggml_mul_mat emits);
++    // rows is dim 2 in both, and the bin count is whichever axis is not the head one.
++    {
++        const int64_t nh = q->ne[2], rows = q->ne[1]*q->ne[3];
++        const bool upstream  = table->ne[0] == nh && table->ne[1] > 0 && table->ne[2] == rows;
++        const bool port_order = table->ne[1] == nh && table->ne[0] > 0 && table->ne[2] == rows;
++        GGML_ASSERT(upstream || port_order);
++    }
+     GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices));
+     GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
+ }
