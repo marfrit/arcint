@@ -1563,3 +1563,102 @@ MUL_MAT (and, against the knob-off graph, the sub and the copy).
 If arm A lands above 1.25 × the probe, the general path or the pre-scale's
 separate accumulator is the first suspect, and the ISA of the score pass (now a
 few dozen instructions a group) the first thing to read.
+
+# 1a, round 4: the review of the design, and arm A revised on paper {#round4}
+
+## The round-3 design against its review
+
+An independent review read §round3 against the kernel. Claim by claim:
+
+| round-3 claim | verdict |
+|---|---|
+| "a 16-key group's biases for 8 rows are one DPAS" | **wrong for 7 of the 8 rows.** The bin of (row r, key j) is `d0 + r - j` (the kernel's own `d0 = qpr[r] - gk0[gb]`), and a DPAS gives all 8 rows the same B column a lane. One DPAS serves one row |
+| "into S's accumulator, R pre-scaled" | **impossible** once fixed: the product's lanes are bins, not keys |
+| +2 DPAS, +2 loads a block; 410-460 / 1,150-1,290 / 1,700-1,900 us | **too low**; see the revised price below |
+| the bound `2⁻¹⁰·Σ|R_i B_i|` for f16 factors | stands (worst case); but **the result-rounded bounds were a factor 2 low**: f16 is `2⁻¹¹·|b|`, bf16 `2⁻⁸·|b|` (half an ulp of an 11-bit and an 8-bit significand) |
+| "ub 1: the logits must be bit-identical to the knob-off run" | **not a usable bar on this card**: the B60 is not bit-stable a forward. The bar is graph-export identity (the knob-on export at ub 1 equals the knob-off one line for line) plus KL against the CPU base |
+| "a cache keyed by the weight tensor" | **rejected**: a pointer key outlives its buffer. The surface belongs in the weight's backend extra, freed with the buffer, guarded across contexts |
+| "1,057 rows, 33.8 kB a layer" | **only for an extent of 1,024**: `attn_rel_bias` is `[16, n_swa]` on window layers and `[16, n_relative_extent]` on global ones; the size is `ne[1]` |
+| the general path's gather | **needs its own bin clamp** (an empty cell's position is -1) and a bounds case |
+| two new source slots, `GGML_MAX_SRC` 22 | **not needed**: r takes the table's slot 12 (there is no table), b the spare slot 19; `GGML_MAX_SRC` stays 20 |
+| the sink identity, the scale, knob-off identity | passed |
+
+## Arm A revised (paper only; nothing of arm A is built)
+
+**The linear path.** For a tile (8 consecutive rows, first position `q0p`) and a
+block whose 32 keys are one run from position `k0`, the bins needed are
+`d00 - 31 … d00 + 7` with `d00 = q0p - k0`: 39 consecutive bins. So:
+
+1. `G = R·B` for 48 bins: three DPAS, each `a` = the tile's `R` (8 rows × 16
+   factors, held in 4 registers), `b` = a transposed 2D read of 16 surface rows
+   (lane = bin), into three accumulators of 8 rows × 16 bins (24 registers,
+   transient). The surface is the bias matrix **bin-reversed**, f16, 32 B a
+   bin, with 48 zero rows on the far side of bin `E - 1` (the pad bin and
+   everything past the extent are then zero by the row index) and 48 rows on
+   the near side of bin 0 (negative bins = future keys, hidden by the compare); the
+   first row read is clamped into that range, so no read depends on the
+   hardware's edge clamp. Size `(E + 96)·32 B`, E from `attn_rel_bias->ne[1]`.
+2. For a (row r, group gb): lane j's bias is `G_r[31 + r - 16·gb - j]`, a run of
+   16 bins that crosses two accumulators: one two-register lane shift
+   (`intel_sub_group_shuffle_down(G_r[c], G_r[c+1], delta)`, delta uniform), 16 a block.
+3. `score = scale_log2·(q·k) + LOG2E·bias`: one multiply-add a (row, group), 16 a
+   block, in the score pass that exists (which loses its three-way `d0` test and
+   its table reads).
+
+When a block's two groups are linear but not one run (a seam exactly between
+them), each group is its own 23-bin span: two DPAS a group. The general path
+(a mixed group, non-linear rows): the 16-term dot a key, 16 gathers a row, with
+the bin clamped to `[0, E]` first (an empty cell's -1 must not index the surface)
+and a bounds case that drives it.
+
+**Price a block** (against the no-bias kernel's 32 DPAS, 32 2D loads): +3 DPAS,
++3 2D loads, 16 two-register lane shifts, 16 multiply-adds, 24 more registers
+live through the score pass. The reviewer's estimate with that work priced:
+**450-510 / 1,270-1,430 / 1,880-2,120 us**, i.e. at or just under the oracle
+(533 / 1,457 / 1,909), not far under it as round 3 said. Because an estimate is
+what failed last time, the design asks for a **probe** before any arm A code:
+the no-bias kernel plus this work on stand-in data (three transposed 2D reads of
+16 rows from a cache-resident surface, three DPAS, and a lane shift and a
+multiply-add a (row, group), their sum entering the score times a run-time
+zero). Its answers are the no-bias kernel's (wrong by design); its time is arm
+A's price before arm A exists. `intel_sub_group_shuffle2` does not exist in this
+compiler (the offline gate refused it); the two-register shift is
+`intel_sub_group_shuffle_down`, which shifts but does not reverse, so the surface
+is stored **bin-reversed** after all (a DPAS's lanes are then descending bins,
+which is ascending keys) and step 2 is one shift a (row, group).
+
+**Exactness** (A = `Σ_i |R_i·B_i|`, b the bias, nats):
+
+| pair | worst case | typical |
+|---|---|---|
+| arm A (f16 factors) against the f32 table | `2⁻¹⁰·A` | about 5e-4 |
+| a bf16 table against the f32 table | `2⁻⁸·|b|` = 1.6e-2 at |b| = 4 | about 4e-3 |
+| a f16 table against the f32 table | `2⁻¹¹·|b|` = 2e-3 at |b| = 4 | about 5e-4 |
+| arm A against a bf16 table | about 2e-2 | about 4e-3 |
+
+Whether arm A's bound is small depends on `A / |b|` on the real model
+(cancellation among the 16 terms makes A large against b). A CPU statistic over the factor path settles it on the real model before arm A
+is built.
+
+**Lifetime of the surface.** Built on first use into the weight tensor's backend
+extra (one more plane beside the weight's own data), released when the weight's
+buffer is released, created under the backend's lock so two contexts of one
+model build it once. No table keyed by a pointer. A weight whose buffer is not
+this backend's (or is rewritten: a LoRA merge) has no surface and the op is
+declined, with a DOWNGRADE line. Tests: the cases must prove **device execution**
+(a gate that needs a weight would decline a test's plain tensor to the CPU and
+read green: the cases mark the matrix as a weight and the run counts executed
+cases and the TAKEN line); red: overwrite B after first use with the
+invalidation disabled - it must FAIL.
+
+**ub 1.** The port's graph needs more than 8 rows, so ub 1 is today's graph. The
+bar: the graph export at ub 1 with the knob on is identical to the knob-off
+export, and KL against the CPU base is inside the card's own band.
+
+**Sources.** r in the table's slot 12, b in the spare slot 19, a flag value of its
+own; `GGML_MAX_SRC` stays 20.
+
+**Arm B** (the half-width table written by the port from the same factors) is
+the review's "sound, build first"; it follows on the rebased branch, as a change
+of its own.
+
