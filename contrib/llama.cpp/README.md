@@ -10400,3 +10400,30 @@ done
 The command list further up (written for the previous revision) is superseded by this one: its
 `-p 'k=2 nt=512 nq=1'` matches no case (the params string is comma-separated, and has
 `n_slot` and `cols` now), and its model run read no bounds or stats line.
+
+**The model's own graph, before and after** (`measured-here` on the recipe host:
+`test-export-graph-ops` on the CPU, c 4096, fa on, ub 512, with `GGML_OPENCL_DEPTH_MIX=1`, so
+the lines are what `src/models` emits, not a reconstruction). The handed-over tree's export has
+the faulting node as a line: a `CONT` to `[2304, 512]` whose source is `[2304, 512]` with nb
+`4, 4718592, 2415919104` - a row step of one slab, a 2.4 GB span over an 18.9 MB tensor. This
+revision's export has no source with that row step at any of ub 512, 1024, 2048, and no copy of
+a mix column at all. It has 12 distinct `DEPTH_MIX` lines a ubatch size, the shapes the op
+cases and the unit test use: the 5-row store's k 1..4 at nq 1 (three sources, and four with
+the norm weight) and nq 3, and the bank store's k 1 at nq 4 (`[2304, 1, T]` at slab step
+18432, cur `[2304, T]`, queries `[2304, 4]`). `test-backend-ops --test-file <that export> -o
+DEPTH_MIX` replays exactly those 12 lines (12/12 on the CPU backend here), which is step 2b of
+the card list: the card's op cases from the graph's own lines.
+
+**State of this revision** (`measured-here`, the recipe host): the series applies from the pin
+in byte order, 150 patches, applied tree `92f3a0347c66d7001b160ae950493fd47a6037a8`; the
+recipe (package build and the `unit` set) is green, 51 of 51, `depth-mix` among them;
+test-backend-ops lists 45 `DEPTH_MIX` cases and passes them CPU against CPU (the graphs
+build and the readers run; it says nothing about the card).
+
+```
+# 2b. after step 2: the graph's own DEPTH_MIX lines replayed (12 a file, 0 FAIL)
+for ub in 512 1024 2048; do
+  GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> \
+    --test-file <knob-on export, ub $ub> -o DEPTH_MIX
+done
+```
