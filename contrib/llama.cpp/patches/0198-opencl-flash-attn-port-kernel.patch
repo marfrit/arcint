@@ -205,7 +205,7 @@ index 0000000..673211a
 +#endif
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index df2ec85..b0dddd4 100644
+index df2ec85..a232d9c 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -8,6 +8,7 @@
@@ -616,18 +616,20 @@ index df2ec85..b0dddd4 100644
      // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
  
      const int n_q = q->ne[1];
-@@ -26277,8 +26636,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26277,6 +26636,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
      {
          static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
          static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
--        if (rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
--            q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
-+        if (fa_row_blocks_split(n_q, n_batch, backend_ctx->gpu_family == INTEL, q->type == GGML_TYPE_F32,
-+                                mask != nullptr && mask->ne[2] == 1, kv_pages != nullptr, gqa_wide, rb_on)) {
++        // 0198: the same predicate as fa_port_gate.h's fa_row_blocks_split, which the port's
++        // routing test models the dispatch with: the two are asserted equal on every call
++        GGML_ASSERT((rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
++                     q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) ==
++                    (fa_row_blocks_split(n_q, n_batch, backend_ctx->gpu_family == INTEL, q->type == GGML_TYPE_F32,
++                                         mask != nullptr && mask->ne[2] == 1, kv_pages != nullptr, gqa_wide, rb_on) != 0));
+         if (rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
+             q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
              for (int r0 = 0; r0 < n_q; r0 += 8) {
-                 const int nr = std::min(8, n_q - r0);
-                 ggml_tensor qv = *q, dv = *dst, mv;
-@@ -26482,6 +26841,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26482,6 +26847,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
