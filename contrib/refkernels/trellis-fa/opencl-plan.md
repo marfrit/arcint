@@ -9,6 +9,17 @@ are `measured-here` and attributed; reasoning from the two is `inferred`.
 Line numbers in `flash_attn_dpas2.cl` here refer to the reviewed revision
 (the earlier draft's PV line numbers were ~34 stale; PV is `K2:400-406`).
 
+## Changes in the second session (2026-11-24)
+
+The plan below is the first session's. What the code does now differs in five
+places, all recorded in README.md, "1a, second session": group classes
+(1 linear / 2 empty / 0 mixed) replace the single flag; the keys a tile visits are
+bounded by a test a 32-key block (fa::Kern's `[lo, hi)`), not by a host hint; the
+online softmax updates `m` a block, with the sink's term in lane 0 from the start;
+the 256-GRF build holds Q in registers and reads it from the op's f32 rows; and
+the port's graph is a prompt batch's graph only, its sources on the op before the
+backend is asked.
+
 ## Changes after review
 
 1. **The pad bin is not zero, and the sink is unfolded.** `INK:386-389` (our pin,

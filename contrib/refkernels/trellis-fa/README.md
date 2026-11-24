@@ -59,6 +59,11 @@ initializer order, `qtiles`/`qgroups`/`n`/`wg` arithmetic and
 | `fa_ref_host.cpp` | standalone OpenCL 3.0 host: `clCreateProgramWithIL` (or `…WithBinary` for an AOT fallback), build, the shapes, CPU oracle, max abs error / per-row KL per module, timing per module, `--dry` |
 | `binding-notes.md` | (no code) what our side must feed this kernel from a `GGML_OP_FLASH_ATTN_EXT` call, with the cost of each item |
 | `opencl-plan.md` | (no code) 1a's plan: `fa::Kern`'s tile structure in OpenCL C, each ESIMD construct against the builtin ours already uses, what has no equivalent, and the binding plan |
+| `fa_port_gate.h` | a copy of the port's pure gate (the llama tree's `ggml/src/ggml-opencl/fa_port_gate.h`, patch 0198), so the test beside it builds from this directory |
+| `port_gate_test.cpp` | the gate's CPU unit test, fed the model's graph export lines; red with `-DFA_PORT_GATE_RED` |
+| `port_abi_check.py` | the kernel's parameter list against the launch's `clSetKernelArg` sequence, no device |
+| `port_kernel_model.py` | the kernel's key-block loop a lane at a time against a direct softmax, with three reds, no device |
+| `port_arithmetic_check.py` | the first session's check of the bias run read (still the kernel's) and of a sink epilogue the kernel no longer has (the model above covers the sink) |
 | `out/` | build products; git-ignored |
 
 ## Build
@@ -746,6 +751,10 @@ against, not results.
 
 ## The card recipe
 
+**Superseded for the port's cases by §commands2 below** (the knobs, the cases and
+the filters changed in the second session); the standing arm and the served legs
+here still hold.
+
 **The standard arm (the operator, 2026-11-24 11:31).** Every Inkling *prefill*
 number here is measured and predicted with the unit at the 1.8.1 deploy:
 
@@ -852,44 +861,62 @@ process (a `getenv` in the model's graph builder, static-initialised).
 
 ### The layout rule: the strides the kernel indexes {#layout}
 
-The card's first port run (the first card window, B60) declined every call:
+The card's first port run (the first card window, B60, `measured-here`) declined every call:
 `DOWNGRADE src=opencl op=FLASH_ATTN port=declined reason=layout`. The gate had
 asked for `ggml_is_contiguous(q/k/v)`; the model's FLASH_ATTN_EXT inputs are
-**permuted views** - from the export (`inkling-ub512.txt` lines 222 /
-223): q `[128, Lq, 24]` nb `[4, 12288, 512]` (row pitch nb1, head stride nb2), K/V
-`[128, n_kv, 8]` nb `[2, 2048, 256]`. Those are exactly the strides the kernel
-indexes, so the rule is now the stride terms with the kernel line that uses each:
+**permuted views**. From the graph export (`inkling-ub512.txt`, lines 222 / 223;
+`code`): q `[128, Lq, 24]` nb `[4, 12288, 512]` (row stride nb1, head stride nb2),
+K/V `[128, n_kv, 8]` nb `[2, 2048, 256]`. For K/V that is the reference's own
+`[Lk, Hk, D]` memory order, and the kernel's 2D block reads take it as it is
+(pitch nb1, base `kvh·nb2`). For Q it is f32 where the kernel's DPAS wants f16:
+the 256-GRF build converts a tile's rows in registers, the 128-GRF build runs a
+prepass (§structure).
 
-| term | rule | kernel / prepass |
+The rule is one pure function, `ggml/src/ggml-opencl/fa_port_gate.h` (no `cl_`
+call, no backend state; a copy is beside this file):
+
+| term | rule | what reads it |
 |---|---|---|
-| q nb[1] (row pitch) | ≥ D·4, % 32 == 0 | `flash_attn_q_to_f16` reads `head·nb[2] + row·nb[1]`, 8 floats a `vload8` |
-| q nb[2] (head stride) | ≥ D·4, % 32 == 0 | same |
-| k/v nb[1] (kv row pitch) | ≥ D·2, % 16 == 0 | the 2D block read's pitch (`KREAD`/`VREAD`), surface `(D·2-1, n_kv-1, nb[1]-1)` |
-| k/v nb[2] (kv head stride) | ≥ D·2, % 64 == 0 | the read's base `kvh·nb[2]` |
-| mask nb[1] | ≥ n_kv·2 | `row·nb[1] + key` |
-| table nb[0..2] | 4, n_bins·4, n_head·n_bins·4 | `((row·n_head+head)·n_bins+bin)` |
-| sink nb[0..1] | 4, n_head·4 | `row·n_head+head` |
-| dst nb[1/nb[2] | ≥ D·4 each | head stride / row stride of the store |
+| q | f32, nb0 = 4, nb1 / nb2 / view offset multiples of 4 | 16 (or 8) contiguous floats at `head·nb2 + row·nb1` |
+| k / v | f16, nb0 = 2, nb1 % 16 = 0, 64 ≤ nb1 < 2^24, nb1 ≥ D·2, nb2 % 64 = 0, view offset % 64 = 0, buffer alignment % 64 = 0 | the 2D block reads, surface `(D·2-1, n_kv-1, nb1-1)` at `base + kvh·nb2` (the same terms `flash_attn_dpas2.cl`'s reads have) |
+| mask | f16 `[≥ n_kv, ≥ rows, 1, 1]`, nb0 = 2, nb1 ≥ n_kv·2 | `row·nb1/2 + key` (the general path) |
+| table | f32 `[n_bins ≥ 17, n_head, ≥ rows]`, nb = 4, n_bins·4, n_head·n_bins·4 | `(row·n_head + head)·n_bins + bin`, a run of 16 bins |
+| sink | f32 `[n_head, ≥ rows]`, nb = 4, n_head·4 | `row·n_head + head` |
+| dst | f32 `[D, n_head, rows]`, nb = 4, D·4, n_head·D·4 | `head·nb1 + row·nb2 + 4·col` |
+| rows | ≥ 9, one stream, head 128, no softcap, no ALiBi, not paged, Intel | the scope |
 
-The gate is one pure function (`ggml/src/ggml-opencl/fa_port_gate.h`, no cl_ call,
-no backend state) and a CPU test feeds it the export's own lines:
-`port_gate_test.cpp` reads `inkling-ub{512,1024,2048}.txt`, takes each
-FLASH_ATTN_EXT line's q/k/v/mask **ne and nb** from the line, the table from the
-MUL_MAT line that produces `[1025, n_head, rows]` (line 216 in each file), and
-synthesizes only what the patched graph adds. It is red-proven: with the old
-contiguity rule the prefill lines (222/223) are refused `layout`; with the stride
-rules they are accepted and the decode lines (220/221, dst ne2 = 1) stay refused
-`decode`.
+Both the model's permuted views and a contiguous q/k/v pass it; a row pitch of
+300 bytes, a head stride of 200, a 32-byte view offset, a `[head, bin, row]`
+table, a per-head sink, two streams, a q8_0 K do not.
 
-Q is f32 in the op and f16 in the kernel: the dispatch now runs
-`flash_attn_q_to_f16` once a call (scale 1.0 - the kernel applies `scale_log2`
-itself) into a `[head][row][D]` scratch, so the kernel's Q surface has row pitch
-D·2 and head stride n_q·D·2. That also closes a real type mismatch the handover
-had overlooked.
+**The unit test, on the export's own lines** (`port_gate_test.cpp`, CPU, no
+OpenCL). It reads the three export files, takes each FLASH_ATTN_EXT line's
+q / k / v / mask **ne and nb** from the line (lines 220-223), the bias table from
+the MUL_MAT that produces `[1025, 24, rows]` (line 91 / 92) with the strides it has
+as a source of the SUB that consumes it (line 11 / 12), the per-query sink from the
+MUL_MAT that produces `[24, rows]` (line 79 / 80), and synthesizes only what 0193 /
+0194 add and no export of today's graph can hold (indices' shape, positions,
+group classes, the op's output). Expected: lines 222 / 223 (the prompt batch: the
+SWA ring `q·ub × kv·(ub+1024)` and the global cache `q·ub × kv4096`) ACCEPT; lines
+220 / 221 (the decode step) refuse `decode`; every accepted line, bent one property
+at a time (18 bends), refuses with that property's reason.
+
+Red first, then green (`measured-here`, the recipe host):
+
+    g++ -DFA_PORT_GATE_RED ...   (0198's contiguity rule)
+        rc 1, "FAIL: 6 failure(s)": lines 222 and 223 of each of the three files, "refuse layout"
+    g++ ...                      (the stride rules)
+        rc 0, "PASS: 0 failure(s)": 6 lines ACCEPT, 6 decode lines refuse "decode",
+        108 bends refused each with its reason, 6 contiguous variants ACCEPT
+
+An earlier version of this section said the table came from "the MUL_MAT line
+216" and that the test was red-proven. Line 216 is the PAD of `attn_rel_bias`;
+the test that existed looked for op 6, which is SUB, had not been compiled, and
+had not been run. Retracted.
 
 ### The offline gate, run on the committed kernel {#gate}
 
-`ocl-gate.sh` (ocloc 26.27.1 with IGC 2.38.2, `bmg-g21`, the backend's
+`ocl-gate.sh` (the recipe host's offline gate) (ocloc 26.27.1 with IGC 2.38.2, `bmg-g21`, the backend's
 options, `IGC_ShaderDumpEnable` read of each kernel's `.zeinfo`) on
 `flash_attn_port.cl`, one argument a variant (base, `GB_PAD_KEYS_OFF=1`,
 `GB_SKIP_SINK`):
@@ -905,8 +932,10 @@ default.
 
 ### GRF: 256 is the default, measured {#GRF}
 
+(The first session's kernel; the current kernel's gate lines are in §gate2.)
+
 The offline gate (`ocloc` 26.27.1 with IGC 2.38.2, `bmg-g21`, the backend's
-options; `ocl-gate.sh`) on this kernel, three variants (base,
+options; `ocl-gate.sh` (the recipe host's offline gate)) on this kernel, three variants (base,
 `GB_PAD_KEYS_OFF=1`, `GB_SKIP_SINK`):
 
     flash_attn_port: grf 128 simd 16 scratch 8192  -> 0/3 variants (FAIL: spill)
@@ -954,6 +983,9 @@ without the permute/copy the first form built.
 
 ## Prediction before the first card run (the coordinator, inference)
 
+(Kept as written. The implementer's prediction for the restructured kernel, per
+register mode, is §prediction2.)
+
 Written 2026-11-24, before the first card run, by the coordinator, not the port session. Inferred from the plan: the port
 follows fa::Kern's structure, so its base loop should sit near the reference's no-table times, plus our table read.
 The 256-GRF build halves the threads a core against a 128-GRF build. fa::Kern's own measured numbers came from its
@@ -966,3 +998,192 @@ default build, which spills at 128 GRF.
 | q512 x kv1536 | ~600-1,000 us | 856 | 537 | 2,293 |
 
 The first window stops at the single case if it is slower than today's kernel.
+
+# 1a, second session: the gate, the graph, the structure {#second}
+
+## What the handed-over state was, claim by claim
+
+Checked against the code, the export and the reference before anything was built
+on it (`code` unless marked):
+
+| handover claim | verdict |
+|---|---|
+| the first card window's `reason=layout` comes from `ggml_is_contiguous(q/k/v)` against permuted views | **true** (export lines 222 / 223) |
+| "Those are exactly the strides the kernel indexes" | **true for K/V** (the reference's `[Lk, Hk, D]` order, pitch nb1, base `kvh·nb2`); **not for Q**: the op's Q is f32, the kernel read f16, which the handover names as its second mismatch |
+| the gate is now a pure function, still carrying the red rule | **true** |
+| `gate_v2.py` holds the stride rules | **partly**: its Q terms (`% 32`) guard a `vload8` that needs no alignment; it has no rule for the view offset or the buffer alignment (the 2D block read's 64-byte base); not applied here, the header was written directly |
+| `port_gate_test.cpp` takes the table "from the MUL_MAT line 216" | **false**: line 216 is PAD; the MUL_MAT is line 91 / 92; the test matched op 6, which is SUB (lines 11 / 12) |
+| the README's "It is red-proven" | **false**: the test had never been compiled |
+| "n_q <= 8 keeps 0143's split kernels" (the gate's `decode` refusal) | **false**: with the knob on, a declined call returned `false` from `supports_op`, so every decode step went to the CPU, on an unfolded graph |
+| 0194: the port's sources are attached after `build_attn` | **a defect the handover did not know**: `build_attn_mha` asks the layer's backend `supports_op` *before* that, so the gate saw no positions, refused `no-positions`, and the graph fell to the dense gather, which cannot read the port's `[n_bins, n_head, rows]` table (`ggml_reshape_4d` asserts). With the knob on the model could not build a prompt graph at all, and the port could never have been taken |
+| 0194: `kq_b = ggml_get_rows(table, rel_pos)` built unconditionally | **the same abort** by itself: on the unfolded table the reshape's element count does not match |
+| 0198: one linearity flag a block (`cfl[t0/16]`) | **a defect**: the block's second 16-key group took the first group's flag |
+| 0198: the `kv_lo` hint | **a defect**: not rounded to the 32-key block, so the group flags were read for the wrong groups; and no causal upper bound at all |
+| 0198: `intel_sub_group_block_read(… + base + lane)` | worked only because the pointer of lane 0 is the one used; now a uniform pointer |
+| 0198: the softmax | **a defect**: `m` was the sink logit for the whole walk and never updated, so `p = exp2(s - m)` overflows f16 for a score 16 (base 2) above the sink; fa::Kern updates `m` a block |
+| 0198: `qps[q0 + r]` for a tile past `n_q` | read up to 7 ints past the buffer (the host's bounds check cannot see a kernel's index) |
+| 0198: no TAKEN line | **true**, added |
+| 0199: "the mask and bins are built from the positions" | **false for the bins and worse for the mask**: the port's branch sat behind the generic `"bi"` branch (the port cases got pseudo-random bins) and, for every non-port case, replaced `init_tensor_kq_mask` by a uniform fill - today's FLASH_ATTN_EXT cases would have lost their masks |
+| 0199: the cases' layout | contiguous q and a kv view: the layout the first card window declined, not the model's |
+| 0199: "RED=2 must FAIL on the q512 case" | **would not have failed**: a sink in [-1, 1] beside ~1,000 keys moves the answer by about 1e-6 NMSE against a 5e-4 tolerance (`inference`); the sink is now in [3, 6] |
+| 0199: the pad bin "is read, and not added" | the test's table had a random pad bin, the kernel adds nothing past the extent: the far-key cases would have failed; the port's table now has a zero pad bin, as the model's has |
+| the oracle table (the oracle window) | taken as recorded (`measured-here`, local only, reference-arm evidence): it is fa::Kern's own SPIR-V built by ocloc and run by `fa_ref_host`; nothing of it ships. `fa_ref_host`'s "mean row KL" is **not a quality number** (it normalises a raw output row to a simplex), and `out/abi.txt` is a SPIR-V dump that `read_abi` does not parse |
+
+## What changed {#structure}
+
+**The graph (0194).** The port's graph is a prompt batch's graph only:
+`GGML_OPENCL_FA_PORT=1`, flash attention on, more than 8 rows, one stream. A
+decode or verify step keeps today's graph, today's kernels, bit for bit. The
+port's sources (per-query sinks, positions, classes, window) ride to
+`build_attn_mha` in `llm_graph_context::fa_port_next` and are on the op before the
+backend is asked; an op that carries them and is declined stays an indexed-bias op
+for the CPU (which reads the port's table and `src[18]`), it is never bent into
+the dense gather. Key-group classes replace the flag: 1 = consecutive positions,
+all cells of the first row's sequence, none empty; 2 = every cell empty; 0 = the
+rest. A row group is 1 when its rows are consecutive positions of that sequence.
+
+**The dispatch (0198).** The port branch is taken for an op that carries
+`src[18]`; any other indexed-bias op takes 0143 / 0144's dispatch as before, and an
+op with `src[18]` and the knob unset is declined (`reason=knob-off`) and not
+handed to a kernel that would read its table another way. A refusal after
+`supports_op` accepted is an abort, not a silent return with the output unwritten.
+Once a process: `TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=… qhoist=… qf32=…
+skip=… qtw=…`.
+
+**The kernel, against fa::Kern** (`inkling2_ops.sycl:509-654`), three structural
+reasons it would have landed well above the oracle, and one of correctness:
+
+1. *The keys a tile visits.* fa::Kern walks `[lo, hi)` a tile: the window's
+   lower bound and the causal upper bound, about 33 of the 96 blocks at
+   q2048 × kv3072. The port walked every block of the kv axis. Positions here
+   are arrays (a ring has a seam, a cache is presented beyond its fill), so the
+   bound is a test a block: skipped when both of its groups are empty, past
+   `n_kv`, or linear under linear rows with every key in the future of the tile's
+   last row or behind the window of its first. A skip is two flag reads and two
+   position reads. The export's global line (q512 × kv4096 with the cache part
+   filled) is the case this decides: without the class 2 skip a first batch
+   would walk 128 blocks for 16 used. `GGML_OPENCL_FA_PORT_SKIP=0` is the A/B.
+2. *Q in registers.* fa::Kern holds a tile's Q (`Qc`, 32 registers); the port
+   re-read 8 × 16 × 8 halves a key block, 8 loads beside the block's 32. The
+   256-GRF build holds it (`PORT_QHOIST`).
+3. *No prepass.* The oracle is handed f16 Q; our op hands f32. A separate
+   conversion launch moves 37.8 MB at q2048 before the kernel starts. The
+   256-GRF build reads the f32 rows itself, 64 sub-group block reads a tile, and
+   converts in registers (`PORT_QF32`); `GGML_OPENCL_FA_PORT_QF32=0` keeps the
+   prepass (the port's own `kernel_flash_attn_port_q16`, built with the kernel -
+   no dependence on `flash_attn_dpas2.cl` having been built).
+4. *The online softmax* as fa::Kern has it: a block's row maxima (8 sub-group
+   reductions), `alpha`, `l` and `O` rescaled, `p ≤ 1` to f16. The sink's term
+   is 1 in lane 0 from the start and is rescaled with the rest.
+
+What stays as it was: one sub-group a (head, 8-row) tile, 32-key blocks, the
+DPAS pair, the K/V 2D reads, the bias run (one block read + a shuffle) and the
+clamped read, the general path through the mask.
+
+`port_kernel_model.py` transcribes the kernel's block loop a lane at a time
+(classes, skip, compares, mask path, bias run, online softmax with f16 `p`) and
+compares it with a direct masked softmax on the op test's own position layouts
+(ring seam in either group, empty tail, window, a short last tile, a group past
+`n_kv`): 13 cases, NMSE ≤ 1e-7, and three bent kernels (the window skip decided
+from the tile's last row, a mixed group taken as linear, the sink in every lane)
+each caught (`measured-here`, the recipe host). It is a model of the control flow,
+not the kernel: the device run is still the proof.
+
+## Knobs (all read once a process; unset = the default named)
+
+| knob | default | what |
+|---|---|---|
+| `GGML_OPENCL_FA_PORT` | off | the arm; unset = today's dispatch and today's graph exactly |
+| `GGML_OPENCL_FA_PORT_GRF` | 256 | `128` or `256`: the register mode of the port's program |
+| `GGML_OPENCL_FA_PORT_QHOIST` | 1 at 256, 0 at 128 | Q held in registers a tile |
+| `GGML_OPENCL_FA_PORT_QF32` | = QHOIST | Q read from the op's f32 rows, no prepass |
+| `GGML_OPENCL_FA_PORT_SKIP` | 1 | `0` walks every key block |
+| `GGML_OPENCL_FA_PORT_QTW` | 1 | adjacent query tiles a work-group (the reference's server runs 4) |
+| `GGML_OPENCL_FA_PORT_RED` | - | `1` K/V one key row up, `2` the sink's term dropped: both must FAIL |
+| `GGML_OPENCL_BOUNDS` | off | every buffer of the launch against its allocation, abort past it |
+
+## The offline gate on this kernel {#gate2}
+
+`ocl-gate.sh` (ocloc 26.27.1, IGC, `bmg-g21`, the backend's options, each kernel's
+`.zeinfo`), `measured-here` on the recipe host, no device:
+
+    256 GRF (-cl-intel-256-GRF-per-thread), five variants - QHOIST+QF32 (the default),
+    QHOIST with the prepass, GB_NO_SKIP, GB_PAD_KEYS_OFF=1, GB_SKIP_SINK:
+      ocloc 5/5 variants
+      kernel_flash_attn_port:     grf 256 simd 16 scratch 0 stack_calls -   (each variant)
+      kernel_flash_attn_port_q16: grf 256 simd 32 scratch 0 stack_calls -
+    128 GRF (no option; QHOIST=0, QF32=0):
+      ocloc 0/1 variants
+      kernel_flash_attn_port:     grf 128 simd 16 scratch 8192 stack_calls -   <-- FAIL (spill)
+      kernel_flash_attn_port_q16: grf 128 simd 32 scratch 0
+
+So Q in registers and the f32 read fit 256 GRF without a spill, and the 128 build
+spills as the first session's did. It builds and is selectable for the timing;
+the gate does not pass it.
+
+Also without a device (`measured-here`, the recipe host): the applied tree builds
+`test-backend-ops` and `llama-cli` with the OpenCL backend and embedded kernels;
+`GGML_OPENCL_FA_PORT=1 test-backend-ops -b CPU -o FLASH_ATTN_EXT -p "port=1"` runs
+the ten port cases, 10/10 (CPU against CPU: the cases construct with the export's
+layout, the layout asserts hold, the graph executes - it compares the port with
+nothing); `port_abi_check.py` 42 positions, 0 failures.
+
+## Prediction before the card run (inference) {#prediction2}
+
+Written before any card run of this code. The oracle's time is proportional to
+the key blocks its tiles visit (`code`: 33.25 blocks a tile inside a 1,024
+window; `measured-here`, the oracle window: 533 / 1,457 / 1,909 us over 51k / 153k / 204k
+block visits = 10.4 / 9.5 / 9.4 ns a visit). The port now visits the same blocks
+with the same loads and DPAS; what it has on top is a header a skipped block
+(63 of 96 at kv3072), two position gathers a block, eight reductions, and the
+per-row bias logic as SIMD-16 code where fa::Kern has hand-laid vectors.
+
+| shape (window 1,024 unless said) | oracle 256 | **port 256 GRF, us a call** | oracle 128 | **port 128 GRF, us a call** | today's kernel |
+|---|---|---|---|---|---|
+| q512 × kv1536 | 533 | **560-720** (620) | 863 | **1,100-1,550** | 2,293 |
+| q2048 × kv2048 | 1,457 | **1,530-1,970** (1,700) | 1,795 | **2,300-3,200** | 9,938 |
+| q2048 × kv3072 | 1,909 | **2,050-2,600** (2,250) | 2,271 | **2,950-4,100** | 12,583 |
+| q512 × kv4096, 1,536 filled, global | - | **650-900** | - | **1,300-1,900** | - |
+
+The 128 column is a spilling build (the gate: 8 KiB a thread against the
+oracle's 2.1 KiB), with Q re-read a block and the prepass launch; it is expected
+to lose to 256 by more than the oracle's own 128 does.
+
+ms a pass (24 attention layers, 20 SWA and 4 global, `code`: binding-notes.md;
+pp4096, the global layers at their mean depth), port at 256 GRF: **ub 512 about
+18 ms (16-23), ub 1024 about 31 ms (27-38), ub 2048 about 63 ms (55-75)**;
+today's kernel is 46 ms for the 20 SWA calls alone at ub 512 (20 × 2,293 us).
+
+If the single case lands above 900 us at 256 GRF, the gap is in the per-row
+score pass (validity, bias, the scalarised 8 × 2 loop), and that loop is the
+candidate for the inline-vISA rule; the ISA dump decides.
+
+## The card commands, in order {#commands2}
+
+`T` is `<build>/bin/test-backend-ops`, the build a fresh pin + `apply-series.sh`
+(write-tree in the commit message), kernels embedded. `P1` is the single case's
+filter, `"kv=1536,nb=512,.*port=1"`.
+
+    # 1. the single case under the bounds check; expect 1 case run, OK, the TAKEN line, no DOWNGRADE port=
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 T -b <OpenCL device> -o FLASH_ATTN_EXT -p "$P1"
+    # 2. the suite: 0 FAIL, and the ten port=1 cases must have RUN (0 cases ran = red)
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 T -b <OpenCL device> -o FLASH_ATTN_EXT
+    #    and once with the knob unset: today's cases as before, the port=1 cases "not supported" (reason=knob-off)
+    T -b <OpenCL device> -o FLASH_ATTN_EXT
+    # 3. the two reds: each must FAIL
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_RED=1 T -b <OpenCL device> -o FLASH_ATTN_EXT -p "port=1"
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_RED=2 T -b <OpenCL device> -o FLASH_ATTN_EXT -p "port=1"
+    # 4. op perf, the single shape: the port, then today's kernel on the same shape (port=0)
+    GGML_OPENCL_FA_PORT=1 T perf -b <OpenCL device> -o FLASH_ATTN_EXT -p "kv=1536,nb=512,.*n_bins=1025.*port=1"
+    T perf -b <OpenCL device> -o FLASH_ATTN_EXT -p "kv=1536,nb=512,.*n_bins=1025.*port=0"
+    #    stop here if the port is slower than today's kernel
+    # 5. the other shapes, both register modes
+    for g in 256 128; do GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_GRF=$g T perf -b <OpenCL device> -o FLASH_ATTN_EXT -p "n_bins=1025.*port=1"; done
+    T perf -b <OpenCL device> -o FLASH_ATTN_EXT -p "n_bins=1025.*port=0"
+    # 6. the A/Bs worth one run each at 256: the prepass, the skip, four tiles a work-group
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_QF32=0 T perf ... -p "n_bins=1025.*port=1"
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_SKIP=0 T perf ... -p "n_bins=1025.*port=1"
+    GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_QTW=4  T perf ... -p "n_bins=1025.*port=1"
+
+The perf mode's time is the op's graph (the launch and, at 128 GRF or with
+QF32=0, the prepass); the oracle's is device time of one launch.

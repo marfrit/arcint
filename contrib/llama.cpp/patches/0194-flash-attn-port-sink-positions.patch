@@ -75,7 +75,7 @@ index 517eba9..5b253b0 100644
                  float vs = 1.0f;
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 358f614..2400367 100644
+index 358f614..6a1d0a8 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1423,6 +1423,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
@@ -108,7 +108,35 @@ index 358f614..2400367 100644
      return res;
  }
  
-@@ -4461,6 +4477,20 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -3151,6 +3167,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+ 
+         if (bias_table) {
+             ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
++            // 0194: the port arm's sources, attached before the backend is asked. With them
++            // the table is the port's [n_bins, n_head, rows] and the sink a logit a query,
++            // which the dense fallback below cannot gather: a backend that declines such
++            // an op leaves it to the CPU, whose kernel reads both (table, indices, src[18]).
++            const bool port_sources = fa_port_next.sinks_q != nullptr;
++            if (port_sources) {
++                ggml_flash_attn_ext_add_query_sinks(cur, fa_port_next.sinks_q);
++                ggml_flash_attn_ext_add_positions(cur, fa_port_next.kpos, fa_port_next.qpos,
++                                                  fa_port_next.cflag, fa_port_next.rflag);
++                ggml_flash_attn_ext_set_window(cur, fa_port_next.window);
++                fa_port_next = {};
++            }
+             // the backend of the layer must support the op with the bias attached, or the
+             // kernel would read a mask without it; find that backend, the CPU is the fallback
+             ggml_backend_t backend = backend_cpu;
+@@ -3164,7 +3192,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+                     }
+                 }
+             }
+-            if (!ggml_backend_supports_op(backend, cur)) {
++            if (!port_sources && !ggml_backend_supports_op(backend, cur)) {
+                 ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
+                 cur->src[3] = dense_bias_mask();
+             }
+@@ -4461,6 +4489,20 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
      ggml_set_input(inp->self_rel_pos_swa);
      ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
  
@@ -130,7 +158,7 @@ index 358f614..2400367 100644
  }
  
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 88565ce..723a640 100644
+index 88565ce..97942fe 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -816,6 +816,17 @@ public:
@@ -151,11 +179,31 @@ index 88565ce..723a640 100644
      const uint32_t extent;
      const uint32_t extent_swa;
  };
+@@ -1138,6 +1149,19 @@ struct llm_graph_context {
+ 
+     ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
+ 
++    // 0194: the port arm's sources for the next build_attn_mha call that attaches an indexed
++    // bias. They must be on the op before the layer's backend is asked whether it supports
++    // it: a backend decides on the sources it sees. Consumed (reset) by that call.
++    struct fa_port_sources {
++        ggml_tensor * sinks_q = nullptr;   // F32 [n_head, n_tokens]
++        ggml_tensor * kpos    = nullptr;   // I32 [n_kv]
++        ggml_tensor * qpos    = nullptr;   // I32 [n_tokens]
++        ggml_tensor * cflag   = nullptr;   // I8  [n_kv/16]
++        ggml_tensor * rflag   = nullptr;   // I8  [n_tokens/8]
++        int32_t       window  = 0;
++    };
++    mutable fa_port_sources fa_port_next;
++
+     const llama_adapter_cvec     * cvec;
+     const llama_adapter_loras    * loras;
+     const llama_memory_context_i * mctx;
 diff --git a/src/llama-kv-cache.cpp b/src/llama-kv-cache.cpp
-index dea7fca..0953835 100644
+index dea7fca..5391512 100644
 --- a/src/llama-kv-cache.cpp
 +++ b/src/llama-kv-cache.cpp
-@@ -2208,6 +2208,45 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
+@@ -2208,6 +2208,53 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
      }
  }
  
@@ -166,8 +214,12 @@ index dea7fca..0953835 100644
 +    GGML_ASSERT(ggml_backend_buffer_is_host(dst_k->buffer) && ggml_backend_buffer_is_host(dst_q->buffer));
 +
 +    const int64_t n_kv = dst_k->ne[0];
-+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
++    const llama_seq_id seq0 = ubatch->seq_id[0][0];
++    const auto & cells = v_cells.at(seq_to_stream.at(seq0));
 +
++    // a key group's class: 1 = consecutive positions, every cell the first row's sequence,
++    // none empty (the kernel then decides by compares and reads no mask under linear rows);
++    // 2 = every cell empty (the kernel skips it); 0 = anything else (the mask decides)
 +    int32_t * kd = (int32_t *) dst_k->data;
 +    int8_t  * cd = (int8_t  *) dst_c->data;
 +    for (int64_t j = 0; j < n_kv; ++j) {
@@ -175,13 +227,16 @@ index dea7fca..0953835 100644
 +    }
 +    for (int64_t g = 0; g < dst_c->ne[0]; ++g) {
 +        const int64_t lo = g * 16, hi = std::min((g + 1) * 16, n_kv);
-+        bool lin = kd[lo] >= 0;
-+        for (int64_t j = lo + 1; j < hi && lin; ++j) {
-+            lin = kd[j] >= 0 && kd[j] == kd[j - 1] + 1;
++        bool lin = true, empty = true;
++        for (int64_t j = lo; j < hi; ++j) {
++            const bool e = cells.is_empty(kv_off + j);
++            empty = empty && e;
++            lin   = lin && !e && cells.seq_has(kv_off + j, seq0) && (j == lo || kd[j] == kd[j - 1] + 1);
 +        }
-+        cd[g] = lin;
++        cd[g] = lin ? 1 : (empty ? 2 : 0);
 +    }
 +
++    // a row group is linear when its rows are consecutive positions of that one sequence
 +    int32_t * qd = (int32_t *) dst_q->data;
 +    int8_t  * rd = (int8_t  *) dst_r->data;
 +    const int64_t n_q = dst_q->ne[0];
@@ -190,9 +245,10 @@ index dea7fca..0953835 100644
 +    }
 +    for (int64_t g = 0; g < dst_r->ne[0]; ++g) {
 +        const int64_t lo = g * 8, hi = std::min((g + 1) * 8, n_q);
-+        bool lin = qd[lo] >= 0;
-+        for (int64_t i = lo + 1; i < hi && lin; ++i) {
-+            lin = qd[i] >= 0 && qd[i] == qd[i - 1] + 1 && ubatch->seq_id[i][0] == ubatch->seq_id[i - 1][0];
++        bool lin = true;
++        for (int64_t i = lo; i < hi && lin; ++i) {
++            lin = qd[i] >= 0 && ubatch->n_seq_id[i] == 1 && ubatch->seq_id[i][0] == seq0 &&
++                  (i == lo || qd[i] == qd[i - 1] + 1);
 +        }
 +        rd[g] = lin;
 +    }
@@ -201,7 +257,7 @@ index dea7fca..0953835 100644
  void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
      if (!(dst->flags & GGML_TENSOR_FLAG_INPUT)) {
          return;  // the device copy (attn_rot_dev), already filled
-@@ -3449,6 +3488,11 @@ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const lla
+@@ -3449,6 +3496,11 @@ void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const lla
      kv->set_input_relative_pos(dst, ubatch, extent, sinfos.empty() ? 0 : sinfos[i_cur].kv_off);
  }
  
@@ -214,24 +270,25 @@ index dea7fca..0953835 100644
      kv->set_input_pos_bucket(dst, ubatch, sinfos.empty() ? 0 : sinfos[i_cur].kv_off);
  }
 diff --git a/src/llama-kv-cache.h b/src/llama-kv-cache.h
-index 4546729..8d7fc23 100644
+index 4546729..658f613 100644
 --- a/src/llama-kv-cache.h
 +++ b/src/llama-kv-cache.h
-@@ -280,6 +280,13 @@ public:
+@@ -280,6 +280,14 @@ public:
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t kv_off = 0) const;
      void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent, uint32_t kv_off = 0) const;
  
-+    // 0194: the port arm's positions and linearity flags: the kv rows' and the query rows'
-+    // positions (an empty cell is -1), and 1 a group when its rows are consecutive positions
-+    // of one sequence with no empty cell. The mask still decides the cells the port reads;
-+    // the flags only let a group take the linear path.
++    // 0194: the port arm's positions and group classes: the kv rows' and the query rows'
++    // positions (an empty cell is -1); a 16-key group is 1 when its cells are consecutive
++    // positions of the first row's sequence with no empty cell, 2 when every cell is empty,
++    // else 0; a 8-row group is 1 when its rows are consecutive positions of that sequence.
++    // The mask still decides every cell outside a class-1 group under a class-1 row group.
 +    void set_input_port_pos(ggml_tensor * dst_k, ggml_tensor * dst_q, ggml_tensor * dst_c, ggml_tensor * dst_r,
 +                            const llama_ubatch * ubatch, uint32_t kv_off = 0) const;
 +
      void set_input_k_rot(ggml_tensor * dst) const;
      void set_input_v_rot(ggml_tensor * dst) const;
  
-@@ -527,6 +534,10 @@ public:
+@@ -527,6 +535,10 @@ public:
      void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
      void set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const;
  
@@ -243,10 +300,10 @@ index 4546729..8d7fc23 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 5fec3cb..1ea6046 100644
+index 5fec3cb..aa9ed9c 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -380,15 +380,25 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -380,27 +380,60 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          const int64_t n_stream = (is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3];
          const int64_t n_kv     = rel_pos->ne[0];
  
@@ -261,41 +318,58 @@ index 5fec3cb..1ea6046 100644
 -        table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
 -        table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 -
+-        ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
+-        kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+-        kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+-        cb(kq_b, "kq_b", il);
 +        // 0194: with the port off the graph is exactly today's: the sink is folded into every
 +        // bin (the model's exp(s-t)/(1+sum exp(s-t)) identity) and the op gets a zero sink.
 +        // With GGML_OPENCL_FA_PORT=1 the sink is unfolded - the table is bias only (the pad
 +        // bin is then zero) and the logit is the port's initial (m, l) at src[18] -, because
 +        // the port's far-key skip must not lose the sink (review finding 1).
-+        static const bool port_on = [] {
++        // It is a prompt batch's graph only (more than 8 rows, one stream): a decode or
++        // verify step keeps today's graph and today's kernels whatever the knob says.
++        static const bool port_env = [] {
 +            const char * e = getenv("GGML_OPENCL_FA_PORT");
 +            return e != nullptr && atoi(e) != 0;
 +        }();
++        const bool port_on = port_env && cparams.flash_attn && n_tokens > 8 && n_stream == 1;
 +        if (!port_on) {
 +            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
 +            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
 +        }
-         ggml_tensor * kq_b = ggml_get_rows(ctx0, table, rel_pos);
-         kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-         kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-@@ -402,6 +412,21 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
-                 nullptr, nullptr, nullptr,
-                 Qcur, Kcur, Vcur, kq_b, sinks, table, rel_pos, 1.0f/sqrtf(n_embd_head), il);
++        // the dense gather is the fallback with flash attention off; the port's graph is a
++        // flash-attention graph and its table is bin-fastest, which this gather cannot read
++        ggml_tensor * kq_b = nullptr;
++        if (!port_on) {
++            kq_b = ggml_get_rows(ctx0, table, rel_pos);
++            kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
++            kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
++            cb(kq_b, "kq_b", il);
++        }
  
-+        // 0194: the port arm's inputs: the positions and linearity flags the kv-cache
-+        // walk fills, the per-query sink logits, and the window (0 on a global layer).
+         sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+ 
++        // 0194: the port arm's inputs, handed to build_attn_mha so that they are on the op
++        // before the layer's backend is asked whether it serves it: the positions and group
++        // classes the kv-cache walk fills, the per-query sink logits (sinks_tok is
++        // [n_head, n_tokens], head fastest: the layout the port kernel reads, no copy), and
++        // the window (0 on a global layer).
 +        if (port_on) {
-+            const bool swa = is_swa;
-+            // sinks_tok is [n_head, n_tokens] with the head fastest, the layout the port
-+            // kernel reads (sink[row*n_head + head]); no permute, no copy
-+            ggml_flash_attn_ext_add_query_sinks(cur, sinks_tok);
-+            ggml_flash_attn_ext_add_positions(cur,
-+                    swa ? inp->self_pos_k_swa : inp->self_pos_k,
-+                    swa ? inp->self_pos_q_swa : inp->self_pos_q,
-+                    swa ? inp->self_cflag_swa : inp->self_cflag,
-+                    swa ? inp->self_rflag_swa : inp->self_rflag);
-+            ggml_flash_attn_ext_set_window(cur, swa ? (int32_t) hparams.n_swa : 0);
++            fa_port_next.sinks_q = sinks_tok;
++            fa_port_next.kpos    = is_swa ? inp->self_pos_k_swa : inp->self_pos_k;
++            fa_port_next.qpos    = is_swa ? inp->self_pos_q_swa : inp->self_pos_q;
++            fa_port_next.cflag   = is_swa ? inp->self_cflag_swa : inp->self_cflag;
++            fa_port_next.rflag   = is_swa ? inp->self_rflag_swa : inp->self_rflag;
++            fa_port_next.window  = is_swa ? (int32_t) hparams.n_swa : 0;
 +        }
 +
+         // flash attention takes the compact table and the indices, the dense gather stays
+         // the fallback: with flash attention off, or on a backend that declines the op
+         cur = build_attn(inp,
+                 nullptr, nullptr, nullptr,
+                 Qcur, Kcur, Vcur, kq_b, sinks, table, rel_pos, 1.0f/sqrtf(n_embd_head), il);
++        GGML_ASSERT(fa_port_next.sinks_q == nullptr && "the port's sources were not attached");
+ 
          cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
          cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
-         cb(cur, "attn_out", il);

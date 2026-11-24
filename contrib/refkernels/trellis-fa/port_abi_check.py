@@ -37,7 +37,7 @@ print(f"host clSetKernelArg calls: {len(args)}")
 
 # --- what each position must carry ---
 expect = {
-    "q": "bq",              "q_offset": "oq",          "q_nb1": "q->nb[1]",    "q_nb2": "q_nb2p",
+    "q": "qsrc",            "q_offset": "qsrc_off",    "q_nb1": "qsrc_nb1",    "q_nb2": "qsrc_nb2",
     "k": "bk",              "k_offset": "ok",          "k_nb1": "k_nb1p",      "k_nb2": "k_nb2p",
     "v": "bv",              "v_offset": "ov",          "v_nb1": "v_nb1p",      "v_nb2": "v_nb2p",
     "dst": "bo",            "o_offset": "oo",          "o_nb1": "dst->nb[1]",  "o_nb2": "o_nb2p",
