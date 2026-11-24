@@ -816,6 +816,22 @@ initial `(m, l)`. The CPU reads `src[18]` when present, so a call the port decli
 still gets the per-token sink in the CPU fallback. The env is read once per
 process (a `getenv` in the model's graph builder, static-initialised).
 
+### The offline gate, run on the committed kernel {#gate}
+
+`ocl-gate.sh` (ocloc 26.27.1 with IGC 2.38.2, `bmg-g21`, the backend's
+options, `IGC_ShaderDumpEnable` read of each kernel's `.zeinfo`) on
+`flash_attn_port.cl`, one argument a variant (base, `GB_PAD_KEYS_OFF=1`,
+`GB_SKIP_SINK`):
+
+    OCL_EXTRA="-cl-intel-256-GRF-per-thread":  ocloc 3/3 variants  (PASS)
+      kernel_flash_attn_port: grf 256 simd 16 slm - scratch 0 stack_calls -   (each variant)
+    no OCL_EXTRA (the 128 arm):                ocloc 0/3 variants  (FAIL)
+      kernel_flash_attn_port: grf 128 simd 16 slm - scratch 8192 stack_calls -  <-- FAIL (each variant)
+
+The 256 arm is the default for that reason (§GRF). The 128 arm is the measured
+alternative and the gate says it spills, so it is not shippable and not the
+default.
+
 ### GRF: 256 is the default, measured {#GRF}
 
 The offline gate (`ocloc` 26.27.1 with IGC 2.38.2, `bmg-g21`, the backend's
@@ -837,6 +853,11 @@ build, and the 8-row tile with its O accumulator and DPAS operands does not fit
 thread occupancy, 256 halves the threads a core (640 against 1,280 on the B60,
 `exl3_ops.sycl:176`, `CL:5341`). `GGML_OPENCL_FA_PORT_GRF=128` builds the
 measured alternative, which the gate reports as spilling.
+
+Also verified, no card: the CPU-only `test-backend-ops -b CPU -o FLASH_ATTN_EXT`
+run after the sink/CPU edits passes (1/1 backends, “OK”, the seven `port=1` cases
+included), and a fresh tree of the pin plus the 145-patch series with the four
+current patches applied configures and builds `test-backend-ops` and `llama-cli`.
 
 `code` here: the four patches were checked against a fresh tree of the pin plus
 the 145-patch series — `git apply --check` clean for all four, and that tree
