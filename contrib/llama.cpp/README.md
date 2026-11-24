@@ -9827,15 +9827,18 @@ GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
 
   At ub 512 that is 5,684 -> 5,322 ms for the 4,096 tokens. The bias-table copy alone accounts for about
   384 x 919 us = 353 ms of that (`inferred` from the op times); the depth-mix copies give the rest.
-- Reach (`llama-bench`, a 2,048-token prompt, `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1`): Qwen3.8-27B 0
-  taken and 0 rejected lines, Dory 4B 0 / 0. The predicate applied to CPU graph-op exports
-  (`test-export-graph-ops`, every CPY / CONT / DUP line) finds 0 eligible copies in each of them:
+- Reach. The proof is the export: the predicate applied to CPU graph-op exports
+  (`test-export-graph-ops`, every CPY / CONT / DUP line) finds 0 eligible copies in each model:
   - Qwen3.8-Flash-Next (IQ3_S, q8_0 KV) at its served ub 8192 and at 512: 0 of 27;
   - the 27B: 0 of 9;
   - Dory: 0 of 2.
 
   The Flash-Next MTP head is arcint's own GGUF, not a llama graph, and is not covered by the
-  export. **No effect on them; Inkling only.** A CPU graph-op
+  export. **No effect on them; Inkling only.** (An earlier `llama-bench` run with
+  `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` printed no taken and no rejected lines for the 27B and Dory. That
+  is not evidence: `llama-bench` mutes every backend log line unless it runs with `-v`. A check that
+  reads printed lines first asserts that the log is not muted, by counting a line known to print at
+  that verbosity.) A CPU graph-op
   export of Inkling lists the eligible copies: the bias table `[24, 1025, T]` and the depth-mix
   stacks `[k, 2304, T]` (k 2..5), at T = 1 as well. So the path is also taken in decode
   (`inferred` from the CPU export; no decode run on the card printed the line, and the decode
