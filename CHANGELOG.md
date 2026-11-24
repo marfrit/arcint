@@ -125,7 +125,11 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   B60, Inkling IQ4_NL, two rounds): pp4096 at ub 512 522.5 -> 628.2 t/s (+20.2 %; 676.6 with the int8 expert tile
   `GGML_OPENCL_KQ_MM_ID_I8=1`), ub 1024 552.0 -> 712.2 with both; decode at 4k 36.0 -> 36.4; KL to the CPU reference
   0.001979 against 0.001952 (same top p 98.50 %), 0.001949 at micro-batch 1; the op cases pass with the bounds check
-  on and the red builds fail them; the agent 27B and Flash-Next give identical logits with the arms on and off.
+  on and the red builds fail them; the agent 27B and Flash-Next (its experts on the CPU, so this covers the F32 arms
+  only) give identical logits with the arms on and off; with Flash-Next's layers 28-47 keeping their experts on the card
+  (`-ncmoe 28`, 512-token ubatches, the defaults: `GGML_OPENCL_Q8_MM_ID` and the F32 arms on, `GGML_OPENCL_KQ_MM_ID_I8` unset)
+  neither 0167-0169's Q8_0 expert tile nor 0171-0179's F32 arms is reached: their red builds give the same logits as the
+  green ones.
 
 ## 1.8.0 — 2026-11-22
 
