@@ -1,0 +1,375 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 8661cf4..edc6140 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -553,6 +553,7 @@ extern "C" {
+         GGML_OP_ROPE_BACK,
+         GGML_OP_CLAMP,
+         GGML_OP_NORM_CLIP,
++        GGML_OP_DEPTH_MIX,
+         GGML_OP_CONV_TRANSPOSE_1D,
+         GGML_OP_IM2COL,
+         GGML_OP_IM2COL_BACK,
+@@ -1826,6 +1827,41 @@ extern "C" {
+             float                 threshold,
+             float                 eps);
+ 
++    // depth attention over the stacked block residuals: one token a program, fp32 throughout.
++    // blocks [n_embd, k, n_tokens] (rows of a block store, the token slabs at their own stride),
++    // cur [n_embd, n_tokens] (the last state), queries [n_embd, nq] rows scaled by n_embd^-0.5,
++    // norm_w [n_embd] (nq == 1) or [n_embd, nq] (fused output RMSNorm weights), or NULL.
++    //   v_s = the k block rows and cur;  inv_s = 1/sqrt(mean(v_s^2) + eps_states)
++    //   scores[q][s] = scale * inv_s * (queries[q] . v_s);  p = softmax_s(scores)
++    //   out[q] = sum_s p[q][s] * v_s;  (norm_w: out[q] *= rsqrt(mean(out[q]^2) + eps_out) * norm_w)
++    // dst [n_embd, n_tokens, nq], contiguous, so a query column's token block is itself contiguous.
++    GGML_API struct ggml_tensor * ggml_depth_mix(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * blocks,
++            struct ggml_tensor  * cur,
++            struct ggml_tensor  * queries,
++            struct ggml_tensor  * norm_w,
++            float                 eps_states,
++            float                 eps_out,
++            float                 scale);
++
++    // the pure shape/type/stride rule the model, the OpenCL dispatch and the CPU op share.
++    // NULL when the four shapes are covered; otherwise a fixed reason for the DOWNGRADE line.
++    // Reaching it is what the arm claims: n_embd a multiple of 256 (the kernel's lane width),
++    // k 1..8 states, nq 1..8 columns, n_tokens > 1 (the arm is a prefill one).
++    GGML_API const char * ggml_depth_mix_refuse(const struct ggml_tensor * blocks,
++                                                const struct ggml_tensor * cur,
++                                                const struct ggml_tensor * queries,
++                                                const struct ggml_tensor * norm_w);
++    GGML_API bool ggml_depth_mix_eligible(const struct ggml_tensor * blocks,
++                                          const struct ggml_tensor * cur,
++                                          const struct ggml_tensor * queries,
++                                          const struct ggml_tensor * norm_w);
++
++    // the arm's switch: NULL (unset), "0" and "off" are off, any other value is on.
++    // Opt-in: unset leaves the model's unfused chain and the dispatch as they are.
++    GGML_API bool ggml_depth_mix_switch(const char * env_value);
++
+     // in-place, returns view(a)
+     GGML_API struct ggml_tensor * ggml_clamp_inplace(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 6f7afd6..5d38340 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1949,6 +1949,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_norm_clip(params, tensor);
+             } break;
++        case GGML_OP_DEPTH_MIX:
++            {
++                ggml_compute_forward_depth_mix(params, tensor);
++            } break;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             {
+                 ggml_compute_forward_conv_transpose_1d(params, tensor);
+@@ -2421,6 +2425,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = n_threads;
+             } break;
++        case GGML_OP_DEPTH_MIX:
++            {
++                n_tasks = MIN(n_threads, (int) node->ne[1]);
++            } break;
+         case GGML_OP_SOFT_MAX:
+             {
+                 n_tasks = MIN(n_threads, ggml_nrows(node->src[0]));
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 517eba9..95f4d95 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -6482,6 +6482,136 @@ void ggml_compute_forward_norm_clip(
+     }
+ }
+ 
++// ggml_compute_forward_depth_mix
++
++// the unfused chain reads: cpy(cur into the stack), rms_norm over the k + 1 states,
++// repeat(queries), mul_mat, soft_max_ext, cont(transpose), mul_mat, then the norm of each
++// output column. Same arithmetic here: fp32 sums over n_embd, one state a row.
++// the order differs from the chain in one place: the chain normalizes a state once and
++// accumulates normalized values in the dot, this accumulates raw values and scales the
++// finished dot by 1/sqrt(mean(v^2) + eps) - the same value, a different rounding.
++void ggml_compute_forward_depth_mix_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * blocks  = dst->src[0];
++    const ggml_tensor * cur     = dst->src[1];
++    const ggml_tensor * queries = dst->src[2];
++    const ggml_tensor * norm_w  = dst->src[3];
++
++    const float eps_states = ggml_get_op_params_f32(dst, 0);
++    const float eps_out    = ggml_get_op_params_f32(dst, 1);
++    const float scale      = ggml_get_op_params_f32(dst, 2);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t n_embd   = blocks->ne[0];
++    const int64_t n_state  = blocks->ne[1] + 1;   // the block rows, then cur
++    const int64_t n_tok    = blocks->ne[2];
++    const int64_t n_q      = queries->ne[1];
++
++    const size_t nb1  = blocks->nb[1], nb2 = blocks->nb[2];
++    const size_t nbc1 = cur->nb[1];
++    const size_t nbq1 = queries->ne[1] > 1 ? queries->nb[1] : 0;
++    const size_t nbn1 = norm_w ? (norm_w->ne[1] > 1 ? norm_w->nb[1] : 0) : 0;
++
++    std::vector<float> v ((size_t) n_state*n_embd);
++    std::vector<float> ss((size_t) n_state);
++    std::vector<float> dots((size_t) n_q*n_state);
++    std::vector<float> p   ((size_t) n_q*n_state);
++
++    for (int64_t t = ith; t < n_tok; t += nth) {
++        const char * bp = (const char *) blocks->data + t*nb2;
++        const char * cp = (const char *) cur->data    + t*nbc1;
++        for (int64_t s = 0; s < n_state; ++s) {
++            float * row = v.data() + s*n_embd;
++            if (s < n_state - 1) {
++                const float * src = (const float *) (bp + s*nb1);
++                for (int64_t i = 0; i < n_embd; ++i) {
++                    row[i] = src[i];
++                }
++            } else {
++                const float * src = (const float *) cp;
++                for (int64_t i = 0; i < n_embd; ++i) {
++                    row[i] = src[i];
++                }
++            }
++            ggml_float sum = 0.0;
++            for (int64_t i = 0; i < n_embd; ++i) {
++                sum += (ggml_float) (row[i]*row[i]);
++            }
++            ss[s] = (float) sum;
++        }
++
++        for (int64_t q = 0; q < n_q; ++q) {
++            const float * qp = (const float *) ((const char *) queries->data + (n_q > 1 ? q*nbq1 : 0));
++            for (int64_t s = 0; s < n_state; ++s) {
++                const float * row = v.data() + s*n_embd;
++                ggml_float sum = 0.0;
++                for (int64_t i = 0; i < n_embd; ++i) {
++                    sum += (ggml_float) (row[i]*qp[i]);
++                }
++                const float inv = 1.0f/sqrtf(ss[s]/(float) n_embd + eps_states);
++                dots[q*n_state + s] = scale*inv*(float) sum;
++            }
++
++            // softmax over the states
++            float mx = -INFINITY;
++            for (int64_t s = 0; s < n_state; ++s) {
++                mx = MAX(mx, dots[q*n_state + s]);
++            }
++            ggml_float tot = 0.0;
++            for (int64_t s = 0; s < n_state; ++s) {
++                const float e = expf(dots[q*n_state + s] - mx);
++                p[q*n_state + s] = e;
++                tot += (ggml_float) e;
++            }
++            const float dsum = (float) tot;
++            for (int64_t s = 0; s < n_state; ++s) {
++                p[q*n_state + s] = p[q*n_state + s] * 1.0f/dsum;
++            }
++
++            float * o = (float *) ((char *) dst->data + q*dst->nb[2] + t*dst->nb[1]);
++            for (int64_t i = 0; i < n_embd; ++i) {
++                ggml_float acc = 0.0;
++                for (int64_t s = 0; s < n_state; ++s) {
++                    acc += (ggml_float) (p[q*n_state + s]*v[s*n_embd + i]);
++                }
++                o[i] = (float) acc;
++            }
++
++            if (norm_w) {
++                const float * w = (const float *) ((const char *) norm_w->data + (norm_w->ne[1] > 1 ? q*nbn1 : 0));
++                ggml_float sumsq = 0.0;
++                for (int64_t i = 0; i < n_embd; ++i) {
++                    sumsq += (ggml_float) (o[i]*o[i]);
++                }
++                const float inv = 1.0f/sqrtf((float) sumsq/(float) n_embd + eps_out);
++                for (int64_t i = 0; i < n_embd; ++i) {
++                    o[i] = o[i]*inv*w[i];
++                }
++            }
++        }
++    }
++}
++
++void ggml_compute_forward_depth_mix(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_depth_mix_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_rope_apply
+ 
+ void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index bfef2a8..1607712 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -65,6 +65,7 @@ void ggml_compute_forward_rope(const struct ggml_compute_params * params, struct
+ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_norm_clip(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_depth_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 9a57c18..086d8ea 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1055,6 +1055,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "ROPE_BACK",
+     "CLAMP",
+     "NORM_CLIP",
++    "DEPTH_MIX",
+     "CONV_TRANSPOSE_1D",
+     "IM2COL",
+     "IM2COL_BACK",
+@@ -1115,7 +1116,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GATED_DELTA_NET_REPLAY",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1173,6 +1174,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "rope_back(x)",
+     "clamp(x)",
+     "norm_clip(x)",
++    "depth_mix(x)",
+     "conv_transpose_1d(x)",
+     "im2col(x)",
+     "im2col_back(x)",
+@@ -1233,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "gated_delta_net_replay(q, k, v, g, beta, s, rec, ctrl)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
++static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4214,6 +4216,103 @@ struct ggml_tensor * ggml_norm_clip(
+     return result;
+ }
+ 
++// the pure shape/type/stride rule: one place, so the model's emission, the OpenCL dispatch and the
++// CPU op cannot disagree about what the arm covers. NULL means covered.
++const char * ggml_depth_mix_refuse(const struct ggml_tensor * blocks, const struct ggml_tensor * cur,
++                                   const struct ggml_tensor * queries, const struct ggml_tensor * norm_w) {
++    if (blocks == NULL || cur == NULL || queries == NULL) {
++        return "missing";
++    }
++    if (blocks->type != GGML_TYPE_F32 || cur->type != GGML_TYPE_F32 || queries->type != GGML_TYPE_F32 ||
++        (norm_w != NULL && norm_w->type != GGML_TYPE_F32)) {
++        return "not-f32";
++    }
++    const int64_t n_embd = blocks->ne[0];
++    if (n_embd % 256 != 0 || n_embd > 256*9) {
++        return "d-lanes";   // the kernel holds n_embd/256 floats a lane (9 at most), lane width 256
++    }
++    if (blocks->ne[1] < 1 || blocks->ne[1] > 6) {
++        return "k";
++    }
++    if (blocks->ne[2] < 2) {
++        return "decode";   // the arm is a prefill one; T = 1 keeps today's chain
++    }
++    if (blocks->ne[3] != 1) {
++        return "blocks-shape";
++    }
++    if (blocks->nb[0] != sizeof(float) || blocks->nb[1] != n_embd*sizeof(float)) {
++        return "blocks-stride";   // the block rows back to back, so a state is a row step
++    }
++    if (blocks->nb[2] < blocks->ne[1]*blocks->nb[1]) {
++        return "blocks-slab";   // a token's slab must not overlap the next token's states
++    }
++    if (cur->ne[0] != n_embd || cur->ne[1] != blocks->ne[2] || cur->ne[2] != 1 || cur->ne[3] != 1) {
++        return "cur-shape";
++    }
++    if (cur->nb[0] != sizeof(float) || cur->nb[1] != n_embd*sizeof(float)) {
++        return "cur-stride";
++    }
++    if (queries->ne[0] != n_embd || queries->ne[1] < 1 || queries->ne[1] > 4 || queries->ne[2] != 1 || queries->ne[3] != 1) {
++        return "q-shape";
++    }
++    if (queries->nb[0] != sizeof(float) || (queries->ne[1] > 1 && queries->nb[1] < n_embd*sizeof(float))) {
++        return "q-stride";   // one column is a 1-D weight, its row step is never read
++    }
++    if (norm_w != NULL) {
++        if (norm_w->ne[0] != n_embd || norm_w->ne[2] != 1 || norm_w->ne[3] != 1 ||
++            (norm_w->ne[1] != 1 && norm_w->ne[1] != queries->ne[1])) {
++            return "nw-shape";
++        }
++        if (norm_w->nb[0] != sizeof(float) || (norm_w->ne[1] > 1 && norm_w->nb[1] < n_embd*sizeof(float))) {
++            return "nw-stride";
++        }
++    }
++    return NULL;
++}
++
++bool ggml_depth_mix_switch(const char * env_value) {
++    if (env_value == NULL) {
++        return false;
++    }
++    if (strcmp(env_value, "0") == 0 || strcmp(env_value, "off") == 0) {
++        return false;
++    }
++    return true;
++}
++
++bool ggml_depth_mix_eligible(const struct ggml_tensor * blocks, const struct ggml_tensor * cur,
++                             const struct ggml_tensor * queries, const struct ggml_tensor * norm_w) {
++    return ggml_depth_mix_refuse(blocks, cur, queries, norm_w) == NULL;
++}
++
++struct ggml_tensor * ggml_depth_mix(
++    struct ggml_context * ctx,
++    struct ggml_tensor  * blocks,
++    struct ggml_tensor  * cur,
++    struct ggml_tensor  * queries,
++    struct ggml_tensor  * norm_w,
++    float                 eps_states,
++    float                 eps_out,
++    float                 scale) {
++    GGML_ASSERT(ggml_depth_mix_eligible(blocks, cur, queries, norm_w));
++
++    // [n_embd, n_tokens, nq]: a query column's whole token block is contiguous, so the graph
++    // views it without a copy
++    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, blocks->ne[0], blocks->ne[2], queries->ne[1]);
++
++    ggml_set_op_params_f32(result, 0, eps_states);
++    ggml_set_op_params_f32(result, 1, eps_out);
++    ggml_set_op_params_f32(result, 2, scale);
++
++    result->op     = GGML_OP_DEPTH_MIX;
++    result->src[0] = blocks;
++    result->src[1] = cur;
++    result->src[2] = queries;
++    result->src[3] = norm_w;
++
++    return result;
++}
++
+ struct ggml_tensor * ggml_clamp_inplace(
+     struct ggml_context * ctx,
+     struct ggml_tensor  * a,

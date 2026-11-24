@@ -1,0 +1,97 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a128fff..31e3ae7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6869,6 +6869,58 @@ struct test_norm_clip : public test_case {
+     }
+ };
+ 
++// 0207: Inkling 2 Mini's depth mix at the shapes its prefill graph hands it: a block
++// count k = 2..5, 512 and 2048 tokens, nq 1 (an SWA layer, the ffn, the output) and
++// nq 3 (a full-attention layer), with and without the folded output norm. The block
++// rows are a view_3d of a [2304, 7, tokens] store, so the strides are the graph's:
++// a state's row step 2304 floats, a token's slab step 7 * 2304 floats.
++struct test_depth_mix : public test_case {
++    const int64_t k;       // block rows
++    const int64_t nt;      // tokens
++    const int64_t nq;      // query columns
++    const bool with_norm;
++
++    std::string vars() override {
++        return VARS_TO_STR4(k, nt, nq, with_norm);
++    }
++
++    test_depth_mix(int64_t k = 4, int64_t nt = 512, int64_t nq = 1, bool with_norm = false)
++        : k(k), nt(nt), nq(nq), with_norm(with_norm) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t n_embd = 2304;
++        const int64_t n_slot = 7;   // 24 physical blocks at attn_res_block_size 4: 6 block rows + cur
++
++        ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_slot, nt);
++        ggml_set_name(stack, "stack");
++
++        ggml_tensor * blocks = ggml_view_3d(ctx, stack, n_embd, k, nt,
++                stack->nb[1], stack->nb[2], (size_t) ((n_slot - 1) - k)*stack->nb[1]);
++        ggml_set_name(blocks, "blocks");
++
++        ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
++        ggml_set_name(cur, "cur");
++
++        ggml_tensor * q = nq == 1
++            ? ggml_reshape_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd), n_embd, 1)
++            : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nq);
++        ggml_set_name(q, "queries");
++
++        ggml_tensor * nw = nullptr;
++        if (with_norm) {
++            nw = nq == 1
++                ? ggml_reshape_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd), n_embd, 1)
++                : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nq);
++            ggml_set_name(nw, "norm_w");
++        }
++
++        ggml_tensor * out = ggml_depth_mix(ctx, blocks, cur, q, nw, 1e-6f, 1e-5f, 1.0f/sqrtf((float) n_embd));
++        ggml_set_name(out, "out");
++
++        return out;
++    }
++};
++
+ // GGML_OP_FLOOR
+ struct test_floor : public test_case {
+     const ggml_type type;
+@@ -13051,6 +13103,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_norm_clip({13, 3, 5, 1}, true));
+     test_cases.emplace_back(new test_norm_clip({7, 5, 2, 2}, false, 8.0f));
+ 
++    // Inkling 2 Mini's depth mix: the block count its prefill reaches (k 2..5), both
++    // ubatch sizes, an SWA layer's one column and a full-attention layer's three
++    for (int64_t k : {2, 3, 4, 5}) {
++        for (int64_t nt : {512, 2048}) {
++            test_cases.emplace_back(new test_depth_mix(k, nt, 1, false));
++            test_cases.emplace_back(new test_depth_mix(k, nt, 3, false));
++        }
++    }
++    // the folded output norm (the SWA layer's, the ffn's, the output's) and a 3-column weight
++    test_cases.emplace_back(new test_depth_mix(2, 512, 1, true));
++    test_cases.emplace_back(new test_depth_mix(5, 2048, 1, true));
++    test_cases.emplace_back(new test_depth_mix(4, 512, 3, true));
++
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
+@@ -14227,6 +14292,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // Inkling 2 Mini's depth mix as one launch a call - the shape it replaced is 8 nodes
++    for (int64_t k : {2, 4, 5}) {
++        for (int64_t nt : {512, 2048}) {
++            test_cases.emplace_back(new test_depth_mix(k, nt, 1, false));
++        }
++    }
++
+     // prompt attention at depth, Mistral Small 24B's geometry (head size 128,
+     // 32 query heads on 8)
+     for (int64_t kv : {4096, 16384}) {

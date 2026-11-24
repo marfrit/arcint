@@ -1,0 +1,554 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index a1c914b..0311c94 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -109,6 +109,7 @@ set(GGML_OPENCL_KERNELS
+     fill
+     clamp
+     norm_clip
++    depth_mix
+     cpy
+     cvt
+     diag_mask_inf
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index f84ca33..16bcbe9 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -723,6 +723,12 @@ static std::mutex g_cl_downgrade_mu;
+ static std::map<std::string, uint64_t> g_cl_downgrades;
+ 
+ static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
++// 0205: the depth-mix arm, defined below; supports_op at the top reaches it
++static bool ggml_cl_depth_mix_on();
++static cl_kernel ggml_cl_depth_mix_kernel(ggml_backend_opencl_context * backend_ctx);
++static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks, const ggml_tensor * cur, ggml_tensor * dst);
++// 0178's bounds helper, defined below supports_op
++static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);
+ static void ggml_cl_downgrade(const char * fmt, ...) {
+     char buf[256];
+     va_list args;
+@@ -988,6 +994,7 @@ struct ggml_backend_opencl_context {
+     cl_program program_moe_add_id_glu;
+     cl_program program_clamp;
+     cl_program program_norm_clip;
++
+     cl_program program_cvt;
+     cl_program program_diag_mask_inf;
+     cl_program program_gelu;
+@@ -1074,6 +1081,12 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_fill_f16 = nullptr;
+     cl_kernel kernel_clamp, kernel_clamp_nc;
+     cl_kernel kernel_norm_clip_f32;
++    // 0205: Inkling 2 Mini's depth attention (depth_mix.cl), one token a work-group,
++    // an fp32 reduction over it. Built on first use, so a model that never emits
++    // GGML_OP_DEPTH_MIX compiles nothing; unset, no node exists and no kernel is built.
++    cl_kernel kernel_depth_mix_f32 = nullptr;
++    int       depth_mix_calls_graph = 0;   // GGML_OPENCL_DEPTH_MIX_STATS=1: launches a graph
++    int       depth_mix_nodes_graph = 0;   // and the nodes the graph handed it
+     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
+               kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
+               kernel_geglu_erf_f16, kernel_geglu_quick_f16, kernel_situ_f32;
+@@ -12381,6 +12394,13 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
++    // 0205: the depth-mix arm's count for this graph, printed at the graph's end
++    // with GGML_OPENCL_DEPTH_MIX_STATS=1
++    backend_ctx->depth_mix_calls_graph = 0;
++    backend_ctx->depth_mix_nodes_graph = 0;
++    for (int i = 0; i < cgraph->n_nodes; ++i) {
++        if (cgraph->nodes[i]->op == GGML_OP_DEPTH_MIX) backend_ctx->depth_mix_nodes_graph++;
++    }
+     // 0130d: the previous graph's pre/post pairs: their events are waited here, the frame's
+     // first point that is not inside a dispatch
+     if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)
+@@ -12693,6 +12713,17 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+                       backend_ctx->ngpt_fused, cgraph->n_nodes, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
+     }
+ 
++    if (backend_ctx->depth_mix_nodes_graph > 0) {
++        static const bool stats_on = [] {
++            const char * e = getenv("GGML_OPENCL_DEPTH_MIX_STATS");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (stats_on) {
++            GGML_LOG_INFO("depth_mix: graph nodes=%d calls=%d of %d\n",
++                          backend_ctx->depth_mix_nodes_graph, backend_ctx->depth_mix_calls_graph, cgraph->n_nodes);
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -13294,6 +13325,33 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
+         case GGML_OP_CLAMP:
+             return op->src[0]->type == GGML_TYPE_F32;
++        case GGML_OP_DEPTH_MIX: {
++            // 0205: opt-in, and only the shapes ggml_depth_mix_eligible names. Unset, the
++            // node does not exist on a model that does not emit it; a build with the knob off
++            // keeps this dispatch exactly as it was. A shape the arm does not cover leaves a
++            // DOWNGRADE line with the reason (once a key).
++            if (ggml_cl_depth_mix_on() == false) {
++                return false;
++            }
++            const char * why = ggml_depth_mix_refuse(op->src[0], op->src[1], op->src[2], op->src[3]);
++            if (why != nullptr) {
++                ggml_cl_downgrade("op=DEPTH_MIX path=cpu reason=%s", why);
++                return false;
++            }
++            if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
++                ggml_cl_downgrade("op=DEPTH_MIX path=cpu reason=dst-layout");
++                return false;
++            }
++            if (op->src[0]->extra == nullptr || op->src[1]->extra == nullptr ||
++                op->src[2]->extra == nullptr || op->extra == nullptr ||
++                (op->src[3] != nullptr && op->src[3]->extra == nullptr)) {
++                return false;   // a tensor without device storage runs nowhere else either
++            }
++            if (ggml_cl_depth_mix_kernel(backend_ctx) == nullptr) {
++                return false;   // the DOWNGRADE "not-built" is logged at the build
++            }
++            return true;
++        }
+         case GGML_OP_NORM_CLIP:
+             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous_rows(op->src[0]) &&
+@@ -21512,6 +21570,153 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++// 0205: Inkling 2 Mini's depth attention as one launch. The unfused chain is, a mix call:
++// cpy(cur into the block store), rms_norm over the k+1 states, repeat(queries over the
++// tokens), mul_mat(states, queries), soft_max_ext, cont(transpose(states)), mul_mat(that,
++// the scores), then the norm(s) of the output columns - 8 to 12 nodes, and the cont's copy
++// is the traffic the reference's own kernel does not have. It reads the k+1 states once and
++// keeps them in registers, writes the output once. A token a work-group, n_embd/256 floats
++// a lane; the reduction over the work-group is depth_mix.cl's.
++//
++// GGML_OPENCL_DEPTH_MIX=1 turns it on; unset, the model emits the chain and the dispatch is
++// exactly today's. The shapes are ggml_depth_mix_eligible: a model that starts taking it
++// prints one TAKEN line, and a shape it does not cover leaves a DOWNGRADE line with the
++// reason (once a key, ggml_cl_downgrade).
++static bool ggml_cl_depth_mix_on() {
++    static const bool on = ggml_depth_mix_switch(getenv("GGML_OPENCL_DEPTH_MIX"));
++    return on;
++}
++
++// the kernel is built on the first eligible node: with the knob unset, or on a model that
++// never emits the op, depth_mix.cl is not compiled and nothing else changes
++static cl_kernel ggml_cl_depth_mix_kernel(ggml_backend_opencl_context * backend_ctx) {
++    static bool tried = false;
++    if (!tried && backend_ctx->kernel_depth_mix_f32 == nullptr) {
++        tried = true;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "depth_mix.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("depth_mix.cl");
++#endif
++        // GGML_OPENCL_DEPTH_MIX_OPTS appends compiler options, the red case's route:
++        // -DDEPTH_MIX_RED drops the softmax denominator in depth_mix.cl
++        const char * extra = getenv("GGML_OPENCL_DEPTH_MIX_OPTS");
++        const std::string opts = backend_ctx->kernel_compile_opts + " -cl-intel-256-GRF-per-thread" +
++                                 (extra != nullptr ? std::string(" ") + extra : std::string());
++        cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
++        if (prog == nullptr) {
++            ggml_cl_downgrade("op=DEPTH_MIX path=cpu reason=not-built");
++            GGML_LOG_WARN("ggml_opencl: depth_mix.cl did not build; GGML_OP_DEPTH_MIX stays on the CPU\n");
++        } else {
++            cl_int err;
++            CL_CHECK((backend_ctx->kernel_depth_mix_f32 = clCreateKernel(prog, "kernel_depth_mix_f32", &err), err));
++            CL_CHECK(clReleaseProgram(prog));
++        }
++    }
++    return backend_ctx->kernel_depth_mix_f32;
++}
++
++static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks, const ggml_tensor * cur, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    const ggml_tensor * queries = dst->src[2];
++    const ggml_tensor * norm_w  = dst->src[3];
++
++    ggml_tensor_extra_cl * extrab = (ggml_tensor_extra_cl *) blocks->extra;
++    ggml_tensor_extra_cl * extrac = (ggml_tensor_extra_cl *) cur->extra;
++    ggml_tensor_extra_cl * extraq = (ggml_tensor_extra_cl *) queries->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
++
++    const cl_ulong offb = extrab->offset + blocks->view_offs;
++    const cl_ulong offc = extrac->offset + cur->view_offs;
++    const cl_ulong offq = extraq->offset + queries->view_offs;
++    const cl_ulong offd = extrad->offset + dst->view_offs;
++
++    const int ne0 = (int) blocks->ne[0];
++    const int k   = (int) blocks->ne[1];     // the block rows; cur is the k+1'th state
++    const int nq  = (int) queries->ne[1];
++    const int nt  = (int) blocks->ne[2];
++
++    const float eps_states = ggml_get_op_params_f32(dst, 0);
++    const float eps_out    = ggml_get_op_params_f32(dst, 1);
++    const float scale      = ggml_get_op_params_f32(dst, 2);
++
++    // the query columns of a 1-D weight are one column: its row step is never read
++    const cl_ulong nbq1 = nq > 1 ? queries->nb[1] : 0;
++    cl_mem nwb = nullptr;
++    cl_ulong offn = 0, nbn1 = 0;
++    int has_nw = 0;
++    if (norm_w != nullptr) {
++        ggml_tensor_extra_cl * extran = (ggml_tensor_extra_cl *) norm_w->extra;
++        nwb   = extran->data_device;
++        offn  = extran->offset + norm_w->view_offs;
++        nbn1  = norm_w->ne[1] > 1 ? norm_w->nb[1] : 0;
++        has_nw = 1;
++    }
++
++    // the furthest byte each argument can reach from the global size and the strides handed
++    // to the kernel, against its buffer (a view's offset included)
++    {
++        const size_t ub = (size_t) offb + (size_t) (k - 1)*blocks->nb[1] + (size_t) (nt - 1)*blocks->nb[2] + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
++        const size_t uc = (size_t) offc + (size_t) (nt - 1)*cur->nb[1] + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
++        const size_t uq = (size_t) offq + (size_t) (nq - 1)*nbq1 + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
++        const size_t ud = (size_t) offd + (size_t) nq*dst->nb[2] - (size_t) dst->nb[2] + (size_t) (nt - 1)*dst->nb[1] + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float);
++        ggml_cl_bounds("depth mix", "blocks", extrab->data_device, ub);
++        ggml_cl_bounds("depth mix", "cur",    extrac->data_device, uc);
++        ggml_cl_bounds("depth mix", "queries", extraq->data_device, uq);
++        ggml_cl_bounds("depth mix", "dst",    extrad->data_device, ud);
++        if (norm_w != nullptr) {
++            ggml_cl_bounds("depth mix", "norm_w", nwb, (size_t) offn + (size_t) (nq - 1)*nbn1 + (size_t) (ne0 - 1)*sizeof(float) + sizeof(float));
++        }
++    }
++
++    cl_kernel kernel = ggml_cl_depth_mix_kernel(backend_ctx);
++    GGML_ASSERT(kernel != nullptr);
++
++    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extrab->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offb));
++    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_ulong), &blocks->nb[1]));
++    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_ulong), &blocks->nb[2]));
++    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_mem),   &extrac->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &offc));
++    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_ulong), &cur->nb[1]));
++    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_mem),   &extraq->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &offq));
++    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_ulong), &nbq1));
++    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_mem),   &nwb));
++    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &offn));
++    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_ulong), &nbn1));
++    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &has_nw));
++    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_ulong), &offd));
++    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &dst->nb[1]));
++    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &dst->nb[2]));
++    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &ne0));
++    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &k));
++    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &nq));
++    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(float),    &eps_states));
++    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(float),    &eps_out));
++    CL_CHECK(clSetKernelArg(kernel, 23, sizeof(float),    &scale));
++    // the partial sums: one float a lane for each reduced quantity, sized at the launch
++    const int np = (k + 1)*(1 + nq);
++    CL_CHECK(clSetKernelArg(kernel, 24, (size_t) np*256*sizeof(float), nullptr));
++
++    const size_t lsz = 256;
++    size_t global_work_size[] = { (size_t) nt*lsz, 1, 1 };
++    size_t local_work_size[]  = { lsz, 1, 1 };
++
++    static bool taken_told = false;
++    if (!taken_told) {
++        taken_told = true;
++        GGML_LOG_INFO("depth_mix: TAKEN opencl f32 token-a-group\n");
++    }
++    backend_ctx->depth_mix_calls_graph++;
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
+ static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -42378,6 +42583,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_norm_clip;
+             break;
++        case GGML_OP_DEPTH_MIX:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_depth_mix;
++            break;
+         case GGML_OP_NORM:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/depth_mix.cl b/ggml/src/ggml-opencl/kernels/depth_mix.cl
+new file mode 100644
+index 0000000..fcd3c6b
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/depth_mix.cl
+@@ -0,0 +1,265 @@
++//------------------------------------------------------------------------------
++// depth_mix
++//------------------------------------------------------------------------------
++// Inkling 2 Mini's depth attention as one launch: a token a work-group, fp32
++// throughout, the states read once from global into registers and never written
++// back. The reference's _mix_kernel (trellis-serve xpu/exl3xpu/inkling2/fused.py
++// @8f8e2fcc) is the same algorithm, a token a program; its three-state read per
++// call (NORM) is the traffic this form drops.
++//
++//   v_s   the k block rows of the store and cur (n_state = k + 1)
++//   ss_s  sum of v_s^2 over n_embd, reduced over the work-group
++//   inv_s 1 / sqrt(ss_s / n_embd + eps_states)
++//   score[q][s] = scale * inv_s * (queries[q] . v_s), softmax over s
++//   out[q]      = sum_s p[q][s] * v_s, and with norm_w: * 1/sqrt(mean(out^2) + eps_out) * norm_w[q]
++//
++// n_embd is a multiple of DEPTH_MIX_LS and at most DEPTH_MIX_LS * DEPTH_MIX_EL,
++// so a lane holds DEPTH_MIX_EL floats of each state; the state and element loops
++// are unrolled over their maxima with a runtime guard, which keeps the register
++// array's indices compile-time (a dynamic index would spill to scratch).
++
++#define DEPTH_MIX_LS   256
++#define DEPTH_MIX_STATE 7    // k <= 6 blocks, plus cur
++#define DEPTH_MIX_Q     4
++#define DEPTH_MIX_EL    9    // n_embd <= 256 * 9
++
++// reduce np partial sums held at red[p*DEPTH_MIX_LS + lane]; 8 sub-groups of 32 lanes
++// take 8 quantities a round, a 5-step tree each. The result lands at red[p*DEPTH_MIX_LS].
++static void depth_mix_reduce(local float * red, local float * tmp8, int np, int lane) {
++    const int sub = lane / 32;
++    const int sl  = lane % 32;
++    for (int base = 0; base < np; base += 8) {
++        const int p = base + sub;
++        float v = 0.0f;
++        if (p < np) {
++            for (int j = sl; j < DEPTH_MIX_LS; j += 32) {
++                v += red[p*DEPTH_MIX_LS + j];
++            }
++        }
++        tmp8[sub*32 + sl] = v;
++        barrier(CLK_LOCAL_MEM_FENCE);
++        for (int st = 16; st >= 1; st >>= 1) {
++            if (sl < st) {
++                tmp8[sub*32 + sl] += tmp8[sub*32 + sl + st];
++            }
++            barrier(CLK_LOCAL_MEM_FENCE);
++        }
++        if (sl == 0 && p < np) {
++            red[p*DEPTH_MIX_LS] = tmp8[sub*32];
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++}
++
++kernel void kernel_depth_mix_f32(
++        global char * blk,
++        ulong         offb,
++        ulong         nb1,
++        ulong         nb2,
++        global char * cur,
++        ulong         offc,
++        ulong         nbc1,
++        global char * qry,
++        ulong         offq,
++        ulong         nbq1,
++        global char * nw,
++        ulong         offn,
++        ulong         nbn1,
++        int           has_nw,
++        global char * dst,
++        ulong         offd,
++        ulong         nbd1,
++        ulong         nbd2,
++        int           ne0,
++        int           k,
++        int           nq,
++        float         eps_states,
++        float         eps_out,
++        float         scale,
++        local float * red
++) {
++    blk = blk + offb;
++    cur = cur + offc;
++    qry = qry + offq;
++    dst = dst + offd;
++
++    const int t    = get_group_id(0);
++    const int lane = get_local_id(0);
++    const int el   = ne0 / DEPTH_MIX_LS;
++    const int ns   = k + 1;
++
++    local float tmp8[8*32];
++
++    // pass A: the states, one global read
++    float x[DEPTH_MIX_STATE][DEPTH_MIX_EL];
++    #pragma unroll
++    for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++        if (s < ns) {
++            global const float * src = (s < k)
++                ? (global const float *)(blk + (ulong) s*nb1 + (ulong) t*nb2)
++                : (global const float *)(cur + (ulong) t*nbc1);
++            #pragma unroll
++            for (int i = 0; i < DEPTH_MIX_EL; ++i) {
++                x[s][i] = (i < el) ? src[lane + i*DEPTH_MIX_LS] : 0.0f;
++            }
++        }
++    }
++
++    // sum of squares each state, and the query dots; partials into local
++    #pragma unroll
++    for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++        if (s < ns) {
++            float v = 0.0f;
++            #pragma unroll
++            for (int i = 0; i < DEPTH_MIX_EL; ++i) {
++                if (i < el) {
++                    v += x[s][i]*x[s][i];
++                }
++            }
++            red[s*DEPTH_MIX_LS + lane] = v;
++        }
++    }
++    #pragma unroll
++    for (int q = 0; q < DEPTH_MIX_Q; ++q) {
++        if (q < nq) {
++            global const float * qp = (global const float *)(qry + (ulong) q*nbq1);
++            #pragma unroll
++            for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                if (s < ns) {
++                    float d = 0.0f;
++                    #pragma unroll
++                    for (int i = 0; i < DEPTH_MIX_EL; ++i) {
++                        if (i < el) {
++                            d += x[s][i]*qp[lane + i*DEPTH_MIX_LS];
++                        }
++                    }
++                    red[(ns + q*ns + s)*DEPTH_MIX_LS + lane] = d;
++                }
++            }
++        }
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    depth_mix_reduce(red, tmp8, ns*(1 + nq), lane);
++
++    // the weights: every lane computes them from the reduced values, they are lane-invariant
++    float inv[DEPTH_MIX_STATE];
++    #pragma unroll
++    for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++        if (s < ns) {
++            inv[s] = rsqrt(red[s*DEPTH_MIX_LS] / (float) ne0 + eps_states);
++        }
++    }
++
++    if (has_nw) {
++        float outv[DEPTH_MIX_Q][DEPTH_MIX_EL];
++        #pragma unroll
++        for (int q = 0; q < DEPTH_MIX_Q; ++q) {
++            if (q < nq) {
++                float mx = -INFINITY;
++                #pragma unroll
++                for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                    if (s < ns) {
++                        mx = fmax(mx, scale*inv[s]*red[(ns + q*ns + s)*DEPTH_MIX_LS]);
++                    }
++                }
++                float pw[DEPTH_MIX_STATE];
++                float tot = 0.0f;
++                #pragma unroll
++                for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                    if (s < ns) {
++                        pw[s] = exp(scale*inv[s]*red[(ns + q*ns + s)*DEPTH_MIX_LS] - mx);
++                        tot += pw[s];
++                    }
++                }
++                #pragma unroll
++                for (int i = 0; i < DEPTH_MIX_EL; ++i) {
++                    if (i < el) {
++                        float o = 0.0f;
++                        #pragma unroll
++                        for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                            if (s < ns) {
++                                o += pw[s]*x[s][i];
++                            }
++                        }
++#ifdef DEPTH_MIX_RED
++                        outv[q][i] = o;   // the red case: the softmax denominator dropped
++#else
++                        outv[q][i] = o / tot;
++#endif
++                    }
++                }
++            }
++        }
++        // the output norm: sum of squares over each column's whole row, reduced, then the weights
++        #pragma unroll
++        for (int q = 0; q < DEPTH_MIX_Q; ++q) {
++            if (q < nq) {
++                float v = 0.0f;
++                #pragma unroll
++                for (int i = 0; i < DEPTH_MIX_EL; ++i) {
++                    if (i < el) {
++                        v += outv[q][i]*outv[q][i];
++                    }
++                }
++                red[q*DEPTH_MIX_LS + lane] = v;
++            }
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++        depth_mix_reduce(red, tmp8, nq, lane);
++        #pragma unroll
++        for (int q = 0; q < DEPTH_MIX_Q; ++q) {
++            if (q < nq) {
++                const float onorm = rsqrt(red[q*DEPTH_MIX_LS] / (float) ne0 + eps_out);
++                global const float * w = (global const float *)(nw + (ulong) q*nbn1);
++                global float * o = (global float *)(dst + (ulong) q*nbd2 + (ulong) t*nbd1);
++                #pragma unroll
++                for (int i = 0; i < DEPTH_MIX_EL; ++i) {
++                    if (i < el) {
++                        o[lane + i*DEPTH_MIX_LS] = outv[q][i] * onorm * w[lane + i*DEPTH_MIX_LS];
++                    }
++                }
++            }
++        }
++    } else {
++        #pragma unroll
++        for (int q = 0; q < DEPTH_MIX_Q; ++q) {
++            if (q < nq) {
++                float mx = -INFINITY;
++                #pragma unroll
++                for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                    if (s < ns) {
++                        mx = fmax(mx, scale*inv[s]*red[(ns + q*ns + s)*DEPTH_MIX_LS]);
++                    }
++                }
++                float pw[DEPTH_MIX_STATE];
++                float tot = 0.0f;
++                #pragma unroll
++                for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                    if (s < ns) {
++                        pw[s] = exp(scale*inv[s]*red[(ns + q*ns + s)*DEPTH_MIX_LS] - mx);
++                        tot += pw[s];
++                    }
++                }
++                global float * o = (global float *)(dst + (ulong) q*nbd2 + (ulong) t*nbd1);
++                #pragma unroll
++                for (int i = 0; i < DEPTH_MIX_EL; ++i) {
++                    if (i < el) {
++                        float acc = 0.0f;
++                        #pragma unroll
++                        for (int s = 0; s < DEPTH_MIX_STATE; ++s) {
++                            if (s < ns) {
++                                acc += pw[s]*x[s][i];
++                            }
++                        }
++#ifdef DEPTH_MIX_RED
++                        // the red case: the softmax denominator dropped (a test must fail)
++                        o[lane + i*DEPTH_MIX_LS] = acc;
++#else
++                        o[lane + i*DEPTH_MIX_LS] = acc / tot;
++#endif
++                    }
++                }
++            }
++        }
++    }
++}

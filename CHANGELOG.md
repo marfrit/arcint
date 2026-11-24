@@ -40,6 +40,19 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   context. A partial offload of Inkling faulted at `-ngl 12` (`measured-here`); the cause by code reading, not
   reproduced, is its depth-mix stacks written through views across devices, the same code without the port. Serve
   Inkling fully offloaded.
+- **Inkling 2 Mini's depth mix as one op** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`). The prefill's depth
+  attention (`src/models/inkling2.cpp:191`) ran as 8-12 nodes a mix call: a copy of the k+1 states as a transposed view
+  (341 ms of a pp4096 pass), the first product on 0178's split-K GEMV (309), the weighted sum on 0171's tiny-K kernel
+  (82) and the query repeat (33) — 765 ms, 12.7 % of the 6,042 ms pass (`measured-here`, B60, ub 512, before this
+  series). `GGML_OP_DEPTH_MIX` is the reference's `_mix_kernel` form in this tree's OpenCL: a token a work-group, fp32,
+  the states read once into registers, the softmax and weighted sum on that copy, an output RMSNorm folded where the
+  chain norms one mixed column with one weight (an SWA layer without messages, the ffn, the output); the store's last-row
+  cpy, the repeat and the per-column cont go with it. **No card row is claimed for these patches yet**: the plan, its
+  predicted numbers and the card command list are `contrib/llama.cpp/README.md`'s 0204-0207 section; the recipe build and
+  the device-free unit test (`test-depth-mix`, the eligibility rule on the graph's real strides) are green. Unset, the
+  graph is today's node for node, decode and every other model untouched; `DEPTH_MIX` leaves a `DOWNGRADE` line with its
+  reason, one fixed `TAKEN` line marks the first taken call, `GGML_OPENCL_DEPTH_MIX_STATS=1` counts the graph's calls, and
+  every launch is bounded under `GGML_OPENCL_BOUNDS=1`.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the

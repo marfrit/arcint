@@ -1,0 +1,373 @@
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 5fec3cb..d5fbaa6 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -1,6 +1,10 @@
+ #include "models.h"
+ #include "../llama-memory-hybrid-iswa.h"
+ 
++#include <cstdlib>
++#include <map>
++#include <string>
++
+ void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+     ml.get_key(LLM_KV_ATTENTION_QK_CLIP,           hparams.f_qk_clip);
+@@ -187,9 +191,27 @@ void llama_model_inkling2::graph::write_res_block(ggml_tensor * block, int j) {
+         ggml_view_3d(ctx0, stack, n_embd, 1, n_tokens, stack->nb[1], stack->nb[2], (n_slot - 1 - j)*stack->nb[1])));
+ }
+ 
++// the arm's switch, read once: unset leaves the chain and the dispatch exactly as they are
++static bool inkling2_depth_mix_on() {
++    static const bool on = ggml_depth_mix_switch(getenv("GGML_OPENCL_DEPTH_MIX"));
++    return on;
++}
++
++// one DOWNGRADE line a key: the reason the arm did not take this call's shapes
++static void inkling2_depth_mix_refused(const char * why) {
++    static std::map<std::string, int> told;
++    std::string key = std::string("reason=") + why;
++    if (told[key]++ == 0) {
++        LLAMA_LOG_WARN("DOWNGRADE src=llama op=DEPTH_MIX path=chain %s\n", key.c_str());
++    }
++}
++
+ // attention over the depth: mix the earlier block outputs and cur with learned queries
++// knobs: GGML_OPENCL_DEPTH_MIX=1 emits one ggml_depth_mix for T > 1 where the shapes the
++// graph hands it are eligible (ggml_depth_mix_refuse), and `norm_w` folds the output
++// column's RMSNorm into it. Unset, the chain below is emitted node for node as today.
+ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
+-        ggml_tensor * stack) {
++        ggml_tensor * stack, ggml_tensor * norm_w) {
+     if (!stack) {
+         stack = res_stack_tensor();
+     }
+@@ -198,6 +220,25 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+     const int64_t n_block = (int64_t) blocks.size();
+     GGML_ASSERT(n_block + 1 <= stack->ne[1]);
+ 
++    // k = 0 (the first block's ffn mix) has no block rows to read: the chain serves it
++    if (inkling2_depth_mix_on() && n_tokens > 1 && n_block >= 1) {
++        // the block rows of the store, cur as the last state (no copy into the store's last
++        // row), the query as a 2-D row set (no repeat over the tokens)
++        ggml_tensor * bview = ggml_view_3d(ctx0, stack, n_embd, n_block, n_tokens,
++                stack->nb[1], stack->nb[2], (n_slot - n_block)*stack->nb[1]);
++        // a 1-D weight is one column: reshape_2d is a view, the row step is never read
++        ggml_tensor * q = ggml_n_dims(query) < 2 ? ggml_reshape_2d(ctx0, query, n_embd, 1) : query;
++        ggml_tensor * nw = norm_w;
++        if (nw && ggml_n_dims(nw) < 2) {
++            nw = ggml_reshape_2d(ctx0, nw, n_embd, 1);
++        }
++        const char * why = ggml_depth_mix_refuse(bview, cur, q, nw);
++        if (why == nullptr) {
++            return ggml_depth_mix(ctx0, bview, cur, q, nw, 1e-6f, hparams.f_norm_rms_eps, 1.0f/sqrtf(n_embd));
++        }
++        inkling2_depth_mix_refused(why);
++    }
++
+     // cur goes to the last row, the blocks are already in their rows from the block starts
+     ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+         ggml_reshape_2d(ctx0, cur, n_embd, n_tokens),
+@@ -324,10 +365,23 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ 
+     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
+     ggml_tensor * inputs[3] = {cur, cur, cur};
++    bool attn_norm_fused = false;
+     if (layer.attn_res_query) {
+-        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
++        // an SWA layer without messages norms the mixed column with one weight: the arm can
++        // fold it. Full-attention layers have three weights (one per input), so they keep
++        // their three norm nodes. A messages merge runs a controller between the mix and
++        // the norm, so that path keeps its nodes too.
++        const bool fuse_norm = !messages && is_swa;
++        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query, nullptr, fuse_norm ? layer.attn_norm : nullptr);
++        const bool took = mixed->op == GGML_OP_DEPTH_MIX;
++        attn_norm_fused = took && fuse_norm;
+         for (int j = 0; j < 3; ++j) {
+-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
++            const int64_t col = is_swa ? 0 : j;
++            // the arm's dst is [n_embd, n_tokens, nq], a column's token block contiguous; the
++            // chain's is [n_embd, nq, n_tokens], a column strided and copied here
++            inputs[j] = took
++                ? ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], col*mixed->nb[2])
++                : ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], col*mixed->nb[1]));
+         }
+     }
+ 
+@@ -343,7 +397,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+             inputs[j] = build_norm(inputs[j], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
+         }
+     } else if (is_swa) {
+-        inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++        if (!attn_norm_fused) {
++            inputs[0] = build_norm(inputs[0], layer.attn_norm, nullptr, LLM_NORM_RMS, il);
++        }
+         inputs[1] = inputs[2] = inputs[0];
+     } else {
+         inputs[0] = build_norm(inputs[0], layer.attn_q_inp_norm, nullptr, LLM_NORM_RMS, il);
+@@ -419,11 +475,15 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+     cb(ffn_inp, "ffn_inp", il);
+ 
+     // MoE
+-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, layer.ffn_res_query), n_embd, n_tokens);
++    // the arm folds the ffn norm when no controller runs between the mix and it
++    ggml_tensor * ffm = mix(blocks, cur, layer.ffn_res_query, nullptr, messages ? nullptr : layer.ffn_norm);
++    cur = ggml_reshape_2d(ctx0, ffm, n_embd, n_tokens);
+     if (messages) {
+         cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
+     }
+-    cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++    if (messages || ffm->op != GGML_OP_DEPTH_MIX) {
++        cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
++    }
+ 
+     cur = build_moe_ffn(cur,
+             layer.ffn_gate_inp,
+@@ -453,8 +513,13 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+ }
+ 
+ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks) {
+-    cur = ggml_reshape_2d(ctx0, mix(blocks, cur, model.output_res_query), n_embd, n_tokens);
+-    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++    // the arm folds the output norm, as the reference's NORM variant does
++    ggml_tensor * om = mix(blocks, cur, model.output_res_query, nullptr, model.output_norm);
++    const bool fused = om->op == GGML_OP_DEPTH_MIX;
++    cur = ggml_reshape_2d(ctx0, om, n_embd, n_tokens);
++    if (!fused) {
++        cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++    }
+ 
+     if (inp_out_ids) {
+         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+diff --git a/src/models/models.h b/src/models/models.h
+index 86397b1..c33bd28 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2301,7 +2301,7 @@ struct llama_model_inkling2 : public llama_model_base {
+     struct graph : public llm_graph_context {
+         graph(const llm_graph_params & params);
+         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
+-                ggml_tensor * stack = nullptr);
++                ggml_tensor * stack = nullptr, ggml_tensor * norm_w = nullptr);
+         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+         ggml_tensor * convolve(
+                 ggml_tensor * cur,
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 33e79ea..2bc849b 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -455,6 +455,10 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
+     llama_build_and_test(test-alloc.cpp LINK ggml)
+ endif()
+ 
++# patch 0206: the depth-mix arm's rule (ggml_depth_mix_refuse / ggml_depth_mix_switch)
++# on Inkling 2 Mini's own prefill strides, device-free
++llama_build_and_test(test-depth-mix.cpp LINK ggml)
++
+ llama_build(test-export-graph-ops.cpp)
+ if (TARGET gguf-model-data)
+     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
+diff --git a/tests/test-depth-mix.cpp b/tests/test-depth-mix.cpp
+new file mode 100644
+index 0000000..eb0cf88
+--- /dev/null
++++ b/tests/test-depth-mix.cpp
+@@ -0,0 +1,198 @@
++// 0206: device-free tests for the depth-mix arm's rule (ggml_depth_mix_refuse /
++// ggml_depth_mix_eligible) and its switch (ggml_depth_mix_switch).
++//
++// The tensors are Inkling 2 Mini's own prefill graph nodes, built with the same
++// ggml constructors the model uses, at the sizes its GGUF carries:
++//   n_embd 2304 (24 physical blocks, attn_res_block_size 4, so the block store
++//   has (24 + 3)/4 + 1 = 7 rows), a 512- and a 2048-token ubatch, K 2..5 blocks,
++//   nq 1 (an SWA layer's attn_res_query, ffn_res_query, output_res_query) and
++//   nq 3 (a full-attention layer's attn_res_query), cur 2-D, the block rows a
++//   view_3d of the store at the store's own strides.
++//
++// The strides are the graph's, not guesses: src/models/inkling2.cpp's
++// res_stack_tensor makes [n_embd, n_slot, n_tokens] F32 and its mix() takes
++// ggml_view_3d(stack, n_embd, n_block, n_tokens, stack->nb[1], stack->nb[2],
++// ...), so a state's row step is 2304 floats and a token's slab step is
++// n_slot * 2304 floats - the slab step is larger than the states' own extent.
++// That is the stride a wrong rule (or a kernel that assumes a contiguous slab)
++// would miss, which is why every refusal below is checked here and why the card
++// cases carry the same shape.
++//
++// The red variants (one bad stride, one wrong type, a decode shape, a width off
++// the lane rule, a query count, a block count, a norm weight that is not the
++// query count) must each be refused by name: an eligible() that says yes to any
++// of them fails this test.
++//
++// No GPU, no OpenCL runtime.
++#include "ggml.h"
++
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static int g_bad = 0;
++
++#define CHECK(cond, what) do { if (!(cond)) { std::printf("FAIL: %s\n", what); ++g_bad; } } while (0)
++
++// a refusal: the rule must return exactly this reason (nullptr, i.e. eligible, is a failure)
++static bool refused(const char * why, const char * want) {
++    return why != nullptr && strcmp(why, want) == 0;
++}
++#define CHECK_REFUSED(why, want, what) CHECK(refused(why, want), what)
++
++static constexpr int64_t k_embd  = 2304;   // Inkling 2 Mini's width
++static constexpr int64_t k_nslot = 7;      // the block store's rows: 6 blocks + cur
++
++struct ctx_hold {
++    ggml_context * ctx = nullptr;
++    ctx_hold() {
++        // only the strides are read here, so the tensors take no storage
++        ggml_init_params p = { (size_t) 16*1024*1024, nullptr, true };
++        ctx = ggml_init(p);
++    }
++    ~ctx_hold() { if (ctx) ggml_free(ctx); }
++};
++
++// the block store, its block-row view, cur and the query rows exactly as the model builds them
++struct real_nodes {
++    ggml_tensor * stack = nullptr;
++    ggml_tensor * blocks = nullptr;   // view_3d at (n_slot - k) rows: k block rows
++    ggml_tensor * cur = nullptr;
++    ggml_tensor * q = nullptr;
++    ggml_tensor * nw = nullptr;
++};
++
++static real_nodes build_real(ggml_context * ctx, int64_t k, int64_t nt, int64_t nq, bool with_nw, int64_t n_embd = k_embd) {
++    real_nodes r;
++    r.stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, k_nslot, nt);
++    // mix(): the block rows sit at (n_slot - n_block) with the store's strides
++    const int64_t row = (r.stack->ne[1] - 1) - k;
++    r.blocks = ggml_view_3d(ctx, r.stack, n_embd, k, nt, r.stack->nb[1], r.stack->nb[2], (size_t) row*r.stack->nb[1]);
++    r.cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nt);
++    if (nq == 1) {
++        // attn_res_query / ffn_res_query / output_res_query are 1-D [n_embd]
++        r.q = ggml_reshape_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd), n_embd, 1);
++    } else {
++        r.q = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nq);
++    }
++    if (with_nw) {
++        r.nw = nq == 1
++            ? ggml_reshape_2d(ctx, ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd), n_embd, 1)
++            : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, nq);
++    }
++    return r;
++}
++
++int main(void) {
++    // ---- the graph's own strides, asserted as numbers ----
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 4, 512, 1, true);
++        CHECK(r.stack->ne[0] == k_embd && r.stack->ne[1] == k_nslot && r.stack->ne[2] == 512, "the store is [2304, 7, 512]");
++        CHECK(r.stack->nb[1] == k_embd*sizeof(float), "a state's row step is 2304 floats");
++        CHECK(r.stack->nb[2] == k_nslot*k_embd*sizeof(float), "a token's slab step is 7 * 2304 floats");
++        CHECK(r.blocks->nb[1] == r.stack->nb[1] && r.blocks->nb[2] == r.stack->nb[2], "the block view keeps the store's strides");
++        CHECK(r.blocks->nb[2] > (uint64_t) (r.blocks->ne[1]*r.blocks->nb[1]), "the slab step exceeds the states' extent");
++        CHECK(r.cur->nb[1] == k_embd*sizeof(float), "cur is [n_embd, n_tokens], rows back to back");
++    }
++
++    // ---- the model's shapes are eligible, at both ubatch sizes ----
++    for (int64_t nt : {512, 2048}) {
++        for (int64_t k : {2, 3, 4, 5}) {
++            ctx_hold h;
++            for (int64_t nq : {1, 3}) {
++                real_nodes r = build_real(h.ctx, k, nt, nq, nq == 1);
++                const char * why = ggml_depth_mix_refuse(r.blocks, r.cur, r.q, r.nw);
++                if (why != nullptr) {
++                    std::printf("FAIL: k=%d nt=%d nq=%d refused with %s\n", (int) k, (int) nt, (int) nq, why);
++                    ++g_bad;
++                } else {
++                    CHECK(ggml_depth_mix_eligible(r.blocks, r.cur, r.q, r.nw), "eligible agrees with refuse");
++                }
++            }
++        }
++    }
++
++    // ---- the op's dst: [n_embd, n_tokens, nq], a query column's token block contiguous ----
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 4, 512, 3, false);
++        ggml_tensor * dst = ggml_depth_mix(h.ctx, r.blocks, r.cur, r.q, r.nw, 1e-6f, 1e-5f, 1.0f/sqrtf(2304.0f));
++        CHECK(dst->ne[0] == k_embd && dst->ne[1] == 512 && dst->ne[2] == 3, "dst is [2304, 512, 3]");
++        CHECK(dst->nb[1] == k_embd*sizeof(float), "a token's rows are back to back");
++        CHECK(dst->nb[2] == k_embd*512*sizeof(float), "a column's whole token block is contiguous");
++        CHECK(dst->nb[3] == dst->nb[2]*dst->ne[2], "the columns follow one another");
++        // the model's per-column view is contiguous: view_2d(dst, n_embd, n_tokens, nb[1], col*nb[2])
++        ggml_tensor * col = ggml_view_2d(h.ctx, dst, k_embd, 512, dst->nb[1], 2*(size_t) dst->nb[2]);
++        CHECK(ggml_is_contiguous(col), "a column view needs no copy");
++    }
++
++    // ---- the red variants: each must be refused, with its own reason ----
++    {
++        // a slab step shorter than the states' extent: two tokens' states overlap
++        ctx_hold h;
++        ggml_tensor * st = ggml_new_tensor_3d(h.ctx, GGML_TYPE_F32, k_embd, k_nslot, 512);
++        ggml_tensor * blk = ggml_view_3d(h.ctx, st, k_embd, 4, 512, st->nb[1], 2*st->nb[1], 2*st->nb[1]);
++        ggml_tensor * cur = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F32, k_embd, 512);
++        ggml_tensor * q = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F32, k_embd, 1);
++        const char * why = ggml_depth_mix_refuse(blk, cur, q, nullptr);
++        CHECK_REFUSED(why, "blocks-slab", "an overlapping slab step is refused as blocks-slab");
++    }
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 4, 512, 1, false);
++        ggml_tensor * cur16 = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F16, k_embd, 512);
++        CHECK_REFUSED(ggml_depth_mix_refuse(r.blocks, cur16, r.q, r.nw), "not-f32", "an f16 cur is refused as not-f32");
++    }
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 4, 1, 1, false);   // a decode step
++        CHECK_REFUSED(ggml_depth_mix_refuse(r.blocks, r.cur, r.q, r.nw), "decode", "T = 1 is refused as decode");
++    }
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 4, 512, 1, false, 1000);   // not a multiple of the lane width
++        CHECK_REFUSED(ggml_depth_mix_refuse(r.blocks, r.cur, r.q, r.nw), "d-lanes", "a width off 256 is refused as d-lanes");
++    }
++    {
++        ctx_hold h;
++        ggml_tensor * st = ggml_new_tensor_3d(h.ctx, GGML_TYPE_F32, 256*10, k_nslot, 512);   // 10 floats a lane
++        ggml_tensor * blk = ggml_view_3d(h.ctx, st, 256*10, 4, 512, st->nb[1], st->nb[2], 2*st->nb[1]);
++        ggml_tensor * cur = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F32, 256*10, 512);
++        ggml_tensor * q = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F32, 256*10, 1);
++        CHECK_REFUSED(ggml_depth_mix_refuse(blk, cur, q, nullptr), "d-lanes", "10 floats a lane is refused as d-lanes");
++    }
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 7, 512, 1, false);   // more blocks than the store has
++        CHECK_REFUSED(ggml_depth_mix_refuse(r.blocks, r.cur, r.q, r.nw), "k", "k = 7 is refused as k");
++    }
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 4, 512, 5, false);   // more columns than the arm's register bound
++        CHECK_REFUSED(ggml_depth_mix_refuse(r.blocks, r.cur, r.q, r.nw), "q-shape", "nq = 5 is refused as q-shape");
++    }
++    {
++        ctx_hold h;
++        real_nodes r = build_real(h.ctx, 4, 512, 1, false);
++        ggml_tensor * nw3 = ggml_new_tensor_2d(h.ctx, GGML_TYPE_F32, k_embd, 3);   // a qkv stack for one column
++        CHECK(strcmp(ggml_depth_mix_refuse(r.blocks, r.cur, r.q, nw3), "nw-shape") == 0, "a norm weight of 3 columns for nq 1 is refused as nw-shape");
++    }
++
++    // ---- the switch: unset, "0" and "off" are off; everything else is on ----
++    CHECK(!ggml_depth_mix_switch(nullptr), "unset is off");
++    CHECK(!ggml_depth_mix_switch("0"), "0 is off");
++    CHECK(!ggml_depth_mix_switch("off"), "off is off");
++    CHECK(ggml_depth_mix_switch("1"), "1 is on");
++    CHECK(ggml_depth_mix_switch("on"), "on is on");
++
++    if (g_bad != 0) {
++        std::printf("%d of the depth-mix rule's checks failed\n", g_bad);
++        return 1;
++    }
++    std::printf("depth-mix rule: all OK device-free\n");
++    return 0;
++}
