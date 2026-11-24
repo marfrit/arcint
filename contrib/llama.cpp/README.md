@@ -9706,9 +9706,9 @@ Card evidence (`measured-here`, the B60 at a 165 W cap unless the B70 (220 W) is
 ## 0187-opencl-cpy-transpose.patch
 
 The card's profile joins two slow `kernel_cpy_f32_f32_pack` copies: the bias table's
-`ggml_cont(ggml_permute(table, 1, 0, 2, 3))` (`src/models/inkling2.cpp:391`, 1,353 us at
+`ggml_cont(ggml_permute(table, 1, 0, 2, 3))` (`src/models/inkling2.cpp:390`, 1,353 us at
 `[1025, 24, 512]`, 5,330 at 2048) and the depth mix's `ggml_cont(ggml_transpose(states))`
-(`mix()` line 221, `[2304, k, T]` -> `[k, 2304, T]`, 8-20 B a destination row). Both swap dims 0
+(`mix()` line 219, `[2304, k, T]` -> `[k, 2304, T]`, 8-20 B a destination row). Both swap dims 0
 and 1: the source's fastest dimension is dim 1, the destination's is dim 0, so the pack kernel
 gathers one side at a 4,100-B (or 96-B) stride and reaches 74-76 GB/s against a plain copy's
 823-1,016 GB/s at the same bytes (`measured-here`, B60, constant data - the compression was in
@@ -9719,8 +9719,9 @@ This patch adds `kernel_cpy_f32_f32_t01`: a 16 x 16 tile of (dim 0, dim 1) throu
 writes coalesced over the destination's. Partial tiles on both edges are guarded per element (the
 bias table's 24 heads and 1,025 bins are not multiples of 16). `ggml_cl_cpy` takes it only when
 `GGML_OPENCL_CPY_TRANSPOSE=1`, only for F32 x F32 copies whose source and destination have the
-same shape, the source's `nb[1] == 4` with `nb[0] > nb[1]`, the destination contiguous, and the
-source's dim-2/3 strides contiguous - **unset, the pack kernel runs exactly as before**. Both
+same shape, the source's `nb[1] == 4` and `nb[0] == ne[1]*4`, the destination contiguous, and the
+source's dim-2 stride covering the slab with dim 3 stepping by dim 2 (the exact terms are in the
+next paragraph) - **unset, the pack kernel runs exactly as before**. Both
 buffers' furthest byte is checked under `GGML_OPENCL_BOUNDS=1`. The red is a build option,
 `GGML_OPENCL_CPY_TRANSPOSE_RED=1` (`-DCPY_T_RED`): the write guard becomes `bin_w < d1 - 1`, which
 loses the last dim-1 edge - visible on 1,025 bins and on the `[33, 17, 3]` tile case.
@@ -9737,9 +9738,9 @@ stride covering the slab (`>= ne[0]*ne[1]*4`), dim-3 stepping by dim 2 - the for
 actually indexes (`src + gz*s_nb2 + dim0*s_nb0 + dim1*s_nb1`, `dst + gz*d_nb2 + dim1*d_nb1 +
 dim0*4`). `tests/test_opencl_cpy_t01.cpp` (arcint, `opencl-cpy-t01`, unit) feeds it the real
 strides derived from the graph: the bias table's view `[24, 1025, T]` with
-`nb = {4*1025, 4, 4*1025*24, ...}` from `inkling2.cpp:386/391`'s product and permute, and the
+`nb = {4*1025, 4, 4*1025*24, ...}` from `inkling2.cpp:386/390`'s product and permute, and the
 depth mix's transpose view `[k, 2304, T]` with `nb = {9,216, 4, 9,216*slots, ...}` from `mix()`
-line 221 - and the negatives (a contiguous source, a slow step that is not one fast row, a
+line 219 - and the negatives (a contiguous source, a slow step that is not one fast row, a
 non-contiguous destination, an f16 pair). Run here: all pass; **with cp39's old terms put back,
 both real cases FAIL** (`eligible=0, want 1`, exit 1) - that is the red, on the CPU, no card.
 
@@ -9760,9 +9761,11 @@ so the copy is tile-bound rather than stride-bound; `[1025, 24, 512]` should lan
 **320-360 GB/s = 280-350 us** (3.9-4.8x the 1,353 us), `[1025, 24, 2048]` at **~1,300-1,600 us**
 (3.3-4.1x the 5,330), and `[2304, 4, 512]` at only **~1.6-2x (200-330 us)**: its destination's
 fastest dimension is 4 floats, so 12 of the tile's 16 lanes in dim 0 idle; a `CPY_T_TILE=8` build
-or a narrow-dimension path is the follow-up if that one stays below 2x. Not measured here.
+or a narrow-dimension path is the follow-up if that one stays below 2x. Not measured when written;
+the card numbers are below, and the prediction missed on all three shapes.
 
-Gate on the card, owed (`GGML_OPENCL_BOUNDS=1` where the op runs):
+Gate on the card (`GGML_OPENCL_BOUNDS=1` where the op runs; run, the results are under "Card
+evidence" below, except step (f) for Inkling at ub 512, which is still owed):
 
     # (a) the single case, knob on, bounds first
     GGML_OPENCL_BOUNDS=1 GGML_OPENCL_CPY_TRANSPOSE=1 test-backend-ops -b GPUOpenCL -o CONT \
@@ -9794,3 +9797,68 @@ Gate on the card, owed (`GGML_OPENCL_BOUNDS=1` where the op runs):
     llama-perplexity -m <pinned IQ4_NL>.gguf -f <gate.txt> -c 2048 --chunks 3 -fa on -ub 512 \
         --kl-divergence --kl-divergence-base <base.logits>
     GGML_OPENCL_CPY_TRANSPOSE=1 llama-perplexity ...  (same line)
+
+(`llama-bench` has no `--llama-swa-window`; its default `swa_full=false` is the same window. The card
+runs below used plain `llama-bench`.)
+
+Card evidence (`measured-here`, the B60 at a 165 W cap, the card-tested applied series with the kernel still
+inside the guard, git write-tree `b7ea4eea617993d5cbeab0452ab636983fe068a6`, `GGML_OPENCL_KQ_MM_ID_I8=1
+GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
+- The path runs. Step (a) printed `0187 cpy-transpose taken ne=[24,1025,512,1]`, and the red (c)
+  failed on 5 cases. The CONT suite passed knob off and on.
+- Op perf, knob off -> on. **The prediction missed: the kernel is slower than predicted on all
+  three shapes.**
+  - `[1025, 24, 512]`: 1,334 -> 415 us (70 -> 227 GB/s as `test-backend-ops` prints it, 2^30 bytes: 75 -> 243 in
+    decimal GB/s; predicted 280-350 us).
+  - `[1025, 24, 2048]`: 5,306 -> 1,660 us (predicted 1,300-1,600).
+  - `[2304, 4, 512]`: 441 -> 356 us, 1.24x (predicted 200-330). The 4-float destination leaves 12
+    of the tile's 16 dim-0 lanes idle.
+
+  The plain copy reaches 360-390 GB/s on random data, so 227 GB/s leaves room. What limits the
+  tile there is not yet known (open).
+- pp4096 t/s, knob off -> on, three interleaved rounds on an idle host (the card host's other
+  model server held, the recipe host quiet):
+
+  | ub | off | on | gain |
+  |---|---|---|---|
+  | 512 | 720.65 / 720.53 / 720.63 | 769.67 / 769.83 / 769.60 | +6.8 % |
+  | 1024 | 763.59 / 763.56 / 763.81 | 816.11 / 815.95 / 816.43 | +6.9 % |
+  | 2048 | 718.39 / 718.66 / 718.49 | 764.40 / 764.21 / 764.33 | +6.4 % |
+
+  At ub 512 that is 5,684 -> 5,322 ms for the 4,096 tokens. The bias-table copy alone accounts for about
+  384 x 919 us = 353 ms of that (`inferred` from the op times); the depth-mix copies give the rest.
+- Reach (`llama-bench`, a 2,048-token prompt, `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1`): Qwen3.8-27B 0
+  taken and 0 rejected lines, Dory 4B 0 / 0. The predicate applied to CPU graph-op exports
+  (`test-export-graph-ops`, every CPY / CONT / DUP line) finds 0 eligible copies in each of them:
+  - Qwen3.8-Flash-Next (IQ3_S, q8_0 KV) at its served ub 8192 and at 512: 0 of 27;
+  - the 27B: 0 of 9;
+  - Dory: 0 of 2.
+
+  The Flash-Next MTP head is arcint's own GGUF, not a llama graph, and is not covered by the
+  export. **No effect on them; Inkling only.** A CPU graph-op
+  export of Inkling lists the eligible copies: the bias table `[24, 1025, T]` and the depth-mix
+  stacks `[k, 2304, T]` (k 2..5), at T = 1 as well. So the path is also taken in decode
+  (`inferred` from the CPU export; no decode run on the card printed the line, and the decode
+  rate knob off vs on is not measured).
+- Logits, knob off as the KL base, knob on (Mean KLD / Max KLD / top p):
+
+  2 chunks each: 1,024 tokens at ub 512 / 1024, 512 at ub 1.
+
+  | model | ub 512 | ub 1024 | ub 1 |
+  |---|---|---|---|
+  | Inkling 2 Mini | not run | 0 / 5.6e-5 / 100 % | 0 / 3.7e-5 / 100 % |
+  | Qwen3.8-27B | 0 / 4.4e-5 / 100 % | 0 / 5.0e-5 / 100 % | 0 / 4.1e-5 / 100 % |
+  | Dory 4B | 0 / 5.2e-5 / 100 % | 0 / 5.8e-5 / 100 % | 0 / 4.8e-5 / 100 % |
+
+  The 27B and Dory never take the path, yet their Max KLD is the same 4-6e-5: that is the card's
+  run-to-run floor, not this patch. Inkling's KL against the CPU reference at ub 1024 was 0.001917
+  / 98.403 % in both arms.
+- The pushed patch differs from the card-tested tree in one place: `kernel_cpy_f32_f32_t01` moved below
+  `#endif // GGML_CL_NO_CPY_PACK` in `cpy.cl`. Its creation is unconditional, so a device that defines the
+  guard would have failed to load the program. Only Adreno A6X defines it (`ggml-opencl.cpp`, `no_cpy_pack`),
+  so on Arc the same kernels compile from the same source. Applied series of this commit: write-tree
+  `182258aeb0f232cdbfc5db9eec26f236347e3969`; offline gate 3/3 (default, `GGML_CL_NO_CPY_PACK`, the red;
+  128 GRF, scratch 0).
+- Open: `llama-perplexity` does not print the once-a-process INFO line. The KL runs therefore do
+  not themselves show the path was taken, although the `llama-bench` runs on the same binary and
+  env do. Inkling's ub 512 logits arm (gate step (f) as written) was not run. Owed: a `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` perplexity run, or a per-call counter.
