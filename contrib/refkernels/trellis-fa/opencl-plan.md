@@ -115,7 +115,12 @@ Line numbers in `flash_attn_dpas2.cl` here refer to the reviewed revision
 
 `measured-here` (the operator, B60, 2026-11-24; the reference kernel inside its
 own SYCL stack, our kernel through our OpenCL path, the same shapes, one call a
-shape, Hq 24, Hk 8, D 128, window 1,024, E 1,025, sinks, table):
+shape, Hq 24, Hk 8, D 128, window 1,024, E 1,025, sinks, table). These are
+kernel-level times. Any *served* prefill comparison runs on the operator's
+standard arm — `GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`, ub
+1024 main with 512/2048 as extra columns (reference pp4096 722.2 / 765.7 / 723.4
+t/s at ub 512 / 1024 / 2048, an earlier window, B60), decode named on the same arm and
+unchanged:
 
 | shape | theirs | theirs, table removed | ours (today) |
 |---|---|---|---|

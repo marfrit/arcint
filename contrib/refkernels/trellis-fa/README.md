@@ -712,6 +712,19 @@ against, not results.
 
 ## The card recipe
 
+**The standard arm (the operator, 2026-11-24 11:31).** Every Inkling *prefill*
+number here is measured and predicted with the unit at the 1.8.1 deploy:
+
+    GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1   # the expert tile
+    ub 1024                                                     # main batch; 512 and 2048 as extra columns
+    --llama-swa-window                                          # 262k context, the SWA ring
+
+The wide tile is a prefill path; decode is unaffected (the arm is still named
+beside a decode number). Reference, `measured-here`, an earlier window, B60: pp4096 with
+WIDE=1 at ub 512 / 1024 / 2048 = **722.2 / 765.7 / 723.4 t/s**. The port's bars
+are the µs of §targets below; a served t/s comparison runs on this arm, not on an
+unset or wide-off build, and the port must not change decode.
+
 1. Build the pin + the series in a tree of its own (the four patches are inside
    the series):
 
@@ -738,11 +751,19 @@ against, not results.
    read past `n_kv`) must fail on the bounds, not on the answers. Then unset and
    green.
 
-4. The two timing arms, one call a shape: `GGML_OPENCL_FA_PORT=1` against `unset`,
-   and `GGML_OPENCL_FA_PORT_QTW=1` and `=4` (production runs 4, `SGL:39`). The
-   dense-prefill bounds (`GGML_OPENCL_FA_PORT_HINT=1`) are a speed lever only for
-   a graph that guarantees a contiguous dense kv run; the default walks the whole
-   kv axis and is safe on a wrapped ring.
+4. The two timing arms, one call a shape, on the standard arm:
+
+       GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 GGML_OPENCL_FA_PORT=1 \
+         <build>/bin/llama-bench -m <Inkling GGUF> -p 4096 -ub 1024
+       # and -ub 512 / -ub 2048 for the extra columns; the same three with GGML_OPENCL_FA_PORT unset
+       # are today's arm, and GGML_OPENCL_FA_PORT_QTW=1 / =4 are the two geometry arms
+       # (production runs 4, SGL:39)
+
+   The reference on this arm is pp4096 722.2 / 765.7 / 723.4 t/s at ub 512 / 1024 /
+   2048 (an earlier window, B60, WIDE=1); decode (tg128) is named on the same arm and must not
+   move. The dense-prefill bounds (`GGML_OPENCL_FA_PORT_HINT=1`) are a speed lever
+   only for a graph that guarantees a contiguous dense kv run; the default walks
+   the whole kv axis and is safe on a wrapped ring.
 
 5. The correctness oracle stays 1b's: `fa_ref_host` (this directory) measures the
    same shapes against the same CPU oracle; its per-module comparison and the
