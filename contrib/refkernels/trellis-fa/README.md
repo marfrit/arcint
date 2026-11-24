@@ -791,9 +791,9 @@ shuffle; the sink in every lane), and the script fails if either red is not
 caught. The `.spv`/SPIR-V tools are untouched by it.
 
 The test cases' plumbing runs on the CPU alone (`test-backend-ops -b CPU -o
-FLASH_ATTN_EXT`): every `FLASH_ATTN_EXT` case including the eight `port=1` ones
-(the three perf shapes, SWA 1024, the wrapped ring, global 1025 and 1088, the pad
-bin) constructs, initializes and executes, CPU against CPU. That run found a real
+FLASH_ATTN_EXT`): every `FLASH_ATTN_EXT` case including the seven `port=1` ones
+(the three perf shapes, SWA 1024, the wrapped ring, and global 1025 and 1088, the
+pad bin) constructs, initializes and executes, CPU against CPU. That run found a real
 defect first: `ggml_flash_attn_ext_add_indexed_bias` asserted upstream's
 `[n_head, n_bins, rows]` only and aborted on the port's `[n_bins, n_head, rows]`;
 the setter now accepts both, with `rows` at dim 2 in either order. It does not
