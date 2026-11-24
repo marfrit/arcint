@@ -12,10 +12,10 @@ index a1c914b..63a481f 100644
      sum_rows
 diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
 new file mode 100644
-index 0000000..93b2b09
+index 0000000..eb20346
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/fa_port_gate.h
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,106 @@
 +// fa_port_gate.h - the port arm's eligibility, as one pure function (no OpenCL call, no
 +// backend state), so a CPU test can feed it a graph export's own lines.
 +//
@@ -31,7 +31,7 @@ index 0000000..93b2b09
 +//   positions and flags: element i;
 +//   dst:   f32 [D, n_head, rows], head*nb[1] + row*nb[2] + 4*col.
 +// 0198's first form asked for ggml_is_contiguous(q/k/v) and declined every call of the
-+// model (the first card window, reason=layout): its FLASH_ATTN_EXT inputs are permuted views, q
++// model on the card (reason=layout): its FLASH_ATTN_EXT inputs are permuted views, q
 +// [128, Lq, 24] nb [4, 12288, 512] and K/V [128, n_kv, 8] nb [2, 2048, 256]. That rule is
 +// kept under FA_PORT_GATE_RED for the unit test's red run (port_gate_test.cpp) only.
 +#ifndef FA_PORT_GATE_H
@@ -46,7 +46,11 @@ index 0000000..93b2b09
 +#endif
 +
 +// 1 accept, 0 refuse with *why set. Pure: the tensors' type/ne/nb/view_offs and scalars.
-+// buf_align is the backend's buffer alignment (a tensor's base offset is a multiple of it).
++// buf_align is the backend's buffer alignment: a tensor's placed offset is its buffer's
++// (a multiple of buf_align, by the allocator) plus its view offset, so "the K/V base is
++// 64-byte aligned" is decided here, from the view and the alignment, before any tensor is
++// placed - the launch only asserts it. wg_max is the work-group the device grants a
++// kernel: one sub-group (16 lanes) a head of a kv head's group must fit it.
 +static inline int fa_port_gate_why(
 +        const struct ggml_tensor * q, const struct ggml_tensor * k, const struct ggml_tensor * v,
 +        const struct ggml_tensor * mask, const struct ggml_tensor * dst,
@@ -54,7 +58,7 @@ index 0000000..93b2b09
 +        const struct ggml_tensor * sinks_q,
 +        const struct ggml_tensor * kpos, const struct ggml_tensor * qpos,
 +        const struct ggml_tensor * cflag, const struct ggml_tensor * rflag,
-+        size_t buf_align, int is_intel, int paged, int has_bias,
++        size_t buf_align, size_t wg_max, int is_intel, int paged, int has_bias,
 +        float max_bias, float logit_softcap, int32_t window,
 +        const char ** why_out) {
 +#define REFUSE(r) do { *why_out = (r); return 0; } while (0)
@@ -75,6 +79,7 @@ index 0000000..93b2b09
 +    const int64_t D = 128, rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_head_kv = k->ne[2];
 +    if (n_kv < 1 || n_kv >= (1 << 24) || n_head_kv < 1 || n_head % n_head_kv != 0 ||
 +        v->ne[1] != n_kv || v->ne[2] != n_head_kv) REFUSE("shape");
++    if ((size_t) (16 * (n_head / n_head_kv)) > wg_max) REFUSE("work-group");
 +    if (mask->ne[0] < n_kv || mask->ne[1] < rows || mask->nb[0] != 2 || mask->nb[1] % 2 != 0 ||
 +        mask->nb[1] < (size_t) (n_kv * 2)) REFUSE("mask");
 +    if (dst == NULL || dst->type != GGML_TYPE_F32 || dst->ne[0] != D || dst->ne[1] != n_head ||
@@ -118,7 +123,7 @@ index 0000000..93b2b09
 +#endif
 +#endif
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..02e38ac 100644
+index df2ec85..9a8b374 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -8,6 +8,7 @@
@@ -129,7 +134,7 @@ index f84ca33..02e38ac 100644
  #include "ggml-opencl-planes.h"   // 0022 / 0116: the planar layout, device-free
  #include "ggml-backend.h"
  #include "ggml-impl.h"
-@@ -722,6 +723,7 @@ struct ggml_cl_kq_act {
+@@ -723,6 +724,7 @@ struct ggml_cl_kq_act {
  static std::mutex g_cl_downgrade_mu;
  static std::map<std::string, uint64_t> g_cl_downgrades;
  
@@ -137,7 +142,7 @@ index f84ca33..02e38ac 100644
  static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
  static void ggml_cl_downgrade(const char * fmt, ...) {
      char buf[256];
-@@ -1497,6 +1499,11 @@ struct ggml_backend_opencl_context {
+@@ -1499,6 +1501,11 @@ struct ggml_backend_opencl_context {
      // flash_attn_dpas2.cl (Xe2): K/V by 2D block reads, Q as f16 re-read a tile
      cl_kernel kernel_fa_dpas2_dk[3] = {}, kernel_fa_dpas2_carry_dk[3] = {}, kernel_fa_q_to_f16_dk[3] = {};
      cl_kernel kernel_fa_mask_cls = nullptr;       // the mask by 8 x 32 blocks (flash_attn_dpas2.cl)
@@ -149,7 +154,7 @@ index f84ca33..02e38ac 100644
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
      // 0106: the build options of the head-256 prompt kernels, so that the
      // head-512 builds made on first use match them (sub-group, sub-groups a
-@@ -13086,6 +13093,150 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+@@ -13094,6 +13101,152 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
      return true;
  }
  
@@ -185,7 +190,8 @@ index f84ca33..02e38ac 100644
 +    const int paged = op->src[GGML_FA_SRC_PAGES] != nullptr || op->src[GGML_FA_SRC_PLAN] != nullptr ||
 +                      op->src[GGML_FA_SRC_TAG] != nullptr;
 +    return fa_port_gate_why(q, k, v, mask, op, bt, bi, sinks, kp, qp, cf, rf,
-+                            backend_ctx->alignment, backend_ctx->gpu_family == INTEL, paged,
++                            backend_ctx->alignment, backend_ctx->max_workgroup_size,
++                            backend_ctx->gpu_family == INTEL, paged,
 +                            ggml_flash_attn_ext_has_indexed_bias(op) != 0 ? 1 : 0,
 +                            max_bias, softcap, ggml_get_op_params_i32(op, GGML_FA_PARAM_WINDOW), why) != 0;
 +}
@@ -270,6 +276,7 @@ index f84ca33..02e38ac 100644
 +        const int r = atoi(red);
 +        if (r == 1) opts += " -DGB_PAD_KEYS_OFF=1";
 +        if (r == 2) opts += " -DGB_SKIP_SINK";
++        if (r == 4) opts += " -DGB_PAD_ZERO";     // the pad bin assumed zero, not read
 +    }
 +    cl_program p = build_program_from_source_optional(backend_ctx, src.c_str(), opts);
 +    if (p == nullptr) {
@@ -300,7 +307,7 @@ index f84ca33..02e38ac 100644
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -13633,6 +13784,40 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13641,6 +13794,41 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
              // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
              // the prompt kernels have no bias yet, so those shapes go to ggml
@@ -319,13 +326,14 @@ index f84ca33..02e38ac 100644
 +                    ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "not-built");
 +                    return false;
 +                }
-+                // the 2D block reads want each kv head's base 64-byte aligned. The gate has
-+                // the strides, the view offset and the backend's alignment; where K/V are
-+                // already placed, the placed offset is checked here too
-+                for (const ggml_tensor * kvt : { op->src[1], op->src[2] }) {
-+                    const ggml_tensor_extra_cl * e = (const ggml_tensor_extra_cl *) kvt->extra;
-+                    if (e != nullptr && (e->offset + kvt->view_offs) % 64 != 0) {
-+                        ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "kv-base-unaligned");
++                // one tile's work-group (16 lanes a head of the kv head's group) against what
++                // this kernel is granted: asked here, where a refusal is still a refusal
++                {
++                    cl_kernel kport = backend_ctx->kernel_fa_port;
++                    size_t wg = 0;
++                    CL_CHECK(clGetKernelWorkGroupInfo(kport, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
++                    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) > wg) {
++                        ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "no-fit");
 +                        return false;
 +                    }
 +                }
@@ -341,7 +349,7 @@ index f84ca33..02e38ac 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26474,6 +26659,178 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26482,6 +26670,174 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
@@ -397,12 +405,11 @@ index f84ca33..02e38ac 100644
 +        const cl_ulong o_nb2p = dst->nb[2];                    // the output's query-row stride
 +        const cl_ulong k_nb1p = k->nb[1], v_nb1p = v->nb[1];
 +        const cl_ulong k_nb2p = k->nb[2], v_nb2p = v->nb[2];   // a kv head's stride
-+        // the 2D block reads want each head's base 64-byte aligned: the gate checked the
-+        // strides and the view offset, the allocation's offset is the backend's alignment
-+        if (ok % 64 != 0 || ov % 64 != 0) {
-+            ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "kv-base-unaligned");
-+            GGML_ABORT("op=FLASH_ATTN port: a K/V base that is not 64-byte aligned");
-+        }
++        // the 2D block reads want each head's base 64-byte aligned. The gate decided it from
++        // the view offset and the backend's alignment; a placed offset is the buffer's (a
++        // multiple of that alignment) plus the view's, so this cannot fail for a tensor this
++        // backend placed - an assertion of that, not a refusal
++        GGML_ASSERT(ok % 64 == 0 && ov % 64 == 0 && "op=FLASH_ATTN port: a K/V base off the backend's alignment");
 +
 +        // Q. The 256-GRF build reads the op's f32 Q itself (PORT_QF32). Otherwise Q goes to
 +        // f16 once a call, [head][row][D] contiguous, unscaled (the kernel applies scale_log2
@@ -438,10 +445,7 @@ index f84ca33..02e38ac 100644
 +        ggml_cl_bounds("op=FLASH_ATTN port", "cflag", bcf, ocf + (size_t)((n_kv + 15) / 16));
 +        ggml_cl_bounds("op=FLASH_ATTN port", "rflag", brf, orf + (size_t)((rows + 7) / 8));
 +
-+        if ((size_t) 16 * G > wg_limit) {
-+            ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "no-fit");
-+            GGML_ABORT("op=FLASH_ATTN port: one tile's work-group does not fit the device");
-+        }
++        GGML_ASSERT((size_t) 16 * G <= wg_limit && "op=FLASH_ATTN port: supports_op accepted a tile the kernel cannot hold");
 +
 +        {
 +            static std::once_flag taken;
@@ -522,10 +526,10 @@ index f84ca33..02e38ac 100644
                            kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 new file mode 100644
-index 0000000..e6d7b93
+index 0000000..66c415e
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
-@@ -0,0 +1,356 @@
+@@ -0,0 +1,366 @@
 +#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroups : enable
 +#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
@@ -583,6 +587,8 @@ index 0000000..e6d7b93
 +// sink's term from the denominator. GB_NO_BIAS (GGML_OPENCL_FA_PORT_PROBE=nobias)
 +// is a timing probe, not a red case: the table is never read, so the difference
 +// to the full kernel is what the table's bytes cost.
++// GB_PAD_ZERO (RED=4) takes the pad bin as zero instead of reading it: a table whose
++// pad bin is not zero must then FAIL.
 +
 +#ifndef QR
 +#define QR 8
@@ -697,7 +703,7 @@ index 0000000..e6d7b93
 +    // and is never live), and the online softmax state with the sink as the initial (m, l)
 +    int    qpr[QR];
 +    size_t trow[QR], mrow[QR];
-+    float  m[QR], l[QR];
++    float  m[QR], l[QR], padv[QR];
 +    _Pragma("unroll")
 +    for (int r = 0; r < QR; ++r) {
 +        const bool live = r < nrow;
@@ -705,6 +711,11 @@ index 0000000..e6d7b93
 +        qpr[r]  = qps[row];
 +        trow[r] = ((size_t) row * n_head + head) * n_bins;       // where the row has its bins
 +        mrow[r] = (size_t) row * (mask_nb1 / sizeof(half));     // where the row has its mask
++#ifdef GB_PAD_ZERO
++        padv[r] = 0.f;                                           // the red case: the pad bin assumed zero
++#else
++        padv[r] = tb[trow[r] + n_bins - 1];                      // the row's pad bin: the bias of a key at or past the extent
++#endif
 +        const float s2 = LOG2E * sk[(size_t) row * n_head + head];
 +        m[r] = live ? s2 : M_INIT;
 +        l[r] = (live && lane == 0) ? SINK_L : 0.f;
@@ -807,7 +818,8 @@ index 0000000..e6d7b93
 +                    // the run: this row's distance to the group's first key is d0 (lane-uniform),
 +                    // lane j's is d0 - j. With d0 in [15, n_bins-1] the 16 bins d0-15 .. d0 are one
 +                    // block read and lane j takes lane 15-j's value; a group wholly at or past the
-+                    // pad bin reads nothing (the pad bin is zero); otherwise a clamped read a key.
++                    // pad bin takes the row's pad value, read once a tile (zero in the model's
++                    // unfolded table, but the kernel does not assume it); otherwise a clamped read a key.
 +                    const int d0 = qpr[r] - gk0[gb];
 +                    if (d0 - 15 < n_bins - 1) {
 +                        if (d0 >= 15 && d0 <= n_bins - 1) {
@@ -818,6 +830,8 @@ index 0000000..e6d7b93
 +                            const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);
 +                            bv = tb[trow[r] + bin];
 +                        }
++                    } else {
++                        bv = padv[r];      // the whole group at or past the extent: the pad bin's value
 +                    }
 +                } else {
 +                    const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);

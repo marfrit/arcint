@@ -13,7 +13,7 @@
 //   positions and flags: element i;
 //   dst:   f32 [D, n_head, rows], head*nb[1] + row*nb[2] + 4*col.
 // 0198's first form asked for ggml_is_contiguous(q/k/v) and declined every call of the
-// model (the first card window, reason=layout): its FLASH_ATTN_EXT inputs are permuted views, q
+// model on the card (reason=layout): its FLASH_ATTN_EXT inputs are permuted views, q
 // [128, Lq, 24] nb [4, 12288, 512] and K/V [128, n_kv, 8] nb [2, 2048, 256]. That rule is
 // kept under FA_PORT_GATE_RED for the unit test's red run (port_gate_test.cpp) only.
 #ifndef FA_PORT_GATE_H
@@ -28,7 +28,11 @@ extern "C" {
 #endif
 
 // 1 accept, 0 refuse with *why set. Pure: the tensors' type/ne/nb/view_offs and scalars.
-// buf_align is the backend's buffer alignment (a tensor's base offset is a multiple of it).
+// buf_align is the backend's buffer alignment: a tensor's placed offset is its buffer's
+// (a multiple of buf_align, by the allocator) plus its view offset, so "the K/V base is
+// 64-byte aligned" is decided here, from the view and the alignment, before any tensor is
+// placed - the launch only asserts it. wg_max is the work-group the device grants a
+// kernel: one sub-group (16 lanes) a head of a kv head's group must fit it.
 static inline int fa_port_gate_why(
         const struct ggml_tensor * q, const struct ggml_tensor * k, const struct ggml_tensor * v,
         const struct ggml_tensor * mask, const struct ggml_tensor * dst,
@@ -36,7 +40,7 @@ static inline int fa_port_gate_why(
         const struct ggml_tensor * sinks_q,
         const struct ggml_tensor * kpos, const struct ggml_tensor * qpos,
         const struct ggml_tensor * cflag, const struct ggml_tensor * rflag,
-        size_t buf_align, int is_intel, int paged, int has_bias,
+        size_t buf_align, size_t wg_max, int is_intel, int paged, int has_bias,
         float max_bias, float logit_softcap, int32_t window,
         const char ** why_out) {
 #define REFUSE(r) do { *why_out = (r); return 0; } while (0)
@@ -57,6 +61,7 @@ static inline int fa_port_gate_why(
     const int64_t D = 128, rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_head_kv = k->ne[2];
     if (n_kv < 1 || n_kv >= (1 << 24) || n_head_kv < 1 || n_head % n_head_kv != 0 ||
         v->ne[1] != n_kv || v->ne[2] != n_head_kv) REFUSE("shape");
+    if ((size_t) (16 * (n_head / n_head_kv)) > wg_max) REFUSE("work-group");
     if (mask->ne[0] < n_kv || mask->ne[1] < rows || mask->nb[0] != 2 || mask->nb[1] % 2 != 0 ||
         mask->nb[1] < (size_t) (n_kv * 2)) REFUSE("mask");
     if (dst == NULL || dst->type != GGML_TYPE_F32 || dst->ne[0] != D || dst->ne[1] != n_head ||

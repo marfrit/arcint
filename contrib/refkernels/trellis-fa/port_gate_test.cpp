@@ -81,7 +81,7 @@ static struct ggml_tensor contiguous(int type, int64_t n0, int64_t n1, int64_t n
 
 struct call_t {
     struct ggml_tensor q, k, v, mask, dst, table, indices, sinks, kpos, qpos, cflag, rflag;
-    size_t align = 4096;
+    size_t align = 4096, wg_max = 256;
     int intel = 1, paged = 0, bias = 1;
     float max_bias = 0.0f, softcap = 0.0f;
     int32_t window = 0;
@@ -90,7 +90,7 @@ struct call_t {
 static int gate(const call_t & c, const char ** why) {
     *why = "";
     return fa_port_gate_why(&c.q, &c.k, &c.v, &c.mask, &c.dst, &c.table, &c.indices, c.no_sinks ? nullptr : &c.sinks,
-                            &c.kpos, &c.qpos, &c.cflag, &c.rflag, c.align, c.intel, c.paged, c.bias,
+                            &c.kpos, &c.qpos, &c.cflag, &c.rflag, c.align, c.wg_max, c.intel, c.paged, c.bias,
                             c.max_bias, c.softcap, c.window, why);
 }
 
@@ -172,6 +172,11 @@ int main(int argc, char ** argv) {
             { call_t m = c; m.k.nb[1] = 300;                      expect(file, l.no, "  K row pitch 300", m, false, "layout-k"); }
             { call_t m = c; m.v.nb[2] = 200;                      expect(file, l.no, "  V head stride 200", m, false, "layout-v"); }
             { call_t m = c; m.k.view_offs = 32;                   expect(file, l.no, "  K view offset 32", m, false, "layout-k"); }
+            { call_t m = c; m.v.view_offs = 32;                   expect(file, l.no, "  V view offset 32", m, false, "layout-v"); }
+            { call_t m = c; m.k.view_offs = 4096 + 16;            expect(file, l.no, "  K view offset 4112", m, false, "layout-k"); }
+            { call_t m = c; m.k.view_offs = 2048 * 512;           expect(file, l.no, "  K view 512 rows in", m, true, ""); }
+            { call_t m = c; m.wg_max = 32;                        expect(file, l.no, "  a 32-lane work-group", m, false, "work-group"); }
+            { call_t m = c; m.k.ne[2] = m.v.ne[2] = 1;            expect(file, l.no, "  24 heads on 1 (G 24)", m, false, "work-group"); }
             { call_t m = c; m.q.nb[0] = 8;                        expect(file, l.no, "  Q element stride 8", m, false, "layout-q"); }
             { call_t m = c; m.align = 32;                         expect(file, l.no, "  buffer alignment 32", m, false, "layout-align"); }
             { call_t m = c; m.table = contiguous(T_F32, n_head, c.table.ne[0], rows, 4);

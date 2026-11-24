@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a128fff..0a3a55c 100644
+index 95f9623..07c96ae 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -468,6 +468,10 @@ static std::string var_to_str(ggml_scale_mode mode) {
+@@ -468,6 +468,11 @@ static std::string var_to_str(ggml_scale_mode mode) {
  #define VARS_TO_STR18(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r) VAR_TO_STR(a) + "," + VARS_TO_STR17(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r)
  #define VARS_TO_STR19(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s) VAR_TO_STR(a) + "," + VARS_TO_STR18(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s)
  #define VARS_TO_STR20(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t) VAR_TO_STR(a) + "," + VARS_TO_STR19(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t)
@@ -10,10 +10,11 @@ index a128fff..0a3a55c 100644
 +#define VARS_TO_STR22(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v) VAR_TO_STR(a) + "," + VARS_TO_STR21(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v)
 +#define VARS_TO_STR23(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w) VAR_TO_STR(a) + "," + VARS_TO_STR22(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w)
 +#define VARS_TO_STR24(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x) VAR_TO_STR(a) + "," + VARS_TO_STR23(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x)
++#define VARS_TO_STR25(a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y) VAR_TO_STR(a) + "," + VARS_TO_STR24(b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y)
  
  // accept FLT_MAX as infinity
  static bool isinf_or_max(float f) {
-@@ -9499,8 +9503,23 @@ struct test_flash_attn_ext : public test_case {
+@@ -9511,8 +9516,26 @@ struct test_flash_attn_ext : public test_case {
      const int64_t n_bins; // table->ne[1]; 0 when bias is off
      const bool sinks_zeros; // fill the sinks with zeros, as the model with a folded-in sink logit does
  
@@ -31,28 +32,31 @@ index a128fff..0a3a55c 100644
 +    const int32_t wrap;
 +    const int32_t window;
 +    const int64_t n_empty;
++    // the value of the table's pad bin (the bias of a key at or past the extent). 0 in the
++    // model's unfolded table; a case with another value proves the kernel reads the bin
++    const float pad_bias;
 +
      std::string vars() override {
 -        return VARS_TO_STR20(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, bias, n_bins, sinks_zeros);
-+        return VARS_TO_STR24(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, bias, n_bins, sinks_zeros, port, wrap, window, n_empty);
++        return VARS_TO_STR25(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, bias, n_bins, sinks_zeros, port, wrap, window, n_empty, pad_bias);
      }
  
      double max_nmse_err() override {
-@@ -9518,10 +9537,11 @@ struct test_flash_attn_ext : public test_case {
+@@ -9530,10 +9553,11 @@ struct test_flash_attn_ext : public test_case {
                          bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                          ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
                          bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
 -                        bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false)
 +                        bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false,
-+                        int32_t port = 0, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0)
++                        int32_t port = 0, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0, float pad_bias = 0.0f)
          : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
            type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
 -          bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros) {}
-+          bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros), port(port), wrap(wrap), window(window), n_empty(n_empty) {}
++          bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros), port(port), wrap(wrap), window(window), n_empty(n_empty), pad_bias(pad_bias) {}
  
      ggml_tensor * build_graph(ggml_context * ctx) override {
          const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
-@@ -9583,7 +9603,9 @@ struct test_flash_attn_ext : public test_case {
+@@ -9595,7 +9619,9 @@ struct test_flash_attn_ext : public test_case {
          ggml_tensor * bi = nullptr;
          if (bias) {
              // one row of bins per head, one query (a row of all streams, flattened in stream order) per column
@@ -63,7 +67,7 @@ index a128fff..0a3a55c 100644
              ggml_set_name(bt, "bt");
              bi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, q->ne[1]*q->ne[3]);
              ggml_set_name(bi, "bi");
-@@ -9593,14 +9615,163 @@ struct test_flash_attn_ext : public test_case {
+@@ -9605,14 +9631,163 @@ struct test_flash_attn_ext : public test_case {
          ggml_flash_attn_ext_add_sinks(out, s);
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_flash_attn_ext_add_indexed_bias(out, bt, bi);
@@ -124,10 +128,10 @@ index a128fff..0a3a55c 100644
 +        // the sink logit of (head, row): it weighs like a seventh of a row's keys, so that a
 +        // dropped or misplaced sink (the red case 2) moves the answer well past the tolerance
 +        auto sinkv = [&](int64_t h, int64_t r) -> float { return 6.0f + 2.0f * det01(3, (uint64_t) (r*n_head + h)); };
-+        // the bias of (bin, head, row); the last bin is the pad bin and zero, as the model's
-+        // is (ggml_pad adds it): a key at or past the extent has no bias
++        // the bias of (bin, head, row); the last bin is the pad bin: pad_bias, zero as the
++        // model's is (ggml_pad adds it) unless the case is about that bin
 +        auto biasv = [&](int64_t b, int64_t h, int64_t r) -> float {
-+            return b == n_bins - 1 ? 0.0f : -4.0f + 8.0f * det01(4, (uint64_t) ((r*n_head + h)*n_bins + b));
++            return b == n_bins - 1 ? pad_bias : -4.0f + 8.0f * det01(4, (uint64_t) ((r*n_head + h)*n_bins + b));
 +        };
 +        // q / k / v by logical index (dim, row, head), through whatever view the case built
 +        auto fill_view = [&](ggml_tensor * tv, uint64_t salt) {
@@ -227,7 +231,7 @@ index a128fff..0a3a55c 100644
              if (strcmp(t->name, "s") == 0) {
                  if (sinks_zeros) {
                      std::vector<float> z(ggml_nelements(t), 0.0f);
-@@ -13907,6 +14078,42 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13930,6 +14105,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 16448, 128, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true, 1025));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 24, {1, 8}, 1024, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
  
@@ -256,6 +260,14 @@ index a128fff..0a3a55c 100644
 +            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
 +            1, (int32_t) c[2], (int32_t) c[3], c[4]));
 +    }
++    // 0199: a table whose pad bin is not zero, with keys far past the extent (2,200 keys, no
++    // window): the port must read the bin (GGML_OPENCL_FA_PORT_RED=4 assumes zero and must
++    // FAIL this case), and its twin gives today's kernels the same table
++    for (int32_t port : { 1, 2 }) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 2200, 24, true, true, 0, 0,
++            GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++            port, 0, 0, 0, 2.5f));
++    }
 +    // 0199: the twins (port=2) of the first two cases: the same data for today's indexed-bias
 +    // kernels, in the model's layout and in a contiguous one with a kv view
 +    for (auto c : std::vector<std::array<int64_t, 5>>{ { 1536, 512, 2, 1024, 0 }, { 4096, 512, 0, 0, 2560 } }) {
@@ -270,7 +282,7 @@ index a128fff..0a3a55c 100644
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -14256,6 +14463,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14279,6 +14498,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                              kvt.first, kvt.second));
          }
      }
@@ -297,7 +309,7 @@ index a128fff..0a3a55c 100644
      // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
      // 27B's geometry (head size 256, 24 query heads on 4)
      for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-@@ -15077,8 +15304,69 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
+@@ -15105,8 +15344,70 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
      return n_fail == 0;
  }
  
@@ -327,7 +339,8 @@ index a128fff..0a3a55c 100644
 +    int n_fail = 0;
 +    for (auto c : std::vector<std::array<int64_t, 5>>{
 +            { 1536, 512, 0, 1024, 0 }, { 2048, 2048, 0, 1024, 0 }, { 3072, 2048, 0, 1024, 0 },
-+            { 4096, 512, 0, 0, 2560 }, { 1536, 512, 2, 1024, 0 }, { 160, 12, 0, 0, 60 } }) {
++            { 4096, 512, 0, 0, 2560 }, { 1536, 512, 2, 1024, 0 }, { 160, 12, 0, 0, 60 },
++            { 2200, 24, 0, 0, 0 } /* with a pad bin of 2.5 */ }) {
 +        std::vector<float> out[3];
 +        std::vector<uint8_t> mask[3];
 +        for (int i = 0; i < 3; ++i) {
@@ -335,7 +348,7 @@ index a128fff..0a3a55c 100644
 +            test_flash_attn_ext tc(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
 +                                   model_layout ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3},
 +                                   !model_layout, false, 0, true, 1025, false,
-+                                   i == 0 ? 1 : 2, (int32_t) c[2], (int32_t) c[3], c[4]);
++                                   i == 0 ? 1 : 2, (int32_t) c[2], (int32_t) c[3], c[4], c[0] == 2200 ? 2.5f : 0.0f);
 +            run(tc, out[i], mask[i]);
 +        }
 +        for (int i = 1; i < 3; ++i) {

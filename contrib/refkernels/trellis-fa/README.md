@@ -1662,3 +1662,90 @@ own; `GGML_MAX_SRC` stays 20.
 the review's "sound, build first"; it follows on the rebased branch, as a change
 of its own.
 
+
+# 1a on the development base: what ran on the card, and the review's should-fixes {#dev}
+
+The branch is rebased onto `development` (patch 0187, the transposing copy, is in
+the series beside the port's 0193 / 0194 / 0198 / 0199); the four patches are
+regenerated against that series.
+
+## What ran on the card (measured-here, the card host, B60 at its 165 W cap)
+
+**The op** (the round-2 kernel, a clean host; us a call, window 1,024):
+
+| shape | port 256 GRF | port 128 GRF | today's kernel (the twin) | oracle 256 | no-bias probe |
+|---|---|---|---|---|---|
+| q512 × kv1536 | 746 | 876 | 2,263 | 533 | 392 |
+| q2048 × kv2048 | 2,092 | 2,113 | 9,577 | 1,457 | 1,100 |
+| q2048 × kv3072 | 2,926 | 2,654 | 12,645 | 1,909 | 1,630 |
+
+Suite: every port case OK; RED=1 and RED=2 fail every case.
+
+**The model** (Inkling 2 Mini, pp4096, three interleaved rounds, t/s, the port
+off / on):
+
+| ub | off | on | |
+|---|---|---|---|
+| 512 | 720.4 | 906.7 | +25.9 % |
+| 1024 | 763.6 | 974.0 | +27.6 % |
+| 2048 | 718.0 | 981.2 | +36.7 % |
+
+Answer level, ub 1024 against the CPU base: mean KL 0.001917 (off) → 0.001965
+(on), top p 98.40 → 98.47: inside the bar (≤ 0.03 nats worse, top p down ≤ 1
+point). ub 1: identical (the port's graph needs more than 8 rows). The TAKEN line
+was printed. Those runs were on the branch before this rebase and before the
+three changes below; **the kernel as it stands here has not run on a card.**
+
+## The should-fixes of the round-2 review
+
+1. **An unaligned K/V base could still abort at launch.** `supports_op` looked at
+   the placed offset only when the tensor was already placed, and the launch
+   aborted otherwise. Now the refusal is the gate's alone, a pure function of the
+   op: the K/V strides, the view offset (`% 64`) and the backend's buffer
+   alignment (`% 64`). A placed offset is the buffer's (a multiple of that
+   alignment, by the allocator) plus the view's, so the launch asserts it and
+   refuses nothing. The same for the work-group: the gate bounds `16 · G` (one
+   sub-group a head of a kv head's group) by the device's work-group, and
+   `supports_op` asks the built kernel's own limit; the launch asserts. Gate
+   test: a V view offset of 32, a K view offset of 4,112, a K view 512 rows in
+   (accepted), a 32-lane work-group, 24 heads on one kv head.
+2. **The linear path assumed the pad bin is zero.** A group wholly at or past
+   the extent read nothing and added 0. It now adds the row's pad bin, read once
+   a tile (8 scalar loads), so the kernel is right for any table; the model's
+   unfolded table has 0 there. `GGML_OPENCL_FA_PORT_RED=4` builds the old
+   assumption and must FAIL the new case: 2,200 keys, no window, a pad bin of
+   2.5 (`pad_bias=2.5`), with its twin for today's kernels.
+3. **The record** is this section.
+
+## Without a device, on this tree (measured-here, the recipe host)
+
+- The gate test on the graph export's lines 220-223 of the three files: red (the
+  contiguity rule) rc 1, 6 × `refuse layout`; green rc 0, 24 ACCEPT, 174 refusals,
+  the five new bends among them.
+- The offline gate, bmg-g21: 256 GRF `ocloc 8/8 variants` (default, prepass,
+  no-skip, RED 1 / 2 / 4, the no-bias probe, varying ids), each `grf 256 simd 16
+  scratch 0`. **128 GRF: `ocloc 0/1`, `scratch 4096`** - it builds and is
+  selectable for timing, it does not pass the gate, and the pad read made it
+  worse (2,048 B before). It was slower than or equal to 256 on the card and is
+  not the default; a spill-free 128 build would need the 8-row tile's output
+  accumulator (64 registers) cut, which is another kernel.
+- `GGML_TEST_FA_PORT_TWINS=1` on the CPU: 14 pairs, the mask bytes identical,
+  NMSE ≤ 4.4e-6 (the pad case the largest).
+- `test-backend-ops -b CPU -o FLASH_ATTN_EXT -p "port=[12]"`: 16/16.
+- `port_abi_check.py`: 42 / 42.
+
+## The card commands for this tree
+
+`T` = `<build>/bin/test-backend-ops`, `D` the OpenCL device, `P` =
+`GGML_OPENCL_FA_PORT=1`.
+
+    P GGML_OPENCL_BOUNDS=1 T -b D -o FLASH_ATTN_EXT -p "kv=1536,nb=512,.*port=1"     # 1 case, OK, the TAKEN line
+    P GGML_OPENCL_BOUNDS=1 T -b D -o FLASH_ATTN_EXT                                  # 0 FAIL; the eleven port=1 cases RUN
+    T -b D -o FLASH_ATTN_EXT                                                          # knob off: port=1 not supported, the twins run
+    for r in 1 2; do P GGML_OPENCL_FA_PORT_RED=$r T -b D -o FLASH_ATTN_EXT -p "port=1"; done   # each FAILs every case
+    P GGML_OPENCL_FA_PORT_RED=4 T -b D -o FLASH_ATTN_EXT -p "pad_bias=2.5.*|port=1.*pad_bias=2.5"   # must FAIL the pad case
+    for g in 256 128; do P GGML_OPENCL_FA_PORT_GRF=$g T perf -b D -o FLASH_ATTN_EXT -p "n_bins=1025.*port=1"; done
+    T perf -b D -o FLASH_ATTN_EXT -p "n_bins=1025.*port=2"
+
+Expected against the round-2 kernel: the same times within the run-to-run
+spread (the pad read is 8 loads a tile), the same answers.
