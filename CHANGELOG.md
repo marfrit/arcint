@@ -146,11 +146,19 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
     red gives 0.96). The 27B: no MUL_MAT_ID.
   - With the expert cache on Flash-Next's unit flags: the same greedy texts on and off (bounds on, no abort). Reach on that
     route is not shown.
-  - Op cases with bounds on, on this revision:
-    - Inkling's real-shape MUL_MAT_ID cases pass on and off: 16 distinct (0192's ten IQ4_NL and 0169's six Q8_0); the run
-      executed 20, four of them duplicates (0192 repeats four of 0169's cases);
-    - the MUL_MAT_ID suite gives the same 556 of 630 (the 74 failures are the known mxfp4 set);
-    - the red build fails all of them and blows up the logits (KL 3.18) at ub 512, 1024 and 2048.
+  - Op cases with bounds on, run on this revision built from the series itself (apply-series.sh on the pin, the applied tree
+    `git write-tree` a5610fc1; B60 at 165 W):
+    - Inkling's 16 distinct real-shape MUL_MAT_ID cases (0192's 10 IQ4_NL and 0169's six Q8_0) pass 16/16 with the knob on
+      and with it off; 0192's two Q8_0 cases that take the Q8_0 prompt arm's fallback (520 rows, not a multiple of 16; 520
+      experts, more than 512) pass 2/2; the run logs the generic path once for their shared key (`DOWNGRADE src=opencl op=MUL_MAT_ID type=q8_0 k=256
+      path=generic reason=no-fast-path`, logged once a key), so a per-case path is not shown;
+    - the MUL_MAT_ID suite gives 554 of 628 with the knob on (the 74 failures are the known mxfp4 set);
+    - the red build fails all 16 with the knob on; KL to the CPU reference (`-c 2048 --chunks 3`) is the same with the
+      knob off and on at ub 512 (0.001932, same top p 98.208 %) and ub 1024 (0.001917, 98.403 %); no bounds abort.
+    The rows above this one (the kernel times, llama-bench, the served numbers, the logit and expert-cache rows) ran on a
+    development worktree, not the applied series, and were not re-measured on it. That worktree differed from the series
+    in two refusal conditions of 0168 (which pass for every shape it ran), in patches 0161-0165 (the Qwen4 converter and
+    model files and their test cases) and in a comment.
   - The bounds check follows the weight arguments the kernel is given (the SoA planes or an expert cache's gathered stage).
 
 ## 1.8.0 — 2026-11-22

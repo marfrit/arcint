@@ -9626,21 +9626,27 @@ commit (`trellis-serve` @8f8e2fcc) in the commit message.
 
 Tests: `test-opencl-kq-i8` reads the knob's parse (unset/off/0 off, 1/on on) and assembles the wide
 program as the backend does, text-checking it and compiling it when a clang exists. `test-backend-ops`
-carries Inkling's real expert shapes, 128 experts top-8. 0192 adds 14 correctness cases: ten IQ4_NL (the three shapes
-below at 512 and 2048 tokens, six cases, and four skew cases) and four Q8_0 cases that repeat 0169's exactly. 0169 has
-six Q8_0 prompt cases (the gate/up and down shapes at 16, 512 and 2048 tokens), so there are 16 distinct cases, and a run
-of both patches' cases executes 20. The shapes, in the correctness and perf lists: gate/up as 2,304 rows at K 2,304; both
-projections in one tensor, 4,608 rows at K 2,304 (the 9-band launch, IQ4_NL only); down as 2,304 rows at K 1,152 (4.5
-super-blocks, so the staging loop's last group is partial). It also carries `test_mul_mat_id_skew`, every slot of every
-token on expert 0 (2,304 rows at K 2,304 and at K 1,152; the perf list has the K 1,152 one), so one expert takes a whole
-chunk and the rest are empty tiles. A tile is 32 pairs. Uniform top-8 over 128 experts gives ~32 pairs an expert at 512 tokens (one
+carries Inkling's real expert shapes, 128 experts top-8, at 512 and 2048 tokens. The correctness and perf lists carry
+IQ4_NL gate/up as 2,304 rows at K 2,304, both projections in one tensor, 4,608 rows at K 2,304 (the 9-band launch), and
+down as 2,304 rows at K 1,152 (4.5 super-blocks, so the staging loop's last group is partial); the 4,608-row and skew
+cases are IQ4_NL only. 0192 adds 12 correctness cases: 10 IQ4_NL, 6 real-shape (the three shapes at two batch sizes)
+and 4 skew (two shapes at two batch sizes), and two Q8_0 cases that take 0168's fallback (520 rows, not a multiple of 16;
+520 experts, more than 512). The Q8_0 real-shape cases are 0169's six (two shapes at 16, 512 and 2048 tokens), so the
+two patches carry 16 distinct real-shape cases and the two fallback cases. The perf list has six a batch size: the
+three IQ4_NL shapes, two Q8_0 (2,304 rows K 2,304 and 2,304 rows K 1,152), timed next to the narrow tile, and one skew. It also carries
+`test_mul_mat_id_skew`, every slot of every token on expert 0 (2,304 rows at K 2,304 and at K 1,152; the perf list has
+the K 1,152 one), so one expert takes a whole chunk and
+the rest are empty tiles. A tile is 32 pairs. Uniform top-8 over 128 experts gives ~32 pairs an expert at 512 tokens (one
 tile) and ~128 at 2048 (four). The skew case gives 128 and 512 tiles to expert 0. The band loop, the last band's second
 column past `ne01`, the partial super-block and the empty-tile tail are all reached. Red tree, the named mutation: in
 `mul_mm_kq_i8_wide.cl`, `acc1[g] +=` becomes `acc0[g] +=` in `I8W_MAD`, so column 0 accumulates both products and column
 1 stays zero.
 
 Bounds under `GGML_OPENCL_BOUNDS=1` follow the weight arguments the kernel is given (`ggml_cl_kq_weight_args`): the SoA
-planes with their offset, or the gathered stage an expert cache hands the kernel. An expert bank in USM host memory
+planes with their offset, or the gathered stage an expert cache hands the kernel. The helper carries no branch for a
+Q8_0 tensor stored as it came (not in SoA planes): unreachable (`code`), the wide int8 arm is IQ4_NL only (its
+kernel exists only for type index 5), and the Q8_0 prompt arm returns before the call unless
+`ggml_cl_is_q8_0_soa(src0)` holds, under `ggml_cl_mul_mat_id`'s `GGML_ASSERT(src0->extra)`. An expert bank in USM host memory
 would be a pointer argument with no buffer size to compare against; the helper returns without bounding it and logs
 nothing. For the wide tile that route does not occur (`code`): an IQ4_NL bank in USM is always gathered first, and the
 Q8_0 arm refuses an expert cache's `.slots` and `.bank` tensors.
@@ -9648,15 +9654,25 @@ Q8_0 arm refuses an expert cache's `.slots` and `.bank` tensors.
 Card evidence (`measured-here`, the B60 at a 165 W cap unless the B70 (220 W) is named, Inkling 2 Mini IQ4_NL,
 `GGML_OPENCL_KQ_MM_ID_I8=1` in every arm):
 
-- Op cases with `GGML_OPENCL_BOUNDS=1`:
-  - Inkling's real-shape MUL_MAT_ID cases (128 experts, top-8; 16 distinct: 0192's ten IQ4_NL and 0169's six Q8_0), run
-    on this revision, pass with the knob on and with it off. The run executed 20: 0192 also repeats four of 0169's cases.
-    Without the knob, no wide program is built.
-  - The 4,608-row single case passes 1/1.
-  - The MUL_MAT_ID suite gives 556 of 630 on and off alike; the 74 failures are the known mxfp4 set.
-  - The red tree fails all 20 executed cases (the 16 distinct ones), IQ4_NL and Q8_0.
-- The kernel time, speed and logit rows below were measured on the previous revision of these patches. Since then the
-  bounds check follows the kernel's arguments and the test shapes were corrected. The kernel text changed only in its
+- Op cases with `GGML_OPENCL_BOUNDS=1`, on this revision built from the series itself (apply-series.sh on the pin; the
+  applied tree's `git write-tree` is a5610fc1):
+  - Inkling's 16 distinct real-shape MUL_MAT_ID cases (128 experts, top-8: 0192's 10 IQ4_NL, 0169's six Q8_0) pass 16/16
+    with the knob on and with it off; without the knob, no wide program is built. 0192's two Q8_0 fallback cases (520
+    rows; 520 experts) pass 2/2. The run logs the generic path once for their shared key (`DOWNGRADE src=opencl
+    op=MUL_MAT_ID type=q8_0 k=256 path=generic reason=no-fast-path`, logged once a key), so a per-case path is not
+    shown.
+  - The MUL_MAT_ID suite gives 554 of 628 with the knob on; the 74 failures are the known mxfp4 set.
+  - The red tree, knob on, fails all 16 (10 IQ4_NL, 6 Q8_0).
+  - KL to the CPU reference (`-c 2048 --chunks 3`), knob off / on: ub 512 0.001932 / 0.001932 (same top p 98.208 %
+    both), ub 1024 0.001917 / 0.001917 (98.403 % both).
+  - No bounds abort in any of these.
+  - The earlier rows (the 4,608-row single case 1/1, the suite 556 of 630 with four duplicate cases counted, and
+    everything below) ran on a development worktree, not the applied series. It differed in two refusal conditions of
+    0168 (`ne01 % 16`, more than 512 experts), which pass for every shape it ran, in patches 0161-0165 (the Qwen4
+    converter and model files and their test cases), and in a comment.
+- The kernel time, speed, served and logit rows below were measured on that worktree's earlier revision of these patches
+  and were not re-measured on the applied series. Since
+  then the bounds check follows the kernel's arguments and the test shapes were corrected. The kernel text changed only in its
   comments, and the dispatch only in the bounds helper (`code`).
 - Kernel time, profiling build, pp4096, per visit (44 IQ4_NL visits a pass; the reference's figures are per visit over its
   48; the reference's are `measured-here` too: trellis-serve @8f8e2fcc on the same B60 at 165 W, a PTI profile over

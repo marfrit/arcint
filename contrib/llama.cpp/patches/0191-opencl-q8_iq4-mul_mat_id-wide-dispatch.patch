@@ -1,7 +1,7 @@
-0191: the wide tile's knob, program build, dispatch and bounds: GGML_OPENCL_KQ_MM_ID_I8_WIDE (unset off), grid {max_tiles * sg, CEIL_DIV(ne01, 512) * 16} at {sg, 16}, the IQ4_NL int8 arm and the Q8_0 prompt arm. The bounds check follows ggml_cl_kq_weight_args to the mem objects the kernel is given: a gathered stage, or a SoA extra's q/d with its offsets; a USM bank (a pointer argument, unreachable for this tile) is not bounded.
+0191: the wide tile's knob, program build, dispatch and bounds: GGML_OPENCL_KQ_MM_ID_I8_WIDE (unset off), grid {max_tiles * sg, CEIL_DIV(ne01, 512) * 16} at {sg, 16}, the IQ4_NL int8 arm and the Q8_0 prompt arm; the bounds check follows ggml_cl_kq_weight_args to the mem objects the kernel is given (a gathered or streamed stage, or a SoA extra's q/d planes), and a USM bank, a pointer argument with no cl_mem (unreachable for this tile), is not bounded.
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index baf85d9..5919b2d 100644
+index baf85d9..2ca5d9d 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -1290,6 +1290,11 @@ struct ggml_backend_opencl_context {
@@ -56,7 +56,7 @@ index baf85d9..5919b2d 100644
                      }
                  }
              }
-@@ -33835,6 +33873,43 @@ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, siz
+@@ -33835,6 +33873,37 @@ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, siz
          GGML_ABORT("%s: a launch past its buffer", arm);
      }
  }
@@ -82,12 +82,6 @@ index baf85d9..5919b2d 100644
 +        ggml_cl_bounds(arm, "d", e->d, d_upto);
 +        return 1;
 +    }
-+    if (src0->type == GGML_TYPE_Q8_0) {
-+        const ggml_tensor_extra_cl * e = (const ggml_tensor_extra_cl *) src0->extra;
-+        const size_t off = (size_t) (e->offset + src0->view_offs);
-+        ggml_cl_bounds(arm, "q", e->data_device, q_upto + off);
-+        return 1;
-+    }
 +    if (src0->type == GGML_TYPE_IQ4_NL) {
 +        const ggml_tensor_extra_cl_iq4_nl * e = (const ggml_tensor_extra_cl_iq4_nl *) soa0->extra;
 +        ggml_cl_bounds(arm, "q", e->q, q_upto);
@@ -100,7 +94,7 @@ index baf85d9..5919b2d 100644
  
  // a batched F32 product of a tiny K (1-8 rows) over a wide N: Inkling 2 Mini's depth mix
  // (2304 rows, K = a block count 1-6, one or three columns a token, a column a token as the
-@@ -37162,6 +37237,16 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -37162,6 +37231,16 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      const bool id2_default = backend_ctx->kq_mm_sg != 8;
      const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
      cl_kernel i8_kernel = ti == 10 ? backend_ctx->kernel_mul_mm_id_iq3_s_i8 : backend_ctx->kernel_mul_mm_id_iq4_nl_i8;
@@ -117,7 +111,7 @@ index baf85d9..5919b2d 100644
      cl_kernel kernel = ids8 ? ids8_kernel :
                         i8 ? i8_kernel :
                         id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
-@@ -37485,6 +37570,36 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+@@ -37485,6 +37564,35 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
      if (i8) {
@@ -137,8 +131,7 @@ index baf85d9..5919b2d 100644
 +            const size_t ncolsw = (size_t) ne11 * ne12;
 +            // the planes the weight arguments carry: a gathered or streamed stage, the
 +            // SoA extra's q/d with its offsets, or a USM bank's pointer (nothing to bound)
-+            const size_t qb = src0->type == GGML_TYPE_Q8_0 ? 32 : 16;
-+            ggml_cl_kq_plane_bounds(src0, "int8 wide", blkmax * qb + qb, blkmax * 2 + 2);
++            ggml_cl_kq_plane_bounds(src0, "int8 wide", blkmax * 16 + 16, blkmax * 2 + 2);
 +            ggml_cl_bounds("int8 wide", "xq",      backend_ctx->prealloc_kq_id8_q.buffer, ncolsw * ne00);
 +            ggml_cl_bounds("int8 wide", "xd",      backend_ctx->prealloc_kq_id8_d.buffer, ncolsw * n32w * sizeof(float));
 +            ggml_cl_bounds("int8 wide", "pairs",    pairs,   (size_t) n_pairs * sizeof(cl_int));
@@ -154,7 +147,7 @@ index baf85d9..5919b2d 100644
          // I8XSG = 8 sub-groups of 16 rows a work-group (mul_mm_kq_i8.cl)
          const int i8_xsg = 8;
          size_t global_work_size[] = { (size_t)max_tiles * sg, (size_t)CEIL_DIV(ne01, i8_xsg * sg) * i8_xsg, 1 };
-@@ -37700,6 +37815,14 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
+@@ -37700,6 +37808,14 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
      }
  
      cl_kernel kernel = backend_ctx->kernel_mul_mm_id_q8_0_i8;
@@ -169,7 +162,7 @@ index baf85d9..5919b2d 100644
      cl_uint a = 0;
      const cl_ulong offq = 0;   // the flat planes' extra starts at the tensor's base (the decode arm's offq)
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e0->q));
-@@ -37720,6 +37843,26 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
+@@ -37720,6 +37836,26 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
      CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
      size_t global_work_size[] = { (size_t) max_tiles * sg, (size_t) CEIL_DIV(ne01, i8_xsg * sg) * i8_xsg, 1 };
      size_t local_work_size[]  = { (size_t) sg, (size_t) i8_xsg, 1 };
