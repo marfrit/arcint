@@ -9846,7 +9846,7 @@ GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
 
   | model | ub 512 | ub 1024 | ub 1 |
   |---|---|---|---|
-  | Inkling 2 Mini | not run | 0 / 5.6e-5 / 100 % | 0 / 3.7e-5 / 100 % |
+  | Inkling 2 Mini | 0 / 6.2e-5 / 100 % | 0 / 5.6e-5 / 100 % | 0 / 3.7e-5 / 100 % |
   | Qwen3.8-27B | 0 / 4.4e-5 / 100 % | 0 / 5.0e-5 / 100 % | 0 / 4.1e-5 / 100 % |
   | Dory 4B | 0 / 5.2e-5 / 100 % | 0 / 5.8e-5 / 100 % | 0 / 4.8e-5 / 100 % |
 
@@ -9859,6 +9859,8 @@ GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
   so on Arc the same kernels compile from the same source. Applied series of this commit: write-tree
   `182258aeb0f232cdbfc5db9eec26f236347e3969`; offline gate 3/3 (default, `GGML_CL_NO_CPY_PACK`, the red;
   128 GRF, scratch 0).
-- Open: `llama-perplexity` does not print the once-a-process INFO line. The KL runs therefore do
-  not themselves show the path was taken, although the `llama-bench` runs on the same binary and
-  env do. Inkling's ub 512 logits arm (gate step (f) as written) was not run. Owed: a `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` perplexity run, or a per-call counter.
+- `llama-perplexity` filters ggml's INFO lines at its default verbosity, so the taken line shows only
+  with `-lv 4`. With `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` alone it printed 0 taken lines and 644 rejected
+  ones (the model's other copies, e.g. `ne=[3,1024,1,1]` failing `same_shape` and `nb01==4`). With `-lv 4`
+  it printed the taken line, in the Inkling ub 512 identity run too. A per-call counter would still
+  give the count; it belongs to the follow-up on the narrow destination.
