@@ -10540,3 +10540,27 @@ The unit test also runs T = 256 now (the CPU check's batch; not an exported size
 kernel text against the chain 2e-14 .. 8e-14 on six calls, the raw-state red 0.016 .. 0.64;
 the chain thresholds are 1e-11. Applied tree `c83de73e1fb7d15c44436481ec667d8280b5091c`
 (a comment in the dispatch); the recipe was last run on the previous tip.
+
+**The noise control: the knob's CPU difference is one-ulp amplification** (`measured-here`, the
+recipe host, CPU, llama-perplexity, Inkling 2 Mini IQ4_NL, c 256, b 256, the knob-off logits as
+the base; 16 chunks = 2,032 scored tokens, whose first 3 chunks are the 381-token set of the
+table above). The control is the knob OFF with every chain mix result the arm would replace
+moved one ulp up or down at random (`contrib/llama.cpp/replay/mix_noise_control.diff`, test
+only, not in the series; relative change 6e-8 .. 1.2e-7, the size measured at the first mix):
+
+| arm | tokens | mean KL, nats | max KL | same top p |
+|---|---|---|---|---|
+| knob on (fold) | 381 | 0.00154 ± 0.00024 | | 98.950 ± 0.523 % |
+| noise, seed 1 | 381 | 0.00253 ± 0.00096 | | 99.213 ± 0.453 % |
+| knob on (fold) | 2,032 | 0.00234 ± 0.00062 | 1.229 | 98.376 ± 0.280 % |
+| noise, seed 1 | 2,032 | 0.00213 ± 0.00027 | 0.357 | 98.081 ± 0.304 % |
+
+A one-ulp perturbation of the unchanged chain moves the logits as far as the arm does: the same
+mean KL within the spread, and a top-p agreement 0.3 points LOWER than the arm's on 2,032
+tokens. The arm's CPU difference is therefore the amplification named above (the quantized
+expert product and what follows), not a defect in the graph under the knob. It also says what
+this CPU check can and cannot gate: any rounding change at these sites costs ~0.002 nats and
+~1.6-1.9 points of top p against a bit-fixed base here, so the 1-point cell of the answer-level
+bar has to be read against a baseline arm's own spread on the card, as the bar says
+(comparative), not against a deterministic CPU base. Owed, after the card window: the nofold
+arm and noise seeds 2 and 3 on the same tokens.
