@@ -880,3 +880,18 @@ passes `q_nb1/q_nb2`, `k_nb1/k_nb2`, `v_nb1/v_nb2`, `o_nb1/o_nb2` and the kernel
 takes the head slice from `nb[2]`; the sink is attached as the raw
 `[n_head, n_tokens]` tensor (head fastest, which is the layout the kernel reads),
 without the permute/copy the first form built.
+
+## Prediction before the first card run (the coordinator, inference)
+
+Written 2026-11-24, before the first card run, by the coordinator, not the port session. Inferred from the plan: the port
+follows fa::Kern's structure, so its base loop should sit near the reference's no-table times, plus our table read.
+The 256-GRF build halves the threads a core against a 128-GRF build. fa::Kern's own measured numbers came from its
+default build, which spills at 128 GRF.
+
+| shape | predicted, port | fa::Kern | fa::Kern without the table | today's kernel |
+|---|---|---|---|---|
+| q2048 x kv3072 | ~1,700-2,600 us | 2,473-3,500 | 1,630 | 12,583 |
+| q2048 x kv2048 | ~1,300-2,000 us | 1,828 | 1,201 | 9,938 |
+| q512 x kv1536 | ~600-1,000 us | 856 | 537 | 2,293 |
+
+The first window stops at the single case if it is slower than today's kernel.
