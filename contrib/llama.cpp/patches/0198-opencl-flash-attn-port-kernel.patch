@@ -11,7 +11,7 @@ index a1c914b..63a481f 100644
      sub
      sum_rows
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index f84ca33..0141fa0 100644
+index f84ca33..13c7b14 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
 @@ -722,6 +722,7 @@ struct ggml_cl_kq_act {
@@ -33,7 +33,7 @@ index f84ca33..0141fa0 100644
      int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
      // 0106: the build options of the head-256 prompt kernels, so that the
      // head-512 builds made on first use match them (sub-group, sub-groups a
-@@ -13086,6 +13091,104 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+@@ -13086,6 +13091,108 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
      return true;
  }
  
@@ -72,7 +72,6 @@ index f84ca33..0141fa0 100644
 +    if (mask == nullptr || mask->type != GGML_TYPE_F16 || mask->ne[0] < k->ne[1] || mask->ne[1] < q->ne[1] || mask->ne[3] != 1) { *why = "mask"; return false; }
 +
 +    const int64_t rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1];
-+    if (rows % 8 != 0 && rows != q->ne[1] * q->ne[3]) { *why = "rows"; return false; }
 +    if (sinks == nullptr || sinks->type != GGML_TYPE_F32 || !ggml_is_contiguous(sinks) ||
 +        sinks->ne[0] != n_head || sinks->ne[1] < rows || sinks->ne[2] != 1) { *why = "sinks"; return false; }
 +    if (bt->type != GGML_TYPE_F32 || !ggml_is_contiguous(bt) ||
@@ -111,6 +110,11 @@ index f84ca33..0141fa0 100644
 +        return nullptr;
 +    }
 +    std::string opts = backend_ctx->kernel_compile_opts + " -DDKQ=128 -DBK=32";
++    // the 128-GRF default; GGML_OPENCL_FA_PORT_GRF=256 is the measured follow-up arm
++    // (it halves the threads a core: exl3_ops.sycl:176, CL:5341)
++    if (const char * grf = getenv("GGML_OPENCL_FA_PORT_GRF"); grf != nullptr && atoi(grf) >= 256) {
++        opts += " -cl-intel-256-GRF-per-thread";
++    }
 +    // the red cases: GGML_OPENCL_FA_PORT_RED=1 reads a key past n_kv,
 +    // =2 drops the sink, =3 forces the per-lane bias read (the run's shuffle off)
 +    if (const char * red = getenv("GGML_OPENCL_FA_PORT_RED")) {
@@ -138,7 +142,7 @@ index f84ca33..0141fa0 100644
  static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
      ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
      ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
-@@ -13633,6 +13736,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13633,6 +13740,20 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
              // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
              // the prompt kernels have no bias yet, so those shapes go to ggml
@@ -159,7 +163,7 @@ index f84ca33..0141fa0 100644
              if (ggml_flash_attn_ext_has_indexed_bias(op)) {
                  const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
                  const ggml_tensor * mask = op->src[3];
-@@ -26474,6 +26591,118 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+@@ -26474,6 +26595,122 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
          max_bias == 0.0f && logit_softcap == 0.0f &&
          q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
          (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
@@ -206,12 +210,13 @@ index f84ca33..0141fa0 100644
 +        argbuf(dst->src[GGML_FA_SRC_CFLAG], &bcf, &ocf);
 +        argbuf(dst->src[GGML_FA_SRC_RFLAG], &brf, &orf);
 +        const int   n_bins = (int) dst->src[GGML_FA_SRC_BIAS_TABLE]->ne[0];
-+        const cl_ulong q_nb2p = q->nb[2], o_nb2p = dst->nb[2];
++        const cl_ulong q_nb2p = q->nb[2], o_nb2p = dst->nb[2];   // Q's head stride; the output's query-row stride
 +        const cl_ulong k_nb1p = k->nb[1], v_nb1p = v->nb[1];
-+        ggml_cl_bounds("op=FLASH_ATTN port", "q",  bq,  oq  + (size_t)(rows - 1) * q_nb2p + q->nb[1]);
-+        ggml_cl_bounds("op=FLASH_ATTN port", "k",  bk,  ok  + (size_t)(n_kv - 1) * k_nb1p + k_nb1p);
-+        ggml_cl_bounds("op=FLASH_ATTN port", "v",  bv,  ov  + (size_t)(n_kv - 1) * v_nb1p + v_nb1p);
-+        ggml_cl_bounds("op=FLASH_ATTN port", "o",  bo,  oo  + (size_t)(rows - 1) * o_nb2p + (size_t)(n_head - 1) * dst->nb[1] + 128 * sizeof(float));
++        const cl_ulong k_nb2p = k->nb[2], v_nb2p = v->nb[2];   // a kv head's stride
++        ggml_cl_bounds("op=FLASH_ATTN port", "q",  bq,  oq  + (size_t)(n_head - 1) * q->nb[2] + (size_t)(rows - 1) * q->nb[1] + q->nb[1]);
++        ggml_cl_bounds("op=FLASH_ATTN port", "k",  bk,  ok  + (size_t)(n_head_kv - 1) * k_nb2p + (size_t)(n_kv - 1) * k_nb1p + k_nb1p);
++        ggml_cl_bounds("op=FLASH_ATTN port", "v",  bv,  ov  + (size_t)(n_head_kv - 1) * v_nb2p + (size_t)(n_kv - 1) * v_nb1p + v_nb1p);
++        ggml_cl_bounds("op=FLASH_ATTN port", "o",  bo,  oo  + (size_t)(n_head - 1) * dst->nb[1] + (size_t)(rows - 1) * o_nb2p + 128 * sizeof(float));
 +        ggml_cl_bounds("op=FLASH_ATTN port", "mask", bm, om + (size_t)(rows - 1) * mask_nb1 + (size_t)n_kv * sizeof(cl_half));
 +        ggml_cl_bounds("op=FLASH_ATTN port", "sink", bs, os + (size_t)rows * n_head * sizeof(float));
 +        ggml_cl_bounds("op=FLASH_ATTN port", "table", bt, ot + (size_t)rows * n_head * n_bins * sizeof(float));
@@ -236,9 +241,12 @@ index f84ca33..0141fa0 100644
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bk));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ok));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &k_nb1p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &k_nb2p));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bv));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ov));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v_nb1p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v_nb2p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v->nb[2]));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bo));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oo));
 +        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &dst->nb[1]));
@@ -280,10 +288,10 @@ index f84ca33..0141fa0 100644
                            kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 new file mode 100644
-index 0000000..b3292be
+index 0000000..fcad919
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
-@@ -0,0 +1,300 @@
+@@ -0,0 +1,304 @@
 +#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroups : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
@@ -355,8 +363,8 @@ index 0000000..b3292be
 +__attribute__((intel_reqd_sub_group_size(16)))
 +kernel void kernel_flash_attn_port(
 +        global const char * q, ulong q_offset, ulong q_nb1, ulong q_nb2,
-+        global const char * k, ulong k_offset, ulong k_nb1,
-+        global const char * v, ulong v_offset, ulong v_nb1,
++        global const char * k, ulong k_offset, ulong k_nb1, ulong k_nb2,
++        global const char * v, ulong v_offset, ulong v_nb1, ulong v_nb2,
 +        global char * dst, ulong o_offset, ulong o_nb1, ulong o_nb2,
 +        global const void * mask_void, ulong mask_offset, ulong mask_nb1,
 +        global const float * sink, ulong sink_offset,
@@ -378,15 +386,17 @@ index 0000000..b3292be
 +    const int g    = get_local_id(1);
 +    const int head = kvh * (n_head / hkv) + g;
 +
-+    const global half * qh = (global half *)((global const char *) q + q_offset);
-+    const long qb = (long) qh;
-+    const long kb = (long) (k + k_offset), vb = (long) (v + v_offset);
++    // Q is [D, Lq, Hq] with D fastest (nb1 a query row, nb2 a head); K/V are [D, Lk, Hk]
++    // with D fastest (nb1 a key row, nb2 a kv head); the head slice is the base offset.
++    const long qb = (long) (global half *)((global const char *) q + q_offset) + (long) head * (long) q_nb2;
++    const long kb = (long) (k + k_offset) + (long) kvh * (long) k_nb2;
++    const long vb = (long) (v + v_offset) + (long) kvh * (long) v_nb2;
 +    const global int * kps = (global const int *)((global const char *) kpos + kpos_offset);
 +    const global int * qps = (global const int *)((global const char *) qpos + qpos_offset);
 +    const global char * cfl = (global const char *)(cflag + cflag_offset);
 +    const global char * rfl = (global const char *)(rflag + rflag_offset);
 +
-+    const int qp = (int) q_nb2, kp = (int) k_nb1;   // row pitches of the Q and K surfaces (bytes)
++    const int qp = (int) q_nb1, kp = (int) k_nb1;   // row pitches of the Q and K surfaces (bytes)
 +    const bool rg_lin = rfl[q0 / QR] != 0;
 +
 +    float m[QR], l[QR], sinkv[QR];
@@ -425,7 +435,7 @@ index 0000000..b3292be
 +        // ---- key state of this lane ----
 +        int  key[NKB];
 +        bool live[NKB], valid[NKB][QR];
-+        float bias[NKB][QR];
++        float bias[NKB][QR], mval[NKB][QR];
 +        _Pragma("unroll")
 +        for (int gb = 0; gb < NKB; ++gb) {
 +            key[gb] = t0 + gb * 16 + lane;
@@ -435,6 +445,7 @@ index 0000000..b3292be
 +                const int d = qps[q0 + r] - kps[min(key[gb], n_kv - 1)];
 +                valid[gb][r] = (q0 + r < n_q) && live[gb] && d >= 0 && (window == 0 || d < window);
 +                bias[gb][r] = 0.f;
++                mval[gb][r] = 0.f;
 +            }
 +        }
 +
@@ -448,7 +459,7 @@ index 0000000..b3292be
 +                _Pragma("unroll")
 +                for (int r = 0; r < QR; ++r) {
 +                    if (q0 + r >= n_q) continue;
-+                    const int d0 = qps[q0 + r] - kps[t0 + gb * 16];
++                    const int d0 = qps[q0 + r] - kps[min(t0 + gb * 16, n_kv - 1)];
 +                    const int dmin = d0 - 15;   // the group's smallest distance
 +                    if (dmin >= n_bins - 1) continue;   // every bin is the pad: zero bias
 +                    if (d0 >= 15 && d0 <= n_bins - 1) {
@@ -488,7 +499,7 @@ index 0000000..b3292be
 +                    if (q0 + r >= n_q) continue;
 +                    const half mh = mb[(q0 + r) * mask_nb1 / sizeof(half) + key[gb]];
 +                    if (as_ushort(mh) == 0xFC00) valid[gb][r] = false;
-+                    else if (valid[gb][r]) sc[gb][r] += (float) mh;
++                    else if (valid[gb][r]) mval[gb][r] = (float) mh;   // added after the scale, as the reference does
 +                }
 +            }
 +        }
@@ -498,7 +509,7 @@ index 0000000..b3292be
 +        for (int gb = 0; gb < NKB; ++gb)
 +            _Pragma("unroll")
 +            for (int r = 0; r < QR; ++r)
-+                sc[gb][r] = valid[gb][r] ? sc[gb][r] * scale_log2 + LOG2E * bias[gb][r] : M_INIT;
++                sc[gb][r] = valid[gb][r] ? sc[gb][r] * scale_log2 + mval[gb][r] + LOG2E * bias[gb][r] : M_INIT;
 +
 +        // ---- per-row max of this lane's two keys, then a sub-group max only when
 +        //      the max moves (flash_attn_dpas2.cl:366-383) ----
@@ -579,7 +590,8 @@ index 0000000..b3292be
 +        _Pragma("unroll")
 +        for (int r = 0; r < QR; ++r) {
 +            if (q0 + r >= n_q) continue;
-+            global float * orow = (global float *)(dst + o_offset + (size_t)(q0 + r) * o_nb2 + (size_t)head * o_nb1);
++            // the op's dst is [D, n_head, n_q]: o_nb1 is a head's stride, o_nb2 a query row's
++            global float * orow = (global float *)(dst + o_offset + (size_t)head * o_nb1 + (size_t)(q0 + r) * o_nb2);
 +            orow[c * 16 + lane] = ov[r] * l[r];
 +        }
 +    }

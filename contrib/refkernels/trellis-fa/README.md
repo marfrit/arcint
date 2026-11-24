@@ -750,8 +750,10 @@ against, not results.
 
 ## What the code is believed to do, and what is owed
 
-`code` here (compiled: ggml-opencl, llama, and test-backend-ops build on this
-host; the `.cl` passes the frontend with the four Intel builtins stubbed, since
+`code` here: the four patches were checked against a fresh tree of the pin plus
+the 145-patch series — `git apply --check` clean for all four, and that tree
+builds `ggml-opencl`, `llama-cli` and `test-backend-ops`; the `.cl` passes the
+frontend with the four Intel builtins stubbed, since
 this frontend has no `intel_sub_group_f16_f16_matrix_mad_k16` or
 `__builtin_IB_subgroup_block_read_*` — the dedicated kernels fail the same way,
 see §tools): the patches apply cleanly to a fresh pin + series. **Owed, and the
@@ -759,3 +761,13 @@ first card step:** a device build and a run — no enqueue has happened for this
 kernel, so its numbers, its spills and its answers are all unmeasured. The
 linearity flags, the GENERAL path on a ring seam, and the `kv_lo` hint are the
 three places a first card run is most likely to correct.
+
+One correction made after the first commit, before any card run: the kernel's
+surfaces. Q is `[D, Lq, Hq]` and K/V `[D, Lk, Hk]` with D fastest, so a head's
+slice is a base offset (`head * nb[2]`, `kvh * nb[2]`) and a row pitch is
+`nb[1]` — the first form used `nb[2]` as the Q row pitch and started every head
+at offset 0, which would read head 0's rows and the wrong pitch. The shim now
+passes `q_nb1/q_nb2`, `k_nb1/k_nb2`, `v_nb1/v_nb2`, `o_nb1/o_nb2` and the kernel
+takes the head slice from `nb[2]`; the sink is attached as the raw
+`[n_head, n_tokens]` tensor (head fastest, which is the layout the kernel reads),
+without the permute/copy the first form built.

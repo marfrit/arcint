@@ -28,7 +28,7 @@ index 517eba9..9024294 100644
  
  static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 358f614..3305e86 100644
+index 358f614..2400367 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
 @@ -1423,6 +1423,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
@@ -46,7 +46,22 @@ index 358f614..3305e86 100644
  }
  
  bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
-@@ -4461,6 +4469,20 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -1435,6 +1443,14 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+     res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+     res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+ 
++    // 0194: the port's position and flag tensors follow the same shapes
++    res &= self_pos_k->ne[0] == attn_ctx->get_base()->get_n_kv();
++    res &= self_pos_q->ne[0] == params.ubatch.n_tokens;
++    res &= self_cflag->ne[0] == (attn_ctx->get_base()->get_n_kv() + 15) / 16;
++    res &= self_rflag->ne[0] == (params.ubatch.n_tokens + 7) / 8;
++    res &= self_pos_k_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
++    res &= self_pos_q_swa->ne[0] == params.ubatch.n_tokens;
++
+     return res;
+ }
+ 
+@@ -4461,6 +4477,20 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
      ggml_set_input(inp->self_rel_pos_swa);
      ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
  
@@ -181,7 +196,7 @@ index 4546729..8d7fc23 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 5fec3cb..61e19b6 100644
+index 5fec3cb..39dc40c 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
 @@ -385,10 +385,11 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
@@ -208,9 +223,9 @@ index 5fec3cb..61e19b6 100644
 +        // walk fills, the per-query sink logits, and the window (0 on a global layer).
 +        {
 +            const bool swa = is_swa;
-+            ggml_tensor * sinks_q = ggml_reshape_3d(ctx0, sinks, n_head, 1, n_tokens);
-+            sinks_q = ggml_cont(ctx0, ggml_permute(ctx0, sinks_q, 1, 0, 2, 3));   // [n_head, n_tokens]
-+            ggml_flash_attn_ext_add_query_sinks(cur, sinks_q);
++            // sinks is [n_head, n_tokens] with the head fastest, the layout the port
++            // kernel reads (sink[row*n_head + head]); no permute, no copy
++            ggml_flash_attn_ext_add_query_sinks(cur, sinks);
 +            ggml_flash_attn_ext_add_positions(cur,
 +                    swa ? inp->self_pos_k_swa : inp->self_pos_k,
 +                    swa ? inp->self_pos_q_swa : inp->self_pos_q,
