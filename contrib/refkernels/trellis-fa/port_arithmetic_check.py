@@ -51,6 +51,21 @@ def sink_accounting(scores, sink2):
     return l_ref, l_kernel
 
 
+def kv_hint_close(poss, qpos_lo, qpos_hi, window):
+    """the dense-prefill bounds the shim computes (kv_lo = max(0, n_kv - n_q -
+    window + 1), kv_hi = n_kv) must not skip a visible key on a dense run: the
+    earliest visible key of the first query row is the one that sets it."""
+    n_kv = len(poss)
+    kv_lo = max(0, n_kv - (qpos_hi - qpos_lo + 1) - window + 1) if window > 0 else 0
+    # visible keys are those with dist >= 0 and (window 0 or dist < window) for some row
+    first_visible = n_kv
+    for i, qp in enumerate(range(qpos_lo, qpos_hi + 1)):
+        for j, p in enumerate(poss):
+            if p <= qp and (window == 0 or qp - p < window):
+                first_visible = min(first_visible, j)
+    return kv_lo <= first_visible
+
+
 def main():
     random.seed(2026)
     nb = 1025                       # extent 1024 + the pad bin, reversed-free
@@ -78,6 +93,19 @@ def main():
             fails += 1
             if fails <= 10:
                 print(f"FAIL sink: ref {lr} kernel {lk}")
+    # the shim's dense-prefill kv_lo must not cut a visible key
+    for _ in range(2000):
+        n_q = random.randint(9, 2048)
+        n_kv = random.randint(n_q, n_q + 4096)
+        window = random.choice([0, 1024])
+        poss = list(range(n_kv))
+        qpos_lo, qpos_hi = n_kv - n_q, n_kv - 1
+        cases += 1
+        if not kv_hint_close(poss, qpos_lo, qpos_hi, window):
+            fails += 1
+            if fails <= 10:
+                print(f"FAIL kv_lo hint: n_q {n_q} n_kv {n_kv} window {window}")
+
     # the two checks can fail: the red variants below must be caught
     table_row = [random.uniform(-4.0, 4.0) for _ in range(nb)]
     d0 = nb // 2

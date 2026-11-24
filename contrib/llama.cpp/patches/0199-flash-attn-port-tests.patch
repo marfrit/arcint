@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index a128fff..600e3d3 100644
+index a128fff..c7d7a03 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -468,6 +468,9 @@ static std::string var_to_str(ggml_scale_mode mode) {
@@ -148,8 +148,8 @@ index a128fff..600e3d3 100644
 +    // 0199: the port arm (GGML_OPENCL_FA_PORT=1), the three perf shapes and Inkling 2
 +    // Mini's real shapes. Every arg after sinks_zeros is (port, wrap, window); the mask
 +    // and bins are built from the positions in initialize_tensors. Red: with
-+    // GGML_OPENCL_FA_PORT_RED=2 (the sink dropped) the q512 case must FAIL; with =1 (a key
-+    // read past n_kv) it must fail on the range, not on the answers.
++    // GGML_OPENCL_FA_PORT_RED=2 (the sink dropped) the q512 case must FAIL; with =1 (every
++    // K/V read shifted one key row up) it must fail on the answers.
 +    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1536, 512, true, true, 0, 0,
 +        GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025, false, true, false, 0));
 +    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 2048, 2048, true, true, 0, 0,

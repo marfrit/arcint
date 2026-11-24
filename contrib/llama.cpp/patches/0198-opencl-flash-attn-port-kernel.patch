@@ -287,10 +287,10 @@ index f84ca33..afbd8d2 100644
                            kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 new file mode 100644
-index 0000000..fcad919
+index 0000000..e160116
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,305 @@
 +#pragma OPENCL EXTENSION cl_khr_fp16 : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroups : enable
 +#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
@@ -325,9 +325,10 @@ index 0000000..fcad919
 +// bias only (the graph's ggml_sub no longer runs): the sink term enters l[0]
 +// once after the reduction, not into every lane's partial sum.
 +//
-+// The red cases the build offers (-DGB_*): GB_PAD_KEYS_OFF=1 reads one key past
-+// n_kv; GB_SKIP_SINK drops the sink term; GB_FORCE_OFF_END=1 reads the bias run
-+// one bin past the row (the pad is then visible as an error).
++// The red cases the build offers (-DGB_*, GGML_OPENCL_FA_PORT_RED): GB_PAD_KEYS_OFF=1
++// shifts every K/V read one key row up, so the scores are another token's and the
++// answers differ; GB_SKIP_SINK drops the sink term. (The 2D block read clamps at
++// the surface height, so a shifted row is an answer difference, not a fault.)
 +
 +#ifndef QR
 +#define QR 8
@@ -356,7 +357,7 @@ index 0000000..fcad919
 +uint    intel_sub_group_block_read(const global uint * p);
 +
 +#ifndef GB_PAD_KEYS_OFF
-+#define GB_PAD_KEYS_OFF 0    // the red case's one-key read past n_kv
++#define GB_PAD_KEYS_OFF 0    // the red case: every key read one row up
 +#endif
 +
 +__attribute__((intel_reqd_sub_group_size(16)))

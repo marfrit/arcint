@@ -747,9 +747,10 @@ unset or wide-off build, and the port must not change decode.
        GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 <build>/bin/test-backend-ops -o FLASH_ATTN_EXT -b OpenCL -p flash_attn  # one case at a time
 
    Red first, as the tests carry it: `GGML_OPENCL_FA_PORT_RED=2` (the sink term
-   dropped) must FAIL on the q512 case, and `GGML_OPENCL_FA_PORT_RED=1` (a key
-   read past `n_kv`) must fail on the bounds, not on the answers. Then unset and
-   green.
+   dropped) must FAIL on the q512 case, and `GGML_OPENCL_FA_PORT_RED=1` (every
+   K/V read shifted one key row up) must fail on the answers - the hardware 2D
+   block read clamps at the surface height, so a shifted row is an answer
+   difference, not a fault. Then unset and green.
 
 4. The two timing arms, one call a shape, on the standard arm:
 
