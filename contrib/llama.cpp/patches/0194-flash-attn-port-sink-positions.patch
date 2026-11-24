@@ -75,10 +75,18 @@ index 517eba9..5b253b0 100644
                  float vs = 1.0f;
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 358f614..23b2f02 100644
+index 358f614..54babdf 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1423,6 +1423,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
+@@ -19,6 +19,7 @@
+ #include "llama-memory-hybrid-iswa.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <atomic>
+ #include <cassert>
+ #include <cmath>
+ #include <cstring>
+@@ -1423,6 +1424,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
      if (self_rel_pos_swa->buffer) {
          attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
      }
@@ -93,7 +101,7 @@ index 358f614..23b2f02 100644
  }
  
  bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
-@@ -1435,6 +1443,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1435,6 +1444,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
      res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
      res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
  
@@ -110,35 +118,37 @@ index 358f614..23b2f02 100644
      return res;
  }
  
-@@ -3151,6 +3169,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
- 
-         if (bias_table) {
-             ggml_flash_attn_ext_add_indexed_bias(cur, bias_table, bias_indices);
+@@ -3164,6 +3183,29 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+                     }
+                 }
+             }
 +            // 0194: the port arm's sources, attached before the backend is asked. With them
-+            // the table is the port's [n_bins, n_head, rows] and the sink a logit a query,
-+            // which the dense fallback below cannot gather: a backend that declines such
-+            // an op leaves it to the CPU, whose kernel reads both (table, indices, src[18]).
-+            const bool port_sources = fa_port_next.sinks_q != nullptr;
-+            if (port_sources) {
++            // the table is the port's [n_bins, n_head, rows] and the sink a logit a query.
++            // The layer's backend declared that it reads them (the model's guard); whether it
++            // serves THIS op is its supports_op. If it refuses (a shape its gate does not
++            // cover), the sources come off again and the op gets today's table: the scheduler
++            // would otherwise move the refused op to the CPU with the port's sources on it. So
++            // no op with the port's sources leaves the backend that accepted it.
++            if (fa_port_next.sinks_q != nullptr) {
 +                ggml_flash_attn_ext_add_query_sinks(cur, fa_port_next.sinks_q);
 +                ggml_flash_attn_ext_add_positions(cur, fa_port_next.kpos, fa_port_next.qpos,
 +                                                  fa_port_next.cflag, fa_port_next.rflag);
 +                ggml_flash_attn_ext_set_window(cur, fa_port_next.window);
++                if (!ggml_backend_supports_op(backend, cur)) {
++                    GGML_ASSERT(fa_port_next.table_today != nullptr);
++                    bias_table = fa_port_next.table_today;
++                    ggml_flash_attn_ext_drop_port_sources(cur, bias_table, bias_indices);
++                    static std::atomic<int> said{0};
++                    if (said.fetch_add(1) < 6) {
++                        LLAMA_LOG_WARN("DOWNGRADE src=llama op=FLASH_ATTN port=off reason=%s layer=%d\n", "op-refused", il);
++                    }
++                }
 +                fa_port_next = {};
 +            }
-             // the backend of the layer must support the op with the bias attached, or the
-             // kernel would read a mask without it; find that backend, the CPU is the fallback
-             ggml_backend_t backend = backend_cpu;
-@@ -3164,7 +3194,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
-                     }
-                 }
-             }
--            if (!ggml_backend_supports_op(backend, cur)) {
-+            if (!port_sources && !ggml_backend_supports_op(backend, cur)) {
+             if (!ggml_backend_supports_op(backend, cur)) {
                  ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
                  cur->src[3] = dense_bias_mask();
-             }
-@@ -4461,6 +4491,27 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -4461,6 +4503,27 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
      ggml_set_input(inp->self_rel_pos_swa);
      ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
  
@@ -167,7 +177,7 @@ index 358f614..23b2f02 100644
  }
  
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 88565ce..97942fe 100644
+index 88565ce..e85582e 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -816,6 +816,17 @@ public:
@@ -188,7 +198,7 @@ index 88565ce..97942fe 100644
      const uint32_t extent;
      const uint32_t extent_swa;
  };
-@@ -1138,6 +1149,19 @@ struct llm_graph_context {
+@@ -1138,6 +1149,22 @@ struct llm_graph_context {
  
      ggml_backend_t backend_cpu; // TODO: needed by build_attn_mha, figure out a way to remove?
  
@@ -202,6 +212,9 @@ index 88565ce..97942fe 100644
 +        ggml_tensor * cflag   = nullptr;   // I8  [n_kv/16]
 +        ggml_tensor * rflag   = nullptr;   // I8  [n_tokens/8]
 +        int32_t       window  = 0;
++        // today's table for the same layer ([n_head, n_bins, n_tokens], the sink folded in):
++        // what the op gets back when the layer's backend refuses it with the port's sources
++        ggml_tensor * table_today = nullptr;
 +    };
 +    mutable fa_port_sources fa_port_next;
 +
@@ -309,7 +322,7 @@ index 4546729..658f613 100644
      void set_input_v_rot(ggml_tensor * dst) const;
  
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 5fec3cb..467d250 100644
+index 5fec3cb..5ef500b 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
 @@ -1,4 +1,8 @@
@@ -321,7 +334,7 @@ index 5fec3cb..467d250 100644
  #include "../llama-memory-hybrid-iswa.h"
  
  void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
-@@ -380,27 +384,106 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+@@ -380,27 +384,111 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
          const int64_t n_stream = (is_swa ? attn->self_kq_mask_swa : attn->self_kq_mask)->ne[3];
          const int64_t n_kv     = rel_pos->ne[0];
  
@@ -398,9 +411,13 @@ index 5fec3cb..467d250 100644
 +                LLAMA_LOG_WARN("DOWNGRADE src=llama op=FLASH_ATTN port=off reason=%s device=%s\n", "layer-backend", dname.c_str());
 +            }
 +        }
++        // today's table, the sink folded in: the op's table when the port is off, and what it
++        // falls back to when the layer's backend refuses the op with the port's sources (then
++        // these nodes are in the graph; otherwise nothing refers to them and they are not)
++        ggml_tensor * table_today = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
++        table_today = ggml_cont(ctx0, ggml_permute(ctx0, table_today, 1, 0, 2, 3));
 +        if (!port_on) {
-+            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-+            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
++            table = table_today;
 +        }
 +        // the dense gather is the fallback with flash attention off; the port's graph is a
 +        // flash-attention graph and its table is bin-fastest, which this gather cannot read
@@ -426,6 +443,7 @@ index 5fec3cb..467d250 100644
 +            fa_port_next.cflag   = is_swa ? inp->self_cflag_swa : inp->self_cflag;
 +            fa_port_next.rflag   = is_swa ? inp->self_rflag_swa : inp->self_rflag;
 +            fa_port_next.window  = is_swa ? (int32_t) hparams.n_swa : 0;
++            fa_port_next.table_today = table_today;
 +        }
 +
          // flash attention takes the compact table and the indices, the dense gather stays

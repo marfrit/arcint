@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 95f9623..3f414a5 100644
+index 95f9623..0c3f1e5 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -19,6 +19,8 @@
@@ -76,7 +76,7 @@ index 95f9623..3f414a5 100644
              ggml_set_name(bt, "bt");
              bi = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, kv, q->ne[1]*q->ne[3]);
              ggml_set_name(bi, "bi");
-@@ -9605,14 +9633,163 @@ struct test_flash_attn_ext : public test_case {
+@@ -9605,14 +9633,165 @@ struct test_flash_attn_ext : public test_case {
          ggml_flash_attn_ext_add_sinks(out, s);
          ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
          ggml_flash_attn_ext_add_indexed_bias(out, bt, bi);
@@ -87,8 +87,10 @@ index 95f9623..3f414a5 100644
 +            // with nb [2, Hk*D*2, D*2] (permute {0, 2, 1, 3}, kv_view off). A case that
 +            // builds another layout is not the port's case.
 +            GGML_ASSERT(q->nb[0] == 4 && q->nb[2] == (size_t) q->ne[0]*4 && q->nb[1] == (size_t) q->ne[2]*q->nb[2]);
-+            GGML_ASSERT(k->nb[0] == 2 && k->nb[2] == (size_t) k->ne[0]*2 && k->nb[1] == (size_t) k->ne[2]*k->nb[2]);
-+            GGML_ASSERT(v->nb[0] == 2 && v->nb[2] == (size_t) v->ne[0]*2 && v->nb[1] == (size_t) v->ne[2]*v->nb[2]);
++            if (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {   // (a refused-shape test builds a q8_0 cache)
++                GGML_ASSERT(k->nb[0] == 2 && k->nb[2] == (size_t) k->ne[0]*2 && k->nb[1] == (size_t) k->ne[2]*k->nb[2]);
++                GGML_ASSERT(v->nb[0] == 2 && v->nb[2] == (size_t) v->ne[0]*2 && v->nb[1] == (size_t) v->ne[2]*v->nb[2]);
++            }
 +            // the port's inputs; the mask and the bins are built from these positions
 +            // in initialize_tensors, so the CPU's indexed-bias path is the same attention
 +            ggml_tensor * pk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
@@ -240,7 +242,7 @@ index 95f9623..3f414a5 100644
              if (strcmp(t->name, "s") == 0) {
                  if (sinks_zeros) {
                      std::vector<float> z(ggml_nelements(t), 0.0f);
-@@ -13930,6 +14107,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13930,6 +14109,50 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 16448, 128, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 0, true, 1025));
      test_cases.emplace_back(new test_flash_attn_ext(128, 128, 24, {1, 8}, 1024, 2, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0, true, 1025));
  
@@ -291,7 +293,7 @@ index 95f9623..3f414a5 100644
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},   512, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
      test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1},  4096,  16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
-@@ -14279,6 +14500,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14279,6 +14502,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                                                              kvt.first, kvt.second));
          }
      }
@@ -318,7 +320,7 @@ index 95f9623..3f414a5 100644
      // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
      // 27B's geometry (head size 256, 24 query heads on 4)
      for (auto kt : {GGML_TYPE_F16, GGML_TYPE_Q8_0}) {
-@@ -15105,8 +15346,183 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
+@@ -15105,8 +15348,236 @@ static bool run_fa_vec_slice(ggml_backend_t backend, ggml_backend_t backend_cpu,
      return n_fail == 0;
  }
  
@@ -429,6 +431,56 @@ index 95f9623..3f414a5 100644
 +    return n_fail == 0;
 +}
 +
++// 0199: GGML_TEST_FA_PORT_REFUSED=1 (no device needed): an op the port's gate refuses does
++// not keep the port's sources. For each shape - the port's eval cases (accepted), and
++// refused ones: 8 rows and 1 row (a decode or verify step), a q8_0 K/V cache, two streams -
++// the op is built with the port's sources, the gate is asked (fa_port_gate_op, the function
++// supports_op calls), and what the graph builder does with the answer is done: a refusal
++// drops the sources and gives the op today's table (ggml_flash_attn_ext_drop_port_sources).
++// Then: an accepted op carries the sources, a refused op carries none - no positions, no
++// per-query sink, no window, and today's table in the table's slot.
++// GGML_TEST_FA_PORT_REFUSED_RED=1 leaves the drop out (the graph builder before it): the
++// refused shapes then still carry the sources, and the test fails.
++static bool test_fa_port_refused() {
++    const bool red = getenv("GGML_TEST_FA_PORT_REFUSED_RED") != nullptr;
++    struct shape { const char * what; int64_t kv, nb; ggml_type tk; int64_t streams; bool want_accept; };
++    const shape shapes[] = {
++        { "the window case, 512 rows",       1536, 512, GGML_TYPE_F16,  1, true  },
++        { "a short prompt batch, 12 rows",    160,  12, GGML_TYPE_F16,  1, true  },
++        { "9 rows",                           160,   9, GGML_TYPE_F16,  1, true  },
++        { "8 rows (a verify step)",           160,   8, GGML_TYPE_F16,  1, false },
++        { "1 row (a decode step)",            160,   1, GGML_TYPE_F16,  1, false },
++        { "a q8_0 K/V cache, 512 rows",      1536, 512, GGML_TYPE_Q8_0, 1, false },
++    };
++    int n_fail = 0;
++    for (const shape & sh : shapes) {
++        test_flash_attn_ext tc(128, 128, 8, {3, sh.streams}, sh.kv, sh.nb, true, true, 0, 0, GGML_PREC_F32, sh.tk, sh.tk,
++                               {0, 2, 1, 3}, false, false, 0, true, 1025, false, 1, 0, 0, 0);
++        ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++        ggml_context * ctx = ggml_init(params);
++        ggml_tensor * op = tc.build_graph(ctx);
++        ggml_tensor * q = op->src[0];
++        // today's table for this op, as the model's graph has it: [n_head, n_bins, rows]
++        ggml_tensor * today = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, q->ne[2], 1025, q->ne[1]*q->ne[3]);
++        const char * why = "";
++        const int accept = fa_port_gate_op(op, 4096, 256, 1, &why);
++        if (!accept && !red) {
++            ggml_flash_attn_ext_drop_port_sources(op, today, op->src[FA_PORT_SRC_IDX]);
++        }
++        const bool carries = fa_port_carries(op) != 0;
++        bool clean = op->src[FA_PORT_SRC_KPOS] == nullptr && op->src[FA_PORT_SRC_QPOS] == nullptr &&
++                     op->src[FA_PORT_SRC_CFLAG] == nullptr && op->src[FA_PORT_SRC_RFLAG] == nullptr &&
++                     op->src[FA_PORT_SRC_SINK_Q] == nullptr && op->src[FA_PORT_SRC_TABLE] == today;
++        const bool ok = (accept != 0) == sh.want_accept && (accept ? carries : (!carries && clean));
++        printf("  %-30s gate %s%s -> the op %s: %s\n", sh.what, accept ? "ACCEPT" : "refuse ", accept ? "" : why,
++               carries ? "carries the port's sources" : "is today's op (no port source, today's table)", ok ? "OK" : "FAIL");
++        n_fail += !ok;
++        ggml_free(ctx);
++    }
++    printf("  port refused shapes%s: %s\n", red ? " (the graph builder before the drop)" : "", n_fail ? "FAIL" : "OK");
++    return n_fail == 0;
++}
++
 +// 0199: GGML_TEST_FA_PORT_TWINS=1: a port case (port=1) and its twins (port=2, both layouts)
 +// must build the same mask and compute the same attention on the given backend - the CPU,
 +// which reads either table layout and either sink. It proves the like-for-like perf pairs
@@ -498,6 +550,9 @@ index 95f9623..3f414a5 100644
 +    }
 +    if (getenv("GGML_TEST_FA_PORT_GUARD") != nullptr) {
 +        return test_fa_port_guard();
++    }
++    if (getenv("GGML_TEST_FA_PORT_REFUSED") != nullptr) {
++        return test_fa_port_refused();
 +    }
      auto filter_test_cases = [](std::vector<std::unique_ptr<test_case>> & test_cases, const char * params_filter) {
          if (params_filter == nullptr) {

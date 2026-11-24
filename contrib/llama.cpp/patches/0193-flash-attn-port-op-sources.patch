@@ -1,5 +1,5 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 8661cf4..248aba7 100644
+index 8661cf4..2cdaeff 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
 @@ -229,9 +229,16 @@
@@ -21,7 +21,7 @@ index 8661cf4..248aba7 100644
  
  #ifndef GGML_MAX_NAME
  #   define GGML_MAX_NAME        64
-@@ -2573,6 +2580,31 @@ extern "C" {
+@@ -2573,6 +2580,40 @@ extern "C" {
              struct ggml_tensor * table,
              struct ggml_tensor * indices);
  
@@ -49,6 +49,15 @@ index 8661cf4..248aba7 100644
 +    GGML_API void ggml_flash_attn_ext_add_query_sinks(
 +            struct ggml_tensor * a,
 +            struct ggml_tensor * sinks_q);
++
++    // 0193: the port arm's sources off again, and the indexed bias as the given table (the
++    // form of ggml_flash_attn_ext_add_indexed_bias: [n_head, n_bins, rows] with whatever the
++    // graph folds into it): what a graph builder does when the backend it built the port's op
++    // for refuses that op, so that no op with the port's sources is left for another backend.
++    GGML_API void ggml_flash_attn_ext_drop_port_sources(
++            struct ggml_tensor * a,
++            struct ggml_tensor * table,
++            struct ggml_tensor * indices);
 +
      // Paged K/V: k and v hold a pool of pages of page_size rows ([n_embd, n_pool_rows, n_head_kv, 1]), and the attended
      // sequence is pages->ne[0]*page_size rows long (the mask's ne[0]). pages (I32 [n_pages, n_tables]) holds page tables,
@@ -88,10 +97,10 @@ index 7c68b0c..74fede7 100644
  
  static inline const uint32_t * ggml_flash_attn_ext_get_ready(const struct ggml_tensor * t) {
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9a57c18..104df9f 100644
+index 9a57c18..2f36ba4 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
-@@ -5692,6 +5692,36 @@ bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
+@@ -5692,6 +5692,51 @@ bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
      return ggml_get_op_params_i32(a, GGML_FA_PARAM_BIAS_FLAG) != 0;
  }
  
@@ -125,10 +134,25 @@ index 9a57c18..104df9f 100644
 +    a->src[GGML_FA_SRC_SINK_Q] = sinks_q;
 +}
 +
++void ggml_flash_attn_ext_drop_port_sources(
++        struct ggml_tensor * a,
++        struct ggml_tensor * table,
++        struct ggml_tensor * indices) {
++    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
++    GGML_ASSERT(table != NULL && indices != NULL);
++    a->src[GGML_FA_SRC_KPOS]   = NULL;
++    a->src[GGML_FA_SRC_QPOS]   = NULL;
++    a->src[GGML_FA_SRC_CFLAG]  = NULL;
++    a->src[GGML_FA_SRC_RFLAG]  = NULL;
++    a->src[GGML_FA_SRC_SINK_Q] = NULL;
++    ggml_set_op_params_i32(a, GGML_FA_PARAM_WINDOW, 0);
++    ggml_flash_attn_ext_add_indexed_bias(a, table, indices);
++}
++
  void ggml_flash_attn_ext_add_indexed_bias(
          struct ggml_tensor * a,
          struct ggml_tensor * table,
-@@ -5714,8 +5744,16 @@ void ggml_flash_attn_ext_add_indexed_bias(
+@@ -5714,8 +5759,16 @@ void ggml_flash_attn_ext_add_indexed_bias(
      GGML_ASSERT(mask && mask->ne[0] == ggml_flash_attn_ext_n_kv(a));
      GGML_ASSERT(mask->ne[1] == q->ne[1]);
      GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);

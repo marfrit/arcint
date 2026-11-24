@@ -1932,3 +1932,50 @@ the guard anyway, and now no case is argued instead of tested).
 
    It passes when no layer on the CPU carries the port's sources; the layers on
    the card must show `sources=attached`.
+
+## A refused op keeps today's graph; the scheduler's table {#refused}
+
+The delta review found the remaining hole: an op with the port's sources that the
+layer's backend refuses (8 rows or fewer, a K/V type or layout the gate does not
+cover) was moved by the scheduler to the CPU **with the sources on it** - the
+same attention, not today's bits, and on the CPU.
+
+**The fix, on the model's side.** `build_attn_mha` attaches the port's sources and
+then asks the layer's backend - the one that declared them - its own
+`supports_op` for exactly this op, which is the port's one decision function
+(`ggml_cl_port_decide`: the pure gate on the op's shapes and strides, then the
+device's two cached facts). A refusal takes the sources off again and gives the
+op today's table (`ggml_flash_attn_ext_drop_port_sources`; the model hands the
+folded table along for that), after which the op is today's op in every respect,
+dense fallback included. So an op with the port's sources exists only on the
+backend that accepted it. One `DOWNGRADE src=llama op=FLASH_ATTN port=off
+reason=op-refused` line a refused layer, the first few times.
+
+**Tests** (`measured-here`, the recipe host, no device):
+
+- `GGML_TEST_FA_PORT_REFUSED=1 test-backend-ops -b CPU -o FLASH_ATTN_EXT`: three
+  accepted shapes (512, 12 and 9 rows) keep the sources; three refused ones (8
+  rows, 1 row, a q8_0 K/V cache) end as today's op - no position, class or sink
+  source, no window, today's table. Red (`GGML_TEST_FA_PORT_REFUSED_RED=1`, the
+  graph builder before the drop): rc 1, the three refused shapes still carry the
+  sources. Green: rc 0.
+- `guard_check.sh` now reads **the scheduler's own node list**
+  (`GGML_SCHED_DEBUG=2`): one row a FLASH_ATTN node with the backend it ran on
+  and whether it carries the port's sources, for a prompt batch and for a decode
+  step, and exits non-zero if any node that ran on the CPU carries them. On this
+  host (every layer on the CPU, the full GGUF): 48 nodes in the prompt batch and
+  48 in the decode step, all on the CPU, none with the sources; with the red
+  (`GGML_OPENCL_FA_PORT_RED=5`) 48 nodes run on the CPU with them and the rule
+  breaks; the knob-set run's statistics are the control's line for line (34
+  lines). PASS.
+- **Not run here**: the path where a declaring backend refuses an op in a real
+  graph needs a card. `guard_sweep.sh` is that confirmation: 71 batch shapes
+  (tails of 1 to 512 rows at ub 512, tails at ub 1024 and 2048, each alone and
+  after earlier context, and micro-batches of 2 to 8), per case the number of
+  FLASH_ATTN nodes the scheduler ran on the CPU with the port's sources, which
+  must be 0 everywhere:
+
+      guard_sweep.sh <bin dir> <model> <text of 8,200 tokens or more> <out dir> 99
+
+  and `guard_check.sh <bin dir> <model> <text> <out dir> 12` for layers split
+  between the card and the CPU.
