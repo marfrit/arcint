@@ -147,9 +147,10 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   - With the expert cache on Flash-Next's unit flags: the same greedy texts on and off (bounds on, no abort). Reach on that
     route is not shown.
   - Op cases with bounds on, on this revision:
-    - Inkling's 20 real-shape MUL_MAT_ID cases (0192's 14 and 0167's six Q8_0 prompt cases) pass on and off;
+    - Inkling's real-shape MUL_MAT_ID cases pass on and off: 16 distinct (0192's ten IQ4_NL and 0169's six Q8_0); the run
+      executed 20, four of them duplicates (0192 repeats four of 0169's cases);
     - the MUL_MAT_ID suite gives the same 556 of 630 (the 74 failures are the known mxfp4 set);
-    - the red build fails all 20 and blows up the logits (KL 3.18) at ub 512, 1024 and 2048.
+    - the red build fails all of them and blows up the logits (KL 3.18) at ub 512, 1024 and 2048.
   - The bounds check follows the weight arguments the kernel is given (the SoA planes or an expert cache's gathered stage).
 
 ## 1.8.0 — 2026-11-22

@@ -9626,11 +9626,14 @@ commit (`trellis-serve` @8f8e2fcc) in the commit message.
 
 Tests: `test-opencl-kq-i8` reads the knob's parse (unset/off/0 off, 1/on on) and assembles the wide
 program as the backend does, text-checking it and compiling it when a clang exists. `test-backend-ops`
-carries Inkling's real expert shapes, 128 experts top-8, at 512 and 2048 tokens, for IQ4_NL and Q8_0, in the correctness
-and perf lists: gate/up as 2,304 rows at K 2,304; both projections in one tensor, 4,608 rows at K 2,304 (the 9-band
-launch); down as 2,304 rows at K 1,152 (4.5 super-blocks, so the staging loop's last group is partial). It also carries
-`test_mul_mat_id_skew`, every slot of every token on expert 0 (2,304 rows, K 1,152), so one expert takes a whole chunk and
-the rest are empty tiles. A tile is 32 pairs. Uniform top-8 over 128 experts gives ~32 pairs an expert at 512 tokens (one
+carries Inkling's real expert shapes, 128 experts top-8. 0192 adds 14 correctness cases: ten IQ4_NL (the three shapes
+below at 512 and 2048 tokens, six cases, and four skew cases) and four Q8_0 cases that repeat 0169's exactly. 0169 has
+six Q8_0 prompt cases (the gate/up and down shapes at 16, 512 and 2048 tokens), so there are 16 distinct cases, and a run
+of both patches' cases executes 20. The shapes, in the correctness and perf lists: gate/up as 2,304 rows at K 2,304; both
+projections in one tensor, 4,608 rows at K 2,304 (the 9-band launch, IQ4_NL only); down as 2,304 rows at K 1,152 (4.5
+super-blocks, so the staging loop's last group is partial). It also carries `test_mul_mat_id_skew`, every slot of every
+token on expert 0 (2,304 rows at K 2,304 and at K 1,152; the perf list has the K 1,152 one), so one expert takes a whole
+chunk and the rest are empty tiles. A tile is 32 pairs. Uniform top-8 over 128 experts gives ~32 pairs an expert at 512 tokens (one
 tile) and ~128 at 2048 (four). The skew case gives 128 and 512 tiles to expert 0. The band loop, the last band's second
 column past `ne01`, the partial super-block and the empty-tile tail are all reached. Red tree, the named mutation: in
 `mul_mm_kq_i8_wide.cl`, `acc1[g] +=` becomes `acc0[g] +=` in `I8W_MAD`, so column 0 accumulates both products and column
@@ -9646,11 +9649,12 @@ Card evidence (`measured-here`, the B60 at a 165 W cap unless the B70 (220 W) is
 `GGML_OPENCL_KQ_MM_ID_I8=1` in every arm):
 
 - Op cases with `GGML_OPENCL_BOUNDS=1`:
-  - Inkling's 20 real-shape MUL_MAT_ID cases (128 experts, top-8: the 14 that 0192 adds and 0167's six Q8_0 prompt cases),
-    run on this revision, pass with the knob on and with it off. Without the knob, no wide program is built.
+  - Inkling's real-shape MUL_MAT_ID cases (128 experts, top-8; 16 distinct: 0192's ten IQ4_NL and 0169's six Q8_0), run
+    on this revision, pass with the knob on and with it off. The run executed 20: 0192 also repeats four of 0169's cases.
+    Without the knob, no wide program is built.
   - The 4,608-row single case passes 1/1.
   - The MUL_MAT_ID suite gives 556 of 630 on and off alike; the 74 failures are the known mxfp4 set.
-  - The red tree fails all 20, IQ4_NL and Q8_0.
+  - The red tree fails all 20 executed cases (the 16 distinct ones), IQ4_NL and Q8_0.
 - The kernel time, speed and logit rows below were measured on the previous revision of these patches. Since then the
   bounds check follows the kernel's arguments and the test shapes were corrected. The kernel text changed only in its
   comments, and the dispatch only in the bounds helper (`code`).
