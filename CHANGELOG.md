@@ -131,6 +131,27 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   neither 0167-0169's Q8_0 expert tile nor 0171-0179's F32 arms is reached: their red builds give the same logits as the
   green ones.
 
+- **The wide int8 expert tile (opt-in)** (patches 0190-0192). `GGML_OPENCL_KQ_MM_ID_I8_WIDE=1` runs the int8 expert tile
+  (`GGML_OPENCL_KQ_MM_ID_I8`, IQ4_NL, and 0167-0169's Q8_0 prompt arm) at one work-group a 512-column band instead of 128, so a
+  route tile's activations are staged 5 times for a 2,304-row expert instead of 18. Unset compiles nothing new. Evidence
+  (`measured-here`, the B60 at 165 W unless named, Inkling IQ4_NL, I8 on in every arm):
+  - Kernel ms a visit (narrow -> wide; the reference stack's per visit beside it):
+    - ub 512: gate/up 31.32 -> 26.46 (reference 25.4), down 16.87 -> 13.56 (reference 9.8; trellis-serve @8f8e2fcc on the
+      same card, a PTI profile);
+    - ub 2048: gate/up 26.12 -> 21.21 (20.3), down 15.26 -> 11.03 (7.5).
+  - llama-bench pp4096: ub 512 676.5 -> 722.2 t/s, ub 1024 712.1 -> 765.7, ub 2048 672.4 -> 723.4.
+  - Served on the planned unit flags at ub 1024: prefill 671.4 -> 718.4 t/s; decode unchanged (35.17 at 4k, 38.94 at 0).
+  - Logits knob on = off: Inkling at ub 512 (direct, mean KLD 0); at ub 1024 / 2048 the same KL and top p against the CPU
+    reference. Flash-Next on the B70 (220 W), with its layers 28-47 experts on the card and no expert cache: reached (its
+    red gives 0.96). The 27B: no MUL_MAT_ID.
+  - With the expert cache on Flash-Next's unit flags: the same greedy texts on and off (bounds on, no abort). Reach on that
+    route is not shown.
+  - Op cases with bounds on, on this revision:
+    - Inkling's 20 real-shape MUL_MAT_ID cases (0192's 14 and 0167's six Q8_0 prompt cases) pass on and off;
+    - the MUL_MAT_ID suite gives the same 556 of 630 (the 74 failures are the known mxfp4 set);
+    - the red build fails all 20 and blows up the logits (KL 3.18) at ub 512, 1024 and 2048.
+  - The bounds check follows the weight arguments the kernel is given (the SoA planes or an expert cache's gathered stage).
+
 ## 1.8.0 — 2026-11-22
 
 Release gate against 1.7.0 (`measured-here`, 2026-11-22, RC 64ad74b0 = the release code; the 1.7.0 package and its llama tools against the RC's; B60 at a 165 W cap, B70 at 220 W). **The existing models** (0147, 0149 and 0150 touch generic OpenCL ops): the agent's 27B Q4_K_M at micro-batch 1 against the CPU Q8_0 reference, mean KL 0.010389 / 96.313 % top-1 on both (1.7.0's own gate figure); the iwo4 coder file and Dory against a 1.7.0 run, KL 0 and 100 % top-1 (the same logits); Flash-Next (experts on the CPU) against a 1.7.0 run, KL 0, 100 %. llama-bench pp512 / tg128 old / new, alternating: the agent 1024.3-1024.8 / 1025.1-1026.1 and 19.72-19.74 / 19.73-19.74; the coder 1807.9-1808.9 / 1808.0-1808.7 and 70.14-70.21 / 70.12-70.13; Dory 1941.3-1944.7 / 1920.5-1932.5 (spreads of 4-22 t/s) and 34.47 / 34.37-34.41. The agent's 12-answer arms on its unit flags (MTP 5): 48.25, 46.01 / 47.13, 47.64 t/s, identical texts, draft acceptance 49.3 % in every run. Flash-Next's 12-answer arms on its unit flags (B70, IQ3_S, MTP 3): old 42.50 / new 42.95, 43.56 t/s, identical texts, draft acceptance 73.0 % in every run (a first old run was lost to a port collision with a parallel window; a rerun's new arms read 44.84 and 43.99 with the same texts, its old arms ran beside a recipe build on the shared host and are not counted); its downgrade keys are the accepted ones on both. No downgrade line new. The op suites on the B70 with the release tools: CONCAT 123, REPEAT 15, SCALE 6, SIGMOID 8, SWIGLU 24, SITU 6, FLASH_ATTN_EXT 3,173 (B70; the two new 0152 cases red on 0150). **Inkling 2 Mini:** mean KL against the CPU reference at 32,768 tokens 0.005965 / 98.065 % top-1 with q8_0 KV (f16 0.005306); the needle found at 64,000 and 120,000 tokens with q8_0 KV on the B70 (131,072 cells), and on the B60 unit's own arguments (q8_0 KV, 49,152 cells) at 45,000 and 8,000 tokens (21,935 MiB, GTT 260 MiB); the acceptance task 10/10 at effort low; two concurrent lanes answer right. The xe kernel log counts no new wedge, CAT error or job timeout in the gate windows.

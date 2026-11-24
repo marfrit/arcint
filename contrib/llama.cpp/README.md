@@ -9574,3 +9574,111 @@ two runs, same top p 100 %; Flash-Next IQ3_S on the B70 (experts on the CPU), 0.
 no bounds abort. That matches the code: both arms take only F32 x F32 products, and no node of
 those models has K <= 8 (SMALLK) or a 3-D activation on both sides with at most 8 rows and columns
 (SMALL_M); their F32 tensors are 2-D weights with K of 128 and more, or 1-D scales.
+
+## 0190-opencl-q8_iq4-mul_mat_id-wide-tile.patch / 0191-...-wide-dispatch.patch / 0192-...-wide-tests.patch
+
+The int8 expert tile (0071, and 0167-0169's Q8_0 prompt arm on it) runs one work-group a (route tile, 128-column band), and a launch is
+`CEIL_DIV(ne01, 128)` bands deep: 18 for a 2,304-row expert, 36 for one of 4,608. Every one of those
+work-groups stages the same tile's 32 pairs of int8 activations into local memory, so a tile's block
+is filled 18 times over. The wide tile takes a 512-column band a work-group instead, 16 sub-groups
+of 16 lanes with two columns a lane, 5 bands over 2,304 rows: the staged block is filled once for
+512 columns, and the launch has 5 bands for the narrow tile's 18.
+
+The model behind it, from the card's per-launch fit (`measured-here`, profiling build, Inkling, I8
+on, pp4096, 44 IQ4_NL visits, 8 chunks at ub 512 = 352 launches a kernel): gate/up `0.71 ms + 6.1
+us a token` and down `0.21 ms + 3.6 us a token`. The floor is launch and empty-tile work (~324 ms a
+run at ub 512, ~80 at 2048); the slope is per-tile work, and a real 32-pair tile is ~1.35 us at
+gate/up and ~0.8 us at down for 248 KB and 124 KB of traffic — weight blocks read a tile once, the
+staged activations read once a band, 18 times a tile. Down's ratio to the reference is worse (1.72x
+a visit against 1.23x) because its staged activation is a larger share of a work-group's bytes: the
+fill's 16-byte loads step 1,152 bytes apart across 32 pairs, 4 sectors to a useful read, while the
+reference's down reads its activation contiguous (trellis-serve, `xpu/csrc/exl3_moe.sycl:559`
+`DownDpasKernel`, `ablk` `[b][r][MB][16]`, and `:432` `GateUpDpasKernel`, `acc = NT*MB*16` at `:466`,
+`MB` 32 at `:795`, `T1` 72 at `:807`, @8f8e2fcc, MIT). The wide tile attacks both terms: bands
+18 -> 5 per tile, so the staging slope falls and the empty/launch floor falls with the work-group
+count. The predicted numbers it has to meet at ub 512 are gate/up 1,378 -> ~1,050 ms and down 742 ->
+~510 ms a run; at ub 2048, gate/up 1,149 -> ~870 and down 671 -> ~470 (the slope coefficient is the
+same a token at both, the floor differs).
+
+Register budget: a lane holds two columns by 32 pair slots = 64 float accumulators, 64 GRF, plus the
+two weight operands (8 words each), two scales and the staged-loop addresses, about 90 GRF of the
+256 the program is built with (`-cl-intel-256-GRF-per-thread`, as the narrow program). The whole
+2,304-row band would be 9 columns a lane, 288 floats, over the budget, and 4,608 rows 576; that is
+why the band is 512 rather than the expert, and the split is the knob's geometry. Whether IGC spills was not
+read from a build log. On the card the kernel times land above the prediction by 11 % (gate/up) and 17 % (down) at ub 512
+and by 7 % and 3 % at ub 2048, not the several-fold a
+rolled K loop gives (inference).
+
+The tile is its own program (`mul_mm_kq_i8_wide.cl`, the helpers and the mm tables prepended as the
+narrow one's), so with `GGML_OPENCL_KQ_MM_ID_I8_WIDE` unset nothing new is compiled and both int8
+paths — the IQ4_NL arm and Q8_0's prompt arm — take the narrow tile and grid exactly as today. The
+knob (`1` or `on`) reaches both. Both kernels keep every buffer the same and add no scratch: the
+route's pairs, tiles and tile count, the int8 activation buffer and its scales, the weight planes and
+dst. Under `GGML_OPENCL_BOUNDS=1` a wide launch checks the furthest byte of each of them
+(`ggml_cl_bounds("int8 wide", ...)`), including `blkmax` over the last expert's last row and last K
+block (on the planes or the stage the kernel reads; see below for a USM bank), `n_cols * ne00` on the activation, `max_tiles * sizeof(cl_int4)` on the tiles, and
+`offsetd + (n_tok-1)*nb2 + (n_used-1)*nb1 + ne01*4` on dst.
+
+Licence: the reference file is MIT; no line of it is copied here — the geometry is followed, the
+code is this tree's OpenCL form of the narrow tile — so no NOTICE entry is owed. A later port that
+copies lines would owe the MIT notice in the file header, a `THIRD_PARTY.md` row, and the repo and
+commit (`trellis-serve` @8f8e2fcc) in the commit message.
+
+Tests: `test-opencl-kq-i8` reads the knob's parse (unset/off/0 off, 1/on on) and assembles the wide
+program as the backend does, text-checking it and compiling it when a clang exists. `test-backend-ops`
+carries Inkling's real expert shapes, 128 experts top-8, at 512 and 2048 tokens, for IQ4_NL and Q8_0, in the correctness
+and perf lists: gate/up as 2,304 rows at K 2,304; both projections in one tensor, 4,608 rows at K 2,304 (the 9-band
+launch); down as 2,304 rows at K 1,152 (4.5 super-blocks, so the staging loop's last group is partial). It also carries
+`test_mul_mat_id_skew`, every slot of every token on expert 0 (2,304 rows, K 1,152), so one expert takes a whole chunk and
+the rest are empty tiles. A tile is 32 pairs. Uniform top-8 over 128 experts gives ~32 pairs an expert at 512 tokens (one
+tile) and ~128 at 2048 (four). The skew case gives 128 and 512 tiles to expert 0. The band loop, the last band's second
+column past `ne01`, the partial super-block and the empty-tile tail are all reached. Red tree, the named mutation: in
+`mul_mm_kq_i8_wide.cl`, `acc1[g] +=` becomes `acc0[g] +=` in `I8W_MAD`, so column 0 accumulates both products and column
+1 stays zero.
+
+Bounds under `GGML_OPENCL_BOUNDS=1` follow the weight arguments the kernel is given (`ggml_cl_kq_weight_args`): the SoA
+planes with their offset, or the gathered stage an expert cache hands the kernel. An expert bank in USM host memory
+would be a pointer argument with no buffer size to compare against; the helper returns without bounding it and logs
+nothing. For the wide tile that route does not occur (`code`): an IQ4_NL bank in USM is always gathered first, and the
+Q8_0 arm refuses an expert cache's `.slots` and `.bank` tensors.
+
+Card evidence (`measured-here`, the B60 at a 165 W cap unless the B70 (220 W) is named, Inkling 2 Mini IQ4_NL,
+`GGML_OPENCL_KQ_MM_ID_I8=1` in every arm):
+
+- Op cases with `GGML_OPENCL_BOUNDS=1`:
+  - Inkling's 20 real-shape MUL_MAT_ID cases (128 experts, top-8: the 14 that 0192 adds and 0167's six Q8_0 prompt cases),
+    run on this revision, pass with the knob on and with it off. Without the knob, no wide program is built.
+  - The 4,608-row single case passes 1/1.
+  - The MUL_MAT_ID suite gives 556 of 630 on and off alike; the 74 failures are the known mxfp4 set.
+  - The red tree fails all 20, IQ4_NL and Q8_0.
+- The kernel time, speed and logit rows below were measured on the previous revision of these patches. Since then the
+  bounds check follows the kernel's arguments and the test shapes were corrected. The kernel text changed only in its
+  comments, and the dispatch only in the bounds helper (`code`).
+- Kernel time, profiling build, pp4096, per visit (44 IQ4_NL visits a pass; the reference's figures are per visit over its
+  48; the reference's are `measured-here` too: trellis-serve @8f8e2fcc on the same B60 at 165 W, a PTI profile over
+  the same 4,096-token fixture), narrow -> wide:
+
+  | ub | gate/up | down | the reference's gate/up / down |
+  |---|---|---|---|
+  | 512 | 31.32 -> 26.46 ms | 16.87 -> 13.56 ms | 25.4 / 9.8 ms |
+  | 2048 | 26.12 -> 21.21 ms | 15.26 -> 11.03 ms | 20.3 / 7.5 ms |
+
+  The prediction above was missed: gate/up landed at 1,164 / 933 ms a pass (predicted ~1,050 / ~870), down at 597 / 485
+  (predicted ~510 / ~470). Gate/up is within 4-5 % of the reference a visit; down is 1.38x / 1.47x.
+- llama-bench pp4096, knob off -> on: ub 512 676.5 -> 722.2 t/s, ub 1024 712.1 -> 765.7, ub 2048 672.4 -> 723.4.
+- Served, the planned Inkling unit flags (262,144 cells, `--llama-swa-window`, q8_0 KV, `--prefill-ubatch 1024`), a fixed
+  4,096-token prompt three times with `cache_prompt: false`: prefill 671.4 -> 718.4 t/s. Decode is unchanged: 35.17 t/s at a
+  4,096-token depth, 38.94 at 0.
+- Logits, knob on against off:
+  - Inkling: mean KLD 0.000000 and the same top p at 512-token ubatches; against the CPU reference the same 0.001917 /
+    98.403 % at ub 1024 and 0.001968 / 98.012 % at 2048.
+  - The red reaches the tile through `llama-perplexity` at ub 512, 1024 and 2048: KL 3.18 against 0.0019.
+  - Flash-Next IQ3_S on the B70 (no expert cache), with layers 28-47's experts on the card (`-ncmoe 28`, 512-token ubatches): 0.000000. Its
+    down projections are IQ4_NL in 39 of 48 layers, and the red there gives 0.96, so the tile is reached and changes nothing.
+  - Flash-Next on its unit's flags with the expert cache (13,000 MiB, `GGML_OPENCL_BANK_STREAM=1`, MTP 3), knob off
+    against knob on with `GGML_OPENCL_BOUNDS=1`: the same greedy text (same md5) for three prompts of 12, 3,129 and
+    8,391 tokens, and no bounds abort. A red build was not run on this route, so reach on it is not shown.
+  - The agent's Qwen3.8 27B: 0.000000. It is dense; no MUL_MAT_ID node.
+  - `-ub 1` takes the mat-vec, not the tiles.
+- The "512-column band built" load line is printed by `test-backend-ops`. `llama-perplexity` does not print it even when
+  the tile runs, so a red build, not the line, shows reach there.
