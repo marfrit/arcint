@@ -213,10 +213,9 @@ What the README's numbers ran with, and what the image has:
 | power | the xe hwmon cap `power1_cap`: B60 165 W, B70 220 W, written at boot | — |
 | kernel cache | `GGML_OPENCL_KERNEL_CACHE_DIR` warm | keep it on a volume: a cold start compiles every kernel |
 
-Decode on these cards depends on the host's kernel submission as well as the card: with build jobs on the same
-host's CPUs, served Flash-Next decoded 27-32 t/s instead of 46-48 (`measured-here`, 2026-11-25, B70). If your decode
-is far below the figures here while prefill matches, compare the host side first: CPU load during the run, the CPU
-model, the kernel and xe module, the GuC firmware.
+A model whose experts partly live in host memory depends on the host's CPUs too: with build jobs on the same host,
+served Flash-Next (its CPU-miss path computes host-resident experts on 8 threads) decoded 27-32 t/s instead of 46-48
+(`measured-here`, 2026-11-25, B70). That is not a figure for a model fully on the card.
 
 The image takes Fedora's `intel-compute-runtime` (26.18.38308.4 with IGC
 2.34.4 in Fedora 43, 2026-10-07). The numbers in this repository were

@@ -27,14 +27,15 @@ logits against 1.8.0 and its A/B on the B70 unit flags; Dory against 1.8.0; Inkl
 prefill/decode rows; the op suites the series touches (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, CPY/CONT, NORM_CLIP,
 DEPTH_MIX, TOP_K MoE); downgrade keys; the xe kernel log's wedge / CAT error / job-timeout counts]**.
 
-**Fixed — read first:** on the OpenCL backend a checkpoint resume with a q8_0 or q4_0 K/V cache restored the cells'
-positions but not their bytes: `set_tensor` returned without writing for a view of a q8_0 / q4_0 tensor, and the
-cache restore writes through views. On Inkling 2 Mini (whose sliding-window cells every checkpoint carries, with or
-without `--llama-swa-window`) the sliding-window layers attended stale keys and values for up to 1,024 positions after
-a resume, with no error. **[owed: the affected range as the code shows it (1.8.0 included?), patch 0209, its op red /
-green and the served resume-against-re-prefill arm on the card]** f16 K/V and models without a sliding-window cache
-(the 27B agent) were not affected. The write for such a view now lands; a view write that still cannot be performed
-(into a split tensor) logs once.
+**Fixed by refusal — read first:** on the OpenCL backend a checkpoint resume with a q8_0 or q4_0 K or V cache
+restored a sliding-window cache's positions but not its bytes: the restore writes the cells through views of the K / V
+tensors, and a view write into a q8_0 / q4_0 tensor returned without writing. On Inkling 2 Mini at q8_0 K/V (with or
+without `--llama-swa-window`) a follow-up that resumed from a checkpoint could answer from stale attention state for
+up to 1,024 positions, with no error **[owed: the first affected version, as the code confirms]**. 1.8.1 refuses it:
+such a start keeps no checkpoints (one load warning) and a restore is refused before any cell is touched ("nothing
+restored ... full re-prefill"), so the follow-up re-reads its prompt (at an Inkling unit's settings about 1,067 t/s).
+f16 K/V keeps checkpoints and is not affected, nor are models without a sliding window (the 27B agent). The fix of the
+write itself, which brings the checkpoints back, is planned for 1.8.2.
 
 **Read first — what changes with no switch set:**
 - **A start that does not fit the card is refused** (the spill guard, below). `--llama-allow-spill` restores 1.8.0's
@@ -293,7 +294,7 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
 - The CPU-miss staging buffers of the expert cache are allocated once; a layer registered later would launch without
   them (code reading; not shown to happen).
 - With more than one KV stream (unnamed lanes, `kv_unified` off) an f16 restore into a stream other than the first
-  could land in the first stream's rows **[owed: closed by 0209 or open]**.
+  could land in the first stream's rows (code reading; no shipped unit runs that configuration).
 - A Qwen4exp GGUF that carries neither `attention.recurrent_layers` nor `full_attention_interval` now fails to load
   (1.8.0 assumed an interval of 4).
 - 1.8.0's S3 (the bias dispatcher's GQA decode variant has no fallback if it fails to build) is still open; the 1.8.0
