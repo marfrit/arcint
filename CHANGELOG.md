@@ -27,6 +27,21 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   sampled tokens, so the lane re-read the whole prompt (two of two turns with ` welches` missed the cache on the
   1.8.1 unit; the controls hit). CPU red / green on ` welches`, ` voices`, ` kwargs` against the vocabulary's ids
   (`measured-here`); the recorded Inkling KL rows used the old rule on both sides and stay valid as comparisons.
+- **Tool call ids unique across the turns of a conversation.** Every response numbered its tool calls from
+  `call_0`, so a later turn's call repeated an earlier turn's id. Inkling 2 Mini's chat template looks a tool
+  result's function name up by `tool_call_id` over all messages and appends every match to the tool header (a
+  `read` and a `bash` call both named `call_0` render the first result as `readbash`), which rewrites earlier
+  prompt text, so the lane's prefix stops matching and each follow-up re-reads the whole prompt (~48 s at 41k
+  tokens on 1.8.1). Now a response's calls are numbered after the highest `call_N` already in the request's
+  history: assistant `tool_calls[].id`, tool messages' `tool_call_id`, and on `/v1/responses` the
+  `function_call` / `function_call_output` `call_id`s, input and stored (`previous_response_id`) alike; an id
+  not of the form `call_<digits>` is ignored. The ids stay deterministic (the same request gives the same
+  ids), and a request without call ids in its history still starts at `call_0`. One rule for
+  `/v1/chat/completions` (streamed and not) and `/v1/responses` (streamed and not); `/v1/completions` parses
+  no tool calls. Evidence: the operator's 5-turn tool test on the served Inkling 1.8.1 (`measured-here`),
+  prefix hits in the 4 follow-up turns: as-is 1, unique ids 4 (a `name` on the tool result message: 4);
+  the routes' ids and the Inkling render's unchanged first-turn prefix in the unit suite (`code`, red with
+  1.8.1's numbering).
 
 ## 1.8.1 — 2026-11-25
 

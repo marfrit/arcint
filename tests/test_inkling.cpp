@@ -488,3 +488,48 @@ TEST(inkling_numeric_effort_survives_other_kwargs) {
     CHECK(!parse_chat_request(body2, p2).has_value());
     CHECK(p2.chat_template_kwargs["reasoning_effort"] == "low");
 }
+
+// Tool call ids unique across turns (1.8.2), at the render. The template finds a
+// tool result's name by tool_call_id over ALL messages and appends every match
+// to the tool header, so two turns that both minted call_0 render the first
+// result as "readbash": the earlier prompt text changes between turns and the
+// lane's prefix misses. Each turn here is answered as the routes do: the model
+// output parsed, then numbered after the history (core/toolcall.h).
+// Mutation: next_call_index returning 0 (1.8.1's numbering) and both headers
+// read <|message_tool|>readbash.
+TEST(inkling_render_two_turn_tool_ids_do_not_merge_names) {
+    auto model_call = [](const char* name) {
+        return std::string(markers::kInkMessageModel) + name + std::string(markers::kInkContentToolJson) +
+               "{\"name\":\"" + name + "\",\"args\":{}}" + std::string(markers::kInkEndMessage);
+    };
+    ChatRequest req;
+    req.model = "inkling2-mini";
+    req.messages.push_back({"user", "Read it, then run it.", {}, {}, {}, {}, {}});
+    req.tools.push_back({"read", "Read a file", nlohmann::json::parse(R"({"type":"object","properties":{}})")});
+    req.tools.push_back({"bash", "Run a command", nlohmann::json::parse(R"({"type":"object","properties":{}})")});
+    for (const char* name : {"read", "bash"}) {
+        ToolCallParse p = parse_tool_calls(model_call(name), ChatDialect::Inkling);
+        CHECK_EQ(p.calls.size(), 1u);
+        if (p.calls.size() != 1) return;
+        number_calls(p.calls, next_call_index(req));
+        ChatMessage assistant;
+        assistant.role       = "assistant";
+        assistant.tool_calls = p.calls;
+        req.messages.push_back(assistant);
+        req.messages.push_back({"tool", "ok", {}, "", p.calls[0].id, {}, {}});
+    }
+    CHECK_EQ(req.messages[1].tool_calls[0].id, std::string("call_0"));
+    CHECK_EQ(req.messages[3].tool_calls[0].id, std::string("call_1"));
+    const std::string got = render(req);
+    const std::string read_hdr = std::string("<|message_tool|>read<|content_text|>ok");
+    const std::string bash_hdr = std::string("<|message_tool|>bash<|content_text|>ok");
+    CHECK(got.find(read_hdr) != std::string::npos);
+    CHECK(got.find(bash_hdr) != std::string::npos);
+    CHECK(got.find("<|message_tool|>readbash") == std::string::npos);
+    // the turn-one render up to and including the first result is what turn two
+    // renders too: the first result's header did not change under the new call
+    ChatRequest after_one = req;
+    after_one.messages.resize(3);
+    const std::string one = render(after_one);
+    CHECK(!one.empty() && got.compare(0, one.size(), one) == 0);
+}

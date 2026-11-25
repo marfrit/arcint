@@ -1638,6 +1638,8 @@ void stream_chat(const Context& ctx, const PreparedChat& prep, int slot,
     ToolCallParse parsed;
     if (parse_calls) {
         parsed = parse_tool_calls(content, prep.dialect, &prep.schemas);
+        // ids unique across turns (core/toolcall.h): after the history's call_N
+        number_calls(parsed.calls, next_call_index(prep.req));
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
                       std::string(tool_call_open(prep.dialect)).c_str(),

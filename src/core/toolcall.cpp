@@ -1,7 +1,12 @@
 #include "core/toolcall.h"
 
+#include <charconv>
+#include <limits>
+#include <system_error>
+
 #include <nlohmann/json.hpp>
 
+#include "core/chat.h"
 #include "core/markers.h"
 #include "util/log.h"
 #include "util/text.h"
@@ -474,6 +479,43 @@ ToolCallParse parse_tool_calls(std::string_view text, ChatDialect dialect, const
     if (dialect.neutral()) return ToolCallParse{std::string(text), {}, false};   // "runs" parses no calls
     if (dialect.inkling()) return parse_inkling_tool_calls(text);
     return dialect.gemma4() ? parse_gemma_tool_calls(text, schemas) : parse_qwen_tool_calls(text, schemas);
+}
+
+namespace {
+
+// N of an id spelled exactly call_<decimal digits>; false for any other id
+// (a client's own "toolu_abc", OpenAI's "call_" + letters, a sign, a space).
+bool call_number(std::string_view id, size_t& n) {
+    constexpr std::string_view kPrefix = "call_";
+    if (id.size() <= kPrefix.size() || id.substr(0, kPrefix.size()) != kPrefix) return false;
+    const std::string_view digits = id.substr(kPrefix.size());
+    for (const char c : digits) {
+        if (c < '0' || c > '9') return false;
+    }
+    const auto [end, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), n);
+    // out of range is ignored too, and so is the upper half of size_t, so that
+    // base + i in number_calls cannot wrap back to call_0
+    return ec == std::errc() && end == digits.data() + digits.size() &&
+           n < std::numeric_limits<size_t>::max() / 2;
+}
+
+}  // namespace
+
+size_t next_call_index(const ChatRequest& req) {
+    size_t next = 0;
+    auto   see  = [&](const std::string& id) {
+        size_t n = 0;
+        if (call_number(id, n) && n + 1 > next) next = n + 1;
+    };
+    for (const ChatMessage& m : req.messages) {
+        see(m.tool_call_id);
+        for (const ToolCall& c : m.tool_calls) see(c.id);
+    }
+    return next;
+}
+
+void number_calls(std::vector<ToolCall>& calls, size_t base) {
+    for (size_t i = 0; i < calls.size(); ++i) calls[i].id = log::format("call_%zu", base + i);
 }
 
 }  // namespace lgc
