@@ -64,7 +64,34 @@ engine's flags. `docker/docker-compose.example.yaml` is the same thing in
 compose form; a cold OpenCL kernel cache recompiles the kernels at every
 start, so keep `GGML_OPENCL_KERNEL_CACHE_DIR` on a persistent volume.
 
-### The three services as the project runs them (0.7.12)
+**One card per model.** arcint loads a model on one card: the one `--device` names (`GPU.N`, or a name word
+such as `B70`), or GPU.0. It does not read `GGML_OPENCL_DEVICE` or `GGML_OPENCL_DEVICES`; with more than one GPU
+visible and no `--device` (and no `ZE_AFFINITY_MASK`) it logs "N GPU devices are visible (...); none chosen with
+--device: loading on GPU.0 (...)". To give the container one card, pass that card's render node instead of all of
+`/dev/dri`, or set `ZE_AFFINITY_MASK`. llama.cpp's own tools in the image (`llama-bench`, `llama-server`) split a
+model's layers over every visible card instead (a user measured Inkling 2 Mini's decode 5x slower on two B70s than on
+one); pin them with `GGML_OPENCL_DEVICE=0`.
+
+**The memory guard (1.8.1).** arcint refuses a start whose device memory would not fit the card, naming every part
+and the `--n-ctx` that would fit; `--llama-allow-spill` starts anyway with a warning. It takes the card's size from
+the xe driver through the process's own render node, so `--device /dev/dri` is enough. Without that figure (an i915
+host) it falls back to OpenCL's global memory size and says so; on a 24 GB B60 that is 23,256 MiB, less than a full
+unit uses. Not yet run inside the image.
+
+**Inkling 2 Mini** (1.8.1; every layer on the card, a partial offload faults):
+
+```bash
+# environment, the opt-in prefill paths (README, "Inkling 2 Mini"):
+#   -e GGML_OPENCL_KQ_MM_ID_I8=1 -e GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 -e GGML_OPENCL_CPY_TRANSPOSE=1 \
+#   -e GGML_OPENCL_FA_PORT=1 -e GGML_OPENCL_DEPTH_MIX=1
+--engine llama --gguf /models/Inkling-2-Mini-IQ4_NL.gguf --served-model-name inkling2-mini \
+  --device GPU.0 --n-ctx 262144 --llama-kv q8_0 --llama-swa-window --prefill-ubatch 1024
+```
+
+`--llama-swa-window` is what makes 262,144 cells fit a 24 GB card: the sliding-window layers keep the window, not
+the whole context.
+
+### The three services as the project ran them (0.7.12, historical)
 
 The command lines below are the ones the project's own services use;
 `docker/docker-compose.example.yaml` carries all three as compose profiles.
@@ -172,6 +199,24 @@ elsewhere) and **must show `ymm`** (their absence means the build fell back
 to SSE-only, which would be a silent performance cliff of its own).
 
 ## The GPU runtime
+
+What the README's numbers ran with, and what the image has:
+
+| | the numbers here | the image |
+|---|---|---|
+| OS | Debian trixie | Fedora 43 base |
+| compute runtime | 26.27.39122.11, IGC 2.38.2 (Intel's release packages) | Fedora's 26.18.38308.4, IGC 2.34.4 |
+| ggml-cpu | `GGML_NATIVE=ON` (the `.deb` recipe asserts it) | `GGML_NATIVE=OFF`, x86-64-v3 |
+| kernel | Linux 7.0.14 with an out-of-tree xe module (below) | the host's |
+| host CPU | AMD Ryzen 7 5700X (8 cores) | the host's |
+| GuC firmware | 70.65.0 on both cards (`/sys/kernel/debug/dri/<pci>/gt0/uc/guc_info`) | the host's |
+| power | the xe hwmon cap `power1_cap`: B60 165 W, B70 220 W, written at boot | — |
+| kernel cache | `GGML_OPENCL_KERNEL_CACHE_DIR` warm | keep it on a volume: a cold start compiles every kernel |
+
+Decode on these cards depends on the host's kernel submission as well as the card: with build jobs on the same
+host's CPUs, served Flash-Next decoded 27-32 t/s instead of 46-48 (`measured-here`, 2026-11-25, B70). If your decode
+is far below the figures here while prefill matches, compare the host side first: CPU load during the run, the CPU
+model, the kernel and xe module, the GuC firmware.
 
 The image takes Fedora's `intel-compute-runtime` (26.18.38308.4 with IGC
 2.34.4 in Fedora 43, 2026-10-07). The numbers in this repository were
