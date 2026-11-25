@@ -9868,6 +9868,9 @@ GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
   it printed the taken line, in the Inkling ub 512 identity run too. A per-call counter would still
   give the count; it belongs to the follow-up on the narrow destination.
 
+- At q8_0 KV (the Inkling units' cache type) the gain holds: Inkling pp4096 ub 1024 763.5 (`GGML_OPENCL_CPY_TRANSPOSE` off) ->
+  816.3 t/s (on), +6.9 % (`measured-here`, llama-bench; not at the units' `--llama-swa-window` / 262,144 context).
+
 ## 0193-flash-attn-port-op-sources.patch / 0194-flash-attn-port-sink-positions.patch / 0198-opencl-flash-attn-port-kernel.patch / 0199-flash-attn-port-tests.patch
 
 Inkling 2 Mini's prompt attention after trellis-serve's `fa::Kern<128>` (MIT; `THIRD_PARTY.md`), as an opt-in arm of the
@@ -9909,6 +9912,17 @@ Inkling pp4096, t/s, the port off / on: 769.2 / 909.8 (ub 512), 816.0 / 973.9 (u
 975.7 (ub 4096). Mean KL at ub 1024 against the CPU base 0.001917 -> 0.001965, top p 98.40 -> 98.47 %. The op suite is
 complete with the knob on (3,190 cases) and off (3,179); the reds fail every case they run; with the knob unset three
 models match the development build. Not through a release gate.
+
+**Limits, read before any unit uses the knob.** Every number above is at f16 KV (llama-bench's default). The port
+REFUSES a q8_0 KV cache, and the Inkling units serve q8_0 KV: at q8_0 `GGML_OPENCL_FA_PORT` changes nothing
+(`measured-here`, pp4096 ub 1024 with `GGML_OPENCL_CPY_TRANSPOSE=1`: 816.3 with the port off, 816.6 with it on and 7
+refusals logged; 974 at f16 KV with the port taken). At the
+units' own flags (262,144 context, `--llama-swa-window`) f16 KV does not fit the 24 GB card beside the model: arcint's
+load-time spill guard refuses it (`measured-here`: context 8,516 MiB at f16 against 4,526 MiB at q8_0, which loads). So the port helps a served Inkling only once it reads
+a q8_0 cache. Not verified: a partial offload (`-ngl` below all layers). At `-ngl 12` the run faulted (`measured-here`). The
+cause, by code reading and the fault's arithmetic (not reproduced): Inkling's depth-mix stacks are graph leaves written
+through views from layers on both devices, which faults or silently loses rows at a CPU / card boundary. The code
+involved is byte-identical on the development build without the port (`code`). Serve Inkling fully offloaded.
 
 Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
 (`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
