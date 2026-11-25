@@ -2291,6 +2291,22 @@ scale above 511.75, a |v| no f16 cache could hold either. At the answer level: m
 most 0.03 nats worse than the port-off arm on the same card and window, top p
 down at most 1 point.
 
+## Known gaps in the tests (the delta review's lows; none changes the kernel that goes to the card)
+
+1. **The kernel's grid check is not derived from what it guards.** The `#error` beside
+   `V8X` tests hand-written constants (`34 * 0 + 4`, ...), not `V8X(0) .. V8X(7)`, and the
+   CPU model transcribes `V8X` by hand. An edit of `V8X` alone that leaves the 4-byte grid
+   would pass every test here. The fix is three lines (`#if V8X(0) % 4 || ... || V8X(7) % 4`)
+   and is not applied: it would change the applied tree after its review (write-tree
+   `e4d76c34…`), for a check that holds today. It belongs in the next change of this file.
+2. **`[FA_PORT] nmse = …` is a line a compared node, not a case,** and it is not printed
+   when the comparison returns early on a NaN or an inf (those print their own line and
+   fail the case). A reader of the log takes every such line before a case's own line as
+   that case's.
+3. **The extension's limits are checked for the q8_0 build's reads only.** The f16
+   build's reads are not modelled; a separate audit of the extension's text found them
+   inside every limit.
+
 ## The card commands, in order {#commands-q8}
 
 `T` = `<build>/bin/test-backend-ops`, `D` the OpenCL device, `P` =
