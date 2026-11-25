@@ -10854,3 +10854,311 @@ pre type of the models served here that mainline sets it for (tekken for the wri
 **What it means for recorded Inkling numbers.** Every Inkling KL and perplexity row in this file and the CHANGELOG was
 computed on text tokenized by the old rule, on both sides of each comparison: they stay valid as comparisons between
 arms. The rate of affected words is small (above); the served prefill and decode rows do not depend on it.
+
+## 0221-loop-control-op.patch
+
+**Status: built and checked offline and on the CPU (`measured-here`, the recipe host). No card run; the card rows
+are written below, with each row's expected result and its write-up line, before any of them runs.**
+
+**What it replaces.** Inkling 2 Mini's loop controller (`src/models/inkling2.cpp` `control()`, the loop model's
+message merge) is, per control and a row at a time, `g = down . concat(rms_norm(cur), rms_norm(msg))` [4608 -> 64],
+`out = (cur - tanh(forget . g)*cur) + tanh(gain . g)*msg` [64 -> 2304]. On the card it is 12 launches, each with its
+output in global memory: the d4096 chunk of the 4k profile (B60, 165 W, the unit's settings) has 96 controls a
+1,024-row ubatch (q, k, v and ffn on the 24 loop visits) at **74.2 ms**, 8.3 % of the chunk (`measured-here`, the
+profile step's trace, summed per launch class). The layer's own rms_norm after it (4.6 ms) stays a node.
+
+**The reference and the deviation (operator, 2026-11-25 20:45).** The vLLM-XPU Inkling port (6b71b90,
+`inkling_xpu/csrc/loop_control.sycl`) fuses the controller only at <= 8 rows (decode, `check_rows`); at prompt rows
+it runs its base's (trellis-serve 8f8e2fc, `sgl_model.py` `_control`) torch chain with gain and forget concatenated
+into one bf16 product (`code`). This patch fuses the prompt rows: the operator approved that addition to the reference
+(arm F, prompt rows included), f32 math by default and the bf16 products as an opt-in variant.
+
+**The op.** `GGML_OP_LOOP_CONTROL(cur, msg, down, gain, forget)`, appended after `GGML_OP_GATED_DELTA_NET_REPLAY`
+(106 ops; no earlier op's id moves, so the knob-off export below compares line for line). One pure rule,
+`ggml_loop_control_refuse` (F32; n_embd a multiple of 256; rank 64; cur and msg `[n_embd, T]` with contiguous rows at
+any row step, a mix column's view included; the weights contiguous), shared by the model, `supports_op` and the
+dispatch; one pure plan, `ggml_loop_control_plan_make` (the geometry, strides and every argument's reach), shared by
+the dispatch and the host replay.
+
+**The CPU has the op, and the model emits it only where a layer's backend declares it.** Both, argued:
+- A CPU reference is needed whatever the emission rule: test-backend-ops compares every backend against the CPU
+  op; the scheduler sends a node the card's `supports_op` refuses to the CPU, and a graph must never abort there;
+  and the unit test ties the CPU op to the chain (below), which is what makes a card case against the CPU op a case
+  against the chain. It is the chain's arithmetic in f32 (`ops.cpp`: the normed row, then the products by
+  `ggml_vec_dot_f32`, tanhf, the chain's mul / sub / mul / add order).
+- The emission follows the FA port's layer guard (`fa_port_layer_attaches`, the design's §3): `control()` emits the
+  op only for a prompt batch (more than 8 rows) on a layer whose backend answers `get_proc_address
+  ("ggml_backend_loop_control")` (OpenCL does). The CPU reference is a plain loop; on a CPU layer it would replace
+  ggml-cpu's tuned products, and on another GPU backend the node would go to the CPU and back 96 times a ubatch. So a
+  CPU-only run with the knob set builds the knob-off graph (measured below), with one line
+  `DOWNGRADE src=llama op=LOOP_CONTROL path=chain reason=layer-backend device=CPU`.
+- `GGML_OPENCL_LOOP_CONTROL=all-layers` lifts the guard: the op on every layer, the CPU serving it. That is the
+  device-free knob-on check (the export and the CPU KL below) and the guard's red.
+- The knob-off identity holds either way: unset, `control()` never reaches the new code and the chain is built node
+  for node.
+- A LoRA adapter, a Hadamard rotation or a precision entry on one of the three weights keeps the chain (`reason=lora`,
+  `hadamard`, `prec`): the chain's products go through `build_lora_mm`, the op's do not.
+
+**Knob and lines.** `GGML_OPENCL_LOOP_CONTROL`: unset, `0`, `off` = off; `1` or `f32` = the f32 kernel; `bf16` = the
+bf16-DPAS build of the same text; `all-layers` = `1` and the guard lifted. Any other value is not a value: the model
+and the backend keep the arm off and each says so in one WARN line (a mistyped `BF16` must not run the f32 kernel;
+review F1). One line when taken: `loop_control: TAKEN opencl <f32|bf16> one-launch rows_wg=<r> n_wg=<n>`. Refusals:
+`DOWNGRADE src=opencl op=LOOP_CONTROL path=cpu reason=<rule reason|switch-off|not-intel|dst-layout|not-built|wg-size|
+local-mem>` (a refused node goes to the CPU reference; the answers stay right, the speed does not).
+`GGML_OPENCL_LOOP_CONTROL_STATS=1`: `loop_control: graph nodes=<n> calls=<c> of <nodes>` a graph (one line a split
+this backend computes, so a request's lines sum to 96 a ubatch). With the knob off the dispatch does not even count
+the op's nodes (0205's open item, not repeated). The kernel's build state (tried, the refusal's reason) belongs to
+the backend context, i.e. the device, so a second device in the process builds its own (review F3).
+The six arguments are bound-checked before every launch, always (the plan's reach plus the offset against
+`CL_MEM_SIZE`). `GGML_OPENCL_LOOP_CONTROL_OPTS` appends compiler options (the reds' route; a test hook, as the depth
+mix's).
+
+**The kernel** (`loop_control.cl`, `kernel_loop_control`, one launch a control, `code`):
+- A work-group of 32 sub-groups of 16 lanes (512) a Xe core: rows_wg = ceil(T / cores) rounded up to 8, at most 64;
+  at 1,024 rows 56 rows x 19 groups on the B60 (20 cores), 32 x 32 on the B70. Local memory 51,200 bytes at 64 rows (g
+  store 16 KB, K-split partials 32 KB, row sums 2 KB), under the 64 KB the device has.
+- Phase A, the down product with the two norms folded in as scales after it: `g = s_c*(down_a . cur) +
+  s_m*(down_b . msg)`. Sub-group s takes the half s / 16 (cur or msg) and its K slice s % 16 (144 of 2,304); lane l
+  the outputs r = l + 16 j. f32: 16-row tiles (an 8-row tail), chunks of 8 k, cur / msg as uniform loads (one load a
+  row, the FMA's scalar operand), the weight rows each lane's own; the slice partials and the rows' sums of squares
+  are reduced in local memory (4 rounds of 16 columns), g stays in local memory. No concat, no normed copy.
+- Phase B, gain and forget and the combine: items of (16 columns, half the rows) round robin over the sub-groups (288
+  items = 9 a sub-group); lane d holds its gain and forget rows (64 floats each) in registers for the whole item; per
+  row the two products, tanh and `(cur - tf*cur) + tg*msg` in registers, out written once.
+- bf16 (`-DLC_BF16`): the same structure on DPAS (`intel_sub_group_bf16_bf16_matrix_mad_k16`, the float-accumulator
+  form; the short8-accumulator form accumulates in bf16 and is never used), the activations (cur, msg, g) rounded to
+  bf16 by round-to-nearest-even, the weights exact (the model's F32 weights are bf16 values); sums of squares,
+  scales, tanh and the combine f32. Operand layout: mul_mm_kq_f16.cl's card-proven SG16 layout. Phase A takes 8-row
+  tiles and two passes of two column sets: with 16-row tiles IGC's first compile spilled 1,472-1,984 bytes beside
+  phase B and its retry rolled the loops into private memory (ocloc, bmg-g21), and the four-set pass spilled through a
+  dynamically indexed pointer array. The f32 build keeps 16.
+- Not folded: the trailing rms_norm (it needs the whole output row before its scale; §10 of the design).
+- No inline vISA: the design admits it only after a measured stall (the knob `GGML_OPENCL_LOOP_CONTROL_ASM` is not
+  built). The C path is the only path.
+
+**Software pipelining, as the ISA has it** (`measured-here`: ocloc 26.27.39122.11, bmg-g21, `tools/isa_pipeline.py`
+on the IGC dump; static, what the schedule allows). In every loop the next block's loads are issued before the
+current block's compute, unconditionally (the index clamped): with conditional loads IGC copied the buffer at the
+branch's join, the copy waiting on the load before the current block's FMAs. What IGC then does with them:
+- f32 phase A (16-row tile, a two-chunk ping-pong, 640 FMA an iteration): 12 of the 24 loads are first waited for in
+  the next iteration (gap 640 compute instructions); IGC sinks the other half (the second chunk's) to just before
+  their FMAs. A one-chunk loop-carried form lost both halves (IGC moved the loads to the top of the next iteration).
+  So the cur / msg rows 4 chunks ahead are prefetched (`prefetch`, IGC's `load.ugm ... null` at L1 uncached / L3
+  cached: one uniform message a row a chunk pair, 80 prefetch sites in the kernel). The prefetched pair is clamped to
+  the slice's last pair (`nc - 2`): clamped to `nc - 1` (the first form, the one the review read) its 16 floats ran 8
+  floats past the K slice, 32 bytes past the tensor on the last row, outside the bounds the dispatch checks (review
+  F2). OpenCL `prefetch()` has no card precedent in this series: the card's first run of it is this kernel's.
+- f32 phase B (2-row blocks, ping-pong): 11 of 40 loads waited in the next iteration, median gap 304; cur / msg 8 rows
+  ahead prefetched.
+- bf16 phase A: a chunk is 2 DPAS, too little to cover any load (the next chunk's data waited for after <= 8 compute
+  instructions), so x and the weight rows 6 chunks ahead are prefetched (`LC_PD`).
+- bf16 phase B: g from local memory for the next 8-row block before the current block's 8 DPAS, cur / msg prefetched
+  a block ahead and read at the combine; gaps 47-772, median 386.
+Whether the card still stalls is the profile row's question (row 2): a launch above 0.2 ms means the next step is
+the stall row (VectorEngineStalls with STALL_SBID), and only then vISA.
+
+**Offline gate** (`tools/ocloc_loop_control.sh`, `measured-here`, ocloc 26.27.39122.11, the backend's options plus
+`-cl-intel-256-GRF-per-thread`): **PASS on bmg-g21 and bmg-g31, both maths** - numGRF=256, scratch 0, one dump (no
+`_1_` retry). Static instruction sites (bmg-g21; bmg-g31 the same):
+
+| build | dpas | load.ugm (incl. prefetch) | prefetch | load.slm | store.ugm | store.slm | sync | asm lines |
+|---|---|---|---|---|---|---|---|---|
+| f32 | 0 | 207 | 80 | 368 | 4 | 34 | 210 | 10,543 |
+| bf16 | 10 | 105 | 46 | 160 | 8 | 7 | 57 | 8,639 |
+
+**Tests** (`measured-here`, the recipe host, device-free):
+
+*The unit test* `tests/test_loop_control.cpp` (`arcint-loop-control`, a `unit` ctest), on the export's own lines
+(`tests/loop_control_export_lines.inc`: the knob-on export's LOOP_CONTROL lines at ub 512 / 1024 / 2048, with and
+without the depth mix, 6 lines):
+- the rule accepts all 6 exported calls (and with cur and msg exchanged, cur a view) and refuses 10 out-of-scope
+  variants each by its reason; red first: an accept-all rule fails exactly the 10 refusals;
+- the plan: every reach equals its tensor's bytes at 20 and 32 cores; 56 x 19 and 32 x 32 at 1,024 rows;
+- **the CPU op against the chain** built node for node on the CPU backend: nmse <= 3.3e-13 at 1, 7, 9, 16, 57 and
+  1,027 rows (bound 1e-7);
+- **loop_control.cl itself on host threads** (512 lane threads a work-group, a sub-group's reduce and DPAS exchanged
+  between its 16 threads, every tensor at its own offset of one buffer, cur / msg at padded row steps, the plan's
+  arguments, 20 and 32 cores), against the CPU op and against the chain:
+
+| build | rows | worst nmse | bound | |
+|---|---|---|---|---|
+| f32 | 1, 7, 9, 16, 57, 1,027 | 3.4e-13 | 1e-6 | green |
+| bf16 | the same | 7.1e-6 | 1e-4 | green |
+| f32 `RED=1` (gain / forget swapped) | 1, 7, 9, 16, 57 | least 1.88 | must exceed 1e-6 | red, every case |
+| f32 `RED=2` (s_c for both halves) | the same | least 1.32 | | red, every case |
+| f32 `RED=3` (the gain's tanh dropped) | the same | least 0.515 | | red, every case |
+| f32 `RED=4` (one K part of msg dropped) | the same | least 0.0243 | | red, every case |
+| bf16 `RED=5` (b pairs swapped) | the same | least 1.70 | must exceed 1e-4 | red, every case |
+
+The replay encodes the documented DPAS layout; whether the card's matches it is op row 3's bf16 cases.
+
+*The knob-off identity, proofs 1 and 2 of the brief* (`measured-here`, `test-export-graph-ops`, CPU, Inkling 2 Mini
+IQ4_NL, c 4096, fa on):
+- knob unset, this tree against the base tree (development f81d6175 + its series, applied tree 1d3e13b9), ub 512 /
+  1024 / 2048: **byte-identical** files (md5 3c249072 / 594e05dc / db4535e6), 9,875 pp nodes each;
+- `GGML_OPENCL_LOOP_CONTROL=1` on the CPU device: byte-identical to the base as well (the guard), with the one
+  layer-backend DOWNGRADE line;
+- `=all-layers`: 9,875 -> **8,819** pp nodes at every ub, **-1,056 = 96 controls x 11** (12 chain nodes become one
+  LOOP_CONTROL; the tool writes a shape once, so the files carry one LOOP_CONTROL line); with
+  `GGML_OPENCL_DEPTH_MIX=1` as well 8,640 -> 7,584, the same -1,056; tg (decode) unchanged.
+
+*The CPU model check* (`measured-here`, CPU, llama-perplexity, Inkling 2 Mini IQ4_NL, wiki.test, c 256, b = ub = 256,
+6 chunks, 765 scored tokens, the knob-off logits as the base, PPL 8.2679):
+
+| arm | mean KL, nats | max KL | same top p | PPL |
+|---|---|---|---|---|
+| knob off again | 0.000000 | 0.000049 | 99.869 ± 0.131 % | 8.2679 |
+| `GGML_OPENCL_LOOP_CONTROL=1` (CPU device: the guard keeps the chain) | 0.000000 | 0.000049 | 99.869 ± 0.131 % | 8.2679 |
+| `=all-layers` (the op on every layer, the CPU reference) | 0.000757 ± 0.000079 | 0.0341 | 99.081 ± 0.346 % | 8.2982 |
+
+The `=1` run's statistics equal the knob-off-again run's **line for line** (34 lines, `cmp`; guard_check.sh's form,
+proof 2 of the brief), with the layer-backend DOWNGRADE line. The all-layers arm moves the logits by 0.00076 nats and
+0.79 points of top p: inside the answer-level bar, and below what one ulp at the depth mix's sites cost on this host's
+CPU (0.0015-0.0027 nats, 0204-0207's noise control; the op agrees with the chain at nmse 3e-13 a call, the
+quantized expert products amplify it). The card's comparative reading is row 4.
+
+*test-backend-ops* (this host has no OpenCL device, so the cases ran nowhere; the recipe builds no llama test, so its
+52 / 52 says nothing about this file: it was compiled and linked in a llama build of the applied tree on the recipe
+host, with OpenCL, and the card build is its first build there): 16 LOOP_CONTROL cases - the op at 1, 7, 9, 16,
+1,024, 1,027 rows, plain and as a mix column's view (`mode=0`), at 300 rows as a view (a partial 16-row tile on the
+B60's 20 cores: 16 rows a group, the last 12; review F6), and the twin (`mode=1`, rows 9, 1,024, 1,027): op and
+chain in one graph, the error the op half against the chain half of the SAME backend's output (and the
+CPU's pair beside it), printed as `[LOOP_CONTROL twin] nmse op/chain backend = .., cpu = ..`. Every LOOP_CONTROL
+row prints its nmse and bound. Bounds, stated before the card run: **f32 1e-6** (the op reorders sums only; host
+replay 3.4e-13, so a device tanh / sqrt a few ulp off is still four orders inside), **bf16 1e-4** (host replay
+7.1e-6). The generic replay case (`--test-file`) takes the same bounds. Perf: the op and the chain (`mode=2`) at
+1,024 and 1,027 rows.
+
+**Recipe** (`measured-here`, the recipe host, the commit that adds 0221): `RECIPE 118761c2: 100% tests passed, 0 tests
+failed out of 52 EXIT 0` - the series applies from the pin in byte order (159 patches), `loop-control` among the
+unit tests (19.3 s). The paragraphs filled in after it (this one and the CPU KL table) are README text only.
+
+**Revision 2: the review's fixes** (an independent review of 118761c2 + 0608108b: no wrong-math finding; F1-F6 as
+cited in the paragraphs above): the f32 prefetch clamped to the K slice (F2), the knob's unknown values refused with
+a WARN (F1), the kernel's build state per backend context and the unreachable `not-taken` line removed (F3), both
+bandwidth readings and the bf16 / f32 ratio in row 2 (F4), the public wording (F5), the 300-row op case, the
+softened identity bound and the test-backend-ops compile note (F6), the dry run and the per-process assertions in the
+card plan (F1). Measured on this revision (`measured-here`, the recipe host, applied tree
+`1ccec95c6dcbd2f9ea1b394bf06935ea20554aa6`, 159 patches):
+- offline gate: **PASS** on bmg-g21 and bmg-g31, both maths (256 GRF, scratch 0, one dump); f32 dpas 0, load.ugm 207
+  (80 prefetch), load.slm 368, sync 197, 10,533 asm lines; bf16 dpas 10, load.ugm 105 (46 prefetch), load.slm 160, sync
+  57, 8,639 lines. The f32 phase-A loop keeps 12 of 24 loads waited in the next iteration (median gap 321);
+- unit test: all passed; the replay at 300 rows (20 and 32 cores) f32 1.4e-13 / bf16 6.3e-6, the summary unchanged
+  (CPU op vs chain 3.3e-13, f32 3.4e-13, bf16 7.1e-6, reds least 0.024 .. 1.88); the knob's value table (unknown
+  values -1) holds; it was not run against the previous parser;
+- the llama tree of this revision compiles and links test-backend-ops, test-export-graph-ops and llama-perplexity
+  (OpenCL on, the recipe host); the knob-off exports are still byte-identical to the base tree's at ub 512 / 1024 /
+  2048, `=all-layers` still 8,819 nodes, and `GGML_OPENCL_LOOP_CONTROL=BF16` (not a value) logs the WARN line and
+  exports the base graph byte for byte;
+- **RECIPE 5d0ef6f4: 100% tests passed, 0 tests failed out of 52 EXIT 0** (`loop-control` 21.9 s).
+
+**Card rows (written, not run), in this order** (the B60, `ZE_AFFINITY_MASK=0`, under its 165 W cap; the Inkling
+unit's settings: `U="GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 GGML_OPENCL_CPY_TRANSPOSE=1
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_FA_PORT=1"`, q8_0 K/V, ub 1,024; `<tree>` this tree's build, `<dev>` the
+development build; `G` the published Inkling 2 Mini IQ4_NL, staged sha-checked onto the measuring NVMe). Every row's
+expected result and its write-up line are here before the run, so a window that stops early still says something.
+Every card log names the B60 and not the B70 (the tools at `-lv 4`), and every timing row records the host's load.
+
+*What every process asserts* (review F1: a t/s says nothing about which path ran, and row 1 is the kernel's first
+card run): an ON process (`=1` or `=bf16`) prints `loop_control: TAKEN opencl <f32|bf16>` with its own math, no
+`op=LOOP_CONTROL` DOWNGRADE line from either source (`src=llama`: the model kept the chain; `src=opencl`: the
+backend refused, the CPU reference ran), and with `GGML_OPENCL_LOOP_CONTROL_STATS=1` stats lines with `nodes ==
+calls` that sum to a positive multiple of 96; an OFF process prints no TAKEN line and no stats line.
+
+*Row 0 - the dry run, before row 1* (~2 min; review F1): row 3's steps 0 and 1 for f32 and for bf16 (the cases are
+found, one case under `GGML_OPENCL_BOUNDS=1`), the first launch of a never-launched kernel with 512-lane groups,
+local memory, DPAS and prefetches. A failure stops the window here. Support mode lists **13** cases, not 16:
+test-backend-ops drops whole-graph cases from it (`MODE_SUPPORT` removes every `run_whole_graph()` case), so the 3
+twins appear only in the test mode's 16 (`measured-here`: the first card attempt stopped here on a body that
+expected 16; the binary was right). Write-up line: `row 0: f32 13 cases found, one case OK nmse x; bf16 13 found,
+one case OK nmse y`.
+
+*Row 1 - the wall-time A/B of the served pass* (~15 min). The arcint binary of this tree's package, the unit's flags
+(n_ctx 262,144, `--llama-swa-window`, ub 1,024, q8_0 K/V, `$U`), a fresh process per arm on a window port, the served
+fixture of the unit's prefill measurement (4,096 tokens, sha 400a7dd1) as the prompt, the first request of each
+process labelled first-compile and not counted (the same construction under another header). Arms interleaved: off,
+F f32, off, F f32, off, F f32, then F f32, F bf16 three times. Readout: the server's prompt t/s a round; second
+instrument `llama-batched-bench -c 262144 -npp 4096 -ntg 0 -ub 1024 -b 1024` of the same build, per arm.
+- Expected: off 1,067.5 t/s (the unit's measurement, 3,837 ms a pass); F f32 **~1,136-1,143 t/s** (+6.4-7.0 %, 232-252
+  ms a pass saved); F bf16 a further 0.2-1.0 %.
+- The gain counts only if **min(F f32) > max(off)** (no size threshold). Slower or overlapping: stop before the KL
+  arm and run row 2 instead (the fuse precedent: P10 / P11 predicted a gain and measured 5-6 % slower).
+- bf16 becomes the default only if min(F bf16) > max(F f32) and row 4 puts it inside its bound.
+- Write-up line: `row 1: off a / b / c, F f32 d / e / f, F bf16 g / h / i t/s; gain rule met|not met; batched-bench
+  off x, f32 y, bf16 z`.
+
+*Row 2 - the knob-on 4k profile* (~6 min; the profiling build of this tree, the profile step's d4096 chunk, the
+unit's settings, `GGML_OPENCL_LOOP_CONTROL=1` and then `=bf16`, `GGML_OPENCL_LOOP_CONTROL_STATS=1`).
+- Expected: `kernel_loop_control` **96 launches** in the chunk, **0.12-0.16 ms** each (f32), 0.07-0.10 (bf16); the
+  stats line `nodes=96 calls=96` a prompt graph; one TAKEN line.
+- Implied DRAM bandwidth, both readings printed (review F4): **30.7 MB** a control if phase B's re-read of cur / msg
+  hits the cache (cur 9.44 + msg 9.44 + weights 2.36 read, out 9.44 written), **49.6 MB** if it misses (one wave at ub
+  1,024 holds cur + msg 18.9 MB, weights 2.4 MB and out 9.4 MB: against an L2 of the B60's size the re-read misses at
+  least partly, `inference`). The two readings overlap in the expected range, so the discriminator is the same row's
+  **bf16 / f32 launch-time ratio**: near 1 = memory-bound (the pipelining and the bytes are the lever, bf16 gains
+  little); well under 1 (towards 0.5-0.6) = compute-bound (bf16 is the lever). **t > 0.2 ms = the pipelining or the
+  cache reuse failed** -> the stall row next (needs the host owner to set `observation_paranoid` 0).
+- None of the chain's launches remain at the control nodes. Against the knob-off chunk's counts (p28-design §6):
+  `kernel_rms_norm` at the controls 168 -> 0, `kernel_concat_b4` 288 -> 192, `kernel_mul_mm_f32_f32_l4_lm` 384 -> 96
+  (P25's table and the router's), `kernel_sum_slices_f32` 96 -> 0 (the down product's),
+  `kernel_tanh_f32_4` 193 -> 1, `kernel_mul` 272 -> 80, `kernel_sub` 96 -> 0, `kernel_add_row` 440 -> 344;
+  `kernel_rms_norm_mul` stays 110.
+- Write-up line: `row 2: kernel_loop_control n launches, x ms total, y us a launch (f32) / z us (bf16), ratio r,
+  implied u / v GB/s (30.7 / 49.6 MB); chain launches left: ...`.
+
+*Row 3 - op suite and reds* (~11 min). `T=<tree>/bin/test-backend-ops`, `-b GPUOpenCL`.
+
+```
+# 0. the cases are found: 13 LOOP_CONTROL cases (support mode lists no twin), none "not supported"
+GGML_OPENCL_LOOP_CONTROL=1 $T support -b GPUOpenCL -o LOOP_CONTROL
+# 1. one case first, bounds on
+GGML_OPENCL_LOOP_CONTROL=1 GGML_OPENCL_BOUNDS=1 $T test -b GPUOpenCL -o LOOP_CONTROL -p "nt=16,mode=0,view=1"
+# 2. the suite, f32: 16 of 16 OK, every row nmse <= 1e-6
+GGML_OPENCL_LOOP_CONTROL=1 $T test -b GPUOpenCL -o LOOP_CONTROL
+# 3. the reds, f32: every case must FAIL
+for r in 1 2 3 4; do GGML_OPENCL_LOOP_CONTROL=1 GGML_OPENCL_LOOP_CONTROL_OPTS=-DLOOP_CONTROL_RED=$r \
+  $T test -b GPUOpenCL -o LOOP_CONTROL; done
+# 4. bf16: 16 of 16 OK at <= 1e-4; its red must FAIL every case
+GGML_OPENCL_LOOP_CONTROL=bf16 $T test -b GPUOpenCL -o LOOP_CONTROL
+GGML_OPENCL_LOOP_CONTROL=bf16 GGML_OPENCL_LOOP_CONTROL_OPTS=-DLOOP_CONTROL_RED=5 $T test -b GPUOpenCL -o LOOP_CONTROL
+# 5. the graph's own line, ub 512 / 1024 / 2048 (the knob-on exports, all-layers): 1 line each, OK
+for ub in 512 1024 2048; do GGML_OPENCL_LOOP_CONTROL=1 $T test -b GPUOpenCL --test-file <export ub$ub> -o LOOP_CONTROL; done
+# 6. perf, the op against the chain at 1,024 / 1,027 rows
+GGML_OPENCL_LOOP_CONTROL=1 $T perf -b GPUOpenCL -o LOOP_CONTROL
+```
+
+The reds, what each proves and the number it is read by (expected from the host replay; on the card every case must
+FAIL, the twin cases included, since the op half then misses the chain half):
+
+| red | what it breaks | expected (host replay, least) | proves when it fails | write-up line |
+|---|---|---|---|---|
+| `RED=1` | gain and forget swapped in the combine | nmse >= ~1.9 | the cases see which product feeds which term | `RED=1: n/16 FAIL, least nmse x` |
+| `RED=2` | s_c used for both halves (msg's norm scale dropped) | >= ~1.3 | msg at 10x cur makes the second norm's scale visible | `RED=2: n/16 FAIL, least x` |
+| `RED=3` | the gain's tanh dropped | >= ~0.5 | the tanh arguments are unsaturated (near 1) at the cases' scales | `RED=3: n/16 FAIL, least x` |
+| `RED=4` | the last K part of the msg half dropped from the reduction | >= ~0.024 | every K-split part reaches g (the local-memory reduction) | `RED=4: n/16 FAIL, least x` |
+| `RED=5` (bf16) | the b operand's pairs swapped | >= ~1.7 | the bf16 build's DPAS operand order is the card's (with the green bf16 row) | `RED=5: n/16 FAIL, least x` |
+
+Green write-up lines: `f32: 16/16 OK, nmse worst x (bound 1e-6), twin op/chain worst y`; `bf16: 16/16 OK, worst x
+(bound 1e-4)`; `perf: op x us, chain y us at 1,024 rows`. Expected: f32 ~1e-13 .. 1e-10, bf16 ~1e-5, the op ~0.12-0.16
+ms against the chain's ~0.77 ms a control.
+
+*Row 4 - the KL arm* (~16 min; `llama-perplexity -m $G -f <gate text> -c 4096 -b 1024 -ub 1024 --chunks 6 -fa on -ctk
+q8_0 -ctv q8_0 -ngl 99 -lv 4` with `$U`).
+- Arms: `<dev>` knob unset (the base logits on the card, `--kl-divergence-base`); `<dev>` again; **`<tree>` knob unset
+  (the brief's third knob-off proof: KL 0 and top p 100 % against `<dev>` if the card's run-to-run floor is 0, else
+  inside the dev / dev arm's band: KL at most dev / dev's + 0.001 nats, top p at least dev / dev's - 0.5 points)**; `<tree>` F f32; `<tree>` F bf16; each with its TAKEN line (or, knob off,
+  none) and the stats line's 96 a ubatch; then each against the CPU base of the published file.
+- Bounds: paired mean KL (F against off) <= **0.004 nats**; against the CPU base <= 0.03 nats worse than off and top
+  p down <= 1 point. Expected: F f32 inside the one-ulp band (0.0020-0.0022 paired), F bf16 0.002-0.004 paired.
+- Write-up line: `row 4: dev/dev x nats y %; tree-off/dev x nats y %; F f32 paired x, vs CPU base +y nats, top p -z;
+  F bf16 ...`.
+
+*Row 5 - answers with the knob on* (~12 min, the unit's flags, `GGML_OPENCL_LOOP_CONTROL=1`): the capital (one
+word), the 44k needle, the acceptance task; then one start with the knob off for the acceptance task alone (its
+comparison: the score with the knob at least the score without it minus 1). Expected: right, right, the score
+unchanged. Write-up line: `row 5: capital right|wrong, needle at 44k right|wrong, task x/10 on, y/10 off`.
+
+**Card minutes:** row 0 2, row 1 15, row 2 9 (off, f32 and bf16: six processes), row 3 11, row 4 16, row 5 12 (the
+acceptance task with the knob off as well, its comparison), setup 5: **~70 min** (B60). The window body is
+operator-local (not in this repository); it follows these rows and assertions in this order, and on a failed check
+it still requests that step's kernel-fault check, prints the rows not reached and a FAIL verdict.

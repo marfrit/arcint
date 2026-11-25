@@ -1,0 +1,1637 @@
+0221: Inkling 2 Mini's loop controller (the loop model's message merge, src/models/inkling2.cpp control()) as one op, GGML_OP_LOOP_CONTROL (appended after GGML_OP_GATED_DELTA_NET_REPLAY, so every earlier op keeps its id), behind GGML_OPENCL_LOOP_CONTROL (unset, 0, off: nothing changes, the chain is emitted node for node; 1 or f32: the f32 kernel; bf16: the bf16-DPAS build of the same kernel; all-layers: 1 and the layer guard lifted; any other value: off, with a WARN line). The op: ggml.h/ggml.c (constructor, a pure rule ggml_loop_control_refuse, the knob's parser, a pure launch plan ggml_loop_control_plan_make shared with the host replay), a CPU reference that is the unfused chain in f32 (ops.cpp), and one OpenCL kernel kernel_loop_control (loop_control.cl): a work-group of 32 sub-groups a Xe core, phase A the down product with the two norms folded in as scales after it (g in local memory, K-split partials reduced in local memory), phase B the gain and forget products, tanh and the combine in registers, out the only global write; the next block's loads issued before the current block computes, prefetches where the ISA shows the loads sunk to their use; 256 GRF, no spill on bmg-g21 / bmg-g31 (both maths). The model emits the op for prompt batches (more than 8 rows) on a layer whose backend declares it (get_proc_address "ggml_backend_loop_control", the FA port's layer guard), else the chain with one DOWNGRADE line; an adapter, a Hadamard rotation or a precision entry on a controller weight keeps the chain. The trailing rms_norm stays a node. Reds through GGML_OPENCL_LOOP_CONTROL_OPTS=-DLOOP_CONTROL_RED=1..5; GGML_OPENCL_LOOP_CONTROL_STATS=1 prints the launches a graph; bounds always checked before the launch. test-backend-ops: LOOP_CONTROL cases at 1 .. 1,027 rows (plain and a mix column's view), the twin against the unfused chain on the same backend, perf cases op against chain.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 37bb093..ed4ad33 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -620,6 +620,7 @@ extern "C" {
+         GGML_OP_ROPE_APPLY,
+ 
+         GGML_OP_GATED_DELTA_NET_REPLAY,
++        GGML_OP_LOOP_CONTROL,   // 0221: appended, so every earlier op keeps its id
+ 
+         GGML_OP_COUNT,
+     };
+@@ -1901,6 +1902,73 @@ extern "C" {
+     // view's contiguous size, so a strided view can pass it and still leave its source.
+     GGML_API bool ggml_view_within_src(const struct ggml_tensor * view);
+ 
++    // 0221: Inkling 2 Mini's loop controller as one op (the loop model's message merge,
++    // src/models/inkling2.cpp control()). The unfused chain it replaces, a row (token) at a time:
++    //   h      = concat(rms_norm(cur, eps), rms_norm(msg, eps))      [2*n_embd]
++    //   g      = down . h                                           [rank]   down   [2*n_embd, rank]
++    //   gain   = tanh(gain_w . g), forget = tanh(forget_w . g)      [n_embd] gain_w, forget_w [rank, n_embd]
++    //   out    = (cur - forget*cur) + gain*msg                      [n_embd]
++    // cur, msg [n_embd, n_tokens] (rows contiguous, any row step); dst [n_embd, n_tokens], contiguous.
++    // The CPU op is that chain in f32 (the normed h, then the products); a backend may reorder it
++    // (OpenCL: g = s_c*(down_a . cur) + s_m*(down_b . msg), the norms as scales after the product).
++    GGML_API struct ggml_tensor * ggml_loop_control(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * cur,
++            struct ggml_tensor  * msg,
++            struct ggml_tensor  * down,
++            struct ggml_tensor  * gain,
++            struct ggml_tensor  * forget,
++            float                 eps);
++
++    // the pure type/shape/stride rule the model, the OpenCL dispatch and the CPU op share: NULL
++    // when covered, else a fixed reason for the DOWNGRADE line. Covered: F32 everywhere, n_embd a
++    // multiple of 256 (16 K-split parts of a half, each a multiple of 16), rank 64, cur and msg
++    // [n_embd, T] with contiguous rows at any row step (a mix column's view), the three weights
++    // contiguous. Any T >= 1 (the model emits the op only for T > 8; the op itself takes any).
++    GGML_API const char * ggml_loop_control_refuse(const struct ggml_tensor * cur,
++                                                   const struct ggml_tensor * msg,
++                                                   const struct ggml_tensor * down,
++                                                   const struct ggml_tensor * gain,
++                                                   const struct ggml_tensor * forget);
++
++    // the knob GGML_OPENCL_LOOP_CONTROL: NULL (unset), "0" and "off" are 0 (off); "bf16" is 2 (the
++    // bf16-DPAS variant); "1" and "f32" are 1 (f32 math, the default arm); any other value is -1 (not a
++    // value: the model and the backend keep the arm off and log a WARN line). "all-layers" is 1 and
++    // also lifts the model's layer-backend guard (ggml_loop_control_all_layers): the op is then
++    // emitted on every layer whatever its backend, and the CPU serves it with the reference - the
++    // device-free knob-on check and the guard's red.
++    GGML_API int  ggml_loop_control_mode(const char * env_value);
++    GGML_API bool ggml_loop_control_all_layers(const char * env_value);
++
++    // the capability a backend declares through its registry's get_proc_address (any non-null
++    // pointer) when it serves GGML_OP_LOOP_CONTROL; the model emits the op only on such a layer
++    #define GGML_LOOP_CONTROL_CAPABILITY_PROC "ggml_backend_loop_control"
++
++    // the fused kernel's fixed geometry (loop_control.cl): 32 sub-groups of 16 lanes a
++    // work-group, rank 64, at most 64 rows a work-group, phase A row tiles of 16 (a tail of 8)
++    #define GGML_LOOP_CONTROL_NSG      32
++    #define GGML_LOOP_CONTROL_SG       16
++    #define GGML_LOOP_CONTROL_RANK     64
++    #define GGML_LOOP_CONTROL_ROWS_MAX 64
++
++    // what a launch reads and writes, from the node and the device's core count alone (no
++    // device): the geometry, the strides the kernel is handed and the furthest byte each argument
++    // reaches past its tensor's own offset. The OpenCL dispatch binds exactly these, and the host
++    // replay of loop_control.cl (arcint tests/test_loop_control.cpp) takes the same struct.
++    struct ggml_loop_control_plan {
++        int      ne0, nt, rank;
++        int      rows_wg;       // rows a work-group owns: ceil(nt / cores) rounded up to 8, at most 64
++        int      n_wg;          // work-groups: ceil(nt / rows_wg)
++        int      rsplit;        // phase B: the row ranges a 16-column group is split into (load balance)
++        int      lsz;           // the work-group size: NSG * SG
++        uint64_t nbc1, nbm1, nbd1;              // cur, msg, dst row steps, bytes
++        uint64_t nbw1, nbg1, nbf1;              // down, gain, forget row steps, bytes
++        uint64_t reach_cur, reach_msg, reach_down, reach_gain, reach_forget, reach_dst;   // bytes
++        uint64_t local_floats;  // g store (rows_wg*64) + K-split partials (NSG*16*16) + row sums (NSG*16)
++    };
++    GGML_API void ggml_loop_control_plan_make(const struct ggml_tensor * dst, int n_cores,
++                                              struct ggml_loop_control_plan * plan);
++
+     // in-place, returns view(a)
+     GGML_API struct ggml_tensor * ggml_clamp_inplace(
+             struct ggml_context * ctx,
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index 5d38340..1731c3e 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -1953,6 +1953,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+             {
+                 ggml_compute_forward_depth_mix(params, tensor);
+             } break;
++        case GGML_OP_LOOP_CONTROL:
++            {
++                ggml_compute_forward_loop_control(params, tensor);
++            } break;
+         case GGML_OP_CONV_TRANSPOSE_1D:
+             {
+                 ggml_compute_forward_conv_transpose_1d(params, tensor);
+@@ -2429,6 +2433,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+             {
+                 n_tasks = MIN(n_threads, (int) node->ne[1]);
+             } break;
++        case GGML_OP_LOOP_CONTROL:
++            {
++                n_tasks = MIN(n_threads, (int) node->ne[1]);
++            } break;
+         case GGML_OP_SOFT_MAX:
+             {
+                 n_tasks = MIN(n_threads, ggml_nrows(node->src[0]));
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 83aa7f5..0045505 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -6615,6 +6615,85 @@ void ggml_compute_forward_depth_mix(
+     }
+ }
+ 
++// ggml_compute_forward_loop_control
++
++// 0221: the loop controller's reference, the unfused chain's arithmetic in f32, a row at a time:
++// rms_norm of cur and msg as ggml_compute_forward_rms_norm_f32 computes it (a ggml_float sum of
++// squares, scale = 1/sqrt(mean + eps)), the concatenated normed row into the down product, the
++// gain and forget products with tanhf, then (cur - forget*cur) + gain*msg in the chain's node
++// order (mul, sub, mul, add). The products use ggml_vec_dot_f32, the f32 x f32 dot the chain's
++// mul_mat takes on this backend.
++static void ggml_compute_forward_loop_control_f32(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    const ggml_tensor * cur    = dst->src[0];
++    const ggml_tensor * msg    = dst->src[1];
++    const ggml_tensor * down   = dst->src[2];
++    const ggml_tensor * gain   = dst->src[3];
++    const ggml_tensor * forget = dst->src[4];
++
++    const float eps = ggml_get_op_params_f32(dst, 0);
++
++    const int ith = params->ith;
++    const int nth = params->nth;
++
++    const int64_t n_embd = cur->ne[0];
++    const int64_t n_tok  = cur->ne[1];
++    const int64_t rank   = down->ne[1];
++
++    std::vector<float> h((size_t) 2*n_embd);
++    std::vector<float> g((size_t) rank);
++
++    for (int64_t t = ith; t < n_tok; t += nth) {
++        const float * c = (const float *) ((const char *) cur->data + t*cur->nb[1]);
++        const float * m = (const float *) ((const char *) msg->data + t*msg->nb[1]);
++        float       * o = (float *)       ((char *)       dst->data + t*dst->nb[1]);
++
++        for (int half = 0; half < 2; ++half) {
++            const float * x = half == 0 ? c : m;
++            ggml_float sum = 0.0;
++            for (int64_t i = 0; i < n_embd; ++i) {
++                sum += (ggml_float) (x[i]*x[i]);
++            }
++            const float mean  = sum/n_embd;
++            const float scale = 1.0f/sqrtf(mean + eps);
++            for (int64_t i = 0; i < n_embd; ++i) {
++                h[half*n_embd + i] = x[i]*scale;
++            }
++        }
++        for (int64_t r = 0; r < rank; ++r) {
++            ggml_vec_dot_f32((int) (2*n_embd), &g[r], 0,
++                    (const float *) ((const char *) down->data + r*down->nb[1]), 0, h.data(), 0, 1);
++        }
++        for (int64_t i = 0; i < n_embd; ++i) {
++            float gv = 0.0f, fv = 0.0f;
++            ggml_vec_dot_f32((int) rank, &gv, 0, (const float *) ((const char *) gain->data   + i*gain->nb[1]),   0, g.data(), 0, 1);
++            ggml_vec_dot_f32((int) rank, &fv, 0, (const float *) ((const char *) forget->data + i*forget->nb[1]), 0, g.data(), 0, 1);
++            const float tg = tanhf(gv);
++            const float tf = tanhf(fv);
++            const float a  = c[i] - tf*c[i];
++            o[i] = a + tg*m[i];
++        }
++    }
++}
++
++void ggml_compute_forward_loop_control(
++        const ggml_compute_params * params,
++        ggml_tensor * dst) {
++
++    switch (dst->src[0]->type) {
++        case GGML_TYPE_F32:
++            {
++                ggml_compute_forward_loop_control_f32(params, dst);
++            } break;
++        default:
++            {
++                GGML_ABORT("fatal error");
++            }
++    }
++}
++
+ // ggml_compute_forward_rope_apply
+ 
+ void ggml_compute_forward_rope_apply(const ggml_compute_params * params, ggml_tensor * dst) {
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 1607712..a1826ab 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -66,6 +66,7 @@ void ggml_compute_forward_rope_back(const struct ggml_compute_params * params, s
+ void ggml_compute_forward_clamp(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_norm_clip(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_depth_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_loop_control(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_conv_transpose_1d(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 1d9faef..c1eac5e 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -110,6 +110,7 @@ set(GGML_OPENCL_KERNELS
+     clamp
+     norm_clip
+     depth_mix
++    loop_control
+     cpy
+     cvt
+     diag_mask_inf
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7b04b86..c387827 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -730,6 +730,10 @@ static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2)
+ static bool ggml_cl_depth_mix_on();
+ static cl_kernel ggml_cl_depth_mix_kernel(ggml_backend_opencl_context * backend_ctx);
+ static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks, const ggml_tensor * cur, ggml_tensor * dst);
++// 0221: the loop-controller arm, defined below; supports_op at the top reaches it
++static int ggml_cl_loop_control_mode();
++static cl_kernel ggml_cl_loop_control_kernel(ggml_backend_opencl_context * backend_ctx, const char ** why);
++static void ggml_cl_loop_control(ggml_backend_t backend, const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * dst);
+ // 0178's bounds helper, defined below supports_op
+ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);
+ static void ggml_cl_bounds_always(const char * arm, const char * which, cl_mem buf, size_t upto);
+@@ -1091,6 +1095,14 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_depth_mix_f32 = nullptr;
+     int       depth_mix_calls_graph = 0;   // GGML_OPENCL_DEPTH_MIX_STATS=1: launches a graph
+     int       depth_mix_nodes_graph = 0;   // and the nodes the graph handed it
++    // 0221: Inkling 2 Mini's loop controller (loop_control.cl), one launch a control, f32 or
++    // (GGML_OPENCL_LOOP_CONTROL=bf16) bf16 DPAS. Built on first use: unset, the model emits
++    // the chain, no node exists and no kernel is built.
++    cl_kernel kernel_loop_control = nullptr;
++    bool        loop_control_tried  = false;     // per context (a device): a second device builds its own
++    const char * loop_control_reason = nullptr;  // why the build was refused, for the DOWNGRADE line
++    int       loop_control_calls_graph = 0;   // GGML_OPENCL_LOOP_CONTROL_STATS=1: launches a graph
++    int       loop_control_nodes_graph = 0;   // and the nodes the graph handed it
+     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
+               kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
+               kernel_geglu_erf_f16, kernel_geglu_quick_f16, kernel_situ_f32;
+@@ -12423,6 +12435,15 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+     for (int i = 0; i < cgraph->n_nodes; ++i) {
+         if (cgraph->nodes[i]->op == GGML_OP_DEPTH_MIX) backend_ctx->depth_mix_nodes_graph++;
+     }
++    // 0221: the same count for the loop-control arm. Unset, the model emits no such node and
++    // this loop does not run (the knob is read once)
++    backend_ctx->loop_control_calls_graph = 0;
++    backend_ctx->loop_control_nodes_graph = 0;
++    if (ggml_cl_loop_control_mode() != 0) {
++        for (int i = 0; i < cgraph->n_nodes; ++i) {
++            if (cgraph->nodes[i]->op == GGML_OP_LOOP_CONTROL) backend_ctx->loop_control_nodes_graph++;
++        }
++    }
+     // 0130d: the previous graph's pre/post pairs: their events are waited here, the frame's
+     // first point that is not inside a dispatch
+     if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)
+@@ -12735,6 +12756,19 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+                       backend_ctx->ngpt_fused, cgraph->n_nodes, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
+     }
+ 
++    if (backend_ctx->loop_control_nodes_graph > 0) {
++        static const bool lc_stats_on = [] {
++            const char * e = getenv("GGML_OPENCL_LOOP_CONTROL_STATS");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        // (no "not-taken" line: a node supports_op refused never enters this backend's graph, and a
++        // dispatch that returns false aborts; the refusal's own DOWNGRADE line is the record)
++        if (lc_stats_on) {
++            GGML_LOG_INFO("loop_control: graph nodes=%d calls=%d of %d\n",
++                          backend_ctx->loop_control_nodes_graph, backend_ctx->loop_control_calls_graph, cgraph->n_nodes);
++        }
++    }
++
+     if (backend_ctx->depth_mix_nodes_graph > 0) {
+         static const bool stats_on = [] {
+             const char * e = getenv("GGML_OPENCL_DEPTH_MIX_STATS");
+@@ -13572,6 +13606,35 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             }
+             return true;
+         }
++        case GGML_OP_LOOP_CONTROL: {
++            // 0221: opt-in (GGML_OPENCL_LOOP_CONTROL), decided from types, shapes and strides
++            // only (supports_op runs before allocation: no extra is read, 0205's lesson), on
++            // Intel only (sub-groups of 16, and the bf16 build's DPAS). Every refusal leaves a
++            // DOWNGRADE line with its reason, once a key.
++            if (ggml_cl_loop_control_mode() == 0) {
++                ggml_cl_downgrade("op=LOOP_CONTROL path=cpu reason=switch-off");
++                return false;
++            }
++            if (backend_ctx->gpu_family != GPU_FAMILY::INTEL) {
++                ggml_cl_downgrade("op=LOOP_CONTROL path=cpu reason=not-intel");
++                return false;
++            }
++            const char * why = ggml_loop_control_refuse(op->src[0], op->src[1], op->src[2], op->src[3], op->src[4]);
++            if (why != nullptr) {
++                ggml_cl_downgrade("op=LOOP_CONTROL path=cpu reason=%s", why);
++                return false;
++            }
++            if (op->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
++                ggml_cl_downgrade("op=LOOP_CONTROL path=cpu reason=dst-layout");
++                return false;
++            }
++            const char * kwhy = nullptr;
++            if (ggml_cl_loop_control_kernel(backend_ctx, &kwhy) == nullptr) {
++                ggml_cl_downgrade("op=LOOP_CONTROL path=cpu reason=%s", kwhy ? kwhy : "not-built");
++                return false;
++            }
++            return true;
++        }
+         case GGML_OP_NORM_CLIP:
+             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous_rows(op->src[0]) &&
+@@ -19068,6 +19131,12 @@ static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q,
+ }
+ 
+ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, GGML_LOOP_CONTROL_CAPABILITY_PROC) == 0) {
++        // 0221: this backend serves GGML_OP_LOOP_CONTROL; the model emits the op only on a
++        // layer whose backend declares it (a declaration, not something to call)
++        static const int declares_lc = 1;
++        return (void *) &declares_lc;
++    }
+     if (strcmp(name, FA_PORT_CAPABILITY_PROC) == 0) {
+         // 0198: this backend reads the port arm's sources (fa_port_gate.h); the pointer is a
+         // declaration, not something to call
+@@ -21962,6 +22031,171 @@ static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++// 0221: Inkling 2 Mini's loop controller as one launch (loop_control.cl). The unfused chain is,
++// a control: rms_norm(cur), rms_norm(msg), concat, the down product (a K-split GEMM and its
++// slice sum), the forget and gain products, two tanh, mul, sub, mul, add - 12 launches, each
++// with its output in global memory (74.2 ms a 1,024-row ubatch on the B60, the profile's d4096
++// chunk). The kernel reads cur, msg and the three weights, keeps g in local memory and writes
++// out once.
++//
++// GGML_OPENCL_LOOP_CONTROL: unset (or 0 / off) the model emits the chain and this is never
++// reached; 1 (or all-layers) the f32 kernel; bf16 the bf16-DPAS build of the same text.
++// GGML_OPENCL_LOOP_CONTROL_OPTS appends compiler options: the reds (-DLOOP_CONTROL_RED=1..5,
++// loop_control.cl's header) - a test hook, as the depth mix's.
++static int ggml_cl_loop_control_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_OPENCL_LOOP_CONTROL");
++        const int m = ggml_loop_control_mode(e);
++        if (m < 0) {
++            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_LOOP_CONTROL=%s is not a value (0, off, 1, f32, bf16, all-layers): the arm is off\n", e);
++            return 0;
++        }
++        return m;
++    }();
++    return mode;
++}
++
++// built on the first eligible node; a build that fails, or a work-group of 512 the kernel
++// cannot take (CL_KERNEL_WORK_GROUP_SIZE), refuses the op with the reason
++static cl_kernel ggml_cl_loop_control_kernel(ggml_backend_opencl_context * backend_ctx, const char ** why) {
++    // tried / reason are the context's (a device's), not function statics: with two devices in one
++    // process the second must build its own kernel (review F3)
++    bool &        tried  = backend_ctx->loop_control_tried;
++    const char *& reason = backend_ctx->loop_control_reason;
++    if (!tried && backend_ctx->kernel_loop_control == nullptr) {
++        tried = true;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "loop_control.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("loop_control.cl");
++#endif
++        const bool  bf16  = ggml_cl_loop_control_mode() == 2;
++        const char * extra = getenv("GGML_OPENCL_LOOP_CONTROL_OPTS");
++        const std::string opts = backend_ctx->kernel_compile_opts + " -cl-intel-256-GRF-per-thread" +
++                                 (bf16 ? " -DLC_BF16" : "") +
++                                 (extra != nullptr ? std::string(" ") + extra : std::string());
++        cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
++        if (prog == nullptr) {
++            reason = "not-built";
++            GGML_LOG_WARN("ggml_opencl: loop_control.cl (%s) did not build; GGML_OP_LOOP_CONTROL stays on the CPU\n",
++                          bf16 ? "bf16" : "f32");
++        } else {
++            cl_int err;
++            cl_kernel k = clCreateKernel(prog, "kernel_loop_control", &err);
++            CL_CHECK(err);
++            CL_CHECK(clReleaseProgram(prog));
++            size_t wg = 0;
++            CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, nullptr));
++            cl_ulong lmem = 0;
++            CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lmem), &lmem, nullptr));
++            const size_t lsz  = GGML_LOOP_CONTROL_NSG*GGML_LOOP_CONTROL_SG;
++            const size_t need = ((size_t) GGML_LOOP_CONTROL_ROWS_MAX*GGML_LOOP_CONTROL_RANK +
++                                 (size_t) GGML_LOOP_CONTROL_NSG*GGML_LOOP_CONTROL_SG*16 +
++                                 (size_t) GGML_LOOP_CONTROL_NSG*16)*sizeof(float);
++            if (wg < lsz) {
++                reason = "wg-size";
++                GGML_LOG_WARN("ggml_opencl: kernel_loop_control takes %zu work-items a group, it needs %zu\n", wg, lsz);
++                CL_CHECK(clReleaseKernel(k));
++            } else if (lmem < need) {
++                reason = "local-mem";
++                GGML_LOG_WARN("ggml_opencl: kernel_loop_control needs %zu bytes of local memory, the device has %llu\n",
++                              need, (unsigned long long) lmem);
++                CL_CHECK(clReleaseKernel(k));
++            } else {
++                backend_ctx->kernel_loop_control = k;
++            }
++        }
++    }
++    if (why != nullptr) {
++        *why = reason;
++    }
++    return backend_ctx->kernel_loop_control;
++}
++
++static void ggml_cl_loop_control(ggml_backend_t backend, const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++
++    const ggml_tensor * down   = dst->src[2];
++    const ggml_tensor * gain   = dst->src[3];
++    const ggml_tensor * forget = dst->src[4];
++
++    // supports_op decided from shapes and strides; device storage is this call's invariant
++    GGML_ASSERT(cur->extra && msg->extra && down->extra && gain->extra && forget->extra && dst->extra);
++    GGML_ASSERT(ggml_loop_control_refuse(cur, msg, down, gain, forget) == nullptr);
++
++    ggml_tensor_extra_cl * ec = (ggml_tensor_extra_cl *) cur->extra;
++    ggml_tensor_extra_cl * em = (ggml_tensor_extra_cl *) msg->extra;
++    ggml_tensor_extra_cl * ew = (ggml_tensor_extra_cl *) down->extra;
++    ggml_tensor_extra_cl * eg = (ggml_tensor_extra_cl *) gain->extra;
++    ggml_tensor_extra_cl * ef = (ggml_tensor_extra_cl *) forget->extra;
++    ggml_tensor_extra_cl * ed = (ggml_tensor_extra_cl *) dst->extra;
++
++    const cl_ulong offc = ec->offset + cur->view_offs;
++    const cl_ulong offm = em->offset + msg->view_offs;
++    const cl_ulong offw = ew->offset + down->view_offs;
++    const cl_ulong offg = eg->offset + gain->view_offs;
++    const cl_ulong offf = ef->offset + forget->view_offs;
++    const cl_ulong offd = ed->offset + dst->view_offs;
++
++    // the geometry, strides and reaches: one pure function, shared with the host replay of
++    // loop_control.cl. One work-group a Xe core: Intel reports EUs as compute units, 8 a core
++    ggml_loop_control_plan plan;
++    ggml_loop_control_plan_make(dst, (int) std::max<cl_uint>(1, backend_ctx->fa.compute_units/8), &plan);
++
++    // always on, as the depth mix's: six host calls a launch, and a card fault is not a diagnosis
++    ggml_cl_bounds_always("loop control", "cur",    ec->data_device, (size_t) (offc + plan.reach_cur));
++    ggml_cl_bounds_always("loop control", "msg",    em->data_device, (size_t) (offm + plan.reach_msg));
++    ggml_cl_bounds_always("loop control", "down",   ew->data_device, (size_t) (offw + plan.reach_down));
++    ggml_cl_bounds_always("loop control", "gain",   eg->data_device, (size_t) (offg + plan.reach_gain));
++    ggml_cl_bounds_always("loop control", "forget", ef->data_device, (size_t) (offf + plan.reach_forget));
++    ggml_cl_bounds_always("loop control", "dst",    ed->data_device, (size_t) (offd + plan.reach_dst));
++
++    cl_kernel kernel = ggml_cl_loop_control_kernel(backend_ctx, nullptr);
++    GGML_ASSERT(kernel != nullptr);
++
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const cl_ulong nbc1 = plan.nbc1, nbm1 = plan.nbm1, nbw1 = plan.nbw1, nbg1 = plan.nbg1, nbf1 = plan.nbf1, nbd1 = plan.nbd1;
++    CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &ec->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offc));
++    CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_ulong), &nbc1));
++    CL_CHECK(clSetKernelArg(kernel,  3, sizeof(cl_mem),   &em->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  4, sizeof(cl_ulong), &offm));
++    CL_CHECK(clSetKernelArg(kernel,  5, sizeof(cl_ulong), &nbm1));
++    CL_CHECK(clSetKernelArg(kernel,  6, sizeof(cl_mem),   &ew->data_device));
++    CL_CHECK(clSetKernelArg(kernel,  7, sizeof(cl_ulong), &offw));
++    CL_CHECK(clSetKernelArg(kernel,  8, sizeof(cl_ulong), &nbw1));
++    CL_CHECK(clSetKernelArg(kernel,  9, sizeof(cl_mem),   &eg->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 10, sizeof(cl_ulong), &offg));
++    CL_CHECK(clSetKernelArg(kernel, 11, sizeof(cl_ulong), &nbg1));
++    CL_CHECK(clSetKernelArg(kernel, 12, sizeof(cl_mem),   &ef->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 13, sizeof(cl_ulong), &offf));
++    CL_CHECK(clSetKernelArg(kernel, 14, sizeof(cl_ulong), &nbf1));
++    CL_CHECK(clSetKernelArg(kernel, 15, sizeof(cl_mem),   &ed->data_device));
++    CL_CHECK(clSetKernelArg(kernel, 16, sizeof(cl_ulong), &offd));
++    CL_CHECK(clSetKernelArg(kernel, 17, sizeof(cl_ulong), &nbd1));
++    CL_CHECK(clSetKernelArg(kernel, 18, sizeof(int),      &plan.ne0));
++    CL_CHECK(clSetKernelArg(kernel, 19, sizeof(int),      &plan.nt));
++    CL_CHECK(clSetKernelArg(kernel, 20, sizeof(int),      &plan.rows_wg));
++    CL_CHECK(clSetKernelArg(kernel, 21, sizeof(int),      &plan.rsplit));
++    CL_CHECK(clSetKernelArg(kernel, 22, sizeof(float),    &eps));
++    CL_CHECK(clSetKernelArg(kernel, 23, (size_t) plan.local_floats*sizeof(float), nullptr));
++
++    size_t global_work_size[] = { (size_t) plan.n_wg*plan.lsz, 1, 1 };
++    size_t local_work_size[]  = { (size_t) plan.lsz, 1, 1 };
++
++    static bool taken_told = false;
++    if (!taken_told) {
++        taken_told = true;
++        GGML_LOG_INFO("loop_control: TAKEN opencl %s one-launch rows_wg=%d n_wg=%d\n",
++                      ggml_cl_loop_control_mode() == 2 ? "bf16" : "f32", plan.rows_wg, plan.n_wg);
++    }
++    backend_ctx->loop_control_calls_graph++;
++
++    backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++}
++
+ static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -43152,6 +43386,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_depth_mix;
+             break;
++        case GGML_OP_LOOP_CONTROL:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_loop_control;
++            break;
+         case GGML_OP_NORM:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/loop_control.cl b/ggml/src/ggml-opencl/kernels/loop_control.cl
+new file mode 100644
+index 0000000..cf9d100
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/loop_control.cl
+@@ -0,0 +1,605 @@
++//------------------------------------------------------------------------------
++// loop_control (0221)
++//------------------------------------------------------------------------------
++// Inkling 2 Mini's loop controller (the loop model's message merge) as ONE launch:
++//
++//   g   = s_c * (Wd_a . cur) + s_m * (Wd_b . msg)    [64]   s_x = 1/sqrt(mean(x^2) + eps)
++//   out = (cur - tanh(Wf . g) * cur) + tanh(Wg . g) * msg
++//
++// The chain it replaces normalizes cur and msg, concatenates them, takes the down product,
++// the two up products, two tanh and four element-wise nodes, each a launch with its output
++// in global memory. Here nothing intermediate is written to global memory: the products,
++// the tanh and the combine stay in registers, g [rows, 64] lives in local memory between
++// the two phases, and the only global write is out.
++//
++// Geometry (the plan: ggml_loop_control_plan_make): a work-group of LC_NSG sub-groups of 16
++// lanes owns rows_wg consecutive rows (one work-group a core, one wave where the rows allow).
++//   Phase A (the down product, the norms folded in as scales after it): row tiles of 16 (a
++//     tail of 8). Sub-group s takes half s / 16 (cur or msg) and the K slice s % 16 of it;
++//     lane l holds the 4 outputs r = l + 16 j. The slice's partials and the rows' sums of
++//     squares go through local memory and are reduced to g, which stays in local memory.
++//   Phase B (the gain and forget products and the combine): items of (16 columns, a row
++//     range) round robin over the sub-groups; lane l holds column d = 16 group + l and its
++//     gain and forget weight rows (64 each) in registers for the whole row range.
++//   Software pipelining in both phases: the loads of block t+1 (phase A: the next K chunk's
++//   cur / msg rows and weight rows; phase B: the next rows' g, cur and msg) are issued before
++//   block t computes, into a second register buffer (ping-pong, no copy).
++//
++// Math: f32 FMA by default. -DLC_BF16 builds the bf16 variant (GGML_OPENCL_LOOP_CONTROL=bf16):
++// the products on DPAS (intel_sub_group_bf16_bf16_matrix_mad_k16, float accumulator, the
++// short8-accumulator form is never used), the activations (cur, msg, g) rounded to bf16 by
++// round-to-nearest-even, the weights exact (the model's are bf16 values stored as F32); the
++// sums of squares, the scales, tanh and the combine stay f32.
++//   DPAS operands, SIMD16 (mul_mm_kq_f16.cl's card-proven layout): a = short8, lane i holds
++//   k = i, component m is row m; b = int8, lane n is column n, its 16 k as 8 pairs (low half
++//   the even k); result float8, lane n column n, component m row m.
++//
++// Reds (GGML_OPENCL_LOOP_CONTROL_OPTS=-DLOOP_CONTROL_RED=<n>; each must fail every op case):
++//   1 gain and forget swapped in the combine (forget on msg, gain on cur)
++//   2 s_c used for both halves of the down product (the msg norm's scale dropped)
++//   3 the gain's tanh dropped
++//   4 the last K-split part of the msg half dropped from the reduction
++//   5 (bf16 build) the b operand's pairs swapped (odd k in the low half)
++
++#ifndef LOOP_CONTROL_HOST_REPLAY
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#ifdef LC_BF16
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#endif
++#define LC_REQD_SG  __attribute__((intel_reqd_sub_group_size(16)))
++#define LC_SGID()   ((int) get_sub_group_id())
++#define LC_LANE()   ((int) get_sub_group_local_id())
++#define LC_ZERO8(v) (v) = (float8)(0.0f)
++#endif
++
++#ifdef LOOP_CONTROL_HOST_REPLAY
++// the host replay (arcint tests/test_loop_control.cpp) includes this text once a build
++#undef LC_NSG
++#undef LC_HALF
++#undef LC_RANK
++#undef LC_REDUCE_TILE
++#undef LC_TG
++#undef LC_OUT
++#undef LC_COMBINE
++#undef LC_PHASE_A
++#undef LC_FMA_A32
++#undef LC_ACC32
++#undef LC_PB
++#undef LC_LOAD_B32
++#undef LC_COMP_B32
++#undef LC_TILE
++#undef LC_PACK_A
++#undef LC_ACCB
++#undef LC_LOAD_BB
++#undef LC_PACK_BB
++#undef LC_COMP_BB
++#endif
++
++#ifndef LOOP_CONTROL_RED
++#define LOOP_CONTROL_RED 0
++#endif
++// the prefetch distances, in chunks (phase A f32: 8 k a chunk; bf16: 16 k a chunk)
++#ifndef LC_PF
++#define LC_PF 4
++#endif
++
++#define LC_NSG   32
++#define LC_HALF  (LC_NSG/2)
++#define LC_RANK  64
++
++#ifdef LC_BF16
++// round to nearest even (finite inputs); exact for a value that is already a bf16 number
++static inline ushort lc_bf16(float f) {
++    uint u = as_uint(f);
++    u += 0x7FFFu + ((u >> 16) & 1u);
++    return (ushort) (u >> 16);
++}
++static inline int lc_pack(float lo, float hi) {
++#if LOOP_CONTROL_RED == 5
++    return (int) ((uint) lc_bf16(hi) | ((uint) lc_bf16(lo) << 16));
++#else
++    return (int) ((uint) lc_bf16(lo) | ((uint) lc_bf16(hi) << 16));
++#endif
++}
++#endif
++
++// the reduction of a row tile, shared by both maths: each sub-group's partials of output
++// column set j (r = lane + 16 j) and its rows' sums of squares go to local memory, then
++// TR*16 lanes sum the 16 K parts of each half and combine them with the rows' scales.
++//   part [NSG][16 lanes][16 rows], ssp [NSG][16 rows]
++// The scales are computed by the reducing lane itself (its row t), in round j = 0, and kept in
++// sc / sm (the caller's). Rounds J0 .. J1-1; the rows' sums go to local memory with round 0.
++#define LC_REDUCE_TILE(TR, ACC, J0, J1)                                                      \
++    {                                                                                        \
++        if ((J0) == 0 && lane == 0) {                                                        \
++            for (int t = 0; t < TR; ++t) ssp[sg*16 + t] = ss[t];                              \
++        }                                                                                    \
++        for (int j = (J0); j < (J1); ++j) {                                                  \
++            _Pragma("unroll")                                                                \
++            for (int t = 0; t < TR; ++t) part[(sg*16 + lane)*16 + t] = ACC(j, t);             \
++            barrier(CLK_LOCAL_MEM_FENCE);                                                    \
++            if (lid < TR*16) {                                                               \
++                const int t = lid / 16;                                                      \
++                const int n = lid % 16;                                                      \
++                if (j == 0) {                                                                \
++                    float qc = 0.0f, qm = 0.0f;                                              \
++                    for (int p = 0; p < LC_HALF; ++p) {                                      \
++                        qc += ssp[p*16 + t];                                                 \
++                        qm += ssp[(LC_HALF + p)*16 + t];                                     \
++                    }                                                                        \
++                    sc = 1.0f/sqrt(qc/(float) D + eps);                                      \
++                    sm = 1.0f/sqrt(qm/(float) D + eps);                                      \
++                    if (LOOP_CONTROL_RED == 2) sm = sc;                                      \
++                }                                                                            \
++                float A = 0.0f, B = 0.0f;                                                    \
++                for (int p = 0; p < LC_HALF; ++p) {                                          \
++                    A += part[(p*16 + n)*16 + t];                                            \
++                }                                                                            \
++                for (int p = 0; p < LC_HALF - (LOOP_CONTROL_RED == 4 ? 1 : 0); ++p) {        \
++                    B += part[((LC_HALF + p)*16 + n)*16 + t];                                \
++                }                                                                            \
++                if (t < tvalid) gst[t*LC_RANK + 16*j + n] = sc*A + sm*B;                     \
++            }                                                                                \
++            barrier(CLK_LOCAL_MEM_FENCE);                                                    \
++        }                                                                                    \
++    }
++
++// the combine, in the chain's node order (mul, sub, mul, add); one row's column d
++#if LOOP_CONTROL_RED == 1
++#define LC_TG(ag) tanh(ag)
++#define LC_OUT(c, m, tg, tf) ((c) - (tg)*(c)) + (tf)*(m)
++#elif LOOP_CONTROL_RED == 3
++#define LC_TG(ag) (ag)
++#define LC_OUT(c, m, tg, tf) ((c) - (tf)*(c)) + (tg)*(m)
++#else
++#define LC_TG(ag) tanh(ag)
++#define LC_OUT(c, m, tg, tf) ((c) - (tf)*(c)) + (tg)*(m)
++#endif
++#define LC_COMBINE(ag, af, c, m, t)                                                          \
++    {                                                                                        \
++        const float tg_ = LC_TG(ag);                                                         \
++        const float tf_ = tanh(af);                                                          \
++        const float o_  = LC_OUT(c, m, tg_, tf_);                                            \
++        if ((t) < rb) {                                                                      \
++            ((global float *) (dst + (ulong) (row0 + (t))*nbd1))[d] = o_;                    \
++        }                                                                                    \
++    }
++
++#ifndef LC_BF16
++//------------------------------------------------------------------------------
++// f32 math
++//------------------------------------------------------------------------------
++// Phase A, one row tile of TR rows: chunks of 8 k. The cur / msg values are the same for every
++// lane of a sub-group (uniform loads: a row's 8 floats once, the FMA's scalar operand); the
++// weight rows are each lane's own (its 4 output columns). ss is uniform as well.
++#define LC_PHASE_A(TR)                                                                       \
++static void lc_phase_a_##TR(const global char * cur, ulong nbc1, const global char * msg,   \
++        ulong nbm1, const global char * down, ulong nbw1, int D, int nt, int rowbase,        \
++        int tvalid, float eps, local float * gst, local float * part, local float * ssp,     \
++        int sg, int lane, int lid) {                                                         \
++    const int hf    = sg / LC_HALF;                                                          \
++    const int kpart = D / LC_HALF;                                                           \
++    const int kbeg  = (sg % LC_HALF)*kpart;                                                  \
++    const global char * X = hf ? msg : cur;                                                \
++    const ulong ldx = hf ? nbm1 : nbc1;                                                    \
++    const global float * xr[TR];                                                             \
++    _Pragma("unroll")                                                                        \
++    for (int t = 0; t < TR; ++t) {                                                           \
++        const int row = min(rowbase + t, nt - 1);                                            \
++        xr[t] = (const global float *) (X + (ulong) row*ldx) + kbeg;                         \
++    }                                                                                        \
++    const global float * wr[4];                                                              \
++    _Pragma("unroll")                                                                        \
++    for (int j = 0; j < 4; ++j) {                                                            \
++        wr[j] = (const global float *) (down + (ulong) (lane + 16*j)*nbw1) + hf*D + kbeg;  \
++    }                                                                                        \
++    float acc[4][TR];                                                                        \
++    float ss[TR];                                                                            \
++    _Pragma("unroll")                                                                        \
++    for (int t = 0; t < TR; ++t) {                                                           \
++        ss[t] = 0.0f;                                                                        \
++        _Pragma("unroll")                                                                    \
++        for (int j = 0; j < 4; ++j) acc[j][t] = 0.0f;                                        \
++    }                                                                                        \
++    /* two chunks an iteration, ping-pong: chunk c+1's loads (B) are issued before chunk  */  \
++    /* c's FMAs (A), chunk c+2's (A) before c+1's (B). The loads are unconditional (the   */  \
++    /* index clamped: past the end the last chunk again, from cache, unused): a           */  \
++    /* conditional load made IGC copy the buffer at the branch's join, the copy waiting   */  \
++    /* on the load. What the ISA then shows (ocloc 26.27, tools/isa_pipeline.py): the A   */  \
++    /* loads are first waited for in the next iteration, after both halves' FMAs; IGC     */  \
++    /* sinks the B loads to just before the B FMAs (and a one-chunk loop-carried form     */  \
++    /* lost both). So the cur / msg rows LC_PF chunks ahead are prefetched to the cache   */  \
++    /* (uniform: one message a row a pair of chunks, 16 floats = a 64-byte line); the     */  \
++    /* weights are read by every work-group and sit in L2. The prefetch's chunk pair is   */  \
++    /* clamped to the slice's last pair (nc - 2; nc = n_embd/128 is even for every n_embd */  \
++    /* the rule accepts): at nc - 1 its 16 floats ran 8 floats past the K slice, 32 bytes */  \
++    /* past the tensor on the last row (review F2).                                       */  \
++    float8 xa[TR], xb[TR], wa[4], wb[4];                                                     \
++    const int nc = kpart/8;                                                                  \
++    _Pragma("unroll")                                                                        \
++    for (int t = 0; t < TR; ++t) xa[t] = vload8(0, xr[t]);                                   \
++    _Pragma("unroll")                                                                        \
++    for (int j = 0; j < 4; ++j) wa[j] = vload8(0, wr[j]);                                    \
++    for (int c = 0; c < nc; c += 2) {                                                        \
++        const int c1 = min(c + 1, nc - 1), c2 = min(c + 2, nc - 1), cp = min(c + LC_PF, nc - 2); \
++        _Pragma("unroll")                                                                    \
++        for (int t = 0; t < TR; ++t) prefetch(xr[t] + cp*8, 16);                             \
++        _Pragma("unroll")                                                                    \
++        for (int t = 0; t < TR; ++t) xb[t] = vload8(c1, xr[t]);                              \
++        _Pragma("unroll")                                                                    \
++        for (int j = 0; j < 4; ++j) wb[j] = vload8(c1, wr[j]);                               \
++        LC_FMA_A32(TR, xa, wa)                                                               \
++        _Pragma("unroll")                                                                    \
++        for (int t = 0; t < TR; ++t) xa[t] = vload8(c2, xr[t]);                              \
++        _Pragma("unroll")                                                                    \
++        for (int j = 0; j < 4; ++j) wa[j] = vload8(c2, wr[j]);                               \
++        if (c + 1 < nc) {                                                                    \
++            LC_FMA_A32(TR, xb, wb)                                                           \
++        }                                                                                    \
++    }                                                                                        \
++    float sc = 0.0f, sm = 0.0f;                                                              \
++    LC_REDUCE_TILE(TR, LC_ACC32, 0, 4)                                                       \
++}
++
++#define LC_FMA_A32(TR, XB, WB)                                                               \
++    _Pragma("unroll")                                                                        \
++    for (int t = 0; t < TR; ++t) {                                                           \
++        _Pragma("unroll")                                                                    \
++        for (int kk = 0; kk < 8; ++kk) {                                                     \
++            const float xv = XB[t][kk];                                                      \
++            ss[t] = fma(xv, xv, ss[t]);                                                      \
++            _Pragma("unroll")                                                                \
++            for (int j = 0; j < 4; ++j) acc[j][t] = fma(WB[j][kk], xv, acc[j][t]);           \
++        }                                                                                    \
++    }
++
++#define LC_ACC32(j, t) acc[j][t]
++
++LC_PHASE_A(16)
++LC_PHASE_A(8)
++#define LC_TILE 16
++
++// Phase B, one item: columns d = 16 group + lane, rows [ra, rb) of the work-group's rows, in
++// blocks of 4. The g row is uniform (local memory, the same address for every lane), cur, msg
++// and out are each lane's own column.
++#define LC_PB 2
++#define LC_LOAD_B32(G, C, M, t0)                                                             \
++    _Pragma("unroll")                                                                        \
++    for (int i = 0; i < LC_PB; ++i) {                                                        \
++        const int tt = min((t0) + i, rb - 1);                                                \
++        _Pragma("unroll")                                                                    \
++        for (int q = 0; q < 8; ++q) G[i][q] = vload8(q, gst + tt*LC_RANK);                   \
++        C[i] = ((const global float *) (cur + (ulong) (row0 + tt)*nbc1))[d];                 \
++        M[i] = ((const global float *) (msg + (ulong) (row0 + tt)*nbm1))[d];                 \
++    }
++#define LC_COMP_B32(G, C, M, t0)                                                             \
++    _Pragma("unroll")                                                                        \
++    for (int i = 0; i < LC_PB; ++i) {                                                        \
++        float ag = 0.0f, af = 0.0f;                                                          \
++        _Pragma("unroll")                                                                    \
++        for (int q = 0; q < 8; ++q) {                                                        \
++            _Pragma("unroll")                                                                \
++            for (int e = 0; e < 8; ++e) {                                                    \
++                ag = fma(wg[q][e], G[i][q][e], ag);                                          \
++                af = fma(wf[q][e], G[i][q][e], af);                                          \
++            }                                                                                \
++        }                                                                                    \
++        LC_COMBINE(ag, af, C[i], M[i], (t0) + i)                                             \
++    }
++
++static void lc_phase_b(const global char * cur, ulong nbc1, const global char * msg, ulong nbm1,
++        const global char * gain, ulong nbg1, const global char * forget, ulong nbf1,
++        global char * dst, ulong nbd1, int D, int row0, int nrows, int rsplit,
++        local const float * gst, int sg, int lane) {
++    const int ngr    = D / 16;
++    const int nitems = ngr*rsplit;
++    const int rchunk = (nrows + rsplit - 1)/rsplit;
++    for (int it = sg; it < nitems; it += LC_NSG) {
++        const int gi = it % ngr;
++        const int ra = (it / ngr)*rchunk;
++        const int rb = min(nrows, ra + rchunk);
++        if (ra >= rb) {
++            continue;
++        }
++        const int d = gi*16 + lane;
++        float8 wg[8], wf[8];
++        const global float * pg = (const global float *) (gain   + (ulong) d*nbg1);
++        const global float * pf = (const global float *) (forget + (ulong) d*nbf1);
++        _Pragma("unroll")
++        for (int q = 0; q < 8; ++q) {
++            wg[q] = vload8(q, pg);
++            wf[q] = vload8(q, pf);
++        }
++        // ping-pong as phase A, the loads unconditional (LC_LOAD_B32 clamps its rows), and
++        // the cur / msg rows four blocks ahead prefetched to the cache (the second half's
++        // loads are sunk to their use, as in phase A)
++        float8 Ga[LC_PB][8], Gb[LC_PB][8];
++        float  Ca[LC_PB], Cb[LC_PB], Ma[LC_PB], Mb[LC_PB];
++        LC_LOAD_B32(Ga, Ca, Ma, ra)
++        for (int t0 = ra; t0 < rb; t0 += 2*LC_PB) {
++            _Pragma("unroll")
++            for (int i = 0; i < 2*LC_PB; ++i) {
++                const int tp = min(t0 + 4*LC_PB + i, rb - 1);
++                prefetch((const global float *) (cur + (ulong) (row0 + tp)*nbc1) + d, 1);
++                prefetch((const global float *) (msg + (ulong) (row0 + tp)*nbm1) + d, 1);
++            }
++            LC_LOAD_B32(Gb, Cb, Mb, t0 + LC_PB)
++            LC_COMP_B32(Ga, Ca, Ma, t0)
++            LC_LOAD_B32(Ga, Ca, Ma, t0 + 2*LC_PB)
++            if (t0 + LC_PB < rb) {
++                LC_COMP_B32(Gb, Cb, Mb, t0 + LC_PB)
++            }
++        }
++    }
++}
++
++#else
++//------------------------------------------------------------------------------
++// bf16 math (DPAS)
++//------------------------------------------------------------------------------
++// Phase A, one row tile of TR rows (TR/8 DPAS row blocks): chunks of 16 k. Lane i holds
++// x[t][k0 + i] (the a operand's k = i) of each row and the 16 k of its 4 weight rows
++// (the b operand's column n = lane); the sums of squares are lane partials, reduced over the
++// sub-group at the tile's end.
++#define LC_PHASE_A(TR)                                                                       \
++static void lc_phase_a_##TR(const global char * cur, ulong nbc1, const global char * msg,   \
++        ulong nbm1, const global char * down, ulong nbw1, int D, int nt, int rowbase,        \
++        int tvalid, float eps, local float * gst, local float * part, local float * ssp,     \
++        int sg, int lane, int lid) {                                                         \
++    const int hf    = sg / LC_HALF;                                                          \
++    const int kpart = D / LC_HALF;                                                           \
++    const int kbeg  = (sg % LC_HALF)*kpart;                                                  \
++    const global char * X = hf ? msg : cur;                                                \
++    const ulong ldx = hf ? nbm1 : nbc1;                                                    \
++    const global float * xr[TR];                                                             \
++    _Pragma("unroll")                                                                        \
++    for (int t = 0; t < TR; ++t) {                                                           \
++        const int row = min(rowbase + t, nt - 1);                                            \
++        xr[t] = (const global float *) (X + (ulong) row*ldx) + kbeg;   /* uniform */                  \
++    }                                                                                        \
++    /* two passes over the K slice, output columns j = 2 jp, 2 jp + 1 each: the register  */  \
++    /* set of one pass (accumulators, the next chunk's raw loads, the packed operands)    */  \
++    /* fits 256 GRF, the four-column set did not (IGC's retry); the second pass re-reads   */  \
++    /* the sub-group's own x slice (16 rows x kpart floats, from cache)                   */  \
++    float sc = 0.0f, sm = 0.0f;                                                              \
++    for (int jp = 0; jp < 2; ++jp) {                                                         \
++        float8 accb[2][TR/8];                                                                \
++        float ssl[TR];                                                                       \
++        _Pragma("unroll")                                                                    \
++        for (int t = 0; t < TR; ++t) ssl[t] = 0.0f;                                          \
++        _Pragma("unroll")                                                                    \
++        for (int jj = 0; jj < 2; ++jj) {                                                     \
++            _Pragma("unroll")                                                                \
++            for (int mb = 0; mb < TR/8; ++mb) LC_ZERO8(accb[jj][mb]);                        \
++        }                                                                                    \
++        /* one raw buffer in flight (the next chunk's f32 loads, issued before this       */  \
++        /* chunk's DPAS) and one packed buffer (this chunk's bf16 operands, packed after  */  \
++        /* its loads arrive, i.e. after the previous chunk's DPAS)                         */  \
++        const global float * wq[2];   /* this pass's two weight rows, constant indices */  \
++        _Pragma("unroll")                                                                    \
++        for (int jj = 0; jj < 2; ++jj) {                                                     \
++            wq[jj] = (const global float *) (down + (ulong) (lane + 16*(2*jp + jj))*nbw1) + hf*D + kbeg; \
++        }                                                                                    \
++        float xn[TR];                                                                        \
++        float16 wn[2];                                                                       \
++        short8 pa[TR/8];                                                                     \
++        int8 pb[2];                                                                          \
++        const int nc = kpart/16;                                                             \
++        _Pragma("unroll")                                                                    \
++        for (int t = 0; t < TR; ++t) xn[t] = xr[t][lane];                                    \
++        _Pragma("unroll")                                                                    \
++        for (int jj = 0; jj < 2; ++jj) wn[jj] = vload16(0, wq[jj]);                   \
++        LC_PACK_A(TR)                                                                        \
++        for (int c = 0; c < nc; ++c) {                                                       \
++            /* unconditional (clamped) loads, as in the f32 build */                         \
++            const int c1 = min(c + 1, nc - 1);                                               \
++            /* a chunk is two DPAS: too little to cover a load's latency (the ISA: the      */ \
++            /* next chunk's data waited for after <= 8 compute instructions), so the rows   */ \
++            /* LC_PD chunks ahead are prefetched to the cache, no registers                 */ \
++            const int cp = min(c + LC_PD, nc - 1);                                           \
++            _Pragma("unroll")                                                                \
++            for (int t = 0; t < TR; ++t) prefetch(xr[t] + cp*16 + lane, 1);                  \
++            _Pragma("unroll")                                                                \
++            for (int jj = 0; jj < 2; ++jj) prefetch(wq[jj] + cp*16, 16);                     \
++            _Pragma("unroll")                                                                \
++            for (int t = 0; t < TR; ++t) xn[t] = xr[t][c1*16 + lane];                        \
++            _Pragma("unroll")                                                                \
++            for (int jj = 0; jj < 2; ++jj) wn[jj] = vload16(c1, wq[jj]);                     \
++            _Pragma("unroll")                                                                \
++            for (int jj = 0; jj < 2; ++jj) {                                                 \
++                _Pragma("unroll")                                                            \
++                for (int mb = 0; mb < TR/8; ++mb) {                                          \
++                    accb[jj][mb] = intel_sub_group_bf16_bf16_matrix_mad_k16(pa[mb], pb[jj], accb[jj][mb]); \
++                }                                                                            \
++            }                                                                                \
++            if (c + 1 < nc) {                                                                \
++                LC_PACK_A(TR)                                                                \
++            }                                                                                \
++        }                                                                                    \
++        float ss[TR];                                                                        \
++        _Pragma("unroll")                                                                    \
++        for (int t = 0; t < TR; ++t) ss[t] = jp == 0 ? sub_group_reduce_add(ssl[t]) : 0.0f;  \
++        const int jbase = 2*jp;                                                              \
++        LC_REDUCE_TILE(TR, LC_ACCB, jbase, jbase + 2)                                        \
++    }                                                                                        \
++}
++
++// pack the raw chunk (xn, wn) into the DPAS operands (pa, pb); the sums of squares take the
++// f32 values
++#define LC_PACK_A(TR)                                                                        \
++    _Pragma("unroll")                                                                        \
++    for (int t = 0; t < TR; ++t) {                                                           \
++        ssl[t] = fma(xn[t], xn[t], ssl[t]);                                                  \
++        pa[t/8][t%8] = (short) lc_bf16(xn[t]);                                               \
++    }                                                                                        \
++    _Pragma("unroll")                                                                        \
++    for (int jj = 0; jj < 2; ++jj) {                                                         \
++        _Pragma("unroll")                                                                    \
++        for (int i = 0; i < 8; ++i) pb[jj][i] = lc_pack(wn[jj][2*i], wn[jj][2*i + 1]);       \
++    }
++
++#define LC_ACCB(j, t) accb[(j) - jbase][(t)/8][(t)%8]
++#ifndef LC_PD
++#define LC_PD 6
++#endif
++
++// 8-row tiles only in this build: with 16 (two DPAS row blocks) IGC's first compile spilled
++// 1,472-1,984 bytes beside phase B and its retry rolled the loops into private memory (ocloc
++// 26.27, bmg-g21); the f32 build keeps 16
++LC_PHASE_A(8)
++#define LC_TILE 8
++
++// Phase B, one item: columns d = 16 group + lane, rows [ra, rb) in blocks of 8 (one DPAS row
++// block). The a operand is g (lane i: k = r = 16 s + i, from local memory), the b operands are
++// the lane's gain and forget weight rows, packed once for the item.
++#define LC_PB 8
++// the next block's g rows (local memory) into the raw set, and a prefetch (to the cache, no
++// registers) of its cur / msg rows: the bf16 build's register set holds the packed weights
++// (64 GRF) and the DPAS operands, and a raw cur / msg set beside them made IGC spill
++#define LC_LOAD_BB(G, t0)                                                                    \
++    _Pragma("unroll")                                                                        \
++    for (int m = 0; m < LC_PB; ++m) {                                                        \
++        const int tt = min((t0) + m, rb - 1);                                                \
++        _Pragma("unroll")                                                                    \
++        for (int s = 0; s < 4; ++s) G[s][m] = gst[tt*LC_RANK + 16*s + lane];                 \
++        prefetch((const global float *) (cur + (ulong) (row0 + tt)*nbc1) + d, 1);            \
++        prefetch((const global float *) (msg + (ulong) (row0 + tt)*nbm1) + d, 1);            \
++    }
++// pack the raw rows (G: g in f32) into the a operands; the raw set is then free
++#define LC_PACK_BB(G)                                                                        \
++    _Pragma("unroll")                                                                        \
++    for (int s = 0; s < 4; ++s) {                                                            \
++        _Pragma("unroll")                                                                    \
++        for (int m = 0; m < 8; ++m) pa[s][m] = (short) lc_bf16(G[s][m]);                     \
++    }
++#define LC_COMP_BB(t0)                                                                       \
++    {                                                                                        \
++        float8 ag, af;                                                                       \
++        LC_ZERO8(ag);                                                                        \
++        LC_ZERO8(af);                                                                        \
++        _Pragma("unroll")                                                                    \
++        for (int s = 0; s < 4; ++s) {                                                        \
++            ag = intel_sub_group_bf16_bf16_matrix_mad_k16(pa[s], bg[s], ag);                 \
++            af = intel_sub_group_bf16_bf16_matrix_mad_k16(pa[s], bf[s], af);                 \
++        }                                                                                    \
++        _Pragma("unroll")                                                                    \
++        for (int m = 0; m < LC_PB; ++m) {                                                    \
++            const int tt = min((t0) + m, rb - 1);                                            \
++            const float cv = ((const global float *) (cur + (ulong) (row0 + tt)*nbc1))[d];   \
++            const float mv = ((const global float *) (msg + (ulong) (row0 + tt)*nbm1))[d];   \
++            LC_COMBINE(ag[m], af[m], cv, mv, (t0) + m)                                       \
++        }                                                                                    \
++    }
++
++static void lc_phase_b(const global char * cur, ulong nbc1, const global char * msg, ulong nbm1,
++        const global char * gain, ulong nbg1, const global char * forget, ulong nbf1,
++        global char * dst, ulong nbd1, int D, int row0, int nrows, int rsplit,
++        local const float * gst, int sg, int lane) {
++    const int ngr    = D / 16;
++    const int nitems = ngr*rsplit;
++    const int rchunk = (nrows + rsplit - 1)/rsplit;
++    for (int it = sg; it < nitems; it += LC_NSG) {
++        const int gi = it % ngr;
++        const int ra = (it / ngr)*rchunk;
++        const int rb = min(nrows, ra + rchunk);
++        if (ra >= rb) {
++            continue;
++        }
++        const int d = gi*16 + lane;
++        int8 bg[4], bf[4];
++        const global float * pg = (const global float *) (gain   + (ulong) d*nbg1);
++        const global float * pf = (const global float *) (forget + (ulong) d*nbf1);
++        _Pragma("unroll")
++        for (int s = 0; s < 4; ++s) {
++            const float16 vg = vload16(s, pg);
++            const float16 vf = vload16(s, pf);
++            _Pragma("unroll")
++            for (int i = 0; i < 8; ++i) {
++                bg[s][i] = lc_pack(vg[2*i], vg[2*i + 1]);
++                bf[s][i] = lc_pack(vf[2*i], vf[2*i + 1]);
++            }
++        }
++        // the next block's g loads and cur / msg prefetches are issued before this block's
++        // DPAS; the current block computes from its packed operands (pa)
++        float  G[4][LC_PB];
++        short8 pa[4];
++        LC_LOAD_BB(G, ra)
++        LC_PACK_BB(G)
++        for (int t0 = ra; t0 < rb; t0 += LC_PB) {
++            LC_LOAD_BB(G, t0 + LC_PB)   // unconditional: LC_LOAD_BB clamps its rows
++            LC_COMP_BB(t0)
++            if (t0 + LC_PB < rb) {
++                LC_PACK_BB(G)
++            }
++        }
++    }
++}
++#endif
++
++LC_REQD_SG
++kernel void kernel_loop_control(
++        global const char * cur,
++        ulong               offc,
++        ulong               nbc1,
++        global const char * msg,
++        ulong               offm,
++        ulong               nbm1,
++        global const char * down,
++        ulong               offw,
++        ulong               nbw1,
++        global const char * gain,
++        ulong               offg,
++        ulong               nbg1,
++        global const char * forget,
++        ulong               offf,
++        ulong               nbf1,
++        global char *       dst,
++        ulong               offd,
++        ulong               nbd1,
++        int                 ne0,
++        int                 nt,
++        int                 rows_wg,
++        int                 rsplit,
++        float               eps,
++        local float *       slm
++) {
++    cur    = cur    + offc;
++    msg    = msg    + offm;
++    down   = down   + offw;
++    gain   = gain   + offg;
++    forget = forget + offf;
++    dst    = dst    + offd;
++
++    const int D     = ne0;
++    const int lid   = (int) get_local_id(0);
++    const int sg    = LC_SGID();
++    const int lane  = LC_LANE();
++    const int row0  = (int) get_group_id(0)*rows_wg;
++    const int nrows = min(rows_wg, nt - row0);
++
++    local float * gst  = slm;                                // [rows_wg][64]
++    local float * part = slm + rows_wg*LC_RANK;              // [NSG][16][16]
++    local float * ssp  = part + LC_NSG*16*16;                // [NSG][16]
++
++    // phase A: g for the work-group's rows, tile by tile (the branch is uniform over the
++    // work-group, so every barrier inside is reached by every lane)
++    for (int t0 = 0; t0 < nrows; t0 += LC_TILE) {
++        const int tvalid = min(LC_TILE, nrows - t0);
++#if LC_TILE == 16
++        if (tvalid > 8) {
++            lc_phase_a_16(cur, nbc1, msg, nbm1, down, nbw1, D, nt, row0 + t0, tvalid, eps,
++                          gst + t0*LC_RANK, part, ssp, sg, lane, lid);
++        } else
++#endif
++        {
++            lc_phase_a_8(cur, nbc1, msg, nbm1, down, nbw1, D, nt, row0 + t0, tvalid, eps,
++                         gst + t0*LC_RANK, part, ssp, sg, lane, lid);
++        }
++    }
++    // the reduction's last barrier also orders the g store before phase B reads it
++
++    // phase B: the up products, tanh and the combine, out written once
++    lc_phase_b(cur, nbc1, msg, nbm1, gain, nbg1, forget, nbf1, dst, nbd1, D, row0, nrows, rsplit,
++               gst, sg, lane);
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index c7077b4..488323c 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1114,9 +1114,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "GLU",
+     "ROPE_APPLY",
+     "GATED_DELTA_NET_REPLAY",
++    "LOOP_CONTROL",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1233,9 +1234,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "glu(x)",
+     "rope_apply(x,pe)",
+     "gated_delta_net_replay(q, k, v, g, beta, s, rec, ctrl)",
++    "loop_control(cur, msg, down, gain, forget)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
++static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -4373,6 +4375,148 @@ struct ggml_tensor * ggml_depth_mix(
+     return result;
+ }
+ 
++// 0221: the loop controller's rule, switch, plan and constructor (ggml.h)
++const char * ggml_loop_control_refuse(const struct ggml_tensor * cur, const struct ggml_tensor * msg,
++                                      const struct ggml_tensor * down, const struct ggml_tensor * gain,
++                                      const struct ggml_tensor * forget) {
++    if (cur == NULL || msg == NULL || down == NULL || gain == NULL || forget == NULL) {
++        return "missing";
++    }
++    if (cur->type != GGML_TYPE_F32 || msg->type != GGML_TYPE_F32 || down->type != GGML_TYPE_F32 ||
++        gain->type != GGML_TYPE_F32 || forget->type != GGML_TYPE_F32) {
++        return "not-f32";
++    }
++    const int64_t n_embd = cur->ne[0];
++    const int64_t rank   = GGML_LOOP_CONTROL_RANK;
++    if (n_embd <= 0 || n_embd % 256 != 0) {
++        return "d-lanes";   // 16 K-split parts of a half, each a whole number of 16-wide chunks
++    }
++    if (cur->ne[1] < 1 || cur->ne[2] != 1 || cur->ne[3] != 1) {
++        return "cur-shape";
++    }
++    if (cur->nb[0] != sizeof(float) || cur->nb[1] < (size_t) n_embd*sizeof(float) || cur->nb[1] % sizeof(float) != 0) {
++        return "cur-stride";   // rows contiguous, any row step at or past a row
++    }
++    if (msg->ne[0] != n_embd || msg->ne[1] != cur->ne[1] || msg->ne[2] != 1 || msg->ne[3] != 1) {
++        return "msg-shape";
++    }
++    if (msg->nb[0] != sizeof(float) || msg->nb[1] < (size_t) n_embd*sizeof(float) || msg->nb[1] % sizeof(float) != 0) {
++        return "msg-stride";
++    }
++    if (down->ne[0] != 2*n_embd || down->ne[2] != 1 || down->ne[3] != 1) {
++        return "down-shape";
++    }
++    if (down->ne[1] != rank || gain->ne[0] != rank || forget->ne[0] != rank) {
++        return "rank";   // the kernel's lanes x 4 output columns of the down product
++    }
++    if (!ggml_is_contiguous(down)) {
++        return "down-stride";
++    }
++    if (gain->ne[1] != n_embd || gain->ne[2] != 1 || gain->ne[3] != 1 || !ggml_is_contiguous(gain)) {
++        return "gain-shape";
++    }
++    if (forget->ne[1] != n_embd || forget->ne[2] != 1 || forget->ne[3] != 1 || !ggml_is_contiguous(forget)) {
++        return "forget-shape";
++    }
++    return NULL;
++}
++
++int ggml_loop_control_mode(const char * env_value) {
++    if (env_value == NULL || strcmp(env_value, "0") == 0 || strcmp(env_value, "off") == 0) {
++        return 0;
++    }
++    if (strcmp(env_value, "bf16") == 0) {
++        return 2;
++    }
++    if (strcmp(env_value, "1") == 0 || strcmp(env_value, "f32") == 0 || strcmp(env_value, "all-layers") == 0) {
++        return 1;
++    }
++    return -1;   // not a value: the callers keep the arm off and say so (a mistyped "BF16" must not run f32)
++}
++
++bool ggml_loop_control_all_layers(const char * env_value) {
++    return env_value != NULL && strcmp(env_value, "all-layers") == 0;
++}
++
++void ggml_loop_control_plan_make(const struct ggml_tensor * dst, int n_cores, struct ggml_loop_control_plan * plan) {
++    const struct ggml_tensor * cur    = dst->src[0];
++    const struct ggml_tensor * msg    = dst->src[1];
++    const struct ggml_tensor * down   = dst->src[2];
++    const struct ggml_tensor * gain   = dst->src[3];
++    const struct ggml_tensor * forget = dst->src[4];
++
++    plan->ne0  = (int) cur->ne[0];
++    plan->nt   = (int) cur->ne[1];
++    plan->rank = (int) down->ne[1];
++    plan->lsz  = GGML_LOOP_CONTROL_NSG*GGML_LOOP_CONTROL_SG;
++
++    // one work-group a core and one wave where the rows allow it (P26's lesson): a work-group
++    // owns ceil(nt / cores) rows rounded up to 8, at most ROWS_MAX (its g store in local memory)
++    const int cores = n_cores > 0 ? n_cores : 1;
++    int rows = (plan->nt + cores - 1)/cores;
++    rows = (rows + 7)/8*8;
++    if (rows > GGML_LOOP_CONTROL_ROWS_MAX) {
++        rows = GGML_LOOP_CONTROL_ROWS_MAX;
++    }
++    plan->rows_wg = rows;
++    plan->n_wg    = (plan->nt + rows - 1)/rows;
++
++    // phase B hands (16-column group, row range) items round robin to the sub-groups: split the
++    // rows so that the item count is a multiple of NSG where a split of at most 4 reaches it
++    const int ngr = plan->ne0/16;
++    int rs = 1;
++    while (rs < 4 && (ngr*rs) % GGML_LOOP_CONTROL_NSG != 0) {
++        rs++;
++    }
++    if ((ngr*rs) % GGML_LOOP_CONTROL_NSG != 0) {
++        rs = ngr >= GGML_LOOP_CONTROL_NSG ? 1 : 2;
++    }
++    plan->rsplit = rs;
++
++    plan->nbc1 = cur->nb[1];
++    plan->nbm1 = msg->nb[1];
++    plan->nbd1 = dst->nb[1];
++    plan->nbw1 = down->nb[1];
++    plan->nbg1 = gain->nb[1];
++    plan->nbf1 = forget->nb[1];
++
++    const uint64_t row = (uint64_t) plan->ne0*sizeof(float);
++    plan->reach_cur    = (uint64_t) (plan->nt - 1)*plan->nbc1 + row;
++    plan->reach_msg    = (uint64_t) (plan->nt - 1)*plan->nbm1 + row;
++    plan->reach_dst    = (uint64_t) (plan->nt - 1)*plan->nbd1 + row;
++    plan->reach_down   = (uint64_t) (plan->rank - 1)*plan->nbw1 + 2*row;
++    plan->reach_gain   = (uint64_t) (plan->ne0 - 1)*plan->nbg1 + (uint64_t) plan->rank*sizeof(float);
++    plan->reach_forget = (uint64_t) (plan->ne0 - 1)*plan->nbf1 + (uint64_t) plan->rank*sizeof(float);
++
++    plan->local_floats = (uint64_t) rows*GGML_LOOP_CONTROL_RANK +
++                         (uint64_t) GGML_LOOP_CONTROL_NSG*GGML_LOOP_CONTROL_SG*16 +
++                         (uint64_t) GGML_LOOP_CONTROL_NSG*16;
++}
++
++struct ggml_tensor * ggml_loop_control(
++    struct ggml_context * ctx,
++    struct ggml_tensor  * cur,
++    struct ggml_tensor  * msg,
++    struct ggml_tensor  * down,
++    struct ggml_tensor  * gain,
++    struct ggml_tensor  * forget,
++    float                 eps) {
++    GGML_ASSERT(ggml_loop_control_refuse(cur, msg, down, gain, forget) == NULL);
++
++    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cur->ne[0], cur->ne[1]);
++
++    ggml_set_op_params_f32(result, 0, eps);
++
++    result->op     = GGML_OP_LOOP_CONTROL;
++    result->src[0] = cur;
++    result->src[1] = msg;
++    result->src[2] = down;
++    result->src[3] = gain;
++    result->src[4] = forget;
++
++    return result;
++}
++
+ struct ggml_tensor * ggml_clamp_inplace(
+     struct ggml_context * ctx,
+     struct ggml_tensor  * a,
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 723dd0f..d6fdaaa 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -335,8 +335,87 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+     return ggml_scale(ctx0, ggml_add(ctx0, cur, out), 1.0f/sqrtf((dynamic ? 2 : 1)*n_conv + 1));
+ }
+ 
++// 0221: the loop controller's arm. GGML_OPENCL_LOOP_CONTROL set (ggml_loop_control_mode != 0)
++// emits one ggml_loop_control for a prompt batch (more than 8 rows) on a layer whose backend
++// declares the op (GGML_LOOP_CONTROL_CAPABILITY_PROC through its registry; the FA port's layer
++// guard, fa_port_layer_attaches): every other layer - the CPU, another GPU backend, a remote
++// one, no device - keeps the chain, so a CPU-only run with the knob set builds the graph it
++// builds without it. The value "all-layers" lifts the guard (the device-free knob-on check, the
++// CPU serving the op with its reference, and the guard's red). Unset, this is never reached and
++// the chain below is today's graph node for node.
++static int inkling2_loop_control_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_OPENCL_LOOP_CONTROL");
++        const int m = ggml_loop_control_mode(e);
++        if (m < 0) {
++            LLAMA_LOG_WARN("GGML_OPENCL_LOOP_CONTROL=%s is not a value (0, off, 1, f32, bf16, all-layers): the chain is emitted\n", e);
++            return 0;
++        }
++        return m;
++    }();
++    return mode;
++}
++static bool inkling2_loop_control_all_layers() {
++    static const bool all = ggml_loop_control_all_layers(getenv("GGML_OPENCL_LOOP_CONTROL"));
++    return all;
++}
++static bool inkling2_loop_control_layer_attaches(ggml_backend_dev_t dev) {
++    if (inkling2_loop_control_all_layers()) {
++        return true;
++    }
++    if (dev == nullptr) {
++        return false;
++    }
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    return reg != nullptr && ggml_backend_reg_get_proc_address(reg, GGML_LOOP_CONTROL_CAPABILITY_PROC) != nullptr;
++}
++// a DOWNGRADE line a reason (and a device for the layer guard), the first few graph builds:
++// the first builds of a context (the memory-fit passes) run with the log off, as the FA port's
++static void inkling2_loop_control_refused(const void * gf, const std::string & key) {
++    static std::mutex said_mu;
++    static std::map<std::string, std::pair<const void *, int>> said;
++    bool say = false;
++    {
++        std::lock_guard<std::mutex> lock(said_mu);
++        auto & e = said[key];
++        if (e.first != gf && e.second < 6) {
++            e.first = gf; e.second++;
++            say = true;
++        }
++    }
++    if (say) {
++        LLAMA_LOG_WARN("DOWNGRADE src=llama op=LOOP_CONTROL path=chain %s\n", key.c_str());
++    }
++}
++
+ // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
+-ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
++ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl, int il) {
++    if (inkling2_loop_control_mode() != 0 && n_tokens > 8) {
++        ggml_tensor * w[3] = { loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl] };
++        // the chain's products go through build_lora_mm: an adapter, a Hadamard rotation or a
++        // precision entry on one of the three weights changes them, so the chain serves those
++        const char * plain = nullptr;
++        for (ggml_tensor * t : w) {
++            for (const auto & lora : *loras) {
++                if (lora.first->get_weight(t) != nullptr) plain = "lora";
++            }
++            if (hdmd && hdmd->rot.find(t) != hdmd->rot.end()) plain = "hadamard";
++            if (prec_policy && (prec_policy->prec_acc.count(t) || prec_policy->prec_src1.count(t))) plain = "prec";
++        }
++        ggml_backend_dev_t dev = model.dev_layer(il);
++        if (plain != nullptr) {
++            inkling2_loop_control_refused(gf, std::string("reason=") + plain);
++        } else if (!inkling2_loop_control_layer_attaches(dev)) {
++            inkling2_loop_control_refused(gf, std::string("reason=layer-backend device=") + (dev ? ggml_backend_dev_name(dev) : "none"));
++        } else {
++            const char * why = ggml_loop_control_refuse(cur, message, w[0], w[1], w[2]);
++            if (why == nullptr) {
++                return ggml_loop_control(ctx0, cur, message, w[0], w[1], w[2], 1e-6f);
++            }
++            inkling2_loop_control_refused(gf, std::string("reason=") + why);
++        }
++    }
++
+     ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
+     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
+ 
+@@ -413,7 +492,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+     if (messages) {
+         // the messages make the Q, K and V inputs of a SWA layer differ
+         for (int j = 0; j < 3; ++j) {
+-            inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j);
++            inputs[j] = control(inputs[j], message(LOOP_CTRL_Q + j), *loop, LOOP_CTRL_Q + j, il);
+         }
+     }
+ 
+@@ -588,7 +667,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
+     ggml_tensor * ffm = mix(blocks, cur, layer.ffn_res_query, nullptr, messages ? nullptr : layer.ffn_norm);
+     cur = ggml_reshape_2d(ctx0, ffm, n_embd, n_tokens);
+     if (messages) {
+-        cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN);
++        cur = control(cur, message(LOOP_CTRL_FFN), *loop, LOOP_CTRL_FFN, il);
+     }
+     if (!(ffm->op == GGML_OP_DEPTH_MIX && ffm->src[3] != nullptr)) {
+         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+diff --git a/src/models/models.h b/src/models/models.h
+index c33bd28..9630470 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -2311,7 +2311,7 @@ struct llama_model_inkling2 : public llama_model_base {
+                 ggml_tensor * history,
+                 llm_graph_input_rs * inp,
+                 int64_t offset);
+-        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
++        ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl, int il);
+ 
+     protected:
+         // the helpers alone, a derived graph builds its own body
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c3ff1b1..bd5cf74 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1571,6 +1571,11 @@ struct test_case {
+             if (ud->tc->err_tag() != nullptr) {
+                 printf("[%s] nmse = %.3g (bound %.3g) ", ud->tc->err_tag(), err, ud->tc->max_err(ud->backend1));
+             }
++            if (t1->op == GGML_OP_LOOP_CONTROL) {
++                // 0221: every loop-control row prints its error, pass or fail (its bound is
++                // stated before the card run)
++                printf("[%s] nmse = %.3g (bound %.3g) ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
++            }
+             if (t1->op == GGML_OP_DEPTH_MIX) {
+                 // 0207: the depth mix's error is printed for every case, pass or fail - its bound is
+                 // stated before the card run, and a passing line must carry the number it passed with
+@@ -7052,6 +7057,136 @@ struct test_depth_mix : public test_case {
+     }
+ };
+ 
++// 0221: GGML_OP_LOOP_CONTROL, Inkling 2 Mini's loop controller (the loop model's message merge).
++// mode 0: the op alone, against the CPU op (the card's op cases);
++// mode 1: the twin - the op and the unfused chain the model emits without the knob (rms_norm x2,
++//         concat, the three products, tanh x2, mul, sub, mul, add) on the same inputs in one
++//         graph, out = concat(op, chain); the error is the op against the chain ON THE SAME
++//         BACKEND (both halves of the backend's own output), and on the CPU the same pair;
++// mode 2: the chain alone (the perf list's knob-off arm).
++// The shapes are the model's: n_embd 2304, rank 64; cur / msg are a mix column's view
++// (view = 1: column 1 of a [2304, nt, 3] tensor, as ggml_depth_mix_column hands them) or plain
++// tensors. msg runs at 10x cur and the rows at amplitudes 0.25 .. 4, so both norms' scales
++// matter; the weights are bf16 values (as the model's F32 weights are) at scales that keep the
++// tanh arguments near 1, unsaturated, so every red moves the output.
++struct test_loop_control : public test_case {
++    const int64_t nt;
++    const int     mode;
++    const bool    view;
++
++    std::string vars() override {
++        return VARS_TO_STR3(nt, mode, view);
++    }
++
++    // the bound, stated before the card run (README 0221): f32 math 1e-6 (the op reorders the
++    // chain's sums only: the norms as scales after the down product, one K-split order); the
++    // bf16 build (GGML_OPENCL_LOOP_CONTROL=bf16) rounds the activations to bf16 and gets its own
++    double max_nmse_err() override {
++        const char * e = getenv("GGML_OPENCL_LOOP_CONTROL");
++        return ggml_loop_control_mode(e) == 2 ? 1e-4 : 1e-6;
++    }
++
++    bool run_whole_graph() override { return mode == 1; }
++
++    std::string op_desc(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return "LOOP_CONTROL";
++    }
++
++    double err(const float * a, const float * b, size_t n) override {
++        if (mode != 1) {
++            return nmse(a, b, n);
++        }
++        // the twin: op half against chain half of each backend's own result
++        const double ea = nmse(a, a + n/2, n/2);
++        const double eb = nmse(b, b + n/2, n/2);
++        printf("[LOOP_CONTROL twin] nmse op/chain backend = %.3g, cpu = %.3g ", ea, eb);
++        return std::max(ea, eb);
++    }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return (uint64_t) 2*nt*(2*2304*64 + 2*64*2304);
++    }
++
++    test_loop_control(int64_t nt = 1024, int mode = 0, bool view = false) : nt(nt), mode(mode), view(view) {}
++
++    void initialize_tensors(ggml_context * ctx) override {
++        std::mt19937 gen(2211);
++        std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
++        auto bf16 = [](float f) { uint32_t u; memcpy(&u, &f, 4); u &= 0xFFFF0000u; memcpy(&f, &u, 4); return f; };
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            const char * nm = t->name;
++            const bool is_cur = strcmp(nm, "cur_src") == 0, is_msg = strcmp(nm, "msg_src") == 0;
++            const bool is_w = strcmp(nm, "down") == 0 || strcmp(nm, "gain") == 0 || strcmp(nm, "forget") == 0;
++            if (!is_cur && !is_msg && !is_w) {
++                if (t->op == GGML_OP_NONE && t->view_src == nullptr && strcmp(nm, "cur") != 0 && strcmp(nm, "msg") != 0) {
++                    init_tensor_uniform(t);
++                }
++                continue;
++            }
++            std::vector<float> data((size_t) ggml_nelements(t));
++            if (is_w) {
++                const float a = strcmp(nm, "down") == 0 ? 0.03f : 0.2f;
++                for (float & v : data) v = bf16(a*dist(gen));
++            } else {
++                // rows (ne[1]) at amplitudes 0.25 .. 4, msg at ten times cur
++                const int64_t ne0 = t->ne[0], rows = ggml_nelements(t)/ne0;
++                for (int64_t r = 0; r < rows; ++r) {
++                    const float amp = (is_msg ? 10.0f : 1.0f)*0.25f*(float) (1 << ((r*7 + (is_msg ? 2 : 0)) % 5));
++                    for (int64_t e = 0; e < ne0; ++e) data[(size_t) (r*ne0 + e)] = amp*dist(gen);
++                }
++            }
++            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
++        }
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t d = 2304, rank = 64;
++        ggml_tensor * cur_src = view ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nt, 3) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
++        ggml_set_name(cur_src, "cur_src");
++        ggml_tensor * msg_src = view ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nt, 3) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
++        ggml_set_name(msg_src, "msg_src");
++        ggml_tensor * cur = view ? ggml_view_2d(ctx, cur_src, d, nt, cur_src->nb[1], 1*cur_src->nb[2]) : cur_src;
++        ggml_tensor * msg = view ? ggml_view_2d(ctx, msg_src, d, nt, msg_src->nb[1], 2*msg_src->nb[2]) : msg_src;
++        if (view) {
++            ggml_set_name(cur, "cur");
++            ggml_set_name(msg, "msg");
++        }
++        ggml_tensor * down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*d, rank);
++        ggml_set_name(down, "down");
++        ggml_tensor * gain   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, d);
++        ggml_set_name(gain, "gain");
++        ggml_tensor * forget = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, rank, d);
++        ggml_set_name(forget, "forget");
++
++        ggml_tensor * op = nullptr;
++        if (mode != 2) {
++            op = ggml_loop_control(ctx, cur, msg, down, gain, forget, 1e-6f);
++            ggml_set_name(op, "op");
++        }
++        ggml_tensor * chain = nullptr;
++        if (mode != 0) {
++            // src/models/inkling2.cpp control(), the knob-off chain node for node
++            ggml_tensor * gate = ggml_concat(ctx, ggml_rms_norm(ctx, cur, 1e-6f), ggml_rms_norm(ctx, msg, 1e-6f), 0);
++            gate = ggml_mul_mat(ctx, down, gate);
++            ggml_tensor * tg = ggml_tanh(ctx, ggml_mul_mat(ctx, gain,   gate));
++            ggml_tensor * tf = ggml_tanh(ctx, ggml_mul_mat(ctx, forget, gate));
++            chain = ggml_add(ctx, ggml_sub(ctx, cur, ggml_mul(ctx, tf, cur)), ggml_mul(ctx, tg, msg));
++            ggml_set_name(chain, "chain");
++        }
++        if (mode == 0) {
++            return op;
++        }
++        if (mode == 2) {
++            return chain;
++        }
++        ggml_tensor * out = ggml_concat(ctx, op, chain, 1);
++        ggml_set_name(out, "out");
++        return out;
++    }
++};
++
+ // GGML_OP_FLOOR
+ struct test_floor : public test_case {
+     const ggml_type type;
+@@ -10959,6 +11094,9 @@ struct test_generic_op : public test_case {
+             // 0207: a DEPTH_MIX line replayed from a graph export (--test-file) takes the bound
+             // the depth mix's own cases have (test_depth_mix), not the tool's 1e-7
+             return 1e-10;
++        case GGML_OP_LOOP_CONTROL:
++            // 0221: a replayed LOOP_CONTROL line takes test_loop_control's bound
++            return ggml_loop_control_mode(getenv("GGML_OPENCL_LOOP_CONTROL")) == 2 ? 1e-4 : 1e-6;
+         default:
+             return 1e-7;
+         }
+@@ -13510,6 +13648,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_depth_mix(5, 4, nt, 3, false, true));
+     }
+ 
++    // 0221: the loop controller at 1 .. 1,027 rows (a work-group's 8-row tail, the 16-row tiles'
++    // 8-row tail, more rows than one wave's work-groups hold at 1,027), plain and as a mix
++    // column's view, then the twin against the unfused chain at the same row counts
++    for (int64_t nt : {1, 7, 9, 16, 1024, 1027}) {
++        test_cases.emplace_back(new test_loop_control(nt, 0, false));
++        test_cases.emplace_back(new test_loop_control(nt, 0, true));
++    }
++    // a partial 16-row tile (tvalid 9..15) on the B60's 20 cores: 300 rows = 16 rows a group, the
++    // last group 12 (a tail ubatch reaches it; review F6)
++    test_cases.emplace_back(new test_loop_control(300, 0, true));
++    for (int64_t nt : {9, 1024, 1027}) {
++        test_cases.emplace_back(new test_loop_control(nt, 1, true));
++    }
++
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
+@@ -14749,6 +14901,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // 0221: the loop controller, the op (one launch) against the chain it replaces (12 launches)
++    for (int64_t nt : {1024, 1027}) {
++        test_cases.emplace_back(new test_loop_control(nt, 0, true));
++        test_cases.emplace_back(new test_loop_control(nt, 2, true));
++    }
++
+     // Inkling 2 Mini's depth mix as one launch a call - the shape it replaced is 8 nodes
+     for (int64_t k : {1, 4}) {
+         for (int64_t nt : {512, 2048}) {

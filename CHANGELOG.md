@@ -18,6 +18,13 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+- llama.cpp patch 0221 (opt-in, `GGML_OPENCL_LOOP_CONTROL=1|bf16`, default off): Inkling 2 Mini's loop controller as
+  one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
+  its 12-launch chain, for prompt batches. Unset, the graph is today's line for line. Built and checked offline and on
+  the CPU only; the card rows are owed (`contrib/llama.cpp/README.md`, 0221).
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn
