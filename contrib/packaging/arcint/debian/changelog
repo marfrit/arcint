@@ -1,3 +1,26 @@
+arcint (1.8.1-1) trixie; urgency=medium
+
+  * FIX: a checkpoint resume with a q8_0 or q4_0 K/V cache on the OpenCL
+    backend restored the cells' positions but not their bytes (a view
+    write into a q8_0 / q4_0 tensor returned without writing); on Inkling
+    2 Mini the sliding-window layers attended stale keys and values after
+    a resume. The write now lands (0209).
+  * NEW DEFAULTS: the spill guard refuses a start that does not fit the
+    card (--llama-allow-spill restores 1.8.0's start); admission by tier
+    (no architecture refused at load; Gemma 4 E4B, Granite 8B and Mistral
+    Small 24B become "runs"); request fields 1.8.0 ignored: 15 answer 400
+    where a silent loss would change the answer, 19 are ignored with one
+    warning per field; default-on OpenCL paths (0156-0159, 0167-0180).
+  * NEW: --llama-swa-window (the window-sized SWA cache with checkpoint
+    resume, 0153); Inkling 2 Mini's opt-in prefill switches
+    (GGML_OPENCL_KQ_MM_ID_I8_WIDE, GGML_OPENCL_CPY_TRANSPOSE,
+    GGML_OPENCL_FA_PORT with q8_0 K/V, GGML_OPENCL_DEPTH_MIX); the dense
+    Qwen4 27B plumbing (0161-0165).
+  * Every ggml tensor is 64 bytes larger (0193): rebuild tools built
+    against this tree's headers, RPC servers and clients together.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 25 Nov 2026 12:00:00 +0100
+
 arcint (1.8.0-1) trixie; urgency=medium
 
   * NEW: Thinking Machines' Inkling 2 Mini (inkling2_loop) on libllama: the
