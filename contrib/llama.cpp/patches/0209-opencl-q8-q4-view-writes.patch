@@ -1,0 +1,380 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7b04b86..f16401c 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -15133,6 +15133,25 @@ static void ggml_cl_f16_copy_build(ggml_backend_opencl_context * backend_ctx, gg
+     ctx->f16_copies.push_back(std::move(c));
+ }
+ 
++// 0209: the Q8_0 / Q4_0 branches of set_tensor return for a view (or a non-contiguous tensor) without
++// writing: a split base's bytes live in its scales and quants, which a byte range of the block layout
++// does not map onto. That return was silent, and a checkpoint resume's K/V writes went through it at
++// q8_0 K/V; since 0209 only a view of a split base (or a weights buffer's view) comes there. Once a
++// process per type, so a path that still lands there shows in the log.
++static void ggml_cl_warn_view_write_dropped(const ggml_tensor * tensor, ggml_backend_buffer_t buffer) {
++    static std::atomic<bool> warned_q8_0{false};
++    static std::atomic<bool> warned_q4_0{false};
++    std::atomic<bool> & warned = tensor->type == GGML_TYPE_Q8_0 ? warned_q8_0 : warned_q4_0;
++    if (warned.exchange(true)) {
++        return;
++    }
++    const ggml_tensor * base = tensor->view_src != nullptr ? tensor->view_src : tensor;
++    GGML_LOG_WARN("ggml_opencl: set_tensor: a view write into a split q8_0/q4_0 tensor was not performed "
++                  "(tensor '%s', type %s, base '%s', %s buffer); logged once per process and type\n",
++                  tensor->name, ggml_type_name(tensor->type), base->name,
++                  ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? "weights" : "non-weights");
++}
++
+ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     if (((ggml_backend_opencl_buffer_context *) buffer->context)->usm) {
+         ggml_cl_usm_set_tensor((ggml_backend_opencl_buffer_context *) buffer->context, tensor, data, offset, size);
+@@ -15159,20 +15178,26 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     }
+ 
+ #ifdef GGML_OPENCL_SOA_Q
+-    // 0123zzzzz2: a partial write of a q8_0 / q4_0 tensor that is not a weight, not a view and never split
+-    // takes a plain copy. The KV stream moves single pages into its pool and ring slots, which the attention
+-    // reads as blocks; the SoA split below converts a whole tensor (it writes ggml_nbytes from `data` at
+-    // `offset`, so a page move ran past the slot: a B60 page fault, window 255). Every other write keeps the
+-    // paths below as they were (a view returns there, a split tensor is split again).
++    // 0123zzzzz2: a partial write of a q8_0 / q4_0 tensor that is not a weight and never split takes a
++    // plain copy. The KV stream moves single pages into its pool and ring slots, which the attention reads
++    // as blocks; the SoA split below converts a whole tensor (it writes ggml_nbytes from `data` at `offset`,
++    // so a page move ran past the slot: a B60 page fault, window 255).
++    // 0209: a VIEW of such a tensor too, at its view_offs. llama_kv_cache::state_read_data writes the K / V
++    // stream views (ggml_view_2d of k / v); the Q8_0 / Q4_0 branches below return for a view before any
++    // write, so a checkpoint resume at q8_0 / q4_0 K/V restored the cells' metadata and none of their bytes.
++    // A view shares its base's extra, whose offset excludes view_offs (init_tensor); get_tensor reads a
++    // non-split view at the same extra->offset + view_offs + offset. The split test follows view_src
++    // (ggml_cl_is_q8_0_soa / ggml_cl_is_q4_0_soa), so a view of a split base keeps the return below.
+     const bool cl_plain_part = (tensor->type == GGML_TYPE_Q8_0 || tensor->type == GGML_TYPE_Q4_0) &&
+         ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+-        (offset != 0 || size != ggml_nbytes(tensor)) && tensor->view_src == nullptr &&
++        (tensor->view_src != nullptr || offset != 0 || size != ggml_nbytes(tensor)) &&
+         !(tensor->type == GGML_TYPE_Q8_0 ? ggml_cl_is_q8_0_soa(tensor) : ggml_cl_is_q4_0_soa(tensor));
+     if (cl_plain_part) {
+         ggml_tensor_extra_cl * extra_plain = (ggml_tensor_extra_cl *) tensor->extra;
+         GGML_ASSERT(extra_plain);
+-        if (!ggml_cl_stage_write(backend_ctx, buffer, extra_plain->data_device, extra_plain->offset + offset, data, size)) {
+-            CL_CHECK(clEnqueueWriteBuffer(queue, extra_plain->data_device, CL_TRUE, extra_plain->offset + offset,
++        const size_t off_plain = extra_plain->offset + tensor->view_offs + offset;
++        if (!ggml_cl_stage_write(backend_ctx, buffer, extra_plain->data_device, off_plain, data, size)) {
++            CL_CHECK(clEnqueueWriteBuffer(queue, extra_plain->data_device, CL_TRUE, off_plain,
+                                           size, data, 0, NULL, NULL));
+         }
+         return;
+@@ -15264,6 +15289,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     if (tensor->type == GGML_TYPE_Q4_0) {
+         // Views can't SoA-ify here — parent owns the layout (see q8_0 guard).
+         if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
++            ggml_cl_warn_view_write_dropped(tensor, buffer);   // 0209: never silent
+             return;
+         }
+         // Tensors should have been preallocated, therefore they should
+@@ -16000,6 +16026,7 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     if (tensor->type == GGML_TYPE_Q8_0) {
+         // Views share the parent's buffer; parent owns SoA conversion.
+         if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
++            ggml_cl_warn_view_write_dropped(tensor, buffer);   // 0209: never silent
+             return;
+         }
+ 
+@@ -16828,7 +16855,8 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         GGML_ASSERT(extra);
+ 
+         cl_ulong n_elements = size / sizeof(ggml_fp16_t);
+-        cl_ulong off_dst = (extra->offset + offset) / sizeof(ggml_fp16_t);
++        // 0209: a view's bytes start at view_offs (the extra is its base's), as get_tensor reads them
++        cl_ulong off_dst = (extra->offset + tensor->view_offs + offset) / sizeof(ggml_fp16_t);
+ 
+         cl_int err;
+         cl_mem data_device = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
+@@ -16857,9 +16885,13 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     ggml_tensor_extra_cl * extra = (ggml_tensor_extra_cl *) tensor->extra;
+     GGML_ASSERT(extra);
+ 
+-    if (!ggml_cl_stage_write(backend_ctx, buffer, extra->data_device, extra->offset + offset, data, size)) {
++    // 0209: a view's bytes start at view_offs (the extra is its base's, init_tensor), as get_tensor reads
++    // them. Without it a write into a view at view_offs != 0 (a KV stream s > 0's view in
++    // state_read_data) landed at the base's start.
++    const size_t off_gen = extra->offset + tensor->view_offs + offset;
++    if (!ggml_cl_stage_write(backend_ctx, buffer, extra->data_device, off_gen, data, size)) {
+         CL_CHECK(clEnqueueWriteBuffer(
+-            queue, extra->data_device, CL_TRUE, extra->offset + offset,
++            queue, extra->data_device, CL_TRUE, off_gen,
+             size, data, 0, NULL, NULL));
+     }
+     ggml_cl_f16_copy_build(backend_ctx, buffer, tensor, data, offset, size);   // 0110
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 956e4f7..1b4eb35 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -258,6 +258,13 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     add_test(NAME test-opencl-image-limit COMMAND $<TARGET_FILE:test-opencl-image-limit> ${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp)
+ endif()
+ 
++# patch 0209: q8_0 / q4_0 / f16 / bf16 writes through a view of a non-weights OpenCL tensor (the KV
++# cache's stream views in a checkpoint restore). Needs the card: built, not a ctest case; run by name.
++if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
++    add_executable(test-opencl-kv-view-write test-opencl-kv-view-write.cpp)
++    target_link_libraries(test-opencl-kv-view-write PRIVATE ggml)
++endif()
++
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+     llama_build_and_test(test-unicode.cpp LINK llama)
+diff --git a/tests/test-opencl-kv-view-write.cpp b/tests/test-opencl-kv-view-write.cpp
+new file mode 100644
+index 0000000..24acbc2
+--- /dev/null
++++ b/tests/test-opencl-kv-view-write.cpp
+@@ -0,0 +1,249 @@
++// 0209: writes through a VIEW of a non-weights OpenCL tensor (a KV cache's stream views).
++//
++// llama_kv_cache::state_read_data writes K / V through ggml_view_2d views of the cache tensors. Before
++// 0209 the OpenCL set_tensor returned for a q8_0 / q4_0 view without writing (a checkpoint resume at
++// q8_0 / q4_0 K/V restored the cells' metadata and none of their bytes), and the generic (f16 / f32)
++// and bf16 writes ignored view_offs (a view at view_offs != 0, a KV stream s > 0, was written at its
++// base's start). This test, on the card:
++//   1. per type (q8_0, q4_0, f16, bf16), a tensor in a non-weights buffer that is never set whole (so a
++//      q8_0 / q4_0 one is never split into scales and quants), filled with a known byte and read whole;
++//      two views of distinct row ranges (both at view_offs != 0) written whole, one partial write at an
++//      offset inside a view; each view read back byte-exact right after its write (a staged,
++//      asynchronous write followed by a read must see it), and the base read whole: the written rows
++//      hold the data, every other row what it held before (the write's offset and the read's agree);
++//      once with views below the 4 MiB staging bound (the USM ring) and once with a view above it (the
++//      blocking clEnqueueWriteBuffer);
++//   2. per type q8_0 / q4_0, a tensor set whole first (split, as test-backend-ops' sources are), then a
++//      view written twice: the write is not performed (the base still reads back the whole write) and
++//      the warning is logged exactly once for that type.
++// The red: before 0209, every q8_0 / q4_0 view read in 1 shows the fill byte, the f16 / bf16 base read
++// shows view a's data at row 0, and 2 logs nothing.
++//
++// Needs an OpenCL device; not a ctest case (the recipe host has no card). Run by name:
++//   test-opencl-kv-view-write [device name, default GPUOpenCL]
++// One line "test-opencl-kv-view-write: PASS (N cases)" or "... FAIL (k of N cases failed)"; exit 1 on
++// FAIL, and a run with zero cases or no device is a FAIL.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static int g_cases  = 0;
++static int g_failed = 0;
++
++static void report(bool ok, const std::string & what) {
++    ++g_cases;
++    if (!ok) {
++        ++g_failed;
++    }
++    std::printf("  %s  %s\n", ok ? "ok  " : "FAIL", what.c_str());
++}
++
++// the logger: count the 0209 warning per type, pass every line through
++static int g_warn_q8_0 = 0;
++static int g_warn_q4_0 = 0;
++
++static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
++    if (level == GGML_LOG_LEVEL_WARN && std::strstr(text, "a view write into a split q8_0/q4_0 tensor was not performed")) {
++        if (std::strstr(text, "type q8_0")) {
++            ++g_warn_q8_0;
++        } else if (std::strstr(text, "type q4_0")) {
++            ++g_warn_q4_0;
++        }
++    }
++    std::fputs(text, stderr);
++}
++
++// n bytes of data for `type`, never all equal to the fill. bf16 is stored as f16 on the card, so its
++// values are small integers (exact in f16, so the read back is byte-exact).
++static std::vector<uint8_t> pattern(ggml_type type, size_t n, uint32_t seed) {
++    std::vector<uint8_t> v(n);
++    uint32_t x = seed * 2654435761u + 12345u;
++    if (type == GGML_TYPE_BF16) {
++        for (size_t i = 0; i + 1 < n; i += 2) {
++            x = x * 1664525u + 1013904223u;
++            const ggml_bf16_t b = ggml_fp32_to_bf16((float) ((int) (x >> 24) - 128));
++            std::memcpy(v.data() + i, &b, 2);
++        }
++        return v;
++    }
++    for (size_t i = 0; i < n; ++i) {
++        x = x * 1664525u + 1013904223u;
++        v[i] = (uint8_t) (x >> 24);
++        if (v[i] == 0xA5) {   // never the fill byte, so a dropped write cannot pass by chance
++            v[i] = 0x5A;
++        }
++    }
++    return v;
++}
++
++static const uint8_t FILL = 0xA5;
++static const size_t  STAGE_MAX = 4u << 20;   // ggml_cl_stage_write's bound
++
++// 1: the never-split tensor. big: view a is larger than the staging bound.
++static void case_plain(ggml_backend_t backend, ggml_type type, bool big) {
++    const std::string tn = std::string(ggml_type_name(type)) + (big ? " big" : " small");
++    const int64_t ne0  = big ? 4096 : 256;
++    const size_t  row  = ggml_row_size(type, ne0);
++    const int64_t r_a  = 2;
++    const int64_t n_a  = big ? (int64_t) (STAGE_MAX / row) + 64 : 4;
++    const int64_t r_b  = r_a + n_a + 3;
++    const int64_t n_b  = 3;
++    const int64_t rows = r_b + n_b + 4;
++
++    ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx  = ggml_init(ip);
++    ggml_tensor * base  = ggml_new_tensor_2d(ctx, type, ne0, rows);
++    ggml_set_name(base, ("kv_" + std::string(ggml_type_name(type))).c_str());
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (buf == nullptr) {
++        report(false, tn + " plain: buffer allocation");
++        ggml_free(ctx);
++        return;
++    }
++    report(ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS, tn + " plain: the buffer is not a weights buffer");
++    ggml_backend_buffer_clear(buf, FILL);
++
++    ggml_init_params vp = { 8 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * vctx = ggml_init(vp);
++    ggml_tensor * va = ggml_view_2d(vctx, base, ne0, n_a, row, r_a * row);
++    ggml_tensor * vb = ggml_view_2d(vctx, base, ne0, n_b, row, r_b * row);
++    ggml_set_name(va, "view_a");
++    ggml_set_name(vb, "view_b");
++    report(ggml_backend_view_init(va) == GGML_STATUS_SUCCESS && ggml_backend_view_init(vb) == GGML_STATUS_SUCCESS,
++           tn + " plain: view init");
++    report(!big || ggml_nbytes(va) > STAGE_MAX, tn + " plain: view a is above the staging bound (" +
++                                                  std::to_string(ggml_nbytes(va)) + " bytes)");
++
++    std::vector<uint8_t> expect(ggml_nbytes(base));
++    ggml_backend_tensor_get(base, expect.data(), 0, expect.size());   // what the fill reads back as
++
++    const std::vector<uint8_t> d1 = pattern(type, ggml_nbytes(va), 1 + type + 16 * big);
++    ggml_backend_tensor_set(va, d1.data(), 0, d1.size());
++    std::memcpy(expect.data() + r_a * row, d1.data(), d1.size());
++    std::vector<uint8_t> got(ggml_nbytes(va));
++    ggml_backend_tensor_get(va, got.data(), 0, got.size());
++    report(got == d1, tn + " plain: view a written whole reads back byte-exact");
++
++    const std::vector<uint8_t> d2 = pattern(type, ggml_nbytes(vb), 2 + type + 16 * big);
++    ggml_backend_tensor_set(vb, d2.data(), 0, d2.size());
++    std::memcpy(expect.data() + r_b * row, d2.data(), d2.size());
++    got.assign(ggml_nbytes(vb), 0);
++    ggml_backend_tensor_get(vb, got.data(), 0, got.size());
++    report(got == d2, tn + " plain: view b reads back byte-exact");
++
++    // a partial write inside view a: its second row (a cell range of a stream view)
++    const std::vector<uint8_t> d3 = pattern(type, row, 3 + type + 16 * big);
++    ggml_backend_tensor_set(va, d3.data(), row, row);
++    std::memcpy(expect.data() + (r_a + 1) * row, d3.data(), d3.size());
++    got.assign(ggml_nbytes(va), 0);
++    ggml_backend_tensor_get(va, got.data(), 0, got.size());
++    report(std::memcmp(got.data(), expect.data() + r_a * row, got.size()) == 0,
++           tn + " plain: view a after the partial write reads back byte-exact");
++
++    std::vector<uint8_t> all(ggml_nbytes(base));
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    int64_t bad_rows = 0, first_bad = -1;
++    for (int64_t r = 0; r < rows; ++r) {
++        if (std::memcmp(all.data() + r * row, expect.data() + r * row, row) != 0) {
++            first_bad = first_bad < 0 ? r : first_bad;
++            ++bad_rows;
++        }
++    }
++    report(bad_rows == 0, tn + " plain: the base read whole: written rows hold the data, the rest what it held (" +
++                              std::to_string(bad_rows) + " of " + std::to_string(rows) + " rows differ, first " +
++                              std::to_string(first_bad) + ")");
++
++    ggml_free(vctx);
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
++// 2: the split tensor (set whole first): the view write keeps today's return, and says so once
++static void case_split(ggml_backend_t backend, ggml_type type) {
++    const std::string tn = ggml_type_name(type);
++    const int64_t NE0 = 256, ROWS = 16;
++
++    ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx  = ggml_init(ip);
++    ggml_tensor * base  = ggml_new_tensor_2d(ctx, type, NE0, ROWS);
++    ggml_set_name(base, ("split_" + tn).c_str());
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (buf == nullptr) {
++        report(false, tn + " split: buffer allocation");
++        ggml_free(ctx);
++        return;
++    }
++    const std::vector<uint8_t> d0 = pattern(type, ggml_nbytes(base), 10 + type);
++    ggml_backend_tensor_set(base, d0.data(), 0, d0.size());   // whole: the base is split
++
++    std::vector<uint8_t> all(ggml_nbytes(base));
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    report(all == d0, tn + " split: the whole write reads back byte-exact");
++
++    ggml_init_params vp = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * vctx = ggml_init(vp);
++    const size_t row = base->nb[1];
++    ggml_tensor * v = ggml_view_2d(vctx, base, NE0, 2, row, 4 * row);
++    ggml_set_name(v, ("split_" + tn + "_view").c_str());
++    report(ggml_backend_view_init(v) == GGML_STATUS_SUCCESS, tn + " split: view init");
++
++    int & warned = type == GGML_TYPE_Q8_0 ? g_warn_q8_0 : g_warn_q4_0;
++    const int before = warned;
++    const std::vector<uint8_t> d4 = pattern(type, ggml_nbytes(v), 20 + type);
++    ggml_backend_tensor_set(v, d4.data(), 0, d4.size());
++    ggml_backend_tensor_set(v, d4.data(), 0, d4.size());
++
++    all.assign(ggml_nbytes(base), 0);
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    report(all == d0, tn + " split: the view write is not performed (the base still holds the whole write; "
++                           "if not, the base was not split and the case does not test the return)");
++    report(warned - before == 1, tn + " split: the not-performed warning logged exactly once for two writes (" +
++                                     std::to_string(warned - before) + ")");
++
++    ggml_free(vctx);
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
++int main(int argc, char ** argv) {
++    ggml_log_set(log_cb, nullptr);
++    const char * name = argc > 1 ? argv[1] : "GPUOpenCL";
++
++    ggml_backend_dev_t dev = ggml_backend_dev_by_name(name);
++    if (dev == nullptr) {
++        std::printf("test-opencl-kv-view-write: FAIL (no device named %s; 0 cases)\n", name);
++        return 1;
++    }
++    ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
++    if (backend == nullptr) {
++        std::printf("test-opencl-kv-view-write: FAIL (device %s does not initialise; 0 cases)\n", name);
++        return 1;
++    }
++    std::printf("device: %s (%s)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev));
++
++    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
++        case_plain(backend, type, false);
++        case_plain(backend, type, true);
++    }
++    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
++        case_split(backend, type);
++    }
++    ggml_backend_free(backend);
++
++    if (g_cases == 0) {
++        std::printf("test-opencl-kv-view-write: FAIL (0 cases)\n");
++        return 1;
++    }
++    if (g_failed != 0) {
++        std::printf("test-opencl-kv-view-write: FAIL (%d of %d cases failed)\n", g_failed, g_cases);
++        return 1;
++    }
++    std::printf("test-opencl-kv-view-write: PASS (%d cases)\n", g_cases);
++    return 0;
++}
