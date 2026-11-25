@@ -10989,8 +10989,8 @@ unit test asserts mode 0 refuses every export line as `off`.
   FAILs.
 - test-backend-ops on the CPU backend, the 31 new correctness cases: 31/31, the whole `-o MUL_MAT -p
   type_a=q8_0` filter 289/289 before the spread cases, the 6 spread cases 6/6 (they construct and run; the
-  CPU against itself proves nothing more). With them the filter holds 295 cases, 65 of which the gate takes
-  by their parameters (Q8_0 x F32, 16+ columns, plain layout, K % 256, at most 8,192 rows).
+  CPU against itself proves nothing more). With them the filter holds 295 cases (292 distinct parameter
+  sets), 67 of which reach the gate and are taken (the card rows' paragraph below says which, and why).
 
 **Card rows (owed).** The B60, by PCI id; the build from the applied series on the pin (development
 `f81d6175` + 0220: write-tree `a6ed9f554cfeb8ad1daa0f43ae1a690947e36f12`); `-b GPUOpenCL`, every suite
@@ -10998,7 +10998,22 @@ run's summary line and per-class counts asserted, not an OK count; the B60's boa
 every number. `UENV` is the Inkling unit's prompt switches (`GGML_OPENCL_KQ_MM_ID_I8=1
 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 GGML_OPENCL_CPY_TRANSPOSE=1 GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_FA_PORT=1`);
 `A` is the arm, `GGML_OPENCL_Q8_2D=0|1|2`. `Q8` is the suite filter `-o MUL_MAT -p 'type_a=q8_0'` (295
-cases, 65 taken by the gate, 6 of them `spread=1`).
+cases, 292 distinct parameter sets): 67 are taken by 0220's gate, 61 uniform (4 of them flattened broadcasts)
+and the 6 `spread=1`; the other 225 pass or are not supported (33 on the B60).
+
+Which cases reach the gate is decided by `ggml_cl_mul_mat`'s order of paths, not by the gate alone (`code`;
+the first card run's red 1, `measured-here`, showed both effects, and a count by the gate's terms alone was off
+by 6). Two paths come first:
+- `ggml_cl_flat_cols`: a 2-D weight times a src1 whose batches lie back to back (the suite's `nr` other than
+  `[1,1]` on a plain case) becomes one product of n x nr0 x nr1 columns through a temporary, which the gate
+  sees as an ordinary 2-D product. Four broadcast cases of 4-16 columns a batch reach 16 or 32 columns this way
+  and are taken.
+- 0115's few-column int8 kernel (`ggml_cl_mul_mm_fewq`) takes Q8_0 at 2-16 columns before the gate, unless
+  `ggml_cl_fewq_chosen_off` declines: on the B60 (sub-group 16) when (K / 32 + 7) / 8 < 4 or the weight is under
+  6 MiB. Two 16-column cases at K 14,336 (512 and 1,001 rows, 7.8 and 15.2 MB) go there, not to 0220.
+
+The card window's case classes follow that order (at the B60's defaults, no `GGML_OPENCL_FEWQ_*` set);
+against the first red 1 run they match on all 292 parameter sets.
 
 **Order of the body: the reds first, each with its expected result and its write-up line written into the
 report before it runs**, so a window that stops early still says what it proved. The body writes the
@@ -11007,18 +11022,18 @@ lines of the table below into its report as `EXPECT` lines at its start; each st
 
 | # | red (arm, options) | expected | what it proves, the number in the line | min |
 |---|---|---|---|---|
-| R1 | arm 2, `GGML_OPENCL_KQ_2D_OPTS=-DQ8_2D_RED=1`, `$Q8` | the build line names `-DQ8_2D_RED=1`; FAIL on the 65 taken cases at NMSE ~0.12-0.13, the other 230 pass | the int8 kernel ran on every taken case and every one of its blocks counts: the count of FAILs = 65 and their NMSE | 3 |
-| R1' | arm 1, the same | the same 65 FAIL, ~0.12 | the same for the fp16 kernel | 3 |
+| R1 | arm 2, `GGML_OPENCL_KQ_2D_OPTS=-DQ8_2D_RED=1`, `$Q8` | the build line names `-DQ8_2D_RED=1`; FAIL on the 67 taken cases at NMSE ~0.12-0.13, the other 225 pass or are not supported | the int8 kernel ran on every taken case and every one of its blocks counts: the count of FAILs = 67 and their NMSE | 3 |
+| R1' | arm 1, the same | the same 67 FAIL, ~0.12 | the same for the fp16 kernel | 3 |
 | R2 | arm 2, `-DQ8_2D_RED=2` | the 6 spread cases FAIL at ~1.1-1.3; the uniform taken cases FAIL at ~1.5-2.1e-3 or pass by a hair | the block-scale row addressing is seen on the spread fill: the spread NMSE; the uniform margin as a number (a uniform pass is that margin) | 3 |
 | R3 | arm 2, `-DQ8_2D_RED=3` | the 6 spread cases FAIL at ~1.0-1.2; every uniform case passes (5-7e-5, 3e-4 at K 256) | the activation-scale token addressing is seen only by the spread fill: the spread NMSE, and the uniform cases' pass on the record (their blindness) | 3 |
-| R3' | arm 1, `-DQ8_2D_RED=3` | 295/295 pass | red 3 is int8-only: a control that the mutant does not reach the fp16 kernel | 2 |
-| R0 | arm 0, `-DQ8_2D_RED=1` | 295/295 pass, no build line for the Q8_0 program | the red options reach nothing at the knob off: arm 0 is today's dispatch | 2 |
+| R3' | arm 1, `-DQ8_2D_RED=3` | every case run passes (262 of the 295 on the B60, 33 not supported) | red 3 is int8-only: a control that the mutant does not reach the fp16 kernel | 2 |
+| R0 | arm 0, `-DQ8_2D_RED=1` | every case run passes, no build line for the Q8_0 program | the red options reach nothing at the knob off: arm 0 is today's dispatch | 2 |
 
 Then the green rows:
 
 | # | step | command shape | expected | min |
 |---|---|---|---|---|
-| 1 | op suite, arms 0 / 1 / 1+vISA / 2, arm 2 with `GGML_OPENCL_BOUNDS=1` | `$A test-backend-ops test -b GPUOpenCL $Q8` | 295/295 on every arm, the 6 spread cases green on arms 1 and 2; TAKEN `2d-f16` on arm 1, `2d-i8` on arm 2, none on arm 0; DOWNGRADE keys only `q8-2d-k` and `q8-2d-layout` (24 and 18 cases by their parameters) | 12 |
+| 1 | op suite, arms 0 / 1 / 1+vISA / 2, arm 2 with `GGML_OPENCL_BOUNDS=1` | `$A test-backend-ops test -b GPUOpenCL $Q8` | every case run passes on every arm (262 of 295 on the B60), the 6 spread cases green on arms 1 and 2; TAKEN `2d-f16` on arm 1, `2d-i8` on arm 2, none on arm 0; DOWNGRADE keys only `q8-2d-k` and `q8-2d-layout` (the two the first red 1 run printed) | 12 |
 | 3 | op perf, the served shapes x 512 / 1,024 / 2,048 tokens, arms 0 / 1 / 1+vISA / 2 | `$A test-backend-ops perf -b GPUOpenCL -o MUL_MAT -p 'type_a=q8_0,type_b=f32,m=(3072\|2304\|1024\|384\|24\|32\|6552),n=(512\|1024\|2048),k=(2304\|3072),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0'`, median of repeats | 3,072 x 2,304 at 1,024: ~425 us (arm 0) -> <= 240 (arm 2), <= 330 (arm 1); 24 rows <= 30 us on arm 2; 6,552 x 2,304 arm 2 >= 60 TFLOP/s (the tile 21 at 512 and 35 at 2,048 tokens): diagnostics, not the acceptance | 8 |
 | 4 | the pass at the unit's settings, arms 0 / 1 / 2, three interleaved rounds, a fresh process each; one screening run of arm 2 at `GGML_OPENCL_Q8_2D_SLOTS=0` | `env $UENV $A llama-batched-bench -m <the published IQ4_NL file> -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -c 262144 -b 1024 -ub 1024 -npl 1 -ntg 0 -npp 4096` | arm 2 above arm 0 outside the run-to-run spread. +3.8-5.5 % is an upper band (140-200 ms of the tile's ~350 a pass, before the quantizer's cost against the f16 conversion's, ~30 ms a pass): +2-3 % would not indicate a defect. Arm 1 +1.5-3 %. The SLOTS=0 run prices the slots (expected within the spread at ub 1,024) | 25 |
 | 5 | the profile at depth 4,096, arms 0 and 2, `GGML_OPENCL_Q8_2D_STATS=1` | the profiling build's chunk step with `$A` added to its environment | `kernel_mul_mm_q8_0_f16` 0 launches on arm 2 (351 on arm 0), `kernel_mul_mm_kq2d_q8_0_i8` 351 launches, 35-55 ms (was 88.3); per arm the time and launches of `kernel_quant_i8` and `kernel_cvt_f32_f16` next to the GEMMs, so the net is read from the profile; the stats line `calls=351` a chunk graph with `hits > 0` and at most 4 quantizer launches a visit (`quants` <= 192) | 6 |
