@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <string>
 #include <string_view>
@@ -27,10 +28,13 @@
 // silently vanish, which the fleet's proxy learned the expensive way.
 namespace lgc {
 
+struct ChatRequest;
+
 struct ToolCall {
-    // Deterministic ("call_0", "call_1", ...) rather than random. Greedy output
-    // must be byte-identical run to run (§3.4); a random id would break that in
-    // the response body even when the tokens matched.
+    // Deterministic ("call_N") rather than random, so the same request gives
+    // the same ids. The parser numbers a turn's calls from call_0; a route that
+    // answers a request renumbers them after its history (number_calls below),
+    // so ids stay unique across the turns of a conversation.
     std::string id;
     std::string name;
     std::string arguments;  // compact JSON object, as OpenAI defines the field
@@ -68,6 +72,22 @@ ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* sc
 // Dispatches on the dialect: Gemma4 takes the form above, every other dialect
 // the Qwen forms, so a caller passes the loaded model's dialect and nothing else.
 ToolCallParse parse_tool_calls(std::string_view text, ChatDialect dialect, const ToolSchemas* schemas = nullptr);
+
+// Tool call ids unique across turns. A template may look a tool result's
+// function name up by its tool_call_id over the whole history (Inkling 2 Mini's
+// does, and concatenates every match): two turns that both minted call_0 then
+// render a header naming both functions, which rewrites earlier prompt text and
+// defeats the lane's prefix reuse. The rule, one for every route that emits
+// ids: a response's calls are numbered after the highest call_N already in the
+// request's history (assistant tool_calls ids and tool messages' tool_call_id;
+// the Responses route maps its function_call / function_call_output call_ids
+// onto these fields). An id not of the form call_<decimal digits> is ignored
+// for the offset. Deterministic: the same request gives the same ids.
+//
+// next_call_index: 0 for a history without any call_N id, else max(N) + 1.
+size_t next_call_index(const ChatRequest& req);
+// Sets calls[i].id = "call_{base + i}".
+void number_calls(std::vector<ToolCall>& calls, size_t base);
 
 // The marker that starts / ends a call in this dialect: the streaming callers
 // hold the text back from the opener on, and need it spelled once, from here.

@@ -252,6 +252,8 @@ void finish_chat_generation(const PreparedChat& prep,
     if (prep.parse_tool_calls) {
         if (out.keep_parse_input) out.parse_input = out.content;
         ToolCallParse parsed = parse_tool_calls(out.content, prep.dialect, &prep.schemas);
+        // ids unique across turns (core/toolcall.h): after the history's call_N
+        number_calls(parsed.calls, next_call_index(prep.req));
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content",
                       std::string(tool_call_open(prep.dialect)).c_str());

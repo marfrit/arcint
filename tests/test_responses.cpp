@@ -3618,6 +3618,211 @@ TEST(responses_stored_output_call_ids_are_engine_minted_and_unique) {
     CHECK_EQ(msgs[0].tool_calls.size(), 2u);
 }
 
+// ------------------------------------------- tool call ids unique across turns
+// 1.8.2: every response numbered its calls from call_0, so a second turn's call
+// repeated the first turn's id; Inkling 2 Mini's template looks a tool result's
+// name up by tool_call_id over the whole history and renders every match, so the
+// earlier prompt text changed and the lane's prefix missed. The rule
+// (core/toolcall.h): a response's calls follow the highest call_N in the
+// request's history. Each route below answers a history holding call_0 and
+// call_1 with two new calls, which must be call_2 and call_3 (red before the
+// fix: call_0 and call_1 again). A history without call ids keeps call_0.
+namespace {
+
+std::string read_call_block() {
+    return std::string(tool_call_tags().open) + "\n{\"name\": \"read_file\", \"arguments\": {}}\n" +
+           std::string(tool_call_tags().close);
+}
+
+json read_file_chat_tool() {
+    return json::array({{{"type", "function"},
+                         {"function",
+                          {{"name", "read_file"},
+                           {"parameters", {{"type", "object"}, {"properties", json::object()}}}}}}});
+}
+
+json read_file_response_tool() {
+    return json::array({{{"type", "function"},
+                         {"name", "read_file"},
+                         {"parameters", {{"type", "object"}, {"properties", json::object()}}}}});
+}
+
+json chat_call(const char* id) {
+    return {{"id", id}, {"type", "function"}, {"function", {{"name", "read_file"}, {"arguments", "{}"}}}};
+}
+
+// A chat request: a user turn, an assistant turn that called read_file twice
+// (call_0, call_1) and both tool results; `history` false leaves only the user.
+json chat_body(bool history, bool stream) {
+    json msgs = json::array({{{"role", "user"}, {"content", "read both"}}});
+    if (history) {
+        msgs.push_back({{"role", "assistant"},
+                        {"content", nullptr},
+                        {"tool_calls", json::array({chat_call("call_0"), chat_call("call_1")})}});
+        msgs.push_back({{"role", "tool"}, {"tool_call_id", "call_0"}, {"content", "a"}});
+        msgs.push_back({{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "b"}});
+    }
+    return {{"model", "stub"}, {"messages", msgs}, {"tools", read_file_chat_tool()},
+            {"stream", stream}, {"max_tokens", 256}};
+}
+
+json response_body(bool history, bool stream) {
+    json input = json::array({{{"type", "message"}, {"role", "user"}, {"content", "read both"}}});
+    if (history) {
+        for (const char* id : {"call_0", "call_1"})
+            input.push_back({{"type", "function_call"}, {"call_id", id}, {"name", "read_file"},
+                             {"arguments", "{}"}});
+        input.push_back({{"type", "function_call_output"}, {"call_id", "call_0"}, {"output", "a"}});
+        input.push_back({{"type", "function_call_output"}, {"call_id", "call_1"}, {"output", "b"}});
+    }
+    return {{"model", "stub"}, {"input", input}, {"tools", read_file_response_tool()},
+            {"stream", stream}, {"max_output_tokens", 256}};
+}
+
+std::vector<std::string> chat_ids_run(ReplayFixture& fx, const json& body) {
+    PreparedChat prep;
+    CHECK(!api::prepare_chat(fx.ctx, body, prep).has_value());
+    const api::HttpResult r = api::run_chat(fx.ctx, prep, 0);
+    CHECK_EQ(r.status, 200);
+    std::vector<std::string> ids;
+    if (r.status != 200) return ids;
+    for (const json& c : r.body["choices"][0]["message"].value("tool_calls", json::array()))
+        ids.push_back(c["id"].get<std::string>());
+    return ids;
+}
+
+std::vector<std::string> chat_ids_stream(ReplayFixture& fx, const json& body) {
+    PreparedChat prep;
+    CHECK(!api::prepare_chat(fx.ctx, body, prep).has_value());
+    std::vector<std::string> ids;
+    api::stream_chat(fx.ctx, prep, 0, [&](std::string_view frame) {
+        constexpr std::string_view kData = "data: ";
+        if (frame.substr(0, kData.size()) != kData) return true;
+        std::string payload(frame.substr(kData.size()));
+        while (!payload.empty() && payload.back() == '\n') payload.pop_back();
+        if (payload == "[DONE]") return true;
+        const json c = json::parse(payload);
+        if (!c.contains("choices") || c["choices"].empty()) return true;
+        const json& delta = c["choices"][0]["delta"];
+        if (delta.contains("tool_calls"))
+            for (const json& tc : delta["tool_calls"]) ids.push_back(tc["id"].get<std::string>());
+        return true;
+    });
+    return ids;
+}
+
+std::vector<std::string> response_ids_run(ReplayFixture& fx, const json& body) {
+    ResponseRequest r;
+    parse_ok(body, r);
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), p).has_value());
+    const api::HttpResult res = api::run_response(fx.ctx, p, 0);
+    CHECK_EQ(res.status, 200);
+    std::vector<std::string> ids;
+    if (res.status != 200) return ids;
+    for (const json& item : res.body["output"])
+        if (item.value("type", "") == "function_call") ids.push_back(item["call_id"].get<std::string>());
+    return ids;
+}
+
+std::vector<std::string> response_ids_stream(ReplayFixture& fx, const json& body) {
+    ResponseRequest r;
+    parse_ok(body, r);
+    PreparedResponse p;
+    CHECK(!api::prepare_response(fx.ctx, std::move(r), p).has_value());
+    std::vector<std::string> raw;
+    api::stream_response(fx.ctx, p, 0, [&](std::string_view frame) {
+        raw.emplace_back(frame);
+        return true;
+    });
+    const Sse s = parse_sse(raw);
+    std::vector<std::string> ids;
+    for (const auto& [name, ev] : s.events)
+        if (name == "response.output_item.added" && ev["item"].value("type", "") == "function_call")
+            ids.push_back(ev["item"]["call_id"].get<std::string>());
+    // the completed resource names the same ids as the added items
+    std::vector<std::string> done;
+    for (const auto& [name, ev] : s.events)
+        if (name == "response.completed")
+            for (const json& item : ev["response"]["output"])
+                if (item.value("type", "") == "function_call") done.push_back(item["call_id"].get<std::string>());
+    CHECK(done == ids);
+    return ids;
+}
+
+using IdsOf = std::vector<std::string> (*)(ReplayFixture&, const json&);
+
+void check_route_ids(IdsOf ids_of, json (*body_of)(bool, bool), bool stream) {
+    const std::vector<std::string> next  = {"call_2", "call_3"};
+    const std::vector<std::string> first = {"call_0", "call_1"};
+    {
+        ReplayFixture fx(/*with_store=*/false);
+        fx.backend.pieces = {{read_call_block(), 1}, {"\n" + read_call_block(), 2}};
+        const std::vector<std::string> got = ids_of(fx, body_of(true, stream));
+        CHECK(got == next);
+        // deterministic: the same request gives the same ids
+        CHECK(ids_of(fx, body_of(true, stream)) == got);
+    }
+    {
+        ReplayFixture fx(/*with_store=*/false);
+        fx.backend.pieces = {{read_call_block(), 1}, {"\n" + read_call_block(), 2}};
+        CHECK(ids_of(fx, body_of(false, stream)) == first);
+    }
+}
+
+}  // namespace
+
+TEST(tool_call_ids_follow_the_history_chat) {
+    check_route_ids(chat_ids_run, chat_body, false);
+}
+
+TEST(tool_call_ids_follow_the_history_chat_stream) {
+    check_route_ids(chat_ids_stream, chat_body, true);
+}
+
+TEST(tool_call_ids_follow_the_history_responses) {
+    check_route_ids(response_ids_run, response_body, false);
+}
+
+TEST(tool_call_ids_follow_the_history_responses_stream) {
+    check_route_ids(response_ids_stream, response_body, true);
+}
+
+// The stored path: a continuation by previous_response_id whose history is the
+// stored turn (its call_0) plus the new tool output. The new call is call_1,
+// and the store keeps the id the client saw.
+TEST(tool_call_ids_follow_the_stored_history) {
+    ReplayFixture fx;
+    fx.backend.pieces = {{read_call_block(), 1}};
+    json b1 = {{"model", "stub"}, {"input", "read it"}, {"tools", read_file_response_tool()},
+               {"max_output_tokens", 256}};
+    const std::string id = fx.prepare_run(b1);
+    CHECK(!id.empty());
+    if (id.empty()) return;
+    const auto first = fx.ctx.responses->get(id, -1);
+    CHECK(first != nullptr);
+    if (!first) return;
+    std::string first_call;
+    for (const json& item : first->output_items)
+        if (item.value("type", "") == "function_call") first_call = item.value("call_id", "");
+    CHECK_EQ(first_call, std::string("call_0"));
+
+    json b2 = {{"model", "stub"}, {"previous_response_id", id}, {"tools", read_file_response_tool()},
+               {"input", json::array({{{"type", "function_call_output"},
+                                       {"call_id", "call_0"}, {"output", "a"}}})},
+               {"max_output_tokens", 256}};
+    const std::string id2 = fx.prepare_run(b2);
+    CHECK(!id2.empty());
+    if (id2.empty()) return;
+    const auto second = fx.ctx.responses->get(id2, -1);
+    CHECK(second != nullptr);
+    if (!second) return;
+    std::vector<std::string> ids;
+    for (const json& item : second->output_items)
+        if (item.value("type", "") == "function_call") ids.push_back(item.value("call_id", ""));
+    CHECK(ids == std::vector<std::string>{"call_1"});
+}
+
 // Review F2: a unit default reasoning_effort is a level a request would have sent.
 // The Responses route states it as reasoning.effort, which lands in the same
 // ChatRequest field the chat route's top-level reasoning_effort does, so it wins
