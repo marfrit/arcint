@@ -371,7 +371,7 @@ struct RawKV {
     std::string note;
 };
 
-RawKV raw_kv(llama_context* ctx, const Layout& L, int n_pos) {
+RawKV raw_kv(llama_context* /*ctx*/, const Layout& L, int n_pos) {
     RawKV R;
     for (const auto& c : L.caches) {
         std::vector<uint8_t> ks, vs;
