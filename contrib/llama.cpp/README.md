@@ -10635,8 +10635,19 @@ end without a stop.
 
 *Op level (the primary bar).* The 45 cases and the three replays of the knob-on export (12
 lines each) ran under the 1e-10 bound with no failing row, the two single cases under
-`GGML_OPENCL_BOUNDS=1` first; the three reds failed the cases the table above names. The
-per-row nmse values are in the window's report and are not copied here.
+`GGML_OPENCL_BOUNDS=1` first. Every row printed its nmse, card against the CPU op:
+
+| rows | n | nmse, lowest .. worst | bound |
+|---|---|---|---|
+| the 45 cases | 45 of 45 OK | 1.04e-14 .. **1.83e-14** | 1e-10 |
+| the replayed export, ub 512 / 1024 / 2048 | 12 of 12 OK each | 7.15e-15 .. 1.74e-14 | 1e-10 |
+| red `-DDEPTH_MIX_RED` | 45 of 45 FAIL | 0.074 .. 0.20 | must fail all |
+| red `-DDEPTH_MIX_RED_RAW` | 45 of 45 FAIL | 0.026 .. 0.44 | must fail all |
+| red `-DDEPTH_MIX_RED_NW` | the 12 `with_norm=1` FAIL, 33 OK | 2.97 .. 3.25; the 33 at most 1.83e-14 | must fail those 12 only |
+
+The worst row is 5,000 times inside the bound, and at the level the kernel's text reached on
+host threads (2e-13 against the chain); the bound's reasoning allowed for a device `exp` or
+`rsqrt` a few ulp off and none showed.
 
 *The model takes it.* `llama-bench -v`, bounds on: pp512 1,023.1 t/s over 2 graphs; pp4096 907.3
 t/s over 16 graphs, 120 nodes and 120 calls a graph, one TAKEN line, no `DEPTH_MIX` downgrade.
