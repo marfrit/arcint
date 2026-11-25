@@ -2022,10 +2022,12 @@ packs `n_batch / n_ctx` sequences into a batch, and the 9-token case became a
 batch of 504 rows (seen in the first dry run). A context of 1 or 2 tokens runs
 too, so no case is expected not to run.
 
-# The port on a q8_0 K/V cache: design, CPU tests, nothing on a card yet {#q8}
+# The port on a q8_0 K/V cache: design and CPU tests (the card's results are in §q8-card) {#q8}
 
 Patches `0199q1` (kernel, gate, dispatch) and `0199q2` (tests). The same knob,
-`GGML_OPENCL_FA_PORT=1`; unset, the dispatch is today's. **Nothing of this has
+`GGML_OPENCL_FA_PORT=1`; unset, the dispatch is today's. This section is the state
+before the card run and is kept as written, its prediction included; §q8-card has
+what the card said, and where this section was wrong. **Nothing of this had
 run on a device.** Every number below is `code` (read off the source or the
 compiled ISA), `measured-here` on the recipe host (no device: the CPU backend,
 ocloc), or `inference`, and says which.
@@ -2115,7 +2117,11 @@ a multiple of 4, not of 64.
   coordinate a multiple of 4 for 8-bit data (kept, above; K's reads are dwords);
   a width of 64 to 2^24 bytes and a multiple of 4 (kept: 136 to 196); a height of
   1 to 2^24 rows (kept: `n_kv`, which the gate bounds below 2^24); a pitch not
-  below the width and a multiple of 16 (the gate). All are kept.
+  below the width and a multiple of 16 (the gate). All are kept. One thing the
+  extension leaves undefined is used: a 32-row read whose last rows lie past the
+  surface's height (`n_kv` not a multiple of 32, e.g. the 1,040-key case). spec:
+  undefined; B60 `measured-here`: the rows read as zeros, and the kernel gives
+  those keys no weight whatever they read (the case passes at nmse 2e-6).
 - **Codes to f16 without a conversion.** `convert_half16(char16)` on these
   layouts compiled to 73 to 91 moves a 16-code operand (`measured-here`, the
   first form's ISA). Instead: a code's byte with its top bit flipped is
@@ -2170,7 +2176,9 @@ the C number first. The two loops with potential are named by the table: the
 code expansion in S (420 against 74) and in P V. A packed 32-wide byte-to-word
 move would replace B16 and its bias (an estimate of 250 instructions a block
 saved of 2,755, `inference`), behind a knob with this C path as the fallback.
-It waits for the C path's card number: by the prediction below the whole q8_0
+(After the card run: the gap is there, 31 ms a 1,024-token ubatch against the f16
+port, and this is item P21; §q8-card.) As written before the run: it
+waits for the C path's card number: by the prediction below the whole q8_0
 path is within 2 % of the f16 port at the model level, so the gap may not be
 there to close.
 
@@ -2261,6 +2269,13 @@ first form and the host never builds it.
 
 ## Prediction, written before any card run (`inference`)
 
+**After the card run: the op figures below are a MISS.** They put the q8_0 port at
+1.27 × the f16 port with a ceiling of 1.43 ×; the card measured about 1.6 to 1.8 ×
+(1,388 / 3,946 / 5,176 us with the test's rebuild, about 1,190-1,240 / 3,680-3,750 /
+4,780-4,880 without), outside the stated range. The model figure (953 predicted,
+945.8 measured) came in by an offsetting error, not because the op model was
+right. §q8-card has the account. The text below is as it was written.
+
 The op, us a call, window 1,024, B60 at 165 W. The f16 port's time splits into
 the table's bytes and the rest by the no-bias probe (§dev: 392 / 1,100 / 1,630 of
 746 / 2,092 / 2,926). The q8_0 build changes only the rest: 1.81 × its static
@@ -2328,7 +2343,8 @@ leaves a quantized base to `fill_view`, which asserts that it writes the base fr
 offset 0 over its full byte size; `initialize_tensors` asserts that no skipped base
 is left unfilled. **No CPU test can show this red**: the CPU backend takes a second
 write. The red / green is the card's step 1 - it aborted on the applied tree
-`e4d76c34…` and must pass on `59732cfe…`. A second `set_tensor` of a q8_0 tensor is
+`e4d76c34…` and passed on `59732cfe…` (`measured-here`, the card host: the suite
+ran through, §q8-card). A second `set_tensor` of a q8_0 tensor is
 a limit of this backend that the patch does not change.
 
 ## The card commands, in order {#commands-q8}
@@ -2377,10 +2393,17 @@ is 1,024 tokens at 816 t/s, not a 4,096-token prompt.
 
 - The suite runs through (the harness fix of §window1 is green). The five q8_0
   port cases: worst nmse 1.93e-6 .. 2.17e-6 against the bound 1e-5; the f16 rows
-  unchanged; RED 1, 2, 6, 7 fail all five.
-- Inkling 2 Mini pp4096 ub 1,024 at q8_0 KV, three interleaved rounds, the three
-  env on both arms: **817.2 t/s off, 945.8 on (+15.7 %)**; 1,253.1 and 1,082.7 ms a
-  ubatch. Predicted 953 (935 .. 974): inside the range, under the point.
+  unchanged. The reds fail all five q8_0 cases: RED=1 at 1.5, RED=2 at 0.02 .. 0.4,
+  RED=6 at 0.12, RED=7 at 0.5.
+- Inkling 2 Mini pp4096 ub 1,024 at q8_0 KV, three interleaved rounds,
+  `GGML_OPENCL_KQ_MM_ID_I8`, `_WIDE` and `GGML_OPENCL_CPY_TRANSPOSE` on both arms:
+  off 817.22 / 816.97 / 817.22, on 945.81 / 945.76 / 945.74 t/s: **817.2 -> 945.8
+  (+15.7 %)**; 1,253.1 and 1,082.7 ms a ubatch. Predicted 953 (935 .. 974): inside
+  the range, under the point. `TAKEN … kv=q8_0` printed in the on arm.
+- The answer level, KL at q8_0 KV against the CPU base of the same file (`-c 2048
+  -b 512`, 6 chunks): off mean 0.002464 nats, top p 98.240 %; on 0.002545, 98.273 %.
+  0.00008 nats worse, top p not down: inside the bar (0.03 nats, 1 point).
+- Not run: the units' own flags (262,144 context, `--llama-swa-window`).
 - The op, us a call (the suite's q8_0 calls also rebuild the planes, both arms):
 
   | shape | q8_0 port | q8_0 port, no-bias probe | today's q8_0 kernels | f16 port | predicted q8_0 port (range) |
@@ -2452,6 +2475,16 @@ Reading the results:
   intercept: item 1 is a tile's setup (the pad bins, the row bases), series B's.
 - B's difference a tile large (above 2 us): the Q read by index is worth a
   block-read form (a tile's Q read in dim order and permuted in registers).
+
+## Open lows of the tests (the final review's; the test code is not changed, the tree is the card-proven one)
+
+- In `0199q2`'s fill, the assert that the buffer covers the base's bytes cannot
+  fire: the buffer is created with that size. The assert that can is the one at the
+  end of `initialize_tensors` (no skipped base left unfilled).
+- A second view on one quantized base is not caught: the second `fill_view` would
+  be the second `set_tensor` this backend cannot take. No case builds one.
+- `fmin(128 d, 65504)` bounds a scale from above only. A negative scale is not a
+  q8_0 block ggml writes, and is not guarded.
 
 ## The three levers, priced from the card's figures
 

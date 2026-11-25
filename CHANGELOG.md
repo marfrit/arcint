@@ -41,9 +41,11 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   reproduced, is its depth-mix stacks written through views across devices, the same code without the port. Serve
   Inkling fully offloaded.
   Patches 0199q1 / 0199q2 add a q8_0 read path to the port (the kernel reads ggml's q8_0 blocks in place, nothing
-  staged; same knob): designed, compiled offline (256 GRF, no scratch) and tested on the CPU only, **not run on a
-  card**. Predicted (`inference`) 816 -> 953 t/s at pp4096 ub 1,024 with q8_0 KV. Record:
-  `contrib/refkernels/trellis-fa/README.md` §q8.
+  staged; same knob). On the card (`measured-here`, B60 at 165 W): Inkling pp4096 ub 1,024 at q8_0 KV 817.2 -> 945.8 t/s
+  (+15.7 %; predicted 953), the five q8_0 op cases at nmse 2e-6 against a bound of 1e-5, mean KL 0.002464 -> 0.002545
+  and top p 98.240 -> 98.273 % (inside the bar). The op itself is 1.6 to 1.8 x the f16 port where 1.27 x was predicted:
+  a miss, recorded. Not run at the units' own flags (262,144 context, `--llama-swa-window`). Record:
+  `contrib/refkernels/trellis-fa/README.md` §q8 and §q8-card.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the

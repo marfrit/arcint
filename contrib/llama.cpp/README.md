@@ -9924,7 +9924,7 @@ cause, by code reading and the fault's arithmetic (not reproduced): Inkling's de
 through views from layers on both devices, which faults or silently loses rows at a CPU / card boundary. The code
 involved is byte-identical on the development build without the port (`code`). Serve Inkling fully offloaded.
 
-**0199q1 / 0199q2: the port reads a q8_0 K/V cache (design and CPU tests; not run on a card).** The same knob. The
+**0199q1 / 0199q2: the port reads a q8_0 K/V cache (on the card: 817.2 -> 945.8 t/s at q8_0 KV).** The same knob. The
 kernel has a second build (`-DPORT_KV8=1`) that reads ggml's q8_0 blocks in place: nothing is staged (the reference
 stages an f16 copy every call, 1,074 MB for one global layer at 262,144 keys - a deviation, named and priced in the
 record). K by five transposed dword reads a 16-key group, V by transformed byte reads on the 4-byte grid the extension
@@ -9940,8 +9940,13 @@ recipe host). Red on the card: `GGML_OPENCL_FA_PORT_RED=6` (K's scale twice), `=
 `TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0 …` once a process. Prediction (`inference`): pp4096 ub 1,024 at
 q8_0 KV 816 -> 953 t/s (range 935 to 974); the op 930 / 2,630 / 3,720 us at the three shapes against the f16 port's
 736 / 2,078 / 2,906. The record, the prediction's arithmetic and the card commands:
-`contrib/refkernels/trellis-fa/README.md` §q8. Until a card run, every statement above about the units stands: the
-measured build refuses q8_0.
+`contrib/refkernels/trellis-fa/README.md` §q8. **The card** (`measured-here`, B60 at 165 W, applied tree `59732cfe…`): pp4096
+ub 1,024 at q8_0 KV 817.2 t/s off, 945.8 on (+15.7 %), three interleaved rounds; the five q8_0 op cases at nmse
+1.93e-6 .. 2.17e-6 (bound 1e-5), the four reds failing all of them; KL at q8_0 KV 0.002464 off, 0.002545 on, top p
+98.240 / 98.273 %: inside the bar. The op prediction above missed: the op is 3,946 us at q2048 x kv2048 with the
+test's rebuild, about 1.6 to 1.8 x the f16 port without it. So with these two patches the port does take a q8_0
+cache; "refuses q8_0" above describes the build before them. Still not measured: the units' own flags (262,144
+context, `--llama-swa-window`). §q8-card of the record has the figures and what follows from them.
 
 Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
 (`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
