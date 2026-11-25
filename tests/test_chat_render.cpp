@@ -162,7 +162,8 @@ TEST(gemma4_replays_tool_call_arguments_as_an_object) {
     auto render = [&](ChatDialect d) {
         minja::chat_template_inputs in;
         in.messages = chat_messages_json(req, tmpl.original_caps().requires_object_arguments ||
-                                                  d.replays_arguments_as_object());
+                                                  d.replays_arguments_as_object(),
+                                         d.names_tool_results());
         return tmpl.apply(in, opts);
     };
     CHECK(!tmpl.original_caps().requires_object_arguments);   // the probe alone would pass a string
@@ -211,7 +212,8 @@ TEST(dory_template_shape_renders_under_the_qwen_dialect) {
     CHECK(tmpl.original_caps().requires_object_arguments);
     CHECK(!d.replays_arguments_as_object());
     minja::chat_template_inputs in;
-    in.messages = chat_messages_json(req, tmpl.original_caps().requires_object_arguments || d.replays_arguments_as_object());
+    in.messages = chat_messages_json(req, tmpl.original_caps().requires_object_arguments || d.replays_arguments_as_object(),
+                                     d.names_tool_results());
     in.add_generation_prompt = true;
     CHECK_EQ(tmpl.apply(in, opts),
              start + "assistant\n<tool_call>\n<function=get_weather>\n<parameter=city>\nKassel\n</parameter>\n"

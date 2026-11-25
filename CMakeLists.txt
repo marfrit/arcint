@@ -917,6 +917,13 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-depth-mix PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME depth-mix COMMAND arcint-depth-mix)
     set_tests_properties(depth-mix PROPERTIES LABELS unit)
+    # patch 0211: the depth mix's TAKEN line at the FA port's level, once a process, and that
+    # level one route_llama_log shows outside -v (read out of the patched tree and src/exec)
+    add_test(NAME depth-mix-taken-line
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_depth_mix_taken_line.py")
+    set_tests_properties(depth-mix-taken-line PROPERTIES LABELS unit)
   endif()
 endif()
 

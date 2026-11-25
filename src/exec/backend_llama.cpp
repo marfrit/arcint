@@ -1382,11 +1382,7 @@ public:
         }
         status_.dialect = dialect_;
         status_.admission_tier = admission_tier_name(tier_);
-        status_.checkpoints    = ckpt_on_    ? "on"
-                                 : ckpt_stale_ ? "off: a q8_0 / q4_0 sliding-window cache cannot be restored on OpenCL by "
-                                                 "this build (its llama.cpp lacks patch 0209); a changed earlier turn "
-                                                 "re-reads the prompt"
-                                               : "off";
+        status_.checkpoints    = checkpoints_status(ckpt_max_, can_snapshot, ckpt_stale_);
         SamplerDefaults d;
         d.temperature        = 0.7f;
         d.top_p              = 0.8f;
@@ -2015,7 +2011,7 @@ public:
 
     std::string render_chat(const ChatRequest& req) const override {
         minja::chat_template_inputs inputs;
-        inputs.messages = chat_messages_json(req, object_arguments());
+        inputs.messages = chat_messages_json(req, object_arguments(), dialect_.names_tool_results());
         inputs.tools    = chat_tools_json(req);
         inputs.add_generation_prompt = true;
         // The one construction of the template context (core/chat.cpp): the

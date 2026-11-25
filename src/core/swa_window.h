@@ -45,4 +45,19 @@ inline bool swa_ckpt_restore_refused(int n_swa, bool on_opencl, bool k_q4q8, boo
     return n_swa > 0 && on_opencl && (k_q4q8 || v_q4q8) && !view_writes;
 }
 
+// /props `checkpoints`: "on", "off", or "off: <reason>" for the refusal above (a build
+// whose llama.cpp lacks 0209).
+// The reason is named only where the refusal took checkpoints away, a start that
+// would have kept them (`ckpt_max` > 0, --llama-checkpoints, and a memory that can
+// snapshot: hybrid, recurrent, or a window-sized SWA cache). A model with a sliding
+// window but no snapshotting memory (Dory without --llama-swa-window) is refused
+// too, and had no checkpoints to lose: plain "off". `refused` is
+// swa_ckpt_restore_refused's answer for the start.
+inline const char* checkpoints_status(int ckpt_max, bool can_snapshot, bool refused) {
+    if (ckpt_max <= 0 || !can_snapshot) return "off";
+    return refused ? "off: a q8_0 / q4_0 sliding-window cache cannot be restored on OpenCL by this build "
+                     "(its llama.cpp lacks patch 0209); a changed earlier turn re-reads the prompt"
+                   : "on";
+}
+
 }  // namespace lgc

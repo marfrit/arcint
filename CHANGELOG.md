@@ -34,6 +34,22 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   has it (`code`); 0209's op test and the probe's exact arms, and the card gate at the Inkling unit's settings (B60,
   `measured-here`: served at about 40k tokens, KL against a full re-read 0.0010-0.0033 nats against a bar of 0.0317,
   the answers right, the restore 23-29 ms against a 45.5 s re-read; contrib/llama.cpp/README.md, 0209's section).
+- **The depth mix's TAKEN line shows in a served unit's log** (patch 0211). `depth_mix: TAKEN opencl f32
+  token-a-group` was printed at ggml's INFO level, which arcint logs only under `-v`, so a unit with
+  `GGML_OPENCL_DEPTH_MIX=1` showed the FA port's TAKEN line and not the mix's. It is now at the port's level (WARN),
+  once a process, text unchanged. Device-free test red on the 1.8.2 series.
+- **`/props` `checkpoints` names the q8_0 / q4_0 refusal only where it took checkpoints away.** 1.8.1 and 1.8.2
+  reported `off: <reason>` for every start with a sliding window at q8_0 / q4_0 K/V on OpenCL, also for a model
+  that keeps no checkpoints anyway (Dory without `--llama-swa-window`: no hybrid or recurrent memory). Now
+  `off: <reason>` only when `--llama-checkpoints` > 0 and the memory can snapshot, else `off`. Behaviour unchanged.
+- **Inkling 2 Mini: a tool result's function name is resolved by arcint.** The model's template looks a nameless
+  tool result's `tool_call_id` up over all messages and appends every match, so a history whose ids repeat (a client
+  or proxy that rewrites them per turn; 1.8.2 made arcint's own ids unique) rendered `readbash` again and re-read the
+  prompt. For the Inkling dialect each tool result without a `name` now carries the name of the call it answers (the
+  nearest earlier assistant turn with its id; two calls of one turn with the same id pair with their results by
+  position); the template takes a `name` and looks nothing up. A client's `name` is kept; other dialects are
+  unchanged. With unique ids the render is byte-identical to 1.8.2's, so a conversation begun on 1.8.2 keeps its
+  cache. A `name` on the result gave 4 of 4 cache hits on the served unit.
 
 ## 1.8.2 — 2026-11-25
 
