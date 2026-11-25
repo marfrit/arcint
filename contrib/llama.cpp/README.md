@@ -11015,3 +11015,7 @@ and local memory are the driver's answers for the compiled kernel, so the cell f
 3. Inkling 2 Mini, `llama-perplexity` KL with `-b 8 -ub 8 -lv 4`, forced against unforced, within the answer-level
    bar (0.03 nats mean KL, 1 point argmax), after asserting that the forced arm printed the DOWNGRADE line and the
    unforced one the TAKEN line.
+
+**Card result, item 3** (`measured-here`, 2026-11-25, B60, `llama-perplexity` over 1,024 scored rows at batch 8): the
+forced fallback equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against
+the unforced kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route.

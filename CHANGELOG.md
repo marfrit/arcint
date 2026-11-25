@@ -56,7 +56,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   the failed build is not retried, and a variant that builds but cannot take the launch (work-group cap, local
   memory) counts as failed. `GGML_OPENCL_FA_BIAS_GQA_FAIL=1` is a debug arm that forces the failure. Evidence:
   the route function's unit cell, its red twin (the old rule) and a gate over the patched tree (`code`, the recipe's
-  suite); the card arm is owed.
+  suite); on the card (`measured-here`, B60, `llama-perplexity` 1,024 scored rows at batch 8) the forced fallback
+  equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against the unforced
+  kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route.
 
 ## 1.8.2 — 2026-11-25
 
