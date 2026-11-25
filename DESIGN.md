@@ -608,6 +608,25 @@ changes the top-1 pick at 2-5 % of positions at equal perplexity,
    answer-level bar.
 5. The byte-equality cells in §5 stay as **tripwires**: a red one on a
    change that passes the answer-level bar is reported, not a veto.
+6. **Comparing rows across batch sizes has a floor, and it is the model's.**
+   A verify pass (MTP, a speculative drafter, a resumed tail) runs its rows
+   in a batch of n > 1 while plain decode runs n = 1; the two take different
+   kernels (one-query attention and matvec against multi-row attention and
+   GEMM) and accumulate in a different order, on the CPU and on OpenCL alike
+   (`code`). On Inkling 2 Mini (CPU, IQ4_NL, Q8_0 head, F16 KV; 2026-11-25,
+   `measured-here`): n = 1 against n = 6 moved the logits by at most 3.41 /
+   2.91 with mean KL 4.0e-4 / 2.3e-3 (602- / 200-token prompts, one argmax
+   flip each at a margin under 0.01), while n = 3 against n = 6 was
+   bit-identical. Nudging one activation of layer 0 by one ulp at n = 1 gave
+   the same size and row pattern (max |d| 5.2 / 7.8, mean KL 5.1e-4 /
+   1.45e-3), carried through the KV and convolution state and amplified by a
+   single MoE routing change. Against a long-double reference the n = 1
+   attention was the more exact path (RMS error 5.0e-4 against 2.0e-3).
+   It is rounding, not a defect. **The rule:** a comparison between verify
+   rows and plain n = 1 decode is held to the answer-level bar, never to a
+   bound tighter than this floor (mean KL about 4e-4 to 1.5e-3, max |d| 3 to
+   8 on this model); a bit-exact comparison is made only against a reference
+   that runs the same batch sizes and boundaries.
 
 What holds today, measured: a resumed turn against a full re-prefill with
 the same batch breaks gives the same text (193/193 and 209/209 characters);
