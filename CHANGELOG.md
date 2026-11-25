@@ -31,7 +31,9 @@ DEPTH_MIX, TOP_K MoE); downgrade keys; the xe kernel log's wedge / CAT error / j
 restored a sliding-window cache's positions but not its bytes: the restore writes the cells through views of the K / V
 tensors, and a view write into a q8_0 / q4_0 tensor returned without writing. On Inkling 2 Mini at q8_0 K/V (with or
 without `--llama-swa-window`) a follow-up that resumed from a checkpoint could answer from stale attention state for
-up to 1,024 positions, with no error **[owed: the first affected version, as the code confirms]**. 1.8.1 refuses it:
+up to 1,024 positions, with no error. Affected since 1.8.0 (the first release with Inkling; the dropped write is in
+the pinned llama.cpp's OpenCL backend, the full-size cache's restore lands the window on other positions' cells), and
+since `--llama-swa-window` also Dory1.0-4B with that flag at q8_0 / q4_0 (`code`). 1.8.1 refuses it:
 such a start keeps no checkpoints (one load warning) and a restore is refused before any cell is touched ("nothing
 restored ... full re-prefill"), so the follow-up re-reads its prompt (at an Inkling unit's settings about 1,067 t/s).
 f16 K/V keeps checkpoints and is not affected, nor are models without a sliding window (the 27B agent). The fix of the
@@ -294,7 +296,8 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
 - The CPU-miss staging buffers of the expert cache are allocated once; a layer registered later would launch without
   them (code reading; not shown to happen).
 - With more than one KV stream (unnamed lanes, `kv_unified` off) an f16 restore into a stream other than the first
-  could land in the first stream's rows (code reading; no shipped unit runs that configuration).
+  lands in the first stream's rows: the generic write omits the view offset that the read adds (code reading; any
+  multi-lane start with a non-unified cache). The fix is planned for 1.8.2 with the q8_0 / q4_0 write.
 - A Qwen4exp GGUF that carries neither `attention.recurrent_layers` nor `full_attention_interval` now fails to load
   (1.8.0 assumed an interval of 4).
 - 1.8.0's S3 (the bias dispatcher's GQA decode variant has no fallback if it fails to build) is still open; the 1.8.0
