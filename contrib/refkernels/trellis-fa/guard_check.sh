@@ -29,13 +29,16 @@
 set -uo pipefail
 BIN=${1:?dir with llama-perplexity}; M=${2:?model}; TXT=${3:?text}; O=${4:?out dir}; NGL=${5:-0}
 mkdir -p "$O"
-run() { "$BIN/llama-perplexity" -m "$M" -f "$TXT" -ngl "$NGL" -fa on "$@"; }
+# every run sets the port's knobs itself, whatever the caller exported: base and ctrl run
+# with the knob UNSET, knob and decode with the knob and without the red, red with both
+off() { env -u GGML_OPENCL_FA_PORT -u GGML_OPENCL_FA_PORT_RED -u GGML_OPENCL_FA_PORT_TRACE -u GGML_SCHED_DEBUG "$@"; }
+on()  { env -u GGML_OPENCL_FA_PORT_RED GGML_OPENCL_FA_PORT=1 GGML_SCHED_DEBUG=2 "$@"; }
 P64="-c 256 -b 64 --chunks 2"; P1="-c 32 -b 1 --chunks 1"
-run $P64 --kl-divergence-base "$O/base.kld" > "$O/base.log" 2>&1 || { echo "FAIL: base run"; exit 2; }
-run $P64 --kl-divergence-base "$O/base.kld" --kl-divergence > "$O/ctrl.log" 2>&1 || { echo "FAIL: ctrl run"; exit 2; }
-GGML_OPENCL_FA_PORT=1 GGML_SCHED_DEBUG=2 run $P64 -v --kl-divergence-base "$O/base.kld" --kl-divergence > "$O/knob.log" 2>&1 || { echo "FAIL: knob run"; exit 2; }
-GGML_OPENCL_FA_PORT=1 GGML_SCHED_DEBUG=2 run $P1 -v > "$O/decode.log" 2>&1 || { echo "FAIL: decode run"; exit 2; }
-GGML_OPENCL_FA_PORT=1 GGML_SCHED_DEBUG=2 GGML_OPENCL_FA_PORT_RED=5 run $P64 -v --kl-divergence-base "$O/base.kld" --kl-divergence > "$O/red.log" 2>&1 || { echo "FAIL: red run"; exit 2; }
+off "$BIN/llama-perplexity" -m "$M" -f "$TXT" -ngl "$NGL" -fa on $P64 --kl-divergence-base "$O/base.kld" > "$O/base.log" 2>&1 || { echo "FAIL: base run"; exit 2; }
+off "$BIN/llama-perplexity" -m "$M" -f "$TXT" -ngl "$NGL" -fa on $P64 --kl-divergence-base "$O/base.kld" --kl-divergence > "$O/ctrl.log" 2>&1 || { echo "FAIL: ctrl run"; exit 2; }
+on "$BIN/llama-perplexity" -m "$M" -f "$TXT" -ngl "$NGL" -fa on $P64 -v --kl-divergence-base "$O/base.kld" --kl-divergence > "$O/knob.log" 2>&1 || { echo "FAIL: knob run"; exit 2; }
+on "$BIN/llama-perplexity" -m "$M" -f "$TXT" -ngl "$NGL" -fa on $P1 -v > "$O/decode.log" 2>&1 || { echo "FAIL: decode run"; exit 2; }
+env GGML_OPENCL_FA_PORT=1 GGML_SCHED_DEBUG=2 GGML_OPENCL_FA_PORT_RED=5 "$BIN/llama-perplexity" -m "$M" -f "$TXT" -ngl "$NGL" -fa on $P64 -v --kl-divergence-base "$O/base.kld" --kl-divergence > "$O/red.log" 2>&1 || { echo "FAIL: red run"; exit 2; }
 # the scheduler's node list -> "ordinal backend sources" a FLASH_ATTN node, distinct rows with their count
 tab() { awk '
     /## SPLIT #0:/ { n = 0 }
