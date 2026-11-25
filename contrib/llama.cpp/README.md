@@ -10686,9 +10686,9 @@ folded norms). pp4096 at ub 512 was predicted at 833-858 t/s and measured 908.1.
 
 The arm is +0.00005 nats and +0.23 points against the chain with the fold, +0.00011 and +0.03
 without it: inside the answer-level bar (0.03 nats, 1 point) by two orders of magnitude, and
-inside the span of the chain with one-ulp noise. The same arms on 6 chunks are further down;
-the task battery (the capital, an arithmetic chain, a JSON extraction, the binary-search
-completion) with the arm off and on is owed.
+inside the span of the chain with one-ulp noise. The same arms on 6 chunks and the task
+battery (the capital, an arithmetic chain, a JSON extraction, the binary-search completion) are
+further down.
 
 The README is not part of the applied tree: these paragraphs leave `13ab33b8` as it is.
 
@@ -10715,7 +10715,8 @@ rounds):
 Every arm's log carried its own TAKEN lines and none of the other's. The two savings add: 831.6
 ms for the arm and 813.2 ms for the port are 1,644.8 ms, both together save 1,648.2 - an overlap of
 -3.4 ms, on disjoint launches. The reference stack's row on this card is 1,220 t/s. At the unit's
-q8_0 KV the arm alone is 979.2 t/s (above); the arm with the port at q8_0 is not measured.
+q8_0 KV the arm alone is 979.2 t/s (above); the arm with the port at q8_0 KV is the last table
+of this section.
 
 llama-perplexity against the CPU base of the published file, 6 chunks of 2,048 (`-b 512`; about
 6,100 scored tokens), every arm's path shown by its TAKEN line in the same log:
@@ -10731,4 +10732,28 @@ llama-perplexity against the CPU base of the published file, 6 chunks of 2,048 (
 
 The arm is +0.000005 nats and +0.07 points against the chain with the fold, +0.000010 and -0.01
 without it: inside the answer-level bar, and inside the two noise seeds. The answer-level bar
-is met on more than 5,000 tokens. Owed: the task battery on the card.
+is met on more than 5,000 tokens.
+
+**The task battery** (`measured-here`, B60, tree `13ab33b8`, the unit's q8_0 KV, all layers on
+the card, temperature 0, `-b 2048 -ub 512`, int8 expert tile + wide + 0187 on; each answer saved
+in full and judged by a script against its known answer; identical text across arms is not
+required at a batched prefill):
+
+| task | prompt tokens | chain | the arm (fold) | text against the chain |
+|---|---|---|---|---|
+| the capital of France, one word | 27 | right | right | identical |
+| an arithmetic chain of six steps (88) | 73 | right | right | differs from char 171 of 548 / 512 |
+| a JSON object of four fields from a 100-record order log | 4,394 | right | right | identical |
+| a binary search completed after 139 code samples, run on 300 random cases | 4,095 | right | right | differs from char 161 of 829 / 752 |
+
+8 of 8 right. The script is the battery in `contrib/llama.cpp/replay/mix_task_battery.sh` (a
+measurement body: it needs `llama-completion`, the model, and three helpers; rehearsed on the CPU
+with a short prompt set first, 8 of 8 there too).
+
+**The arm with the FA port at the unit's q8_0 KV** (`measured-here`, B60, a combined tree that
+adds another patch set's q8_0 support for the port, applied tree `a52a4c2a`; pp4096, medians):
+chain 816.55 t/s, the arm 980.46, the port 945.74, both **1,171.43** (the additive prediction was
+1,171). llama-perplexity against the CPU base on that tree: chain 0.002464 ± 0.000073 nats, the
+arm 0.002470 ± 0.000085.
+
+Nothing in this section is owed any more.

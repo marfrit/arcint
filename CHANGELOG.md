@@ -105,8 +105,10 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   against the CPU base: chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp
   noise 0.0019-0.0021 / 98.3 %; on 6 chunks (about 6,100 tokens) chain 0.002256 / 98.27 %, the arm 0.002261 / 98.34 %,
   noise 0.002346 and 0.002270. With development's FA port also on (f16 KV, ub 1024): chain 815.9, the arm 978.5, the
-  port 973.6, both **1,215.7 t/s**; the two savings add (831.6 + 813.2 ms against 1,648.2 together). Owed: the task
-  battery on the card. Details: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
+  port 973.6, both **1,215.7 t/s**; the two savings add (831.6 + 813.2 ms against 1,648.2 together). At the unit's q8_0
+  KV on a combined tree: chain 816.6, the arm 980.5, the port 945.7, both **1,171.4 t/s**. The task battery at q8_0 KV
+  (the capital, an arithmetic chain, a JSON extraction from 4,394 tokens, a binary search after 4,095 tokens run on 300
+  random cases): 8 of 8 right, the arm off and on. Details: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
