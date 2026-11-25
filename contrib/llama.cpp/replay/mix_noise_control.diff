@@ -1,16 +1,16 @@
 diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
-index 6d6175b..4f71e82 100644
+index 723dd0f..af25abd 100644
 --- a/src/models/inkling2.cpp
 +++ b/src/models/inkling2.cpp
-@@ -1,6 +1,7 @@
- #include "models.h"
+@@ -5,6 +5,7 @@
+ #include <string>
  #include "../llama-memory-hybrid-iswa.h"
  
 +#include <cstdio>
  #include <cstdlib>
  #include <map>
  #include <string>
-@@ -221,6 +222,26 @@ static ggml_tensor * inkling2_mix_column(ggml_context * ctx, ggml_tensor * mixed
+@@ -225,6 +226,26 @@ static ggml_tensor * inkling2_mix_column(ggml_context * ctx, ggml_tensor * mixed
      return ggml_cont(ctx, view);
  }
  
@@ -37,7 +37,7 @@ index 6d6175b..4f71e82 100644
  // one DOWNGRADE line a key: the reason the arm did not take this call's shapes
  static void inkling2_depth_mix_refused(const char * why) {
      static std::map<std::string, int> told;
-@@ -282,7 +303,19 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+@@ -286,7 +307,19 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
      ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
      scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
  
