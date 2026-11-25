@@ -75,10 +75,15 @@ index 517eba9..5b253b0 100644
                  float vs = 1.0f;
  
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index 358f614..54babdf 100644
+index 358f614..1f2c0d2 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -19,6 +19,7 @@
+@@ -1,3 +1,4 @@
++#include "../ggml/src/ggml-opencl/fa_port_gate.h"   // 0194: fa_port_settle, pure
+ #include "llama-graph.h"
+ #include "llama-expert-route-trace.h"
+ #include "llama-expert-cache.h"
+@@ -19,6 +20,7 @@
  #include "llama-memory-hybrid-iswa.h"
  #include "llama-memory-recurrent.h"
  
@@ -86,7 +91,7 @@ index 358f614..54babdf 100644
  #include <cassert>
  #include <cmath>
  #include <cstring>
-@@ -1423,6 +1424,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
+@@ -1423,6 +1425,14 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
      if (self_rel_pos_swa->buffer) {
          attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
      }
@@ -101,7 +106,7 @@ index 358f614..54babdf 100644
  }
  
  bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & params) {
-@@ -1435,6 +1444,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
+@@ -1435,6 +1445,16 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
      res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
      res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
  
@@ -118,7 +123,19 @@ index 358f614..54babdf 100644
      return res;
  }
  
-@@ -3164,6 +3183,29 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+@@ -3154,16 +3174,45 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             // the backend of the layer must support the op with the bias attached, or the
+             // kernel would read a mask without it; find that backend, the CPU is the fallback
+             ggml_backend_t backend = backend_cpu;
++            bool backend_is_layers = false;   // 0194: the scheduler has a backend for the layer's device
+             const ggml_backend_dev_t dev = model.dev_layer(il);
+             if (dev) {
+                 for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                     ggml_backend_t b = ggml_backend_sched_get_backend(sched, i);
+                     if (ggml_backend_get_device(b) == dev) {
+                         backend = b;
++                        backend_is_layers = true;
+                         break;
                      }
                  }
              }
@@ -134,13 +151,17 @@ index 358f614..54babdf 100644
 +                ggml_flash_attn_ext_add_positions(cur, fa_port_next.kpos, fa_port_next.qpos,
 +                                                  fa_port_next.cflag, fa_port_next.rflag);
 +                ggml_flash_attn_ext_set_window(cur, fa_port_next.window);
-+                if (!ggml_backend_supports_op(backend, cur)) {
-+                    GGML_ASSERT(fa_port_next.table_today != nullptr);
++                // fa_port_settle (fa_port_gate.h): kept only on the layer's own backend and
++                // only if that backend accepts this op; no scheduler backend for the layer's
++                // device (the op would run on the CPU fallback) drops them too
++                GGML_ASSERT(fa_port_next.table_today != nullptr);
++                if (!fa_port_settle(cur, backend, backend_is_layers ? 1 : 0, fa_port_next.table_today, bias_indices)) {
 +                    bias_table = fa_port_next.table_today;
-+                    ggml_flash_attn_ext_drop_port_sources(cur, bias_table, bias_indices);
 +                    static std::atomic<int> said{0};
-+                    if (said.fetch_add(1) < 6) {
-+                        LLAMA_LOG_WARN("DOWNGRADE src=llama op=FLASH_ATTN port=off reason=%s layer=%d\n", "op-refused", il);
++                    if (said.load() < 6) {      // a line for the first few, the counter stops there
++                        said.fetch_add(1);
++                        LLAMA_LOG_WARN("DOWNGRADE src=llama op=FLASH_ATTN port=off reason=%s layer=%d\n",
++                                       backend_is_layers ? "op-refused" : "no-layer-backend", il);
 +                    }
 +                }
 +                fa_port_next = {};
@@ -148,7 +169,7 @@ index 358f614..54babdf 100644
              if (!ggml_backend_supports_op(backend, cur)) {
                  ggml_flash_attn_ext_add_indexed_bias(cur, nullptr, nullptr);
                  cur->src[3] = dense_bias_mask();
-@@ -4461,6 +4503,27 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
+@@ -4461,6 +4510,27 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
      ggml_set_input(inp->self_rel_pos_swa);
      ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
  

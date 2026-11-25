@@ -1979,3 +1979,44 @@ reason=op-refused` line a refused layer, the first few times.
 
   and `guard_check.sh <bin dir> <model> <text> <out dir> 12` for layers split
   between the card and the CPU.
+
+## The builder's step as one function, and its unit {#settle}
+
+What `build_attn_mha` does with an op it has just given the port's sources is one
+function, `fa_port_settle` (`fa_port_gate.h`): the op keeps them only if the
+scheduler has a backend for the layer's device (otherwise the op would run on the
+CPU fallback) **and** that backend's `supports_op` accepts this op; else
+`ggml_flash_attn_ext_drop_port_sources` makes it today's op (no port source,
+window 0, today's table). The refusal line's counter stops at its cap.
+
+`GGML_TEST_FA_PORT_SETTLE=1 test-backend-ops -b CPU -o FLASH_ATTN_EXT` calls that
+function with a mock backend that declares the port's sources and answers
+`supports_op` with the port's gate (`measured-here`, the recipe host): 512 and 9
+rows on the layer's backend keep the sources (window 64 kept); 8 rows and a q8_0
+K/V cache lose them; 512 rows with no scheduler backend for the layer lose them;
+each dropped op has window 0. Red (`GGML_TEST_FA_PORT_SETTLE_RED=1`, the builder
+before the step): rc 1, the three dropped rows still carry the sources. Green:
+rc 0. The refused-shapes unit checks the window too.
+
+**The sweep, run before it goes to a card.** Its first form never ran: the case
+name reached llama-perplexity as an argument, and it set `-b` without `-ub`. Both
+are fixed, a case that does not run stops the sweep at once, and the last line
+counts the cases that ran. A dry run on the recipe host (`measured-here`, the full
+GGUF, every layer on the CPU, under the host's model lock; the lines of two
+runs of 5 cases each, the second of which ended `guard sweep: PASS: 5 of 5 ran,
+0 hits`):
+
+    ub512-tail1-alone:           n_ubatch 1,    n_ctx=1,    batch_size=1,    rows seen 1        | 720 FLASH_ATTN nodes, 0 hits
+    ub512-tail2-alone:           n_ubatch 2,    n_ctx=2,    batch_size=2,    rows seen 1 2      | 768, 0 hits
+    ub512-tail9-alone:           n_ubatch 9,    n_ctx=9,    batch_size=9,    rows seen 1 9      | 768, 0 hits
+    ub512-tail65-alone:          n_ubatch 65,   n_ctx=65,   batch_size=65,   rows seen 1 65     | 768, 0 hits
+    ub512-tail65-after-context:  n_ubatch 512,  n_ctx=577,  batch_size=512,  rows seen 1 65 512 | 816, 0 hits
+    ub1024-tail9-after-context:  n_ubatch 1024, n_ctx=1033, batch_size=1024, rows seen 1 9 1024 | 816, 0 hits
+    drafter-ub2:                 n_ubatch 2,    n_ctx=32,   batch_size=2,    rows seen 1 2      | 864, 0 hits
+
+and its red, the same cases with `GGML_OPENCL_FA_PORT_RED=5` (the model without
+its guard): `ub512-tail9-alone` 240 hits, `ub512-tail65-after-context` 288 hits,
+exit 1. An "alone" case runs with `-b <tail>`: with the full ub llama-perplexity
+packs `n_batch / n_ctx` sequences into a batch, and the 9-token case became a
+batch of 504 rows (seen in the first dry run). A context of 1 or 2 tokens runs
+too, so no case is expected not to run.

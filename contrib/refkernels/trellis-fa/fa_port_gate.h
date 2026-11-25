@@ -182,6 +182,22 @@ static inline int fa_port_layer_attaches(ggml_backend_dev_t dev, int guard) {
     return reg != NULL && ggml_backend_reg_get_proc_address(reg, FA_PORT_CAPABILITY_PROC) != NULL;
 }
 
+// What a graph builder does with an op it has just given the port's sources: the op keeps
+// them only if `backend` is the layer's own backend (backend_is_layers: the scheduler has a
+// backend for the layer's device - otherwise the op would run somewhere else) and that
+// backend's supports_op accepts exactly this op. Else they come off and the op is today's,
+// with `table_today` ([n_head, n_bins, rows], the form ggml_flash_attn_ext_add_indexed_bias
+// takes). Returns 1 when the op keeps the port's sources. The one place this is decided:
+// the model's build_attn_mha calls it, and the unit test calls it with a mock backend.
+static inline int fa_port_settle(struct ggml_tensor * op, ggml_backend_t backend, int backend_is_layers,
+                                 struct ggml_tensor * table_today, struct ggml_tensor * indices) {
+    if (backend != NULL && backend_is_layers && ggml_backend_supports_op(backend, op)) {
+        return 1;
+    }
+    ggml_flash_attn_ext_drop_port_sources(op, table_today, indices);
+    return 0;
+}
+
 // The dispatch's block split of a 9 to 64-row call (rows are independent for the kernels it
 // feeds: it re-enters the dispatch with stack copies of the op, 8 rows each). The predicate
 // is here so that the dispatch and the routing test below share it.
