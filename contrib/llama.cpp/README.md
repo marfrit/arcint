@@ -10846,7 +10846,7 @@ occurrence in 18k-24k tokens of English or C++ text, none in 24k of German notes
 **Red / green** (`measured-here`, CPU, `llama-tokenize --ids` on the Inkling 2 Mini GGUF, the applied series a52a4c2a
 without and with this patch): ` welches` [220, 31889, 590] -> [171256]; ` voices` [220, 53430, 590] -> [193067];
 ` kwargs` [220, 86226, 70, 82] -> [194390]; ` welcher` [163934] both (control); each green id is the GGUF vocabulary's
-single entry for the word (`Ġwelches` 171256, `Ġvoices` 193067, `Ġkwargs` 194390, `ĠCollins` 194023).
+single entry for the word (`Ġwelches` 171256, `Ġvoices` 193067, `Ġkwargs` 194390).
 
 **Other pre types.** `inkling2` is the only pre type this series adds. The pin already sets `ignore_merges` for every
 pre type of the models served here that mainline sets it for (tekken for the writer included).

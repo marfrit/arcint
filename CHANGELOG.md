@@ -18,7 +18,7 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased (branch `development`)
+## Unreleased
 
 - **Inkling 2 Mini's tokenizer takes a whole-word vocabulary entry whole** (patch 0210, mainline d2bceda3d; no switch).
   1.8.x split words whose single token is in the vocabulary but not reachable by the BPE merges (` welches` became
