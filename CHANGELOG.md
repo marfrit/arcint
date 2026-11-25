@@ -18,6 +18,14 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased (development)
+
+- Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
+  ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are
+  skipped, for Inkling 2 Mini's IQ4_NL experts and its Q8_0 layers. Priced on the B60 at 221-492 ms saved a
+  4,096-token pass at ub 1024 (window C1b, option 2). The served A/B, op rows, KL and answers are owed before the
+  default can change. Patch 0208b adds the test cases (balanced and served-routing replay).
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn

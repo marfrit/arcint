@@ -1,0 +1,371 @@
+0222: the wide int8 expert tile at 64 pairs, behind GGML_OPENCL_KQ_MM_ID_I8_XT=64 (unset: today's 32-pair tile and route, the 64-pair program not built): the route cuts each expert into ceil(c/64) tiles, the wide program is built a second time with I8W_XT=64 and I8W_SKIP=1 (a tile's 8-pair groups past its real count skip their staging, DPAS and scale), for the IQ4_NL arm and the Q8_0 prompt arm; the gate is a pure host function (kq_i8_xt64_refusal) with its DOWNGRADE reasons; tests: the gate on the export shapes, the skip's text and the 64-pair program's compile (test-opencl-kq-i8), the tails routing (routed=4) and a served 1,024-token launch in test-backend-ops.
+
+--- a/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
++++ b/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
+@@ -244,6 +244,40 @@
+     return env[0] == '1' ? 1 : 0;                // "1", "1..." on; anything else off
+ }
+ 
++// ---- 0222: the 64-pair wide tile (host-only) ----
++// GGML_OPENCL_KQ_MM_ID_I8_XT: the pairs a wide int8 tile carries. Only the exact text "64" asks for 64; unset, empty,
++// "32" and anything else keep 32, today's tile and route, bit-identical (the 64-pair program is not even built).
++static inline int kq_i8_xt_wanted(const char *env) {
++    return (env != 0 && env[0] == '6' && env[1] == '4' && env[2] == 0) ? 64 : 32;
++}
++
++// The reasons the 64-pair tile is refused for a launch (0 = it takes it), as the DOWNGRADE line names them.
++enum { KQ_I8_XT_OK = 0, KQ_I8_XT_NOT_ASKED, KQ_I8_XT_NOT_WIDE, KQ_I8_XT_NOT_BUILT, KQ_I8_XT_CACHE, KQ_I8_XT_SHAPE };
++static inline const char * kq_i8_xt_reason(int r) {
++    return r == KQ_I8_XT_NOT_ASKED ? "not-asked" : r == KQ_I8_XT_NOT_WIDE ? "not-wide" : r == KQ_I8_XT_NOT_BUILT ? "not-built" :
++           r == KQ_I8_XT_CACHE ? "expert-cache" : r == KQ_I8_XT_SHAPE ? "shape" : "ok";
++}
++
++// The gate of a MUL_MAT_ID launch already on the int8 arm: whether its tile is 64 pairs. Only the wide tile has a
++// 64-pair program (built with I8W_XT=64 and I8W_SKIP=1, the 8-pair groups past a tile's real count skipped), so the
++// knob must ask for 64, the launch must be on the wide tile with the 64-pair kernel built for its format, the weights
++// must not be an expert cache's slots or bank (their -1 ids and bank stages were not checked with this tile), and the
++// shape must be one the wide tile serves: K a multiple of 32 (an IQ4_NL / Q8_0 block), rows a multiple of 16 (the
++// wide tile's rule), at most 512 experts (the route kernel's local counters) and at least 16 tokens (the GEMM arm).
++static inline int kq_i8_xt64_refusal(int xt_wanted, int wide, int kernel64_built, int cache_src,
++                                     long ne00, long ne01, long n_expert, long n_tok) {
++    if (xt_wanted != 64)   return KQ_I8_XT_NOT_ASKED;
++    if (!wide)             return KQ_I8_XT_NOT_WIDE;
++    if (!kernel64_built)   return KQ_I8_XT_NOT_BUILT;
++    if (cache_src)         return KQ_I8_XT_CACHE;
++    if (ne00 <= 0 || ne00 % 32 != 0 || ne01 <= 0 || ne01 % 16 != 0 || n_expert < 1 || n_expert > 512 || n_tok < 16) {
++        return KQ_I8_XT_SHAPE;
++    }
++    return KQ_I8_XT_OK;
++}
++// the tile in pairs the route cuts and the kernel carries: 64 when the gate passes, else 32
++static inline int kq_i8_tile_pairs(int refusal) { return refusal == KQ_I8_XT_OK ? 64 : 32; }
++
+ // The group's mean routed pairs (rows) per expert. n_expert is the matrix's
+ // expert count; min(n_expert, n_pairs) is the upper bound of the experts a
+ // call touches, so the mean is never understated (Strata reads the real cnt
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl
+@@ -46,6 +46,25 @@
+ #define I8W_XTHR (I8W_XSG * 16)
+ #define I8W_BW   (I8W_XTHR * I8W_NC)
+ 
++// 0222: I8W_SKIP=1 (the 64-pair program, I8W_XT=64, built only when GGML_OPENCL_KQ_MM_ID_I8_XT=64): a tile runs the
++// staging, DPAS and scale of its 8-pair groups that hold a real pair only, ceil(te.z / 8) of them. te is one load at
++// the work-group's id, so the count is the same in every lane (the broadcast makes that explicit) and a skipped
++// group is skipped by the whole work-group: DPAS keeps its full execution mask. A skipped group's slots are at or
++// past te.z, which I8W_STORE never stores, so no output byte depends on the skip. Unset (0) is today's program:
++// I8W_ROWS is I8W_XT and every group runs.
++#ifndef I8W_SKIP
++#define I8W_SKIP 0
++#endif
++#if I8W_SKIP
++#define I8W_NG_DECL     const int i8w_ng = sub_group_broadcast((te.z + 7) >> 3, 0);
++#define I8W_ROWS        (i8w_ng * 8)
++#define I8W_GROUP_ON(g) ((g) < i8w_ng)
++#else
++#define I8W_NG_DECL
++#define I8W_ROWS        I8W_XT
++#define I8W_GROUP_ON(g) 1
++#endif
++
+ // the staged activation super-block and its scales, as the narrow tile stages
+ // them ([block][pair][32 bytes], [block][pair]), over the wide group's threads
+ #define I8W_STAGE                                                                                       \
+@@ -54,7 +73,7 @@
+     for (int k0 = 0; k0 < ne00; k0 += 256) {                                                            \
+         const int nb = min((ne00 - k0) / 32, 8);                                                        \
+         barrier(CLK_LOCAL_MEM_FENCE);                                                                   \
+-        for (int u = get_local_linear_id(); u < I8W_XT * nb * 2; u += I8W_XTHR) {                       \
++        for (int u = get_local_linear_id(); u < I8W_ROWS * nb * 2; u += I8W_XTHR) {                     \
+             const int row = u / (nb * 2), unit = u % (nb * 2);                                          \
+             const int j = unit >> 1, hpart = unit & 1;                                                  \
+             uchar16 v = (uchar16)(0);                                                                   \
+@@ -64,8 +83,8 @@
+                     (ulong)j * 32 + (ulong)hpart * 16));                                                \
+             vstore16(v, 0, xa + (j * I8W_XT + row) * 32 + hpart * 16);                                  \
+         }                                                                                               \
+-        for (int u = get_local_linear_id(); u < I8W_XT * nb; u += I8W_XTHR) {                           \
+-            const int j = u / I8W_XT, row = u % I8W_XT;                                                 \
++        for (int u = get_local_linear_id(); u < I8W_ROWS * nb; u += I8W_XTHR) {                         \
++            const int j = u / I8W_ROWS, row = u % I8W_ROWS;                                             \
+             xs[j * I8W_XT + row] = te.y + row < te.y + te.z                                             \
+                 ? xd[(ulong)kq_i8_col(pairs[te.y + row], n_used, ne11) * (ne00 / 32) + (k0 / 32) + j] : 0.f; \
+         }                                                                                               \
+@@ -80,6 +99,7 @@
+ #define I8W_MAD                                                                                         \
+         _Pragma("unroll")                                                                               \
+         for (int g = 0; g < I8W_XT / 8; ++g) {                                                          \
++          if (I8W_GROUP_ON(g)) {                                                                        \
+             const short8 av = as_short8(intel_sub_group_block_read_us8((local const ushort *)(xa + (j * I8W_XT + g * 8) * 32))); \
+             if (act0) {                                                                                 \
+                 const int8 tf = intel_sub_group_i8_i8_matrix_mad_k32(av, bq0, (int8)(0));               \
+@@ -89,6 +109,7 @@
+                 const int8 tf = intel_sub_group_i8_i8_matrix_mad_k32(av, bq1, (int8)(0));               \
+                 acc1[g] += convert_float8(tf) * (float8)(ws1) * vload8(0, xs + j * I8W_XT + g * 8);     \
+             }                                                                                           \
++          }                                                                                             \
+         }                                                                                               \
+         }                                                                                               \
+     }
+@@ -117,6 +138,7 @@
+     const int ti = get_group_id(0);                                                                     \
+     if (ti >= *n_tiles) return;                                                                         \
+     const int4 te = tiles[ti];                                                                          \
++    I8W_NG_DECL                                                                                         \
+     const int lane = get_sub_group_local_id(), sgi = get_sub_group_id();                                \
+     const int r0 = get_group_id(1) * I8W_BW + sgi * 16 + lane;                                     \
+     const int r1 = r0 + I8W_XSG * 16;                                                                   \
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1313,6 +1313,10 @@
+     // built only when GGML_OPENCL_KQ_MM_ID_I8_WIDE asks for it.
+     cl_kernel kernel_mul_mm_id_iq4_nl_i8_wide = nullptr;
+     cl_kernel kernel_mul_mm_id_q8_0_i8_wide   = nullptr;
++    // 0222: the same wide program built a second time with I8W_XT=64 and I8W_SKIP=1 (64-pair tiles, the empty
++    // 8-pair groups skipped), only when GGML_OPENCL_KQ_MM_ID_I8_XT=64 asks for it
++    cl_kernel kernel_mul_mm_id_iq4_nl_i8_wide64 = nullptr;
++    cl_kernel kernel_mul_mm_id_q8_0_i8_wide64   = nullptr;
+     // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
+     // up and down share their ids tensor, so it is computed once a layer
+     struct {
+@@ -3579,6 +3583,21 @@
+                                     CL_CHECK((backend_ctx->kernel_mul_mm_id_q8_0_i8_wide = clCreateKernel(wide_prog, "kernel_mul_mm_id_q8_0_i8_wide", &err), err));
+                                     CL_CHECK(clReleaseProgram(wide_prog));
+                                     GGML_LOG_INFO("ggml_opencl: int8 DPAS expert GEMM (MUL_MAT_ID, 512-column band) built\n");
++                                    // 0222: the 64-pair tile, the same text built again with I8W_XT=64 and
++                                    // I8W_SKIP=1, only when GGML_OPENCL_KQ_MM_ID_I8_XT=64 asks for it; unset, no
++                                    // second program and every launch keeps the 32-pair tile
++                                    if (kq_i8_xt_wanted(getenv("GGML_OPENCL_KQ_MM_ID_I8_XT")) == 64) {
++                                        cl_program w64 = build_program_from_source_optional(backend_ctx, wide_prog_src.c_str(),
++                                                                                            wide_opts + " -DI8W_XT=64 -DI8W_SKIP=1");
++                                        if (w64 == nullptr) {
++                                            ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "id_i8_wide64"), GGML_LOG_WARN("ggml_opencl: the 64-pair wide int8 tile is not built; the 32-pair tile stays\n");
++                                        } else {
++                                            CL_CHECK((backend_ctx->kernel_mul_mm_id_iq4_nl_i8_wide64 = clCreateKernel(w64, "kernel_mul_mm_id_iq4_nl_i8_wide", &err), err));
++                                            CL_CHECK((backend_ctx->kernel_mul_mm_id_q8_0_i8_wide64 = clCreateKernel(w64, "kernel_mul_mm_id_q8_0_i8_wide", &err), err));
++                                            CL_CHECK(clReleaseProgram(w64));
++                                            GGML_LOG_INFO("ggml_opencl: int8 DPAS expert GEMM (MUL_MAT_ID, 512-column band, 64-pair tile) built\n");
++                                        }
++                                    }
+                                 }
+                             }
+                         }
+@@ -37937,6 +37956,22 @@
+     if (i8_wide) {
+         i8_kernel = i8w_kernel;
+     }
++    // 0222: the 64-pair wide tile when GGML_OPENCL_KQ_MM_ID_I8_XT=64 asks for it and the gate passes (unset: 32,
++    // today's tile and route). A refusal under the knob is logged once a key (DOWNGRADE), never silent.
++    static const int i8xt_wanted = kq_i8_xt_wanted(getenv("GGML_OPENCL_KQ_MM_ID_I8_XT"));
++    int i8_tile = 32;
++    if (i8) {
++        cl_kernel w64 = ti == 5 ? backend_ctx->kernel_mul_mm_id_iq4_nl_i8_wide64 : nullptr;
++        const int why = kq_i8_xt64_refusal(i8xt_wanted, i8_wide, w64 != nullptr, cache_src, ne00, ne01, n_expert, n_tok);
++        i8_tile = kq_i8_tile_pairs(why);
++        if (i8_tile == 64) {
++            i8_kernel = w64;
++            static bool xt_logged = false;
++            if (!xt_logged) { GGML_LOG_INFO("ggml_opencl: int8 wide expert tile: 64 pairs (GGML_OPENCL_KQ_MM_ID_I8_XT=64)\n"); xt_logged = true; }
++        } else if (why != KQ_I8_XT_NOT_ASKED) {
++            ggml_cl_downgrade("op=MUL_MAT_ID type=%s path=xt32 reason=%s", ggml_type_name(src0->type), kq_i8_xt_reason(why));
++        }
++    }
+     cl_kernel kernel = ids8 ? ids8_kernel :
+                        i8 ? i8_kernel :
+                        id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
+@@ -38158,7 +38193,7 @@
+     const ggml_cl_kq_tile & t = backend_ctx->kq_mm_id;
+     const int sg        = backend_ctx->kq_mm_sg;
+     const int id2_xt = backend_ctx->kq_id2_xt, id2_xsg = backend_ctx->kq_id2_xsg;   // XT, XSG of mul_mm_kq_f16.cl
+-    const int tile      = ids8 ? backend_ctx->kq40_sg8_tm : i8 ? 32 : id2 ? id2_xt : t.nt(sg);
++    const int tile      = ids8 ? backend_ctx->kq40_sg8_tm : i8 ? i8_tile : id2 ? id2_xt : t.nt(sg);   // 0222: i8_tile 32 or 64
+     const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min(n_expert, n_pairs);
+     backend_ctx->prealloc_kq_pairs.allocate(backend_ctx->context, (size_t)n_pairs * sizeof(cl_int));
+     backend_ctx->prealloc_kq_tiles.allocate(backend_ctx->context, (size_t)max_tiles * sizeof(cl_int4));
+@@ -38450,8 +38485,16 @@
+     const int n_vals = n_cols * ne00;
+     const cl_ulong offset1 = extra1->offset + src1->view_offs;
+ 
+-    // the route: 32 pairs a tile (I8XT), cached per ids as the IQ arm's route is
+-    const int tile = 32;
++    // the route: 32 pairs a tile (I8XT), cached per ids as the IQ arm's route is; 0222: 64 on the wide tile when
++    // GGML_OPENCL_KQ_MM_ID_I8_XT=64 asks for it and the shared gate passes (this arm refused an expert cache above)
++    static const int xt_wanted = kq_i8_xt_wanted(getenv("GGML_OPENCL_KQ_MM_ID_I8_XT"));
++    const bool wide0 = kq_i8_wide_wanted(getenv("GGML_OPENCL_KQ_MM_ID_I8_WIDE")) != 0 && backend_ctx->kernel_mul_mm_id_q8_0_i8_wide != nullptr;
++    const int  xt_why = kq_i8_xt64_refusal(xt_wanted, wide0, backend_ctx->kernel_mul_mm_id_q8_0_i8_wide64 != nullptr, 0,
++                                           ne00, ne01, (long) src0->ne[2], n_tok);
++    const int tile = kq_i8_tile_pairs(xt_why);
++    if (tile != 64 && xt_why != KQ_I8_XT_NOT_ASKED) {
++        ggml_cl_downgrade("op=MUL_MAT_ID type=%s path=xt32 reason=%s", ggml_type_name(src0->type), kq_i8_xt_reason(xt_why));
++    }
+     const int sg = backend_ctx->kq_mm_sg;
+     const int i8_xsg = 8;
+     const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min((int) src0->ne[2], n_pairs);
+@@ -38510,7 +38553,8 @@
+     const bool w_on = kq_i8_wide_wanted(w_env) != 0;
+     const bool w_wide = w_on && backend_ctx->kernel_mul_mm_id_q8_0_i8_wide != nullptr;
+     if (w_wide) {
+-        kernel = backend_ctx->kernel_mul_mm_id_q8_0_i8_wide;
++        // 0222: the 64-pair program's kernel when the route above was cut at 64
++        kernel = tile == 64 ? backend_ctx->kernel_mul_mm_id_q8_0_i8_wide64 : backend_ctx->kernel_mul_mm_id_q8_0_i8_wide;
+     }
+     cl_uint a = 0;
+     const cl_ulong offq = 0;   // the flat planes' extra starts at the tensor's base (the decode arm's offq)
+--- a/tests/test-opencl-kq-i8.cpp
++++ b/tests/test-opencl-kq-i8.cpp
+@@ -275,6 +275,54 @@
+     CHECK(kq_i8_wide_wanted("yes") == 0, "wide: an unparsable word -> off");
+ }
+ 
++// 0222: the 64-pair tile's knob and gate. The knob: only the exact "64" asks for it. The gate is fed the shapes of
++// the graph exports' MUL_MAT_ID lines (src0 ne00 = K, ne01 = rows, ne02 = experts; the ids' ne1 = tokens):
++//   Inkling 2 Mini ffn_moe_down-*     IQ4_NL [1152, 2304, 128] (nb 18 / 648 / 1,492,992), ub 512 / 1024 / 2048
++//   Inkling 2 Mini ffn_moe_gate_up-*  IQ4_NL [2304, 2304, 128] (nb 18 / 1,296 / 2,985,984), the same ubatches
++//   Inkling 2 Mini layers 20-23       Q8_0, the same two shapes (the Q8_0 prompt arm)
++//   0192's 4,608-row gate/up          IQ4_NL [2304, 4608, 128] (9 bands)
++//   Flash-Next down                   IQ4_NL [640, 2560, 512], its expert cache's .slots / .bank
++static void check_xt64(void) {
++    CHECK(kq_i8_xt_wanted(nullptr) == 32, "xt: unset -> 32");
++    CHECK(kq_i8_xt_wanted("") == 32, "xt: empty -> 32");
++    CHECK(kq_i8_xt_wanted("32") == 32, "xt: 32 -> 32");
++    CHECK(kq_i8_xt_wanted("64") == 64, "xt: 64 -> 64");
++    CHECK(kq_i8_xt_wanted("640") == 32, "xt: 640 -> 32 (only the exact text)");
++    CHECK(kq_i8_xt_wanted("6") == 32, "xt: 6 -> 32");
++    CHECK(kq_i8_xt_wanted("on") == 32, "xt: on -> 32 (a number, not a switch)");
++    CHECK(kq_i8_xt_wanted("1") == 32, "xt: 1 -> 32");
++    struct shape { const char * what; long ne00, ne01, n_expert; };
++    const shape served[] = {
++        { "inkling ffn_moe_down",    1152, 2304, 128 },
++        { "inkling ffn_moe_gate_up", 2304, 2304, 128 },
++        { "0192 gate/up 4,608 rows", 2304, 4608, 128 },
++        { "flash-next down",          640, 2560, 512 },
++    };
++    for (const shape & s : served) {
++        for (long n_tok : { 512L, 1024L, 2048L, 16L }) {
++            char msg[160];
++            std::snprintf(msg, sizeof(msg), "xt64 gate: %s at %ld tokens, knob 64, wide, built -> 64", s.what, n_tok);
++            CHECK(kq_i8_tile_pairs(kq_i8_xt64_refusal(64, 1, 1, 0, s.ne00, s.ne01, s.n_expert, n_tok)) == 64, msg);
++            std::snprintf(msg, sizeof(msg), "xt64 gate: %s at %ld tokens, knob unset -> 32 (today)", s.what, n_tok);
++            CHECK(kq_i8_tile_pairs(kq_i8_xt64_refusal(32, 1, 1, 0, s.ne00, s.ne01, s.n_expert, n_tok)) == 32, msg);
++            CHECK(kq_i8_xt64_refusal(32, 1, 1, 0, s.ne00, s.ne01, s.n_expert, n_tok) == KQ_I8_XT_NOT_ASKED, "xt64 gate: knob unset -> not-asked (no DOWNGRADE line)");
++            std::snprintf(msg, sizeof(msg), "xt64 gate: %s, the narrow tile -> 32 (not-wide)", s.what);
++            CHECK(kq_i8_xt64_refusal(64, 0, 1, 0, s.ne00, s.ne01, s.n_expert, n_tok) == KQ_I8_XT_NOT_WIDE, msg);
++            std::snprintf(msg, sizeof(msg), "xt64 gate: %s, no 64-pair program -> 32 (not-built)", s.what);
++            CHECK(kq_i8_xt64_refusal(64, 1, 0, 0, s.ne00, s.ne01, s.n_expert, n_tok) == KQ_I8_XT_NOT_BUILT, msg);
++            std::snprintf(msg, sizeof(msg), "xt64 gate: %s, an expert cache's slots / bank -> 32 (expert-cache)", s.what);
++            CHECK(kq_i8_xt64_refusal(64, 1, 1, 1, s.ne00, s.ne01, s.n_expert, n_tok) == KQ_I8_XT_CACHE, msg);
++        }
++    }
++    // shapes the wide tile does not serve keep 32
++    CHECK(kq_i8_xt64_refusal(64, 1, 1, 0, 1150, 2304, 128, 512) == KQ_I8_XT_SHAPE, "xt64 gate: K not a multiple of 32 -> shape");
++    CHECK(kq_i8_xt64_refusal(64, 1, 1, 0, 1152, 2306, 128, 512) == KQ_I8_XT_SHAPE, "xt64 gate: rows not a multiple of 16 -> shape");
++    CHECK(kq_i8_xt64_refusal(64, 1, 1, 0, 1152, 2304, 520, 512) == KQ_I8_XT_SHAPE, "xt64 gate: more than 512 experts -> shape");
++    CHECK(kq_i8_xt64_refusal(64, 1, 1, 0, 1152, 2304, 128, 15) == KQ_I8_XT_SHAPE, "xt64 gate: under 16 tokens -> shape");
++    CHECK(std::strcmp(kq_i8_xt_reason(KQ_I8_XT_CACHE), "expert-cache") == 0, "xt64 gate: the reason text");
++    CHECK(kq_i8_tile_pairs(KQ_I8_XT_OK) == 64 && kq_i8_tile_pairs(KQ_I8_XT_SHAPE) == 32, "xt64 gate: the tile from the verdict");
++}
++
+ // ---- the activation's column mapping ----
+ // the fp16 tile kernel's column, (i % ne11) + t * ne11, not the route pair: a
+ // broadcast b (ne11 = 1, the served gate/up) holds one activation a token.
+@@ -658,6 +706,32 @@
+     const int rc = std::system(cmd.c_str());
+     if (rc != 0) std::printf("FAIL: opencl-wide: the assembled wide program does not compile (%s)\n", cc.c_str());
+     CHECK(rc == 0, "opencl-wide: the assembled wide program compiles as OpenCL C");
++    // 0222: the same text as the 64-pair program (I8W_XT=64, I8W_SKIP=1), as load_cl_kernels builds it
++    const std::string cmd64 = cc + " -target spir64 -x cl -cl-std=CL3.0 -DSG=16 -DI8W_XT=64 -DI8W_SKIP=1" +
++                              " -fsyntax-only \"" + KQ_I8_WIDE_ASSEMBLED_PATH + "\" >/dev/null 2>&1";
++    const int rc64 = std::system(cmd64.c_str());
++    if (rc64 != 0) std::printf("FAIL: opencl-wide: the 64-pair program does not compile (%s)\n", cc.c_str());
++    CHECK(rc64 == 0, "opencl-wide: the 64-pair program compiles as OpenCL C");
++}
++
++// 0222: the skip's text in the wide source: the group count rounds UP (a partial last group runs), every loop the
++// skip bounds uses the same count, and with I8W_SKIP unset the program is today's (I8W_ROWS is I8W_XT, every group on)
++static void check_xt64_text(void) {
++    bool ok_w = false;
++    const std::string w = read_text(KQ_I8_WIDE_PATH, &ok_w);
++    CHECK(ok_w, "opencl-wide64: mul_mm_kq_i8_wide.cl is readable");
++    if (!ok_w) return;
++    const std::string cl = strip_comments(w);
++    CHECK(cl.find("#define I8W_SKIP 0") != std::string::npos, "opencl-wide64: I8W_SKIP defaults to 0");
++    CHECK(cl.find("sub_group_broadcast((te.z + 7) >> 3, 0)") != std::string::npos, "opencl-wide64: ng = ceil(te.z / 8), uniform");
++    CHECK(cl.find("#define I8W_ROWS        (i8w_ng * 8)") != std::string::npos, "opencl-wide64: the staged rows = ng * 8");
++    CHECK(cl.find("#define I8W_ROWS        I8W_XT") != std::string::npos, "opencl-wide64: unset, the staged rows = I8W_XT (today)");
++    CHECK(cl.find("#define I8W_GROUP_ON(g) 1") != std::string::npos, "opencl-wide64: unset, every group runs (today)");
++    CHECK(cl.find("if (I8W_GROUP_ON(g))") != std::string::npos, "opencl-wide64: the DPAS loop asks the group predicate");
++    CHECK(cl.find("u < I8W_ROWS * nb * 2") != std::string::npos && cl.find("u < I8W_ROWS * nb;") != std::string::npos,
++          "opencl-wide64: both staging loops bounded by I8W_ROWS");
++    CHECK(cl.find("const int j = u / I8W_ROWS, row = u % I8W_ROWS;") != std::string::npos, "opencl-wide64: the scale loop's index by I8W_ROWS");
++    CHECK(cl.find("if (slot >= te.y + te.z) continue;") != std::string::npos, "opencl-wide64: the store stops at the real count");
+ }
+ 
+ int main() {
+@@ -670,10 +744,12 @@
+     check_formats();
+     check_program();
+     check_wide();
++    check_xt64();
+     check_columns();
+     check_opencl_part();
+     check_opencl_text();
+     check_wide_text();
++    check_xt64_text();
+     if (g_bad == 0) std::printf("test-opencl-kq-i8: all OK\n");
+     return g_bad == 0 ? 0 : 1;
+ }
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6372,18 +6372,23 @@
+                        int64_t m, int64_t n, int64_t k)
+         : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k), mode(mode), replay(replay) {
+         GGML_ASSERT(n_mats == 128 && n_used == 8);
+-        GGML_ASSERT(mode == 2 || (mode == 3 && replay >= 0 && replay < p5_n_replay && p5_replay[replay].n == n));
++        GGML_ASSERT(mode == 2 || (mode == 3 && replay >= 0 && replay < p5_n_replay && p5_replay[replay].n == n) ||
++                    (mode == 4 && n == 520));
+     }
+     std::string vars() override {
++        if (mode == 4) { return test_mul_mat_id::vars() + ",routed=4"; }
+         return test_mul_mat_id::vars() + (mode == 2 ? std::string(",routed=2") : std::string(",routed=3,replay=") + p5_replay[replay].tag);
+     }
+     void initialize_tensors(ggml_context * ctx) override {
+         std::vector<int32_t> list;
+-        if (mode == 3) {
++        if (mode == 3 || mode == 4) {
++            // 0222, routed=4 (tails): expert e holds (e mod 64) + 1 pairs, 4,160 = 520 x 8 in all, so every count
++            // 1..64 occurs twice: every partial last tile at 64 (and at 32) and two full 64-pair tiles
+             int mx = 0;
+             for (int e = 0; e < 128; ++e) {
+-                mx = std::max(mx, p5_replay[replay].cnt[e]);
+-                for (int c = 0; c < p5_replay[replay].cnt[e]; ++c) { list.push_back(e); }
++                const int c_e = mode == 4 ? (e % 64) + 1 : p5_replay[replay].cnt[e];
++                mx = std::max(mx, c_e);
++                for (int c = 0; c < c_e; ++c) { list.push_back(e); }
+             }
+             GGML_ASSERT((int64_t) list.size() == n * n_used && mx <= n);
+         }
+@@ -13399,6 +13404,14 @@
+     // 0208b: one correctness case each new routing (balanced down at 128 tokens, a served launch's gate/up at 512)
+     test_cases.emplace_back(new test_mul_mat_id_p5(2, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, 128, 1152));
+     test_cases.emplace_back(new test_mul_mat_id_p5(3, 1, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, 512, 2304));
++    // 0222: the tails routing (every count 1..64 twice, partial last tiles at 64 and 32, two full 64-pair tiles),
++    // down and gate/up, and one served launch at 1,024 tokens (counts up to 685: full 64-pair tiles and a partial
++    // last one in one expert); they run with the 64-pair knob on or off alike
++    test_cases.emplace_back(new test_mul_mat_id_p5(4, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, 520, 1152));
++    test_cases.emplace_back(new test_mul_mat_id_p5(4, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, 520, 2304));
++    test_cases.emplace_back(new test_mul_mat_id_p5(3, 3, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, 1024, 1152));
++    // the Q8_0 prompt arm (Inkling's layers 20-23) on the same tails routing
++    test_cases.emplace_back(new test_mul_mat_id_p5(4, 0, GGML_TYPE_Q8_0,   GGML_TYPE_F32, 128, 8, false, 2304, 520, 1152));
+ 
+     // 0168's Q8_0 prompt arm refuses rows that are not a multiple of 16 and more
+     // than 512 experts; these two take its fallback, so that text is run too.
+@@ -15241,6 +15254,9 @@
+         test_cases.emplace_back(new test_mul_mat_id_p5(3, i, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, p5_replay[i].n, 1152));
+         test_cases.emplace_back(new test_mul_mat_id_p5(3, i, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, p5_replay[i].n, 2304));
+     }
++    // 0222: the tails routing in the perf list too (the 64-pair knob's op rows time it off and on)
++    test_cases.emplace_back(new test_mul_mat_id_p5(4, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, 520, 1152));
++    test_cases.emplace_back(new test_mul_mat_id_p5(4, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, 520, 2304));
+ 
+     // Qwen3.8-Flash-Next GSQ-RCO IQ2_XS: 512 experts, 10 used, gate/up 2560 -> 640, down 640 -> 2560; decode and a verify
+     for (int bs : {1, 3}) {
