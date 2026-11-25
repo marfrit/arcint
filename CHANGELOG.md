@@ -43,8 +43,8 @@ write itself, which brings the checkpoints back, is planned for 1.8.2.
 - **A start that does not fit the card is refused** (the spill guard, below). `--llama-allow-spill` restores 1.8.0's
   start-and-spill. The guard bounds by the xe driver's card figure; where that figure is missing (an i915 host, the
   default driver for A-series cards, or a build without `drm/xe_drm.h`) it falls back to OpenCL's smaller global size,
-  under which a start that 1.8.0 served can be refused (the 27B agent at 262,144 cells on a B60 is one): use
-  `--llama-allow-spill` there. The refusal names the figure it used.
+  under which a start that 1.8.0 served can be refused (the 27B agent at 262,144 cells on a B60 is one); the refusal
+  then names the fallback as its figure.
 - **No architecture is refused at load any more; three admitted families lose their full surface.** Gemma 4 E4B,
   Granite 4.2 8B and Mistral Small 3.2 24B (the writer's Cydonia) are now tier "runs": no token mode, no renderer
   material, `--tool-grammar` refused.

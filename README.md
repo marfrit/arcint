@@ -567,7 +567,7 @@ service's production flags, Flash-Next's expert cache included
   and the `--n-ctx` (or `--llama-expert-cache`) that would fit; `--llama-allow-spill` starts anyway with a warning
   (the 1.8.0 behaviour). `/props` carries the accounting (`device_memory`). Without the xe figure (an i915 host, a
   build without `drm/xe_drm.h`) the guard falls back to OpenCL's global memory size, which on the B60 (23,256 MiB) is
-  below what a full 24 GB unit uses: start such a unit with `--llama-allow-spill`.
+  below what a full 24 GB unit uses, and the refusal says that the fallback's figure was used.
 - **`--llama-swa-window`** (opt-in) gives a model with sliding-window attention a window-sized cache for those layers
   (`n_swa + n_ubatch` cells) instead of one sized to the whole context: Inkling 2 Mini at 131,072 cells and f16 drops
   from 24,576 to 4,336 MiB of sliding-window cache. The cache cannot then be cut back to an arbitrary prefix; the
