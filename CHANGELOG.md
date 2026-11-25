@@ -71,6 +71,15 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   count) fail their cases. The knob stays off by default until the operator changes it. Patch 0208b adds the test
   cases (balanced and served-routing replay).
 
+- llama.cpp patch 0220 (opt-in, `GGML_OPENCL_Q8_2D=1|2`, default off): dense Q8_0 prompt products on Intel Xe2 on the
+  2D-block GEMM (int8 or fp16 DPAS) in place of 0058's local-memory tile, for Inkling 2 Mini's attention projections.
+  Unset, nothing changes. Card rows (`measured-here`, B60 at 165 W, the Inkling unit's settings): the op suite
+  262 of 262 on the tile, fp16 and int8 arms, every red visible where its fill can see it; the 4,096-token prompt
+  pass 1,176.5 -> 1,230.1 t/s (fp16, +4.6 %) and 1,255.3 t/s (int8, +6.7 %), the slowest on-run above the fastest
+  off-run in 3 interleaved rounds; mean KL against the CPU base 0.002825 nats (int8) against 0.002598 (off), same top
+  97.96 % against 98.16 %; the battery 8 of 8 right. The knob stays off by default until the operator changes it
+  (`contrib/llama.cpp/README.md`, 0220).
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn
