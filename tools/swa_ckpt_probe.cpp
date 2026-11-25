@@ -64,9 +64,13 @@
 //      and every tail logit row (unequal: the card is not deterministic here)
 //   R1 / R2 after E1's / E2's restore, seq 0's K / V rows read from the WHOLE
 //      storage tensors (not the views the state I/O uses), in position order, vs U's
-//   C  no save / restore: the lane runs on as E1's, is cleared whole and prefills
-//      the prefix again in the same calls, so its cells sit where a restore puts
-//      them; its layout is printed and compared with E1's, its tail with U's and E1's
+//   E3 the restore without a history: a context's own partial state restored into
+//      it at once (the restored layout, none of the lane's history), vs U and E1
+//   C  the lane's history without a restore: the lane runs on as E1's, is cleared
+//      whole and prefills the prefix again in the same calls; its layout per cache
+//      is compared with E1's (by reading its SWA cache sits as U's: a prefill keeps
+//      position p in cell p, a restore refills the window from cell 0), its tail
+//      with U's and E1's
 //   layout lines: per attention cache the cells of seq 0 (index by position,
 //      used, used_max_p1) and the recurrent memory's head / rs_z / seq 0's cell
 // The expectations per candidate are printed first; the "E reading" line gives the
@@ -529,7 +533,9 @@ int main(int argc, char** argv) {
             "expect: E0' (two untouched contexts, the same calls) differing = the card is not deterministic here; nothing else is readable\n"
             "expect: (a) a kernel reads another layout than set / get: E0' equal, E1 differs, R1 (raw K/V, the whole tensors, no view) differs\n"
             "expect: (b) a derived cache / state outside the serialized state is not invalidated: E0' equal, E1 differs, R1 equal\n"
-            "expect: (c) the cell layout changes the summation order: C (no save / restore, the restored layout) differs from U like E1 (C == E1 rows)\n");
+            "expect: (c) the cell layout changes the summation order: E3 (the restore without a history) equals E1, C (the history without a restore, U's SWA layout) equals U, "
+            "and with GGML_OPENCL_FA_DPAS2_SPLIT=1 E1 / E2 match U up to the decode row (its n_kv differs)\n"
+            "expect: history (a derived state of the lane's decodes): C differs from U\n");
         const std::vector<llama_token> prefix(lane_tokens.begin(), lane_tokens.begin() + cut);
         const std::vector<llama_token> tail(lane_tokens.begin() + cut, lane_tokens.begin() + cut + e_tail);
         const llama_token next = lane_tokens[cut + e_tail];
@@ -643,9 +649,43 @@ int main(int argc, char** argv) {
             llama_free(l);
         }
 
-        // C: no save / restore. The lane runs on as E1's, is cleared whole (a hybrid refuses a partial trim),
-        // and prefills the prefix again in the same calls: its cells sit where a restore puts them (a clear
-        // frees every cell, the head returns to 0); the layout lines say whether they match E1's
+        // E3: the restore without a history: a context's own partial state restored into it at once. The
+        // restore clears the sequence and refills its cells from cell 0, so E3 has the restored layout
+        // (as E1 / E2) and none of the lane's history
+        std::vector<float> rows_e3;
+        bool e3_like_e1 = false, e3_lay_eq = false, have_e3 = false;
+        {
+            auto* l = make_ctx(m, n_ctx);
+            if (!prefill_prefix(l)) { return 2; }
+            const std::vector<uint8_t> ck = save_partial(l, 0);
+            if (ck.empty() || llama_state_seq_set_data_ext(l, ck.data(), ck.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != ck.size() ||
+                !llama_memory_seq_rm(llama_get_memory(l), 0, (llama_pos) cut, -1)) {
+                std::fprintf(stderr, "FAIL %-58s the restore was refused\n", "E3 restore in place, no history");
+                ++failures;
+            } else {
+                const ByteDiff bd = diff_bytes(ck, save_partial(l, 0));
+                const Layout lay = layout_of(l);
+                print_layout("E3", lay);
+                e3_lay_eq = have_e1 && layout_equal(lay, lay_e1);
+                std::fprintf(stderr, "E3 layout vs E1: %s; vs U: %s\n", have_e1 ? (e3_lay_eq ? "equal" : "DIFFERS") : "no E1",
+                             layout_equal(lay, lay_u) ? "equal" : "differs");
+                if (!run_tail(l, rows_e3)) { return 2; }
+                const RowDiff rd = diff_rows(rows_u, rows_e3, n_vocab);
+                if (!report("E3 restore in place, no history", &bd, &rd)) ++failures;
+                if (have_e1) {
+                    const RowDiff r31 = diff_rows(rows_e1, rows_e3, n_vocab);
+                    e3_like_e1 = r31.equal();
+                    report("E3 vs E1 tail logits", nullptr, &r31);
+                }
+                have_e3 = true;
+            }
+            llama_free(l);
+        }
+
+        // C: the lane's history without a restore. The lane runs on as E1's, is cleared whole (a hybrid
+        // refuses a partial trim) and prefills the prefix again in the same calls. By reading, its base
+        // cache sits as E1's (positions in their own cells) but its SWA cache as U's (a prefill keeps
+        // position p in cell p; a restore refills the window from cell 0): the layout lines say which
         bool c_like_e1 = false, c_rows_ok = false, c_lay_eq = false;
         {
             auto* c = make_ctx(m, n_ctx);
@@ -658,13 +698,19 @@ int main(int argc, char** argv) {
             c_lay_eq = have_e1 && layout_equal(lay, lay_e1);
             std::fprintf(stderr, "C layout vs E1: %s; vs U: %s\n", have_e1 ? (c_lay_eq ? "equal" : "DIFFERS") : "no E1",
                          layout_equal(lay, lay_u) ? "equal" : "differs");
+            if (have_e1) {
+                for (size_t i = 0; i < lay.caches.size() && i < lay_e1.caches.size(); ++i) {
+                    const bool eq = lay.caches[i].cells == lay_e1.caches[i].cells && lay.caches[i].used_max_p1 == lay_e1.caches[i].used_max_p1;
+                    std::fprintf(stderr, "C layout vs E1, %s cache: %s\n", lay.caches[i].name.c_str(), eq ? "equal" : "DIFFERS");
+                }
+            }
             std::fprintf(stderr, "E1 layout vs U: %s\n", have_e1 ? (layout_equal(lay_e1, lay_u) ? "equal" : "differs") : "no E1");
             std::vector<float> rows;
             if (!run_tail(c, rows)) { return 2; }
             const RowDiff rd = diff_rows(rows_u, rows, n_vocab);
             c_rows_ok = rd.equal();
-            report("C no restore, the restored layout: partial state vs U's", &bp, nullptr);
-            report("C no restore, the restored layout: tail logits vs U's", nullptr, &rd);
+            report("C the lane's history, no restore: partial state vs U's", &bp, nullptr);
+            report("C the lane's history, no restore: tail logits vs U's", nullptr, &rd);
             if (have_e1) {
                 const RowDiff rce = diff_rows(rows_e1, rows, n_vocab);
                 c_like_e1 = rce.equal();
@@ -674,15 +720,19 @@ int main(int argc, char** argv) {
         }
 
         // the reading, by the expectations above
-        const char* verdict =
-            !e0p_ok                                   ? "nondeterministic (E0' differs: nothing else is readable)" :
-            !have_e1                                  ? "unclear (E1 did not run)" :
-            e1_rows_ok                                ? "none (E1's tail logits equal U's)" :
-            (c_like_e1 && !c_rows_ok)                 ? "c (the layout: C differs from U like E1)" :
-            !r1_ok                                    ? "a (the raw K/V differ although the state bytes are equal)" :
-            c_rows_ok                                 ? "b (raw K/V equal, the layout control equals U: a derived cache / state outside the serialized state)" :
-                                                        "unclear (C differs from U, but not like E1)";
-        std::fprintf(stderr, "E reading: %s%s\n", verdict, (have_e1 && !c_lay_eq) ? " [C's layout is not E1's: (c) is not tested by C]" : "");
+        std::string verdict;
+        if (!e0p_ok) verdict = "nondeterministic (E0' differs: nothing else is readable)";
+        else if (!have_e1) verdict = "unclear (E1 did not run)";
+        else if (e1_rows_ok) verdict = "none (E1's tail logits equal U's)";
+        else if (!r1_ok) verdict = "a (the raw K/V differ although the state bytes are equal)";
+        else if (c_lay_eq && c_like_e1 && !c_rows_ok) verdict = "c (the layout: C, E1's layout without a restore, differs from U like E1)";
+        else if (c_lay_eq && c_rows_ok) verdict = "b (raw K/V equal; C, E1's layout without a restore, equals U: a derived state of the restore)";
+        else if (!c_rows_ok) verdict = "history (C, the lane's history without a restore, differs from U)";
+        else if (have_e3 && e3_lay_eq && e3_like_e1)
+            verdict = "c or b-by-restore (E3, the restore without a history, equals E1; C, the history without a restore and in U's SWA layout, equals U): "
+                      "the restored layout or the restore itself; the one-split run decides (c: E1 / E2 match U there)";
+        else verdict = "unclear (C equals U in another layout; E3 is not E1)";
+        std::fprintf(stderr, "E reading: %s\n", verdict.c_str());
         llama_model_free(m);
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return failures == 0 ? 0 : 3;
