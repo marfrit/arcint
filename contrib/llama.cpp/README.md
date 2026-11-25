@@ -10750,7 +10750,8 @@ base for the card's 6-chunk KL is made from the published file (2,456,010,284 by
 2,048 on the gate text, knob off, tree `13ab33b8`).
 
 **With the FA port, and the 6-chunk answer-level arms** (`measured-here`, B60, tree `13ab33b8`, f16
-KV - the port refuses a q8_0 KV cache -, int8 expert tile + wide + 0187 on; `GGML_OPENCL_FA_PORT=1` is
+KV - on that tree the port refused a q8_0 KV cache; with 0199q1 / 0199q2 it reads one, and the q8_0 row
+of both knobs is in the port's section and below -, int8 expert tile + wide + 0187 on; `GGML_OPENCL_FA_PORT=1` is
 development's opt-in port, another patch set). pp4096 at ub 1024 (`-b 2048`, three interleaved
 rounds):
 
