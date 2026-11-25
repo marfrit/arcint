@@ -9999,7 +9999,15 @@ the cap; the suite's large 512-expert cases dominate), so the full-family CPU ro
 - Open: `llama-perplexity` does not print the once-a-process INFO line. The KL runs therefore do
   not themselves show the path was taken, although the `llama-bench` runs on the same binary and
   env do. Inkling's ub 512 logits arm (gate step (f) as written) was not run. Owed: a `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` perplexity run, or a per-call counter.
-## 0204-0207: Inkling 2 Mini's depth mix as one op (the plan, written before any card run)
+## 0204-0207: Inkling 2 Mini's depth mix as one op
+
+**Status: card-proven (2026-11-25).** This section is chronological and nothing in it was edited
+away: the plan as written before any card run comes first, then the card results and the
+defects they named, with retractions on the record. The current numbers are under "Card result
+3" and the tables after it (the op rows, pp4096, the profile, the answer-level arms, the task
+battery, the rows with the FA port); what is still open is the list at the section's end.
+
+**The plan, written before any card run.**
 
 A native DEPTH-MIX kernel for the prefill, ported from the reference's Triton `_mix_kernel`
 (the trellis-serve project, `xpu/exl3xpu/inkling2/fused.py:41`, "a token a program, fp32"; the model's
@@ -10703,7 +10711,9 @@ and 978.5 with `=nofold`; f16 KV 815.8 -> 978.6.
 
 *The profile, one pp4096 pass at ub 512 (a profiling build; read the ms, not its t/s):* all
 kernels 5,229 ms with the chain, 4,431 ms with the arm; `kernel_depth_mix_f32` **99.1 ms over
-960 launches, 103 us a launch**. The reference's own mix kernel is 399 ms a pass on this card,
+960 launches, 103 us a launch**. The reference's own mix kernel is 399 ms a pass on this card
+(`measured-here` on the reference stack, a trace of its 4,096-token prefill at chunk 512, first
+recorded in this section's plan as 398.96 ms; the reference run's commit is not recorded here),
 the chain's four probed parts were 765 ms (699 with 0187).
 
 *The prediction's miss, on the record.* Predicted 150-300 us a call and 145-290 ms a pass;
@@ -10713,7 +10723,8 @@ The pass saves 798 ms where the four probed parts priced 600-700: the rest is wh
 prediction listed as unpriced (the states' `rms_norm`, the cur copy, the column copies, the
 folded norms). pp4096 at ub 512 was predicted at 833-858 t/s and measured 908.1.
 
-*Answer level (the secondary bar), llama-perplexity against the CPU base, 3 chunks of 2,048:*
+*Answer level (the secondary bar), llama-perplexity against the 3-chunk CPU base made from the
+card's own file (the published GGUF, knob off), 3 chunks of 2,048:*
 
 | arm | mean KL, nats | same top p |
 |---|---|---|
@@ -10724,9 +10735,9 @@ folded norms). pp4096 at ub 512 was predicted at 833-858 t/s and measured 908.1.
 
 The arm is +0.00005 nats and +0.23 points against the chain with the fold, +0.00011 and +0.03
 without it: inside the answer-level bar (0.03 nats, 1 point) by two orders of magnitude, and
-inside the span of the chain with one-ulp noise. The same arms on 6 chunks are further down;
-the task battery (the capital, an arithmetic chain, a JSON extraction, the binary-search
-completion) with the arm off and on is owed.
+inside the span of the chain with one-ulp noise. The same arms on 6 chunks and the task
+battery (the capital, an arithmetic chain, a JSON extraction, the binary-search completion) are
+further down.
 
 The README is not part of the applied tree: these paragraphs leave `13ab33b8` as it is.
 
@@ -10752,8 +10763,11 @@ rounds):
 
 Every arm's log carried its own TAKEN lines and none of the other's. The two savings add: 831.6
 ms for the arm and 813.2 ms for the port are 1,644.8 ms, both together save 1,648.2 - an overlap of
--3.4 ms, on disjoint launches. The reference stack's row on this card is 1,220 t/s. At the unit's
-q8_0 KV the arm alone is 979.2 t/s (above); the arm with the port at q8_0 is not measured.
+-3.4 ms, on disjoint launches. The reference stack's row on this card is 1,220 t/s
+(`measured-here` on the reference stack; this is the row's first record in the repository, and
+the reference run's commit is not recorded here). At the unit's
+q8_0 KV the arm alone is 979.2 t/s (above); the arm with the port at q8_0 KV is the last table
+of this section.
 
 llama-perplexity against the CPU base of the published file, 6 chunks of 2,048 (`-b 512`; about
 6,100 scored tokens), every arm's path shown by its TAKEN line in the same log:
@@ -10769,4 +10783,45 @@ llama-perplexity against the CPU base of the published file, 6 chunks of 2,048 (
 
 The arm is +0.000005 nats and +0.07 points against the chain with the fold, +0.000010 and -0.01
 without it: inside the answer-level bar, and inside the two noise seeds. The answer-level bar
-is met on more than 5,000 tokens. Owed: the task battery on the card.
+is met on more than 5,000 tokens.
+
+**The task battery** (`measured-here`, B60, tree `13ab33b8`, the unit's q8_0 KV, all layers on
+the card, temperature 0, `-b 2048 -ub 512`, int8 expert tile + wide + 0187 on; each answer saved
+in full and judged by a script against its known answer; identical text across arms is not
+required at a batched prefill):
+
+| task | prompt tokens | chain | the arm (fold) | text against the chain |
+|---|---|---|---|---|
+| the capital of France, one word | 27 | right | right | identical |
+| an arithmetic chain of six steps (88) | 73 | right | right | differs from char 171 of 548 / 512 |
+| a JSON object of four fields from a 100-record order log | 4,394 | right | right | identical |
+| a binary search completed after 139 code samples, run on 300 random cases | 4,095 | right | right | differs from char 161 of 829 / 752 |
+
+8 of 8 right. The script is the battery in `contrib/llama.cpp/replay/mix_task_battery.sh` (a
+measurement body: it needs `llama-completion`, the model, and three helpers; rehearsed on the CPU
+with a short prompt set first, 8 of 8 there too).
+
+**The arm with the FA port at the unit's q8_0 KV** (`measured-here`, B60, a combined tree that
+adds another patch set's q8_0 support for the port, applied tree `a52a4c2a`; pp4096, medians):
+chain 816.55 t/s, the arm 980.46, the port 945.74, both **1,171.43** (the additive prediction was
+1,171). llama-perplexity against the CPU base on that tree: chain 0.002464 ± 0.000073 nats, the
+arm 0.002470 ± 0.000085.
+
+No measurement in this section is owed any more.
+
+**Open list** (from the final review; none of it changes a result above, and no patch file is
+touched for it now, because that would move the card-proven tree `13ab33b8`):
+
+- the launch (`ggml_cl_depth_mix`) does not call `ggml_depth_mix_refuse` again - it relies on
+  `supports_op` having decided - and the dst-layout check (`F32`, contiguous) sits in
+  `supports_op` beside the pure rule, not inside it;
+- with the knob off the dispatch still counts `GGML_OP_DEPTH_MIX` nodes once a graph (a loop
+  over the graph's nodes; no kernel, no launch);
+- two comments in 0205 are wrong: "0178's bounds helper" at the forward declarations (the helper
+  is 0198's), and "the card run of 0.5.1", which names a version where it means this arm's
+  first card result;
+- the two reference readings in this section (399 ms a pass for its mix kernel, 1,220 t/s for
+  its pp4096 row) are `measured-here` on the reference stack, but no document in the repository
+  names the tree and commit of those runs: they need that line, from the runs' own record;
+- `GGML_OPENCL_DEPTH_MIX_OPTS` (the reds' route: extra compiler options for `depth_mix.cl`) is a
+  test hook that lives in the production dispatch.

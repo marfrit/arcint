@@ -50,7 +50,30 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   noise. The op itself is 1.6 to 1.8 x the f16 port where 1.27 x was predicted:
   a miss, recorded. Not run at the units' own flags (262,144 context, `--llama-swa-window`). Record:
   `contrib/refkernels/trellis-fa/README.md` §q8 and §q8-card.
+- **Inkling 2 Mini's depth mix as one op: the current entry** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`;
+  the three entries after this one are its history and are superseded by it; `measured-here`, B60, f16 KV,
+  int8 expert tile + wide + 0187 on, the FA port off). pp4096: ub 512 771.1 -> 908.1 t/s (+17.8 %), ub 1024 818.6 ->
+  982.1 (+20.0 %), ub 2048 770.0 -> 917.4 (+19.1 %); at the unit's ub 1024, q8_0 KV 816.4 -> 979.2. The kernel is 99.1
+  ms a pp4096 pass (960 launches, 103 us each) where the chain's four probed parts were 765 ms and the reference's own
+  mix kernel 399 ms; the pass's kernel time falls 5,229 -> 4,431 ms. The prediction (145-290 ms) missed low. Op level:
+  45 cases and 36 replayed export lines under an nmse bound of 1e-10, three reds failing what each must. Answer level
+  against the CPU base made from the card's own file (3 chunks): chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp
+  noise 0.0019-0.0021 / 98.3 %; on 6 chunks (about 6,100 tokens) chain 0.002256 / 98.27 %, the arm 0.002261 / 98.34 %,
+  noise 0.002346 and 0.002270. With development's FA port also on (f16 KV, ub 1024): chain 815.9, the arm 978.5, the
+  port 973.6, both **1,215.7 t/s**; the two savings add (831.6 + 813.2 ms against 1,648.2 together). At the unit's q8_0
+  KV on a combined tree: chain 816.6, the arm 980.5, the port 945.7, both **1,171.4 t/s**. The task battery at q8_0 KV
+  (the capital, an arithmetic chain, a JSON extraction from 4,394 tokens, a binary search after 4,095 tokens run on 300
+  random cases): 8 of 8 right, the arm off and on. Details: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
+  State of the arm: the output norm is folded where the chain norms one mixed column (`=nofold` keeps the norms nodes);
+  its five buffers are bounds-checked before every launch, not only under `GGML_OPENCL_BOUNDS=1`; unset, the graph and
+  the dispatch are the chain's, node for node. Provenance: every card number here ran the published GGUF; the CPU
+  numbers quoted in the history entries below (the knob-on KL 0.0015, 381 tokens) ran a re-quantized variant with a
+  Q6_K output tensor on the recipe host and compare arms of that one file only.
+
 - **Inkling 2 Mini's depth mix as one op** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`). The prefill's depth
+  *Superseded by the current entry above; kept as the record. What it says about the state ("no speed row is claimed",
+  "the model no longer folds the norm", "bounded under `GGML_OPENCL_BOUNDS=1`", "no card run of this revision", "the card
+  arm decides") describes that revision only.*
   attention (`src/models/inkling2.cpp:191`) ran as 8-12 nodes a mix call: a copy of the k+1 states as a transposed view
   (341 ms of a pp4096 pass), the first product on 0178's split-K GEMV (309), the weighted sum on 0171's tiny-K kernel
   (82) and the query repeat (33) — 765 ms, 12.7 % of the 6,042 ms pass (`measured-here`, B60, ub 512, before this
@@ -78,6 +101,9 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   reason, one fixed `TAKEN` line marks the first taken call, `GGML_OPENCL_DEPTH_MIX_STATS=1` counts the graph's calls, and
   every launch is bounded under `GGML_OPENCL_BOUNDS=1`.
 - **The depth mix's two card failures, named and fixed** (patches 0204-0207, still opt-in `GGML_OPENCL_DEPTH_MIX=1`;
+  *Superseded by the current entry above; kept as the record. What it says about the state ("no speed row is claimed",
+  "the model no longer folds the norm", "bounded under `GGML_OPENCL_BOUNDS=1`", "no card run of this revision", "the card
+  arm decides") describes that revision only.*
   `code`, and `measured-here` on the recipe host for the replays - no card run of this revision yet). *The page fault*
   was not in the arm's kernel: Inkling 2 Mini is the loop model, its cross-pass `messages` are a mix result (the bank
   store, k 1, four query columns), the arm took that call, and `build_layer`'s `message()` read the arm's
@@ -96,6 +122,9 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   call, 145-290 ms a pass against the chain's 765 and the reference's 399 (`inference`); card commands in
   `contrib/llama.cpp/README.md`.
 - **The depth mix mixed raw states** (patches 0204, 0205, 0207; found by an independent code read, `code` and
+  *Superseded by the current entry above; kept as the record. What it says about the state ("no speed row is claimed",
+  "the model no longer folds the norm", "bounded under `GGML_OPENCL_BOUNDS=1`", "no card run of this revision", "the card
+  arm decides") describes that revision only.*
   `measured-here` on the recipe host). The chain and the reference mix the NORMALIZED states (the chain's `rms_norm`
   output feeds the score product and the weighted sum; the reference's `pw = p / sum(p) * inv`); the kernel and the CPU
   op weighted the raw rows by `p` alone - a per-state reweighting a following norm does not undo, and one the op cases
@@ -106,17 +135,6 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   (knob off twice: 0, 100 %) - the KL well inside the bar, the folded arm's top p at its 1-point edge on too few tokens
   to decide; the card arm decides. `-DDEPTH_MIX_RED` now doubles one state's weight (every case must fail; the old red
   was cancelled by the folded norm on 12 cases), `-DDEPTH_MIX_RED_RAW` is the red of this defect.
-- **The depth mix on the card** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`; `measured-here`, B60, f16 KV,
-  int8 expert tile + wide + 0187 on, the FA port off). pp4096: ub 512 771.1 -> 908.1 t/s (+17.8 %), ub 1024 818.6 ->
-  982.1 (+20.0 %), ub 2048 770.0 -> 917.4 (+19.1 %); at the unit's ub 1024, q8_0 KV 816.4 -> 979.2. The kernel is 99.1
-  ms a pp4096 pass (960 launches, 103 us each) where the chain's four probed parts were 765 ms and the reference's own
-  mix kernel 399 ms; the pass's kernel time falls 5,229 -> 4,431 ms. The prediction (145-290 ms) missed low. Op level:
-  45 cases and 36 replayed export lines under an nmse bound of 1e-10, three reds failing what each must. Answer level
-  against the CPU base: chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp
-  noise 0.0019-0.0021 / 98.3 %; on 6 chunks (about 6,100 tokens) chain 0.002256 / 98.27 %, the arm 0.002261 / 98.34 %,
-  noise 0.002346 and 0.002270. With development's FA port also on (f16 KV, ub 1024): chain 815.9, the arm 978.5, the
-  port 973.6, both **1,215.7 t/s**; the two savings add (831.6 + 813.2 ms against 1,648.2 together). Owed: the task
-  battery on the card. Details: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
