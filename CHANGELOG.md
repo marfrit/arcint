@@ -32,7 +32,7 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   result's function name up by `tool_call_id` over all messages and appends every match to the tool header (a
   `read` and a `bash` call both named `call_0` render the first result as `readbash`), which rewrites earlier
   prompt text, so the lane's prefix stops matching and each follow-up re-reads the whole prompt (~48 s at 41k
-  tokens on 1.8.1). Now a response's calls are numbered after the highest `call_N` already in the request's
+  tokens on 1.8.1, the B60 at q8_0 KV). Now a response's calls are numbered after the highest `call_N` already in the request's
   history: assistant `tool_calls[].id`, tool messages' `tool_call_id`, and on `/v1/responses` the
   `function_call` / `function_call_output` `call_id`s, input and stored (`previous_response_id`) alike; an id
   not of the form `call_<digits>` is ignored. The ids stay deterministic (the same request gives the same

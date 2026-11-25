@@ -174,7 +174,7 @@ TEST(toolcall_values_keep_angle_brackets) {
     if (j.calls.size() == 1) CHECK_EQ(json::parse(j.calls[0].arguments)["sql"].get<std::string>(), sql);
 }
 
-// ---------------------------------------------- ids unique across turns (1.8.2)
+// ---------------------------------------------- ids unique across turns (the 1.8.1 hotfix)
 // The parser numbers a turn's calls from call_0; the routes renumber them after
 // the highest call_N in the request's history (next_call_index, number_calls).
 namespace {

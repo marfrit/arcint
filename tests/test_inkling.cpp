@@ -489,7 +489,7 @@ TEST(inkling_numeric_effort_survives_other_kwargs) {
     CHECK(p2.chat_template_kwargs["reasoning_effort"] == "low");
 }
 
-// Tool call ids unique across turns (1.8.2), at the render. The template finds a
+// Tool call ids unique across turns (the 1.8.1 hotfix), at the render. The template finds a
 // tool result's name by tool_call_id over ALL messages and appends every match
 // to the tool header, so two turns that both minted call_0 render the first
 // result as "readbash": the earlier prompt text changes between turns and the
