@@ -9948,6 +9948,20 @@ test's rebuild, about 1.6 to 1.8 x the f16 port without it. So with these two pa
 cache; "refuses q8_0" above describes the build before them. Still not measured: the units' own flags (262,144
 context, `--llama-swa-window`). §q8-card of the record has the figures and what follows from them.
 
+**Both knobs at q8_0 KV, the combined tree** (`measured-here`, the card host, B60 at 165 W, the test merge of the depth
+mix and this read path, applied tree `a52a4c2a…`, pp4096 ub 1,024, `GGML_OPENCL_KQ_MM_ID_I8`, `_WIDE` and
+`GGML_OPENCL_CPY_TRANSPOSE` on every arm, three interleaved rounds): off 816.55, `GGML_OPENCL_DEPTH_MIX=1` 980.46,
+`GGML_OPENCL_FA_PORT=1` 945.74, both **1,171.43 t/s** (1,172.51 / 1,171.43 / 1,170.08). The savings add: 1,171 was
+predicted from the two arms alone, and the window's own additive figure is 1,172.8. Answer level against the CPU
+base, 6 chunks: off 0.002464 ± 0.000073, the depth mix 0.002470 ± 0.000085, the port 0.002545 ± 0.000088, both
+0.002571 ± 0.000087. Paired against the off arm's own logits on the card: the depth mix 0.002041 ± 0.000060, the
+port 0.002083 ± 0.000089, both 0.002125 ± 0.000077, one-ulp noise 0.002031 .. 0.002161 over four seeds (mean
+0.002069, sd 0.000062), a second off run 0.000000: every arm inside the noise. Not at the units' own flags.
+
+Paired against
+the off arm's own logits on the card (6 chunks) the port moves the answer by 0.002083 ± 0.000089 nats, a one-ulp noise
+control by 0.002031 .. 0.002161 over four seeds: inside the noise (§q8-paired).
+
 Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
 (`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
 
