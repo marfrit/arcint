@@ -761,6 +761,28 @@ if(ARCINT_TESTS)
       add_test(NAME fa-paged-predicate COMMAND arcint-fa-paged-predicate)
       set_tests_properties(fa-paged-predicate PROPERTIES LABELS unit)
     endif()
+    # patch 0212's device-free cell: the route of an indexed-bias decode (1.8.0's review item
+    # S3), a failed GQA bias build falling back to the split variant instead of the abort. The
+    # red twin compiles the rule before 0212 (FA_BIAS_ROUTE_RED) and must fail; the python
+    # gate reads the dispatcher's wiring and the debug switch out of the patched tree.
+    if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-fa-bias-route.h")
+      add_executable(arcint-fa-bias-route tests/test_fa_bias_route.cpp)
+      target_include_directories(arcint-fa-bias-route PRIVATE "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl")
+      target_compile_options(arcint-fa-bias-route PRIVATE -Wall -Wextra -Wpedantic)
+      add_test(NAME fa-bias-route COMMAND arcint-fa-bias-route)
+      set_tests_properties(fa-bias-route PROPERTIES LABELS unit)
+      add_executable(arcint-fa-bias-route-red tests/test_fa_bias_route.cpp)
+      target_include_directories(arcint-fa-bias-route-red PRIVATE "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl")
+      target_compile_definitions(arcint-fa-bias-route-red PRIVATE FA_BIAS_ROUTE_RED=1)
+      target_compile_options(arcint-fa-bias-route-red PRIVATE -Wall -Wextra -Wpedantic)
+      add_test(NAME fa-bias-route-red COMMAND arcint-fa-bias-route-red)
+      set_tests_properties(fa-bias-route-red PROPERTIES LABELS unit WILL_FAIL TRUE)
+      add_test(NAME fa-bias-route-gate
+               COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                       "${Python3_EXECUTABLE}"
+                       "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_bias_route.py")
+      set_tests_properties(fa-bias-route-gate PROPERTIES LABELS unit)
+    endif()
     # I5, design section 4.3: the start refusal that stops the scheduler's silent CPU
     # placement of a paged FA. The rules are src/exec/kv_stream_refusal.h; the red
     # branch sets ARCINT_KV_STREAM_REFUSE_OFF=1 in the cell's main, which accepts an

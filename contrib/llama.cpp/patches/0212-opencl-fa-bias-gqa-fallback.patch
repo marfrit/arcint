@@ -1,0 +1,183 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-fa-bias-route.h b/ggml/src/ggml-opencl/ggml-opencl-fa-bias-route.h
+new file mode 100644
+index 000000000..7d2860961
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-fa-bias-route.h
+@@ -0,0 +1,64 @@
++// ggml-opencl-fa-bias-route.h - 0212: which decode kernel an indexed-bias FLASH_ATTN_EXT
++// (0143) runs on, as one pure function (no OpenCL call, no backend state), so a CPU test
++// can drive every case, the failed GQA build included.
++//
++// 0143 builds the bias variant of a decode kernel on first use (-DFA_BIAS_TABLE=<n_bins>)
++// and memoises it, a failure included. supports_op builds the intel split variant (or
++// its quantized pair) and declines the op when that fails, so the split variant exists
++// for every call the dispatcher sees. The GQA variant (flash_attn_gqa_dpas.cl) is built
++// only when the call's rows took the GQA kernel (4-8 rows by default, Xe2), at dispatch;
++// before 0212 a failed build there aborted the process. Now the call runs on the split
++// variant, which serves the same rows: the 1-3 row calls take it by default, and 4-8
++// rows do under GGML_OPENCL_FA_GQA_MIN_ROWS=9.
++#ifndef GGML_OPENCL_FA_BIAS_ROUTE_H
++#define GGML_OPENCL_FA_BIAS_ROUTE_H
++
++#include <stddef.h>
++#include <stdlib.h>
++
++enum ggml_cl_fa_bias_route_t {
++    GGML_CL_FA_BIAS_ROUTE_NONE  = 0,   // no kernel: the dispatcher aborts (supports_op prevents it)
++    GGML_CL_FA_BIAS_ROUTE_GQA   = 1,   // the GQA decode kernel's bias variant
++    GGML_CL_FA_BIAS_ROUTE_SPLIT = 2,   // the intel split kernel's bias variant (or its quantized pair)
++};
++
++// rows_gqa:  the dispatcher put the call's rows on the GQA kernel (its plain build exists)
++// gqa_built: the GQA bias variant built and its kernel was created
++// split_ok:  the split bias variant built (read only when the GQA variant is not taken)
++//
++// FA_BIAS_ROUTE_RED compiles the rule before 0212 (rows on the GQA kernel had no other
++// kernel), for the unit test's red run only.
++static inline int ggml_cl_fa_bias_route(int rows_gqa, int gqa_built, int split_ok) {
++#ifdef FA_BIAS_ROUTE_RED
++    if (rows_gqa) {
++        return gqa_built ? GGML_CL_FA_BIAS_ROUTE_GQA : GGML_CL_FA_BIAS_ROUTE_NONE;
++    }
++#endif
++    if (rows_gqa && gqa_built) {
++        return GGML_CL_FA_BIAS_ROUTE_GQA;
++    }
++    return split_ok ? GGML_CL_FA_BIAS_ROUTE_SPLIT : GGML_CL_FA_BIAS_ROUTE_NONE;
++}
++
++// A built GQA bias variant is used only when it can take the launch: its work-group cap
++// holds the widest form (`sides` sub-groups x 8 row tiles x 16 lanes) and its local memory
++// fits the device, the rule the plain GQA build applies at load. A variant that builds but
++// fails it would die in clEnqueueNDRangeKernel; the builder treats it as unbuilt, so its
++// calls fall back like a failed build. FA_BIAS_ROUTE_RED: any variant that built is used.
++static inline int ggml_cl_fa_gqa_fits(size_t wg, unsigned long long lm, unsigned long long lm_dev, int sides) {
++#ifdef FA_BIAS_ROUTE_RED
++    (void) wg; (void) lm; (void) lm_dev; (void) sides;
++    return 1;
++#else
++    return sides > 0 && wg >= (size_t) sides * 8 * 16 && lm <= lm_dev;
++#endif
++}
++
++// GGML_OPENCL_FA_BIAS_GQA_FAIL=1 (debug, red only): the GQA bias variant is built with
++// -DFA_BIAS_GQA_FORCE_FAIL, which flash_attn_gqa_dpas.cl turns into a compile error, so
++// the card takes the failed-build path for real. Unset or 0: the normal build.
++static inline int ggml_cl_fa_bias_gqa_fail(const char * env_value) {
++    return env_value != NULL && atoi(env_value) != 0;
++}
++
++#endif // GGML_OPENCL_FA_BIAS_ROUTE_H
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7b04b8664..0b31cabca 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13,6 +13,7 @@
+ #include "ggml-backend.h"
+ #include "ggml-impl.h"
+ #include "ggml-opencl-fa-paged.h"
++#include "ggml-opencl-fa-bias-route.h"   // 0212: the indexed-bias decode route, a pure function (CPU-testable)
+ #include "ggml-opencl-cpy-t01.h"
+ #include <cstdarg>
+ #include <cstdio>
+@@ -8863,14 +8864,45 @@ static cl_kernel ggml_opencl_fa_bias_kernel(ggml_backend_opencl_context * backen
+                    " -DGQA_SIDES=" + std::to_string(backend_ctx->fa_gqa_sides) +
+                    " -DKT=" + std::to_string(gkv[kvq_gqa][0]) + " -DVT=" + std::to_string(gkv[kvq_gqa][1]);
+             if (const char * gopt = getenv("GGML_OPENCL_FA_GQA_OPTS")) { opts += std::string(" ") + gopt; }
++            // 0212: GGML_OPENCL_FA_BIAS_GQA_FAIL=1 (debug, red only) makes this build fail
++            // in the compiler (an #error in the kernel source), to prove the fallback
++            static const bool gqa_fail = ggml_cl_fa_bias_gqa_fail(getenv("GGML_OPENCL_FA_BIAS_GQA_FAIL"));
++            if (gqa_fail) {
++                opts += " -DFA_BIAS_GQA_FORCE_FAIL";
++            }
+             name = "flash_attn_gqa_dpas";
+             cl_program prog = build_program_from_source_ex(backend_ctx->context, backend_ctx->device,
+                 src.c_str(), opts + bias_opt, /*fatal=*/false, "fa gqa bias", backend_ctx->queue);
+             if (prog != nullptr) {
+                 k = clCreateKernel(prog, name.c_str(), &err);
+                 if (err != CL_SUCCESS) { k = nullptr; }
++                if (k != nullptr) {
++                    // 0212: the plain GQA build's fit rule; a variant that cannot take the
++                    // launch counts as unbuilt instead of failing in the enqueue
++                    size_t   wg = 0;
++                    cl_ulong lm = 0, lm_dev = 0;
++                    CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg), &wg, NULL));
++                    CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_LOCAL_MEM_SIZE, sizeof(lm), &lm, NULL));
++                    CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(lm_dev), &lm_dev, NULL));
++                    if (!ggml_cl_fa_gqa_fits(wg, lm, lm_dev, backend_ctx->fa_gqa_sides)) {
++                        GGML_LOG_WARN("ggml_opencl: the indexed-bias GQA decode variant cannot take the launch "
++                                      "(work-group cap %zu, needs %d; local memory %llu of %llu)\n",
++                                      wg, backend_ctx->fa_gqa_sides * 8 * 16, (unsigned long long) lm,
++                                      (unsigned long long) lm_dev);
++                        CL_CHECK(clReleaseKernel(k));
++                        k = nullptr;
++                    }
++                }
+                 CL_CHECK(clReleaseProgram(prog));
+             }
++            // 0212: a failed variant is memoised below, so this line and the build
++            // run once a (dk, dv, kv pair, bins); the dispatcher falls back to the split
++            // variant (ggml_cl_fa_bias_route)
++            if (k == nullptr) {
++                GGML_LOG_WARN("ggml_opencl: the indexed-bias GQA decode variant did not build (dk=%d dv=%d kvq=%d bins=%d%s); "
++                              "its calls take the split kernel\n", dk, dv, kvq_gqa, n_bins,
++                              gqa_fail ? ", forced by GGML_OPENCL_FA_BIAS_GQA_FAIL" : "");
++            }
+         } else if (kind == 1 || (kind == 2 && kvq >= 0 && kvq < 3 && dk % 32 == 0)) {
+             const char * qn[3] = { "flash_attn_q8q8_q1_split_intel", "flash_attn_q8q4_q1_split_intel",
+                                    "flash_attn_q4q4_q1_split_intel" };
+@@ -27984,12 +28016,32 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         // supports_op ran earlier already has it, one that did not gets it here
+         ggml_opencl_ensure_fa_variant(backend_ctx, d_head_q, d_head_v, FA_VARIANT_F32_F16);
+         GGML_ASSERT(!kv_pages && "a paged FLASH_ATTN_EXT cannot take an indexed bias");
+-        fd_k_split = use_fd_gqa ? ggml_opencl_fa_bias_kernel(backend_ctx, 0, d_head_q, d_head_v,
+-                                                            is_mixed ? 0 : kvq + 1, fa_bias_bins)
+-                   : is_mixed   ? ggml_opencl_fa_bias_kernel(backend_ctx, 1, d_head_q, d_head_v, -1, fa_bias_bins)
+-                   : kvq >= 0   ? ggml_opencl_fa_bias_kernel(backend_ctx, 2, d_head_q, d_head_v, kvq, fa_bias_bins)
+-                   : nullptr;
+-        if (fd_k_split == nullptr) {
++        // 0212: the GQA variant when the rows took the GQA kernel and it built; else the
++        // split variant (supports_op built it, so this is a lookup), with a DOWNGRADE line
++        // once a process. Before 0212 a failed GQA build aborted here.
++        cl_kernel k_bias_gqa = use_fd_gqa ? ggml_opencl_fa_bias_kernel(backend_ctx, 0, d_head_q, d_head_v,
++                                                                       is_mixed ? 0 : kvq + 1, fa_bias_bins)
++                                          : nullptr;
++        cl_kernel k_bias_split = nullptr;
++        if (k_bias_gqa == nullptr) {
++            k_bias_split = is_mixed ? ggml_opencl_fa_bias_kernel(backend_ctx, 1, d_head_q, d_head_v, -1, fa_bias_bins)
++                         : kvq >= 0 ? ggml_opencl_fa_bias_kernel(backend_ctx, 2, d_head_q, d_head_v, kvq, fa_bias_bins)
++                         : nullptr;
++        }
++        const int bias_route = ggml_cl_fa_bias_route(use_fd_gqa, k_bias_gqa != nullptr, k_bias_split != nullptr);
++        if (bias_route == GGML_CL_FA_BIAS_ROUTE_GQA) {
++            fd_k_split = k_bias_gqa;
++            static std::once_flag taken_bias_gqa;
++            std::call_once(taken_bias_gqa, [] {
++                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN indexed-bias form=gqa\n");
++            });
++        } else if (bias_route == GGML_CL_FA_BIAS_ROUTE_SPLIT) {
++            if (use_fd_gqa) {
++                ggml_cl_downgrade("op=FLASH_ATTN indexed-bias path=split reason=gqa-variant-unbuilt");
++                use_fd_gqa = false;   // the split kernel's launch: its split size, grid and arguments
++            }
++            fd_k_split = k_bias_split;
++        } else {
+             GGML_ABORT("ggml_opencl: an indexed-bias FLASH_ATTN_EXT reached the dispatcher without a kernel");
+         }
+         use_fd_mq = false;
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+index ab1c10dc9..cae29ac65 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_gqa_dpas.cl
+@@ -50,6 +50,11 @@
+ #ifndef FA_BIAS_TABLE
+ #define FA_BIAS_TABLE 0
+ #endif
++// 0212: the host's debug switch GGML_OPENCL_FA_BIAS_GQA_FAIL=1 adds this define to the
++// bias variant's build, which must then fail, to prove the split fallback
++#ifdef FA_BIAS_GQA_FORCE_FAIL
++#error FA_BIAS_GQA_FORCE_FAIL: the bias variant build is failed on purpose
++#endif
+ #ifndef GQA_SIDES
+ #define GQA_SIDES 2             // sub-groups sharing 8 rows, each a column range
+ #endif
