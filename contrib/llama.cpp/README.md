@@ -10626,3 +10626,57 @@ tolerance switch has `GGML_OP_DEPTH_MIX` at 1e-10, and the comparison prints
 `[DEPTH_MIX] nmse = <value> (bound <bound>)` for every depth-mix output, pass or fail. So the
 45 cases and the 36 replayed lines all sit under 1e-10 and each row carries the number it
 passed with. Applied tree `13ab33b8232fac4b4fddd2cf6ed414e8328f1868`.
+
+**Card result 3, 2026-11-25: the arm on the B60** (`measured-here`, the operator's window; tree
+`13ab33b8`, `GGML_OPENCL_KQ_MM_ID_I8=1`, `GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`,
+`GGML_OPENCL_CPY_TRANSPOSE=1`, `GGML_OPENCL_FA_PORT` unset; Inkling 2 Mini IQ4_NL; f16 KV unless
+a row says otherwise). The window's script is the command list above in body form; it ran to its
+end without a stop.
+
+*Op level (the primary bar).* The 45 cases and the three replays of the knob-on export (12
+lines each) ran under the 1e-10 bound with no failing row, the two single cases under
+`GGML_OPENCL_BOUNDS=1` first; the three reds failed the cases the table above names. The
+per-row nmse values are in the window's report and are not copied here.
+
+*The model takes it.* `llama-bench -v`, bounds on: pp512 1,023.1 t/s over 2 graphs; pp4096 907.3
+t/s over 16 graphs, 120 nodes and 120 calls a graph, one TAKEN line, no `DEPTH_MIX` downgrade.
+
+*Prefill, pp4096, knob off -> on:*
+
+| ubatch | chain | arm | gain |
+|---|---|---|---|
+| 512 | 771.1 t/s | 908.1 t/s | +17.8 % |
+| 1024 | 818.6 | 982.1 | +20.0 % |
+| 2048 | 770.0 | 917.4 | +19.1 % |
+
+At the serving unit's settings (ub 1024, three rounds): q8_0 KV 816.4 -> 979.2 t/s with the fold
+and 978.5 with `=nofold`; f16 KV 815.8 -> 978.6.
+
+*The profile, one pp4096 pass at ub 512 (a profiling build; read the ms, not its t/s):* all
+kernels 5,229 ms with the chain, 4,431 ms with the arm; `kernel_depth_mix_f32` **99.1 ms over
+960 launches, 103 us a launch**. The reference's own mix kernel is 399 ms a pass on this card,
+the chain's four probed parts were 765 ms (699 with 0187).
+
+*The prediction's miss, on the record.* Predicted 150-300 us a call and 145-290 ms a pass;
+measured 103 us and 99 ms. The barrier cost the revision added to the first estimate was
+overpriced: the first estimate's low end (110 us, bytes at the reference's rate) was nearer.
+The pass saves 798 ms where the four probed parts priced 600-700: the rest is what the
+prediction listed as unpriced (the states' `rms_norm`, the cur copy, the column copies, the
+folded norms). pp4096 at ub 512 was predicted at 833-858 t/s and measured 908.1.
+
+*Answer level (the secondary bar), llama-perplexity against the CPU base, 3 chunks of 2,048:*
+
+| arm | mean KL, nats | same top p |
+|---|---|---|
+| chain (twice, identical) | 0.001932 | 98.208 % |
+| arm, fold | 0.001982 | 98.436 % |
+| arm, `=nofold` | 0.002043 | 98.240 % |
+| chain + one-ulp noise, two seeds | 0.002104, 0.001921 | 98.273 %, 98.306 % |
+
+The arm is +0.00005 nats and +0.23 points against the chain with the fold, +0.00011 and +0.03
+without it: inside the answer-level bar (0.03 nats, 1 point) by two orders of magnitude, and
+inside the span of the chain with one-ulp noise. Owed before this lands: the same arms on at
+least 5,000 scored tokens (a 6-chunk CPU base), and the task battery (the capital, an arithmetic
+chain, a JSON extraction, the binary-search completion) with the arm off and on.
+
+The README is not part of the applied tree: these paragraphs leave `13ab33b8` as it is.

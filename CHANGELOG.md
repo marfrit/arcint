@@ -96,6 +96,14 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   (knob off twice: 0, 100 %) - the KL well inside the bar, the folded arm's top p at its 1-point edge on too few tokens
   to decide; the card arm decides. `-DDEPTH_MIX_RED` now doubles one state's weight (every case must fail; the old red
   was cancelled by the folded norm on 12 cases), `-DDEPTH_MIX_RED_RAW` is the red of this defect.
+- **The depth mix on the card** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`; `measured-here`, B60, f16 KV,
+  int8 expert tile + wide + 0187 on, the FA port off). pp4096: ub 512 771.1 -> 908.1 t/s (+17.8 %), ub 1024 818.6 ->
+  982.1 (+20.0 %), ub 2048 770.0 -> 917.4 (+19.1 %); at the unit's ub 1024, q8_0 KV 816.4 -> 979.2. The kernel is 99.1
+  ms a pp4096 pass (960 launches, 103 us each) where the chain's four probed parts were 765 ms and the reference's own
+  mix kernel 399 ms; the pass's kernel time falls 5,229 -> 4,431 ms. The prediction (145-290 ms) missed low. Op level:
+  45 cases and 36 replayed export lines under an nmse bound of 1e-10, three reds failing what each must. Answer level
+  against the CPU base: chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp
+  noise 0.0019-0.0021 / 98.3 %. Details and what is still owed: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
