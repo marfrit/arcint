@@ -19,6 +19,7 @@
 //   --type-v T        V cache type (as --type-k)
 //   --swa-full        the full-size SWA cache (no --llama-swa-window, 1.8.0's
 //                     default) instead of the window-sized one
+//   --exact           run only the exact-restore arms E0-E2 below (and exit)
 // With --ngl > 0 the answer-level bar is comparative (CLAUDE.md): an arm passes
 // at the same top token and a KL at most 0.03 nats above the floor arm D on the
 // same card (the B60's per-forward floor is ~0.14 nats, an absolute bound would
@@ -38,6 +39,24 @@
 //      this arm is the red case, it must NOT match
 // A partial state at a position above the window must be larger than one below
 // it: without the SWA part both are the recurrent-only size (red the same way).
+//
+// B and D are comparative, not exact: B's tail is prefilled in other ubatches
+// than the fresh reference's (and its last token alone), D is the same prompt in
+// another split, so neither is zero on a card, and the last token's mean KL on
+// these synthetic tokens barely moves when a few hundred SWA cells hold the wrong
+// bytes. The E arms (--exact) hold a restore to what it must be: bit-identical to
+// the cells never having left the device.
+//   E0 two contexts prefill the same prefix in the same calls: their partial
+//      states are byte-equal (the card's determinism, the E arms' premise)
+//   E1 arcint's case: the lane runs on past the checkpoint (the SWA ring reuses
+//      the cells), restores the partial checkpoint and trims to the cut. The
+//      partial state read back must equal the checkpoint byte for byte, and the
+//      tail's logits (every row of one batch, then one decode) must equal the
+//      untouched context's, which prefilled the same prefix in the same calls
+//   E2 the early edit: after a FULL state save at the cut the lane is cleared and
+//      prefilled with another text from position 64 on, then the full state is
+//      restored: the stale cells hold different text, so a restore that writes
+//      nothing differs by construction. State bytes and tail logits as in E1.
 #include "llama.h"
 #include "llama-ext.h"   // llama_memory_attn_seq_pos_min (contrib/llama.cpp 0153)
 #include "core/swa_window.h"
@@ -57,6 +76,7 @@ struct Config {
     ggml_type type_k   = GGML_TYPE_F16;
     ggml_type type_v   = GGML_TYPE_F16;
     bool      swa_full = false;   // false: --llama-swa-window
+    bool      exact    = false;   // --exact: the E arms only
 };
 Config g_cfg;
 
@@ -147,12 +167,84 @@ llama_context* make_ctx(llama_model* m, int n_ctx, uint32_t n_ubatch = 512, uint
     return llama_init_from_model(m, cp);
 }
 
-std::vector<uint8_t> save_partial(llama_context* ctx, int seq) {
-    const size_t sz = llama_state_seq_get_size_ext(ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+std::vector<uint8_t> save_state(llama_context* ctx, int seq, llama_state_seq_flags flags) {
+    const size_t sz = llama_state_seq_get_size_ext(ctx, seq, flags);
     std::vector<uint8_t> out(sz);
     if (sz == 0) return out;
-    if (llama_state_seq_get_data_ext(ctx, out.data(), sz, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != sz) out.clear();
+    if (llama_state_seq_get_data_ext(ctx, out.data(), sz, seq, flags) != sz) out.clear();
     return out;
+}
+
+std::vector<uint8_t> save_partial(llama_context* ctx, int seq) {
+    return save_state(ctx, seq, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+}
+
+// the E arms: byte and logit equality
+struct ByteDiff {
+    size_t n_a = 0, n_b = 0, n_diff = 0, first = 0;
+    bool equal() const { return n_a == n_b && n_a > 0 && n_diff == 0; }
+};
+
+ByteDiff diff_bytes(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b) {
+    ByteDiff d;
+    d.n_a = a.size();
+    d.n_b = b.size();
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) {
+            if (d.n_diff == 0) d.first = i;
+            ++d.n_diff;
+        }
+    }
+    d.n_diff += std::max(a.size(), b.size()) - n;
+    return d;
+}
+
+// every row's logits: one batch with a logit asked for each token
+bool decode_rows(llama_context* ctx, const std::vector<llama_token>& t, int p0, std::vector<float>& rows) {
+    const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+    llama_batch b = llama_batch_init((int) t.size(), 0, 1);
+    for (int i = 0; i < (int) t.size(); ++i) {
+        b.token[i]     = t[i];
+        b.pos[i]       = p0 + i;
+        b.n_seq_id[i]  = 1;
+        b.seq_id[i][0] = 0;
+        b.logits[i]    = 1;
+    }
+    b.n_tokens = (int) t.size();
+    const int rc = llama_decode(ctx, b);
+    llama_batch_free(b);
+    if (rc != 0) return false;
+    for (int i = 0; i < (int) t.size(); ++i) {
+        const float* l = llama_get_logits_ith(ctx, i);
+        rows.insert(rows.end(), l, l + n_vocab);
+    }
+    return true;
+}
+
+struct RowDiff {
+    int    rows = 0, rows_diff = 0, argmax_diff = 0;
+    double max_abs = 0.0;
+    bool equal() const { return rows > 0 && rows_diff == 0; }
+};
+
+RowDiff diff_rows(const std::vector<float>& a, const std::vector<float>& b, int n_vocab) {
+    RowDiff d;
+    if (a.size() != b.size() || a.empty()) { d.rows_diff = d.rows = 1; d.max_abs = INFINITY; return d; }
+    d.rows = (int) (a.size() / n_vocab);
+    for (int r = 0; r < d.rows; ++r) {
+        const float* x = a.data() + (size_t) r * n_vocab;
+        const float* y = b.data() + (size_t) r * n_vocab;
+        if (std::memcmp(x, y, sizeof(float) * n_vocab) != 0) ++d.rows_diff;
+        int ax = 0, ay = 0;
+        for (int i = 0; i < n_vocab; ++i) {
+            if (x[i] > x[ax]) ax = i;
+            if (y[i] > y[ay]) ay = i;
+            d.max_abs = std::max(d.max_abs, (double) std::fabs(x[i] - y[i]));
+        }
+        if (ax != ay) ++d.argmax_diff;
+    }
+    return d;
 }
 
 }  // namespace
@@ -171,6 +263,8 @@ int main(int argc, char** argv) {
             }
         } else if (a == "--swa-full") {
             g_cfg.swa_full = true;
+        } else if (a == "--exact") {
+            g_cfg.exact = true;
         } else if (a.rfind("--", 0) == 0) {
             std::fprintf(stderr, "unknown option %s\n", a.c_str());
             return 2;
@@ -179,7 +273,7 @@ int main(int argc, char** argv) {
         }
     }
     if (pos.empty()) {
-        std::fprintf(stderr, "usage: %s model.gguf [n_ctx] [per_loop|last_loop] [--ngl N] [--type-k T] [--type-v T] [--swa-full]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s model.gguf [n_ctx] [per_loop|last_loop] [--ngl N] [--type-k T] [--type-v T] [--swa-full] [--exact]\n", argv[0]);
         return 2;
     }
     const int n_ctx = pos.size() > 1 ? std::atoi(pos[1]) : 8192;
@@ -241,6 +335,86 @@ int main(int argc, char** argv) {
     for (int i = 0; i < 256; ++i) append_tokens.push_back(tok(lane_end + i));
 
     int failures = 0;
+
+    if (g_cfg.exact) {
+        std::fprintf(stderr, "E arms: prefix %d tokens (the lane's calls), lane %d, tail %d rows + 1 decode, early edit at 64\n",
+                     cut, lane_end, std::min(128, lane_end - cut - 2));
+        const int e_tail = std::min(128, lane_end - cut - 2);
+        const std::vector<llama_token> prefix(lane_tokens.begin(), lane_tokens.begin() + cut);
+        const std::vector<llama_token> tail(lane_tokens.begin() + cut, lane_tokens.begin() + cut + e_tail);
+        const llama_token next = lane_tokens[cut + e_tail];
+        auto run_tail = [&](llama_context* c, std::vector<float>& rows) {
+            return decode_rows(c, tail, cut, rows) && decode_rows(c, {next}, cut + e_tail, rows);
+        };
+        auto report = [&](const char* what, const ByteDiff& bd, const RowDiff* rd) {
+            const bool ok = bd.equal() && (rd == nullptr || rd->equal());
+            std::fprintf(stderr, "%s %-58s bytes %zu of %zu differ (first at %zu, sizes %zu/%zu)", ok ? "PASS" : "FAIL", what,
+                         bd.n_diff, std::max(bd.n_a, bd.n_b), bd.n_diff ? bd.first : 0, bd.n_a, bd.n_b);
+            if (rd) std::fprintf(stderr, "; rows %d of %d differ, argmax %d, max |d| %.6g", rd->rows_diff, rd->rows, rd->argmax_diff, rd->max_abs);
+            std::fprintf(stderr, "\n");
+            if (!ok) ++failures;
+        };
+
+        // U: the untouched context, the prefix in the lane's calls, then the tail
+        auto* u = make_ctx(m, n_ctx);
+        if (!decode(u, prefix, 0, true)) { std::fprintf(stderr, "E: untouched prefill failed\n"); return 2; }
+        const std::vector<uint8_t> u_part = save_partial(u, 0);
+        std::vector<float> rows_u;
+        if (!run_tail(u, rows_u)) { std::fprintf(stderr, "E: untouched tail failed\n"); return 2; }
+        llama_free(u);
+
+        // E1: the lane runs on, restores the partial checkpoint, trims to the cut
+        {
+            auto* l = make_ctx(m, n_ctx);
+            if (!decode(l, prefix, 0, true)) { return 2; }
+            const std::vector<uint8_t> ck = save_partial(l, 0);
+            report("E0 two prefills of the prefix: partial states equal", diff_bytes(u_part, ck), nullptr);
+            if (!decode(l, std::vector<llama_token>(lane_tokens.begin() + cut, lane_tokens.end() - 1), cut, false)) { return 2; }
+            if (!decode(l, {lane_tokens[lane_end - 1]}, lane_end - 1, true)) { return 2; }
+            llama_memory_t mem_l = llama_get_memory(l);
+            if (ck.empty() || llama_state_seq_set_data_ext(l, ck.data(), ck.size(), 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != ck.size() ||
+                !llama_memory_seq_rm(mem_l, 0, (llama_pos) cut, -1)) {
+                std::fprintf(stderr, "FAIL %-58s the restore was refused\n", "E1 partial restore after the lane ran on");
+                ++failures;
+            } else {
+                const ByteDiff bd = diff_bytes(ck, save_partial(l, 0));
+                std::vector<float> rows;
+                if (!run_tail(l, rows)) { std::fprintf(stderr, "E1: tail failed\n"); return 2; }
+                const RowDiff rd = diff_rows(rows_u, rows, n_vocab);
+                report("E1 partial restore after the lane ran on", bd, &rd);
+            }
+            llama_free(l);
+        }
+
+        // E2: full state at the cut, the lane refilled with another text from 64 on, the full state restored
+        {
+            auto* l = make_ctx(m, n_ctx);
+            if (!decode(l, prefix, 0, true)) { return 2; }
+            const std::vector<uint8_t> ck = save_state(l, 0, LLAMA_STATE_SEQ_FLAGS_NONE);
+            llama_memory_t mem_l = llama_get_memory(l);
+            llama_memory_seq_rm(mem_l, 0, -1, -1);
+            std::vector<llama_token> other(lane_tokens.begin(), lane_tokens.end());
+            for (int i = 64; i < (int) other.size(); ++i) {
+                other[i] = (llama_token) (1000 + (i * 104729 + 17) % (n_vocab - 2000));
+            }
+            if (!decode(l, other, 0, true)) { std::fprintf(stderr, "E2: the other text failed\n"); return 2; }
+            if (ck.empty() || llama_state_seq_set_data_ext(l, ck.data(), ck.size(), 0, LLAMA_STATE_SEQ_FLAGS_NONE) != ck.size()) {
+                std::fprintf(stderr, "FAIL %-58s the restore was refused\n", "E2 full restore over another text (early edit)");
+                ++failures;
+            } else {
+                const ByteDiff bd = diff_bytes(ck, save_state(l, 0, LLAMA_STATE_SEQ_FLAGS_NONE));
+                std::vector<float> rows;
+                if (!run_tail(l, rows)) { std::fprintf(stderr, "E2: tail failed\n"); return 2; }
+                const RowDiff rd = diff_rows(rows_u, rows, n_vocab);
+                report("E2 full restore over another text (early edit)", bd, &rd);
+            }
+            llama_free(l);
+        }
+        llama_model_free(m);
+        std::fprintf(stderr, "%d failure(s)\n", failures);
+        return failures == 0 ? 0 : 3;
+    }
+
     auto gate = [&](bool ok, const char* what, const char* detail, const Result& r) {
         std::fprintf(stderr, "%s %-58s KL %.9f dmax %.6g top %d/%d%s%s\n",
                      ok ? "PASS" : "FAIL", what, r.kl, r.dmax, r.top_ref, r.top_got,
