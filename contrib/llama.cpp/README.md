@@ -10827,3 +10827,30 @@ touched for it now, because that would move the card-proven tree `13ab33b8`):
   names the tree and commit of those runs: they need that line, from the runs' own record;
 - `GGML_OPENCL_DEPTH_MIX_OPTS` (the reds' route: extra compiler options for `depth_mix.cl`) is a
   test hook that lives in the production dispatch.
+
+## 0210-vocab-inkling2-ignore-merges.patch
+
+**What.** Inkling 2 Mini's tokenizer pre (`inkling2`, added by 0133) now sets `ignore_merges = true`, as the model's
+Hugging Face `tokenizer.json` does (`"ignore_merges": true`) and as mainline llama.cpp has since d2bceda3d ("vocab:
+enable ignore_merges for inkling2", #32799). With it, a pre-token that is itself a vocabulary entry is taken whole
+instead of being rebuilt from BPE merges.
+
+**Why.** 0133 set the pre type, BOS and `clean_spaces` only, so a word whose single token is in the vocabulary but is
+not reachable by the merges was split: ` welches` (vocabulary id 171256) became ` `, `welch`, `es` (220, 31889, 590).
+The model samples the single token, so a served conversation's re-tokenized history no longer matched the lane's
+cached tokens and the lane re-read the whole prompt; prompts with such words were also tokenized differently from
+training. The operator's measurement on the served unit (1.8.1): two turns with ` welches`, two misses; controls
+(` welcher`, ` sounds`, ` args`), six hits; 337 vocabulary entries affected (239 with a leading space), about one
+occurrence in 18k-24k tokens of English or C++ text, none in 24k of German notes.
+
+**Red / green** (`measured-here`, CPU, `llama-tokenize --ids` on the Inkling 2 Mini GGUF, the applied series a52a4c2a
+without and with this patch): ` welches` [220, 31889, 590] -> [171256]; ` voices` [220, 53430, 590] -> [193067];
+` kwargs` [220, 86226, 70, 82] -> [194390]; ` welcher` [163934] both (control); each green id is the GGUF vocabulary's
+single entry for the word (`Ġwelches` 171256, `Ġvoices` 193067, `Ġkwargs` 194390, `ĠCollins` 194023).
+
+**Other pre types.** `inkling2` is the only pre type this series adds. The pin already sets `ignore_merges` for every
+pre type of the models served here that mainline sets it for (tekken for the writer included).
+
+**What it means for recorded Inkling numbers.** Every Inkling KL and perplexity row in this file and the CHANGELOG was
+computed on text tokenized by the old rule, on both sides of each comparison: they stay valid as comparisons between
+arms. The rate of affected words is small (above); the served prefill and decode rows do not depend on it.

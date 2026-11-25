@@ -18,6 +18,16 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased (branch `development`)
+
+- **Inkling 2 Mini's tokenizer takes a whole-word vocabulary entry whole** (patch 0210, mainline d2bceda3d; no switch).
+  1.8.x split words whose single token is in the vocabulary but not reachable by the BPE merges (` welches` became
+  ` `, `welch`, `es`; 337 entries, about one occurrence in 18k-24k tokens of English or C++ text): such prompts were
+  tokenized differently from training, and in a served conversation the re-tokenized history no longer matched the
+  sampled tokens, so the lane re-read the whole prompt (two of two turns with ` welches` missed the cache on the
+  1.8.1 unit; the controls hit). CPU red / green on ` welches`, ` voices`, ` kwargs` against the vocabulary's ids
+  (`measured-here`); the recorded Inkling KL rows used the old rule on both sides and stay valid as comparisons.
+
 ## 1.8.1 — 2026-11-25
 
 Release gate against 1.8.0 (`measured-here`, 2026-11-25, one window: the B60 at 165 W, then the B70 at 220 W; the
