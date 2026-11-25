@@ -10710,8 +10710,49 @@ folded norms). pp4096 at ub 512 was predicted at 833-858 t/s and measured 908.1.
 
 The arm is +0.00005 nats and +0.23 points against the chain with the fold, +0.00011 and +0.03
 without it: inside the answer-level bar (0.03 nats, 1 point) by two orders of magnitude, and
-inside the span of the chain with one-ulp noise. Owed before this lands: the same arms on at
-least 5,000 scored tokens (a 6-chunk CPU base), and the task battery (the capital, an arithmetic
-chain, a JSON extraction, the binary-search completion) with the arm off and on.
+inside the span of the chain with one-ulp noise. The same arms on 6 chunks are further down;
+the task battery (the capital, an arithmetic chain, a JSON extraction, the binary-search
+completion) with the arm off and on is owed.
 
 The README is not part of the applied tree: these paragraphs leave `13ab33b8` as it is.
+
+**Provenance of the numbers in this section.** The card rows (card result 3) ran the published
+Inkling 2 Mini IQ4_NL file (`output.weight` and `token_embd.weight` Q8_0). The recipe host's CPU
+arms above (the first knob-on / knob-off KL, the per-node dump, the noise control) ran a
+re-quantized variant of the same model whose output tensor is Q6_K: they compare arms of one
+file with each other and are not comparable with the card's KL against its CPU base. The CPU
+base for the card's 6-chunk KL is made from the published file (2,456,010,284 bytes, 6 chunks of
+2,048 on the gate text, knob off, tree `13ab33b8`).
+
+**With the FA port, and the 6-chunk answer-level arms** (`measured-here`, B60, tree `13ab33b8`, f16
+KV - the port refuses a q8_0 KV cache -, int8 expert tile + wide + 0187 on; `GGML_OPENCL_FA_PORT=1` is
+development's opt-in port, another patch set). pp4096 at ub 1024 (`-b 2048`, three interleaved
+rounds):
+
+| arm | t/s, three rounds | device ms a pass (profiling build) |
+|---|---|---|
+| chain, port off | 815.86, 815.77, 815.02 | 4,923.4 |
+| the arm (fold) | 978.48, 978.43, 978.05 | 4,091.8 |
+| the FA port alone | 973.64, 971.71, 972.10 | 4,110.2 |
+| the arm and the port | **1,215.69, 1,215.12, 1,214.52** | 3,275.2 |
+
+Every arm's log carried its own TAKEN lines and none of the other's. The two savings add: 831.6
+ms for the arm and 813.2 ms for the port are 1,644.8 ms, both together save 1,648.2 - an overlap of
+-3.4 ms, on disjoint launches. The reference stack's row on this card is 1,220 t/s. At the unit's
+q8_0 KV the arm alone is 979.2 t/s (above); the arm with the port at q8_0 is not measured.
+
+llama-perplexity against the CPU base of the published file, 6 chunks of 2,048 (`-b 512`; about
+6,100 scored tokens), every arm's path shown by its TAKEN line in the same log:
+
+| arm | mean KL, nats | same top p |
+|---|---|---|
+| chain (twice, identical) | 0.002256 | 98.27 % |
+| the arm, fold | 0.002261 | 98.34 % |
+| the arm, `=nofold` | 0.002266 | 98.26 % |
+| the FA port alone | 0.002237 | 98.49 % |
+| the arm and the port | 0.002172 | 98.49 % |
+| chain + one-ulp noise, two seeds | 0.002346, 0.002270 | 98.16 %, 98.37 % |
+
+The arm is +0.000005 nats and +0.07 points against the chain with the fold, +0.000010 and -0.01
+without it: inside the answer-level bar, and inside the two noise seeds. The answer-level bar
+is met on more than 5,000 tokens. Owed: the task battery on the card.

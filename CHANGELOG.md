@@ -109,7 +109,10 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   mix kernel 399 ms; the pass's kernel time falls 5,229 -> 4,431 ms. The prediction (145-290 ms) missed low. Op level:
   45 cases and 36 replayed export lines under an nmse bound of 1e-10, three reds failing what each must. Answer level
   against the CPU base: chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp
-  noise 0.0019-0.0021 / 98.3 %. Details and what is still owed: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
+  noise 0.0019-0.0021 / 98.3 %; on 6 chunks (about 6,100 tokens) chain 0.002256 / 98.27 %, the arm 0.002261 / 98.34 %,
+  noise 0.002346 and 0.002270. With development's FA port also on (f16 KV, ub 1024): chain 815.9, the arm 978.5, the
+  port 973.6, both **1,215.7 t/s**; the two savings add (831.6 + 813.2 ms against 1,648.2 together). Owed: the task
+  battery on the card. Details: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
