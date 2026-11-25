@@ -61,8 +61,9 @@ initializer order, `qtiles`/`qgroups`/`n`/`wg` arithmetic and
 | `opencl-plan.md` | (no code) 1a's plan: `fa::Kern`'s tile structure in OpenCL C, each ESIMD construct against the builtin ours already uses, what has no equivalent, and the binding plan |
 | `fa_port_gate.h` | a copy of the port's pure gate (the llama tree's `ggml/src/ggml-opencl/fa_port_gate.h`, patch 0198), so the test beside it builds from this directory |
 | `port_gate_test.cpp` | the gate's CPU unit test, fed the model's graph export lines; red with `-DFA_PORT_GATE_RED` |
+| `fixtures/` | the model's graph exports the gate test reads: `inkling-ub*.txt` (f16 KV) and `inkling-q8kv-ub*.txt` (q8_0 KV, §q8) |
 | `port_abi_check.py` | the kernel's parameter list against the launch's `clSetKernelArg` sequence, no device |
-| `isa_phases.py` | the key-block loop of a kernel's IGC `.asm` dump cut into phases, with instruction counts a phase |
+| `isa_phases.py` | the key-block loop of a kernel's IGC `.asm` dump cut into phases, with instruction counts a phase (`--pre-dpas 8 --loop-dpas 40` for the q8_0 build) |
 | `port_kernel_model.py` | the kernel's key-block loop a lane at a time against a direct softmax, with three reds, no device |
 | `port_arithmetic_check.py` | the first session's check of the bias run read (still the kernel's) and of a sink epilogue the kernel no longer has (the model above covers the sink) |
 | `out/` | build products; git-ignored |
@@ -2020,3 +2021,308 @@ exit 1. An "alone" case runs with `-b <tail>`: with the full ub llama-perplexity
 packs `n_batch / n_ctx` sequences into a batch, and the 9-token case became a
 batch of 504 rows (seen in the first dry run). A context of 1 or 2 tokens runs
 too, so no case is expected not to run.
+
+# The port on a q8_0 K/V cache: design, CPU tests, nothing on a card yet {#q8}
+
+Patches `0199q1` (kernel, gate, dispatch) and `0199q2` (tests). The same knob,
+`GGML_OPENCL_FA_PORT=1`; unset, the dispatch is today's. **Nothing of this has
+run on a device.** Every number below is `code` (read off the source or the
+compiled ISA), `measured-here` on the recipe host (no device: the CPU backend,
+ocloc), or `inference`, and says which.
+
+## What was handed over
+
+Nothing: no work in progress and no state note existed for this item. The base
+is `development` with the port as §card-final describes it. Its three claims
+this work rests on were checked against the code and a fresh export
+(`measured-here`): the gate refuses a q8_0 cache (`kv-type`, before any layout
+rule); the export's prompt lines are 222 / 223; the model's f16 K/V views are
+`[128, n_kv, 8]`, nb `[2, 2048, 256]`. All three hold. The f16 fixtures were
+exported with f16 KV, so they say nothing about q8_0 strides.
+
+## Why (the coordinator's numbers, `measured-here`, the card host, B60 at 165 W)
+
+The Inkling units serve q8_0 KV. There the knob changes nothing: pp4096 ub 1024
+is 816.3 t/s off and 816.6 on, 7 refusals logged. At f16 KV the port gives 974,
+and f16 KV does not fit the units' 262,144 context (the load-time spill guard:
+8,516 MiB of context against 4,526 at q8_0). So +19 % is the ceiling of this
+item, measured at f16.
+
+## What exists for a q8_0 cache (`code`)
+
+- **This backend today** (`flash_attn_dpas.cl`, `load8`): a prompt's K / V tiles
+  are staged in local memory as f16; for q8_0 the staging load is
+  `f16(float(int8) * d)`, a block's 34 bytes = an f16 scale `d` and 32 codes. A
+  second form (`flash_attn_kv_to_f16`) converts 16,384 keys at a time into an
+  f16 buffer and carries the softmax between blocks.
+- **The reference** (trellis-serve, the vendored tree's source): `fa::Kern` is f16 only
+  (`prefill_attn` checks `kHalf` for q, k and v). Its Inkling binding
+  (`attention_prefill_esimd`) hands the kernel `k.to(float16).contiguous()`: a
+  staged f16 copy of the call's K and V, every call. Its dense-model path over an
+  fp8 cache (`fp8kv_prefill.py`) stages too, 32,768 keys a block, and merges the
+  blocks' outputs by their log-sum-exp. Neither reads a quantized cache in the
+  kernel.
+
+## The decision: dequantize in the kernel, stage nothing
+
+**A deviation from the reference, which stages.** The reason is bytes, and the
+operator decides whether it holds:
+
+| | bytes a call | at the SWA ring (2,048 keys) | at a global layer, 262,144 keys |
+|---|---|---|---|
+| staged f16 copy (the reference) | 2 × n_kv × 8 × 256 B written, then read | 8.4 MB | 1,074 MB |
+| in the kernel (this patch) | 0 | 0 | 0 |
+
+The staged copy of one global layer at the units' context is a quarter of the
+3,990 MiB the spill guard already refuses for f16 KV, allocated beside a cache
+that fills the card; staging it in key blocks needs the softmax carried between
+launches, which the port does not have. In the kernel the K/V bytes a tile reads
+also drop from 256 to 136 a (key, head). What the staged form would have for it:
+the kernel stays the measured f16 one, at the price of two conversion launches a
+call (`inference`: 0.1 to 0.3 ms at 2,048 keys, i.e. about 965 t/s at pp4096
+ub 1024 where this patch predicts 953). It is the fallback if the card refuses
+this kernel, and it is not built.
+
+## The read path (`code`: `flash_attn_port.cl`, `-DPORT_KV8=1`)
+
+A (key, kv head) is 136 bytes = 34 dwords = four blocks of `[d: f16][32 × int8]`.
+The model's row is 8 heads × 136 = 1,088 bytes, so a head starts at `kvh × 136`:
+a multiple of 4, not of 64.
+
+- **The surface.** The base is the head's first byte rounded down to 64, the
+  remainder (0..60) goes into the x coordinate. Width `kx + 136`, the pitch the
+  row's (1,088), the height `n_kv`.
+- **K: five transposed dword reads a 16-key group** (lane = key; dwords 0, 8, 16,
+  24 and 26 of the head: the last overlaps so that none leaves the head's bytes)
+  against eight for f16. Scales: the low short of dwords 0 and 17, the high short
+  of dwords 8 and 25. Blocks 1 and 3 have their codes on dwords; blocks 0 and 2
+  start 2 bytes off, so their codes 0, 1, 30, 31 are the halves of two dwords,
+  spliced into one (3 instructions a block).
+- **V: transformed byte reads on the 4-byte grid** (lane = byte column, 32 key
+  rows = both key groups; the f16 build needs two short reads for the same 16
+  dims). The extension defines the 8-bit read only at a first coordinate that is a
+  multiple of 4, and the codes of blocks 0 and 2 start at bytes 2 and 70. So an
+  odd block is read at its codes 0 and 16 (bytes 36, 52, 104, 120), an even block
+  at its code 2 and 18 (bytes 4, 20, 72, 88): the second read ends in the next
+  block's scale, and those two lanes take the block's codes 0 and 1 from a third
+  read at the block's first byte (lanes 2, 3, by a lane shuffle). Ten reads a
+  32-key block. A lane is then not dim `16 c + lane`; the output store has the
+  map (`KV8_ODIM`). The scales come by one 16-bit gather a (key group, block).
+  The review of the first form found this: it read at `34 b + 2`, 2 mod 4 for half
+  of the V reads, which is undefined by the extension's text.
+- **The extension's stated limits** (`cl_intel_subgroup_2d_block_io`, "behavior is
+  undefined unless"): the base on 64 bytes (kept: rounded down); the first
+  coordinate a multiple of 4 for 8-bit data (kept, above; K's reads are dwords);
+  a width of 64 to 2^24 bytes and a multiple of 4 (kept: 136 to 196); a height of
+  1 to 2^24 rows (kept: `n_kv`, which the gate bounds below 2^24); a pitch not
+  below the width and a multiple of 16 (the gate). All are kept.
+- **Codes to f16 without a conversion.** `convert_half16(char16)` on these
+  layouts compiled to 73 to 91 moves a 16-code operand (`measured-here`, the
+  first form's ISA). Instead: a code's byte with its top bit flipped is
+  `code + 128`, and `0x6400 | x` is the f16 of `1024 + x`, so
+  `(w & 0x00FF00FF) ^ 0x64806480` turns a dword's bytes 0 and 2 into two f16 of
+  value `1152 + code`, and the same after `>> 8` its bytes 1 and 3: five dword
+  operations for 16 codes. The 1152 is taken out by starting the accumulator at
+  `-1152 × sum` of the other operand, the sum by the DPAS itself on sixteen 1.0h.
+  The halves come out as (bytes 0, 2 of each dword), then (bytes 1, 3): the other
+  operand takes that order - Q once a tile (read by index instead of by block
+  read), P by 16 lane shuffles a block.
+- **The DPAS inputs and exactness.** f16 × f16 into f32, as before; an int8 DPAS
+  is not used (it would need Q in int8, which is what the CPU reference does and
+  costs it 2e-6 NMSE; and P in 8 bits, which loses the softmax's tail).
+  - S: `sum_b d_b(key) × (sum q × (1152 + code) - 1152 × sum q)`. The codes are
+    exact, the products are exact in f32 (11 × 11 bits), the scale multiplies the
+    f32 sum once a block. K is never rounded to f16; the staged form rounds
+    `d × code`. The cancellation costs about 4 of f32's 24 bits.
+  - O: `d(key, block)` stands under the sum over keys, so it cannot follow the
+    DPAS. It goes into the operand that has the key in its lane:
+    `pe = f16(f16(p) × d × 128)`, a block's own P; V's codes stay exact. Two
+    roundings a term (p, then p × d), as today's (p, and `d × code`). 128 keeps
+    `p × d` in f16's range for every |v| an f16 cache can hold (`d < 512`; the
+    scale is clamped at 65,504 beyond) and comes off in the final division. Small
+    scales: `p × d × 128` is subnormal below 6.1e-5, absolute resolution 6e-8 as
+    f16 p has today.
+- **Registers.** 256 GRF, scratch 0 (§gate below). The build is one form:
+  `PORT_QHOIST`, `PORT_QF32`, `PORT_UNIFORM`; with lane-varying ids it spills
+  2,048 B, so the q8_0 build ignores `GGML_OPENCL_FA_PORT_UNIFORM=0` (and `_GRF`,
+  `_QHOIST`, `_QF32`) and says so once.
+- **What only a device can show.** The lane and byte order of
+  `__builtin_IB_subgroup_block_read_flat_transform_u8_k32` (assumed: lane =
+  column, the 32 bytes the rows in order, x in bytes - by analogy with the short
+  form the f16 build uses), and that a surface whose base is rounded down with x
+  up to 60 dwords-aligned bytes in reads what the f16 form reads at x = 0.
+
+Static instructions a 32-key block, bmg-g21 (`measured-here`, `isa_phases.py
+--pre-dpas 8 --loop-dpas 40` on the offline gate's dump; both arms of a branch
+counted):
+
+| build | loop | S = Q Kᵀ | score pass | softmax + P V | DPAS | 2D loads | other loads |
+|---|---|---|---|---|---|---|---|
+| f16 (unchanged by this patch) | 1,788 | 74 | 1,222 | 292 | 32 | 33 | 78 |
+| q8_0, first form (`convert_half16`, V scaled in f16) | 4,658 | 1,270 | 1,223 | 1,965 | 32 | 27 | 81 |
+| q8_0, codes by B16, V scaled in f16 | 3,375 | 387 | 1,216 | 1,572 | 32 | 26 | 84 |
+| q8_0, scale in P, V read at the codes' own byte (off the 4-byte grid) | 2,637 | 398 | 1,219 | 820 | 40 | 18 | 93 |
+| **q8_0, this patch** (V on the grid, the splice) | **2,755** | 420 | 1,232 | 903 | 40 | 20 | 93 |
+| q8_0, no-bias probe | 2,137 | | | | 40 | 20 | 36 |
+
+**Inline vISA: not used.** The rule asks for a measured gap on a named loop and
+the C number first. The two loops with potential are named by the table: the
+code expansion in S (420 against 74) and in P V. A packed 32-wide byte-to-word
+move would replace B16 and its bias (an estimate of 250 instructions a block
+saved of 2,755, `inference`), behind a knob with this C path as the fallback.
+It waits for the C path's card number: by the prediction below the whole q8_0
+path is within 2 % of the f16 port at the model level, so the gap may not be
+there to close.
+
+## The gate (`code`: `fa_port_gate.h`; one function for `supports_op` and the launch)
+
+K and V both f16 (the rules as before) or both q8_0; any other pair is
+`kv-type`. For q8_0: `nb[0] == 34`; the row pitch a multiple of 16, at least 196
+(60 + 136: the surface row) and below 2^24; the head stride and the view offset
+multiples of 4; the buffer alignment a multiple of 64. `fa_port_kv_q8(op)` picks
+the build. The launch asserts the placed offsets and logs K's and V's type, `ne`,
+`nb` and offset before it aborts. A q8_0 tensor written with `set_tensor` is
+stored as planes by this backend; the launch rebuilds its blocks a call, as
+today's dispatch does (`DOWNGRADE … port=kv-rebuilt reason=q8_0-planes`, once).
+The model's cache is written by the graph and is blocks already; the op suite's
+K/V are planes, so its q8_0 timings carry the rebuild on both arms.
+
+Lines the device prints, once a process:
+
+    TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0 grf=256 qhoist=1 qf32=1 skip=1 uniform=1 qtw=1
+    TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=256 …        (the f16 build's, unchanged)
+
+Refusals: `DOWNGRADE src=opencl op=FLASH_ATTN port=declined reason=<why>`, with
+`not-built-q8` / `compile-q8` for the q8_0 build.
+
+## Without a device (`measured-here`, the recipe host)
+
+- **The export with a q8_0 cache.** `test-export-graph-ops` on the model, CPU,
+  context 4,096, `-ctk q8_0 -ctv q8_0`, ub 512 / 1,024 / 2,048:
+  `fixtures/inkling-q8kv-ub*.txt`. Lines 222 / 223: K and V type 8, `[128, n_kv,
+  8]`, nb `[34, 1088, 136]`. Real export lines, not derived strides. The file loaded is the
+  recipe host's `Inkling-2-Mini-IQ4_NL-out-q6k.gguf` (the IQ4_NL model with `output.weight` in
+  Q6_K; the card's file has that tensor in Q8_0). The output head's type shows in two lines
+  of an export only, 117 / 118 (the head's MUL_MAT, a type-14 source). No line used here
+  depends on it: the gate unit reads the four FLASH_ATTN_EXT lines 220..223 and, for the
+  table and the sink, the MUL_MAT / SUB lines whose outputs are `[n_bins, 24, rows]` and
+  `[24, rows]` - attention tensors, all f32, f16 or the cache's q8_0. (The same
+  command with f16 KV reproduces the f16 fixtures' shapes; this tree writes 20
+  op parameters a line where they have 16.) Each export peaked at 28.8 GB
+  resident, so it ran under the model slot lock.
+- **The gate unit** on the six fixtures: green rc 0, 66 ACCEPT, 318 refusals
+  (the q8_0 lines accepted at `supports_op` and at the launch, build `q8_0`; 19
+  bends a line: mixed pairs, q4_0, a view offset of 2, a head stride of 138, a
+  pitch of 1,080 or 192, ..., and the accepted ones: a view 4 bytes, one head, 512
+  rows in). Red: `-DFA_PORT_GATE_RED_KV8_TYPE` (the rule before) rc 1, `kv-type`
+  on every q8_0 line; `-DFA_PORT_GATE_RED_KV8_STRIDE` (the f16 build's 64-byte
+  head stride asked of q8_0, a wrong rule) rc 1, `layout-k` on 222 / 223.
+- **The read path, modelled** (`GGML_TEST_FA_PORT_KV8=1 test-backend-ops -b
+  CPU`): the kernel's q8_0 statements transcribed and run on the bytes of the
+  port's q8_0 cases, built from the export's strides. Every modelled read is
+  checked against its surface, the tensor's bytes and the extension's limits above. Four cases, 105 tiles, 151,625 2D reads:
+
+  | | model vs exact | CPU op vs exact | model vs CPU op |
+  |---|---|---|---|
+  | green | 8.2e-8 .. 9.3e-8 | 1.9e-6 .. 2.0e-6 | 2.0e-6 .. 2.1e-6 |
+  | red 1: K's scale twice | 0.10 .. 0.12 | | |
+  | red 2: V's scale from the next block | 0.48 .. 0.51 | | |
+  | red 3: the two splices left out | 0.012 .. 0.013 | | |
+  | red 4: Q in dim order | 0.18 .. 0.20 | | |
+  | red 5: V read at the codes' own byte (the first form) | 8.7e-8, and 7,680 of 34,560 reads off the 4-byte rule: FAIL on the rule | | |
+
+  "exact" is a double-precision attention on ggml's own dequantized K/V and the
+  f32 Q; the bar is 1e-6, and model vs CPU must be below 1e-5. Reads outside a
+  surface or a buffer: 0; reads off the extension's rules: 0. It is not the
+  kernel: the DPAS and the block reads are what the kernel assumes of them.
+- `test-backend-ops -b CPU -o FLASH_ATTN_EXT -p "port=[12]"`: 23 of 23 (7 with a
+  q8_0 cache). The q8_0 port cases run at a bound of 1e-5 (the f16 cases keep
+  5e-4), and every port case and twin prints `[FA_PORT] nmse = <v> (bound <b>)`,
+  pass or fail: 23 such cases, 5 at 1e-05. (On the CPU both sides are the CPU, so
+  the q8_0 values print 0.)
+- `GGML_TEST_FA_PORT_TWINS=1`: 20 pairs, the q8_0 ones among them (port against
+  twin, both layouts): masks identical, NMSE at most 4.4e-6 (q8_0: 8.3e-7).
+- `GGML_TEST_FA_PORT_DECISIONS=1`: 16 port cases (11 f16, 5 q8_0), `supports_op`
+  and the launch agree on each. `_REFUSED`, `_SETTLE`: a q8_0 cache keeps the
+  port's sources, a q4_0 cache and 8 rows lose them.
+- `port_abi_check.py`: 42 / 42 (one argument list for both builds).
+- The recipe on the code commit: 50 of 50 unit tests, the package builds. The applied tree
+  (a fresh pin + `apply-series.sh`, 153 patches): write-tree `e4d76c347d70c59d69231e3f4a5f01179aa2e4a2`.
+- The f16 build is untouched: its ISA is the same text before and after the patch.
+
+## The offline gate on this kernel {#gate-q8}
+
+ocloc 26.27.1, bmg-g21, `-cl-intel-256-GRF-per-thread` (`measured-here`):
+**`ocloc 9/9 variants`**, each `grf 256 simd 16 scratch 0`, no stack call, no
+retry dump: the f16 build; the q8_0 build; its no-skip arm; RED 1, 2, 4, 6, 7;
+the no-bias probe. The q8_0 build with `PORT_UNIFORM=0` spilled 2,048 B in the
+first form and the host never builds it.
+
+## Prediction, written before any card run (`inference`)
+
+The op, us a call, window 1,024, B60 at 165 W. The f16 port's time splits into
+the table's bytes and the rest by the no-bias probe (§dev: 392 / 1,100 / 1,630 of
+746 / 2,092 / 2,926). The q8_0 build changes only the rest: 1.81 × its static
+instructions (2,137 against 1,179 without the table), half the K/V bytes, 20
+block reads and 8 scale gathers against 33 block reads. Point: the rest × 1.5; range: × 1.0 to × 1.81.
+
+| shape | f16 port (measured) | q8_0 port, point | range | today's kernels (the f16 twin, measured) |
+|---|---|---|---|---|
+| q512 × kv1536 | 736 | 930 | 740 .. 1,050 | 2,263 |
+| q2048 × kv2048 | 2,078 | 2,630 | 2,080 .. 2,970 | 9,577 |
+| q2048 × kv3072 | 2,906 | 3,720 | 2,910 .. 4,230 | 12,645 |
+
+The op suite's q8_0 calls add the rebuild of the planes to both arms (not in
+the table; it is why q8_0 is compared with q8_0 there).
+
+The model, pp4096 ub 1,024 at q8_0 KV: today 816 t/s = 1,255 ms a pass. The f16
+port saves 203 ms a pass (974 t/s). The q8_0 build keeps 79 to 100 % of that
+(its op is at most 1.43 × the f16 port's, which is 22 to 33 % of today's):
+**953 t/s, range 935 .. 974; 1,074 ms a pass, range 1,095 .. 1,052.** At the
+units' own flags (262,144 context, `--llama-swa-window`) no f16 number exists to
+scale from; the same +15 to +19 % is expected at pp4096 and not claimed.
+
+The op-level bound, stated beforehand: every q8_0 port case's NMSE against the
+CPU reference is expected at 2e-6 (the CPU's own distance from exact, above) and
+must be below 1e-5 - which is the bound those cases run at, so the suite enforces
+it, and each prints its value. The reds must exceed it by the factors in the
+table above. Kept as it is: `fmin(128 d, 65504)` clamps without a word for a
+scale above 511.75, a |v| no f16 cache could hold either. At the answer level: mean KL at
+most 0.03 nats worse than the port-off arm on the same card and window, top p
+down at most 1 point.
+
+## The card commands, in order {#commands-q8}
+
+`T` = `<build>/bin/test-backend-ops`, `D` the OpenCL device, `P` =
+`GGML_OPENCL_FA_PORT=1`, `Q` = `-p "type_K=q8_0.*port=1"`. Build from
+`apply-series.sh` on the pin (write-tree in the commit message).
+
+    # 0. the counts this tree promises, from the tree itself (no hand count)
+    P T support -b D -o FLASH_ATTN_EXT | grep -c "type_K=q8_0.*port=1"          # the q8_0 port cases listed
+    P T support -b D -o FLASH_ATTN_EXT | grep "type_K=q8_0.*port=[12]"           # each: SUPPORTED with the knob
+    T support -b D -o FLASH_ATTN_EXT | grep "type_K=q8_0.*port=[12]"             # knob off: port=1 NOT SUPPORTED; the twins as today
+    # 1. one case, the TAKEN line (test-backend-ops prints backend lines; assert the log is not muted first)
+    P GGML_OPENCL_BOUNDS=1 T -b D -o FLASH_ATTN_EXT -p "kv=1536,nb=512,.*type_K=q8_0.*port=1" 2>&1 | grep -c "TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0"
+    # 2. the suite: 0 FAIL, and the q8_0 port cases RUN (count them against step 0)
+    P GGML_OPENCL_BOUNDS=1 T -b D -o FLASH_ATTN_EXT
+    T -b D -o FLASH_ATTN_EXT                                                     # knob off: as development
+    # 3. the reds: each must FAIL every q8_0 port case
+    for r in 1 2 6 7; do P GGML_OPENCL_FA_PORT_RED=$r T -b D -o FLASH_ATTN_EXT Q; done
+    # 4. the op: the q8_0 port against today's q8_0 kernels (same data), then the f16 port
+    P T perf -b D -o FLASH_ATTN_EXT -p "type_K=q8_0.*n_bins=1025.*port=1"
+    T perf -b D -o FLASH_ATTN_EXT -p "type_K=q8_0.*n_bins=1025.*port=2"
+    P T perf -b D -o FLASH_ATTN_EXT -p "type_K=f16.*n_bins=1025.*port=1"
+    P GGML_OPENCL_FA_PORT_PROBE=nobias T perf -b D -o FLASH_ATTN_EXT -p "type_K=q8_0.*n_bins=1025.*port=1"   # WRONG answers: the table's share
+    # 5. the model at q8_0 KV, three interleaved rounds, knob off / on (llama-bench mutes backend lines without -v)
+    GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 GGML_OPENCL_CPY_TRANSPOSE=1 [P] \
+        llama-bench -m <Inkling 2 Mini> -ngl 99 -fa 1 -ctk q8_0 -ctv q8_0 -p 4096 -n 0 -ub 1024 -b 2048 -r 3 -v
+    # with P: exactly one "TAKEN … kv=q8_0" line, and no "port=declined" line for a prompt batch
+    # 6. the answer level, ub 1024, q8_0 KV, against the CPU base (llama-perplexity needs -lv 4 for the lines)
+    #    the port-off arm and the port-on arm on the same card and window; a ub 1 run does not exercise the port
+    # 7. the units' flags: 262,144 context, --llama-swa-window, --prefill-ubatch 1024, q8_0 KV, the three env above, P
+
+In step 2 every port case prints `[FA_PORT] nmse = <v> (bound <b>)`: the q8_0
+port cases with bound 1e-05, expected near 2e-06.
+
+Pass: step 2 with 0 FAIL and every q8_0 port case run; step 3 all red; step 6
+inside the answer-level bar. Step 4 and 5 are read against the prediction.

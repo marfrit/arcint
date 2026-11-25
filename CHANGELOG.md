@@ -40,6 +40,10 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   context. A partial offload of Inkling faulted at `-ngl 12` (`measured-here`); the cause by code reading, not
   reproduced, is its depth-mix stacks written through views across devices, the same code without the port. Serve
   Inkling fully offloaded.
+  Patches 0199q1 / 0199q2 add a q8_0 read path to the port (the kernel reads ggml's q8_0 blocks in place, nothing
+  staged; same knob): designed, compiled offline (256 GRF, no scratch) and tested on the CPU only, **not run on a
+  card**. Predicted (`inference`) 816 -> 953 t/s at pp4096 ub 1,024 with q8_0 KV. Record:
+  `contrib/refkernels/trellis-fa/README.md` §q8.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
