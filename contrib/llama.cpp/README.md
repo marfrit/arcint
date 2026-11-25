@@ -10888,6 +10888,13 @@ calls `std::find` without `<algorithm>`). On a card the bar is comparative: arm 
 checkpoint) has the same top token and mean KL <= arm D (the same prompt in another ubatch split, the card's floor) +
 0.03 nats, and the run asserts RESTORE TAKEN.
 
+**The exact arms** (`tools/swa_ckpt_probe.cpp --exact`): E0, two contexts prefilling the same prefix in the same calls
+must hold byte-equal states (the premise); E1, the lane runs on past the checkpoint (the ring reuses the cells),
+restores the partial checkpoint and trims to it: the state read back must equal the checkpoint byte for byte and the
+tail's logits must be bit-equal, row for row, to an untouched context with the same calls; E2, the early edit: a full
+state saved, the lane cleared and refilled with other tokens from position 64, the state restored, checked as E1. A
+restore that writes nothing differs by construction in E2, in either cache layout, so the red tree must fail E2.
+
 **The card gate** (B60; its trimmed form ran 2026-11-25, results under Status above). In order: the op test red then green (the device line names the card; red rc 1 with
 its failing set compared to the reading's 34, green `PASS (64 cases)`, rc 0, two warnings, one per type);
 `test-backend-ops -b GPUOpenCL` on both trees (the summary line printed in both, the same total, the same failing set);
