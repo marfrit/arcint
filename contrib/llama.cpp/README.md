@@ -10830,8 +10830,17 @@ touched for it now, because that would move the card-proven tree `13ab33b8`):
 
 ## 0209-opencl-q8-q4-view-writes.patch
 
-**Status: not yet run on a card.** The code is reviewed (`code`); the op test and the probe below are built on both
-trees and their card gate is written and rehearsed, not run. This section gets the card rows when the gate has run.
+**Status: card-proven at the op level on the B60** (`measured-here`, the trimmed gate below, 2026-11-25, B60 at its
+165 W cap): the op test red `FAIL (34 of 64 cases failed)`, exactly the reading's set, rc 1; green `PASS (64 cases)`,
+rc 0; the device line names the B60 in both. The green op suite: 14,035 of 14,192 passed, the 157 failing cases equal
+to the last recorded B60 suite's 157 (an older tree; 0 new, 0 gone). The probe's arm B did not separate the trees and
+proves nothing about the defect (a measured result, explained by the code: B compares only the last token against a
+fresh context in other ubatch splits, the edit is a cut late in the window on synthetic tokens, so a dropped write
+hardly moves it, and with `--swa-full` the lane never overwrites the cells a dropped write would leave stale): B KL
+red / green, D, q8_0 0.004499 / 0.003324, 0.001826; `--swa-full` 0.002606 / 0.003324, 0.001826; q8_0:q4_0 0.013151 /
+0.001511, 0.001677; f16 0.000065 on both, 0.000040. The probe's exact arms (`--exact`, below) replace it as the
+served-level red: on the CPU (`measured-here`, q8_0 K / q4_0 V, window-sized) E0, E1 and E2 read back 0 differing
+bytes of 72-87 M and 0 differing logit rows; their card run is part of the 1.8.3 checkpoint gate.
 
 **What.** `ggml_backend_opencl_buffer_set_tensor` writes through a VIEW of a non-weights q8_0 / q4_0 tensor: 0123zzzzz2's
 plain copy (a q8_0 / q4_0 tensor that is not a weight and was never split into scales and quants) now also takes a view
@@ -10879,7 +10888,7 @@ calls `std::find` without `<algorithm>`). On a card the bar is comparative: arm 
 checkpoint) has the same top token and mean KL <= arm D (the same prompt in another ubatch split, the card's floor) +
 0.03 nats, and the run asserts RESTORE TAKEN.
 
-**The card gate** (B60, not run). In order: the op test red then green (the device line names the card; red rc 1 with
+**The card gate** (B60; its trimmed form ran 2026-11-25, results under Status above). In order: the op test red then green (the device line names the card; red rc 1 with
 its failing set compared to the reading's 34, green `PASS (64 cases)`, rc 0, two warnings, one per type);
 `test-backend-ops -b GPUOpenCL` on both trees (the summary line printed in both, the same total, the same failing set);
 the probe on Inkling 2 Mini IQ4_NL at n_ctx 8192, red then green, 3 rounds of four arms (q8_0 / q8_0, the same with
