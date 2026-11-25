@@ -717,7 +717,7 @@ service's production flags, Flash-Next's expert cache included
   not evict the referenced stored response — it is a lookup, so it refreshes
   that entry's LRU rank like any other read.
 
-## Known limits (1.8.1)
+## Known limits (1.8.3)
 
 - **A build against a llama.cpp tree without patch 0209 keeps no context checkpoints for a sliding-window cache at
   q8_0 / q4_0 K/V on OpenCL** (1.8.1's refusal; a release applies the whole series and is not affected): a follow-up
