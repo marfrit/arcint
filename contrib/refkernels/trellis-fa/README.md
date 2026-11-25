@@ -2447,7 +2447,10 @@ one ulp at random (four seeds), and a second off run:
 
 The port minus the noise mean is +0.000014 nats, 0.2 of the seeds' standard deviation:
 **inside the noise.** Against the CPU base its 0.002545 lies inside the four seeds'
-range as well. The question was written into the script before the run (is the port
+range as well. One figure stands out and is a tail, not the floor: the largest
+KL of a single token is 0.409 for the port against 0.134 / 0.166 / 0.316 / 0.199 for
+the four seeds (the depth mix 0.159, both 0.282) - one token of 6,144, with the mean
+inside the noise at 0.2 sd and top p equal. The question was written into the script before the run (is the port
 above the noise by more than twice its spread?) and the answer is no. What this shows:
 about 0.002 nats is what any change of rounding costs this model on this card, and
 the read path's own differences from today's q8_0 kernels (K's scale applied to an f32
