@@ -340,6 +340,12 @@ generated tokens, measured at a context depth of 0, 4,096 and 32,768 tokens.
 | arcint at first light (the port and the flash-attention bias, before the speed work) | 183.9 / 177.5 / 164.1 | 24.0 / 22.6 / 20.8 |
 | mainline llama.cpp, Vulkan backend, same tool and card | 33.3 / 32.3 / 30.1 | 8.3 / 10.1 / 10.2 |
 
+The llama-bench rows run with window-sized sliding-window caches (llama-bench sets
+`swa_full = false`); the 1.8.0 server keeps the full-size cache, which lets the sliding-window
+layers attend over every cached key, so its decode at depth is lower: after a 15,790-token
+prompt on the B60, 20.5 t/s with q8_0 KV and 24.3 with f16 (`measured-here`), against the
+bench's 30.4 / 31.9 at 16,384. Window-sized caches with checkpoints for prefix reuse are 1.8.1 work.
+
 The B70 gives the same answers (mean KL against the CPU reference identical to the B60's, the
 acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 23-30 % on generation,
 which fits Inkling's decode being bound by the number of small kernel launches more than by
