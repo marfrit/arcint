@@ -2276,7 +2276,8 @@ block reads and 8 scale gathers against 33 block reads. Point: the rest × 1.5; 
 The op suite's q8_0 calls add the rebuild of the planes to both arms (not in
 the table; it is why q8_0 is compared with q8_0 there).
 
-The model, pp4096 ub 1,024 at q8_0 KV: today 816 t/s = 1,255 ms a pass. The f16
+The model, pp4096 ub 1,024 at q8_0 KV ("a pass" here is one 1,024-token ubatch, four
+of them a prompt): today 816 t/s = 1,255 ms a pass. The f16
 port saves 203 ms a pass (974 t/s). The q8_0 build keeps 79 to 100 % of that
 (its op is at most 1.43 × the f16 port's, which is 22 to 33 % of today's):
 **953 t/s, range 935 .. 974; 1,074 ms a pass, range 1,095 .. 1,052.** At the
@@ -2365,3 +2366,117 @@ port cases with bound 1e-05, expected near 2e-06.
 
 Pass: step 2 with 0 FAIL and every q8_0 port case run; step 3 all red; step 6
 inside the answer-level bar. Step 4 and 5 are read against the prediction.
+
+# The q8_0 read path on the card, and what follows from it {#q8-card}
+
+Units: "a ubatch" below is one 1,024-token ubatch of a pp4096 run (four of them
+a prompt). §q8's prediction wrote "ms a pass" for the same thing: 1,255 ms there
+is 1,024 tokens at 816 t/s, not a 4,096-token prompt.
+
+## The card (`measured-here`, the card host, B60 at its 165 W cap, the applied tree `59732cfe…`)
+
+- The suite runs through (the harness fix of §window1 is green). The five q8_0
+  port cases: worst nmse 1.93e-6 .. 2.17e-6 against the bound 1e-5; the f16 rows
+  unchanged; RED 1, 2, 6, 7 fail all five.
+- Inkling 2 Mini pp4096 ub 1,024 at q8_0 KV, three interleaved rounds, the three
+  env on both arms: **817.2 t/s off, 945.8 on (+15.7 %)**; 1,253.1 and 1,082.7 ms a
+  ubatch. Predicted 953 (935 .. 974): inside the range, under the point.
+- The op, us a call (the suite's q8_0 calls also rebuild the planes, both arms):
+
+  | shape | q8_0 port | q8_0 port, no-bias probe | today's q8_0 kernels | f16 port | predicted q8_0 port (range) |
+  |---|---|---|---|---|---|
+  | q512 × kv1536 | 1,388 | 938 | 2,587 | 735 | 930 (740 .. 1,050) |
+  | q2048 × kv2048 | 3,946 | 2,742 | 10,541 | 2,072 | 2,630 (2,080 .. 2,970) |
+  | q2048 × kv3072 | 5,176 | 3,667 | 14,046 | 2,898 | 3,720 (2,910 .. 4,230) |
+
+**The op prediction missed, outside its own range.** Even with an estimated
+rebuild of 150 .. 400 us taken off (`inference`: a two-term fit of "q8_0 minus
+f16" on the f16 port's time and on n_kv; it fits poorly, the middle shape is 260
+to 340 us off), the q8_0 port is 1.6 to 1.8 × the f16 port where 1.27 × was
+predicted. The model figure came in because today's q8_0 kernels are slower
+than the f16 twin the prediction was scaled from (10,541 against 9,577), which
+offset the miss. The error in the model of §q8: it scaled only the part of the
+op the no-bias probe leaves and took the table's part as fixed. A key block
+executes one arm of the score pass, so the executed loop is about 1,180
+instructions for f16 and about 2,150 for q8_0, 1.8 × on the whole loop - which is
+what the card shows.
+
+## Where the extra instructions are (`measured-here`, ocloc 26.27.1, bmg-g21, static, a key row)
+
+| kind | S = Q Kᵀ | softmax + P V | both |
+|---|---|---|---|
+| integer logic (B16's code expansion, the splices) | +6.6 | +6.2 | +12.7 |
+| mov (operand packing, the spliced lanes) | +2.7 | +5.6 | +8.2 |
+| mul / mad (the scales, the accumulators' start) | +1.8 | +3.5 | +5.3 |
+| add | +0.3 | +1.5 | +1.8 |
+| lane shuffles | 0 | +1.0 | +1.0 |
+| DPAS | 0 | +0.25 | +0.25 |
+| 2D reads and gathers | -0.2 | +0.1 | -0.1 |
+| total (f16 55.9 a key row -> q8_0 85.8) | +10.8 | +19.1 | +29.9 |
+
+The score pass is the same code (+0.3). Reads and DPAS are not it. Two thirds of
+the extra is the P V phase's operand build, one third K's.
+
+## What the card leaves unexplained
+
+1. **The table's part is larger in the q8_0 build**: full minus no-bias is 449 /
+   1,204 / 1,509 us against the f16 build's 344 / 978 / 1,276, for the same
+   statements.
+2. **The rest is 2.0 to 2.3 × the f16 build's** (938 / 2,742 / 3,667 less the
+   estimated rebuild, against 392 / 1,100 / 1,630), where the executed
+   instructions say 1.8 ×.
+
+Neither is explained from the ISA. The rebuild estimate itself is the weakest
+input: if the rebuild is twice the estimate, item 2 disappears.
+
+## The op case that would settle it (a design; not built, no card)
+
+Perf cases only (test-backend-ops, the model's layout, 24 heads on 8, 1,025 bins),
+each in four arms: K/V f16 and q8_0, each full and with
+`GGML_OPENCL_FA_PORT_PROBE=nobias`. `GB_NO_SKIP` is not needed.
+
+| series | shapes | what varies | what it gives |
+|---|---|---|---|
+| A, the rebuild | 16 rows × kv 1,536 / 2,048 / 3,072 / 8,192, window 1,024 | n_kv at two tiles | q8_0 minus f16 is the rebuild plus nothing else of size: its us a key. Replaces the estimate above. |
+| B, a tile's fixed cost | 2,048 rows × kv 64, window 32 | tiles, at two key blocks a tile | q8_0 minus f16 a tile: Q read by index and the eight sums against eight block reads |
+| C, a key block's cost | 512 rows, no window, kv 1,024 / 2,048 / 4,096, every key live | key blocks a tile | the slope a key block, four arms: the in-loop ratio (1.8 by the ISA) and the table's share a block, each build |
+
+Reading the results:
+- A's slope near 0.1 us a key and C's slope ratio near 1.8: item 2 was the
+  rebuild; the kernel is as the ISA says, and the asm arm's estimate stands.
+- C's slope ratio above 2 with the rebuild confirmed small: the loop is slower a
+  instruction than the f16 loop. Then look at the dump's `sync` lines (25 against
+  20 in the score pass, 41 against 28 in P V) and at the gathers before any asm.
+- C's table share a block larger for q8_0: the table read is slowed by what
+  surrounds it in the loop (item 1 is in the loop). The same share with a larger
+  intercept: item 1 is a tile's setup (the pad bins, the row bases), series B's.
+- B's difference a tile large (above 2 us): the Q read by index is worth a
+  block-read form (a tile's Q read in dim order and permuted in registers).
+
+## The three levers, priced from the card's figures
+
+A ubatch at q8_0 KV: 1,253.1 ms off, 1,082.7 ms with the in-kernel read; the f16
+port at f16 KV: 1,051.4 ms. The off arms are equal (816.0 and 817.2 t/s), so
+**31.3 ms a ubatch is what the in-kernel dequantization costs against the f16
+port** (`measured-here`, two arms at two cache types).
+
+The model's layers (`code`: the ordered graph dump): 48, of which 40 windowed and
+8 global (every sixth: 5, 11, .. 47). Keys a call at a 4k prompt: 2,048 windowed
+(window + ubatch); 1,024 to 4,096 global (the live prefix, `inference`), mean
+2,560. At 64k: 2,048 and about 65,536. With a global call weighted twice a
+windowed one (`inference`), 22 of the 31.3 ms are the windowed layers', 9 the
+global ones'.
+
+| lever | what | a ubatch | pp4096 ub 1,024 | class |
+|---|---|---|---|---|
+| in the kernel (this patch) | | 1,082.7 ms | 945.8 t/s | `measured-here` |
+| the hybrid | a staged f16 copy for the 40 windowed layers (4.5 MB of q8_0 in, 8.4 MB of f16 out a call; 0.15 .. 0.30 ms a call = 6 .. 12 ms a ubatch), the kernel's read for the 8 global ones | 1,066 .. 1,072 ms | 955 .. 960 (957); 961 .. 964 if only the ubatch's new keys are converted into a kept f16 ring, 336 MB for the 40 layers; 965.7 if the copy were free | `inference` |
+| inline vISA on the code expansion (item P21) | about 425 integer instructions a 32-key block (B16 in S and in P V) against an estimated 130 .. 190 for a packed 32-wide byte-to-word form: about 12 % of the executed loop | about 9 ms less, 1,074 ms | about 954 | `inference` |
+| the f16 port at f16 KV (does not fit the units' context) | | 1,051.4 ms | 973.9 | `measured-here` |
+
+A 4,096-token prompt is four ubatches: the asm arm's 9 ms is 36 ms a prompt. At
+64k the global layers are about nine tenths of the attention's time, so the
+hybrid gains nothing there and the kernel's read is what counts; the asm arm
+applies at every depth. Neither is built. The asm arm qualifies under the
+standing rule (a measured gap, an ISA dump, one named loop: B16); it addresses
+the code expansion only, not the two unexplained items above.
