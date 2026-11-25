@@ -875,6 +875,14 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-opencl-cpy-t01 PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME opencl-cpy-t01 COMMAND arcint-opencl-cpy-t01)
     set_tests_properties(opencl-cpy-t01 PROPERTIES LABELS unit)
+    # patch 0220's device-free cell: the dense Q8_0 2D GEMM's gate on the exported graph's
+    # MUL_MAT lines (red first), its launch shape, and a model of its arithmetic and red builds
+    add_executable(arcint-opencl-q8-2d tests/test_opencl_q8_2d.cpp)
+    target_include_directories(arcint-opencl-q8-2d PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl")
+    target_compile_options(arcint-opencl-q8-2d PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME opencl-q8-2d COMMAND arcint-opencl-q8-2d)
+    set_tests_properties(opencl-q8-2d PROPERTIES LABELS unit)
     # patches 0204-0207's device-free cell: the depth mix's eligibility rule on the exported
     # graph's lines (red first), the launch plan, depth_mix.cl itself replayed on host threads
     # against the CPU op (and its red build), and the message read behind the card's page fault

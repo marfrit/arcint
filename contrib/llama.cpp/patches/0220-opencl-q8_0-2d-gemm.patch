@@ -1,0 +1,786 @@
+0220: dense Q8_0 x F32 products of 16 or more columns on the 2D-block GEMM of mul_mm_kq_2d.cl behind GGML_OPENCL_Q8_2D (0 off, the default: nothing is built and the 0058 tile takes Q8_0 as before; 1 fp16, kernel_mul_mm_kq2d_q8_0; 2 int8, kernel_mul_mm_kq2d_q8_0_i8, the Q4_0 int8 kernel with the decode removed: Q8_0's codes are the DPAS operand). A program of its own from the same text (Q8_2D_ONLY: the K-quants' program is unchanged), the work-group sized to the rows, a pure gate (ggml-opencl-q8-2d.h: Q8_0 SoA, F32, K % 256, contiguous, no view, at most 8,192 rows, the 2D limits) with a DOWNGRADE line on refusal and one TAKEN line a process, the int8 activations in GGML_OPENCL_Q8_2D_SLOTS slots (default 4), bounds under GGML_OPENCL_BOUNDS, two reds through GGML_OPENCL_KQ_2D_OPTS (-DQ8_2D_RED=1 / 2), an inline-vISA decode for the fp16 arm behind GGML_OPENCL_Q8_2D_VISA=1 (the C form the fallback), and the served shapes as op and perf cases.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h b/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h
+new file mode 100644
+index 0000000..2e34409
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h
+@@ -0,0 +1,137 @@
++// 0220: the gate and the launch shape of the dense Q8_0 2D-block GEMM (mul_mm_kq_2d.cl,
++// kernel_mul_mm_kq2d_q8_0_i8 and kernel_mul_mm_kq2d_q8_0, GGML_OPENCL_Q8_2D). Pure: no cl_
++// calls and no device, so a unit test feeds them a graph export's real types, shapes and
++// strides on the CPU host (arcint tests/test_opencl_q8_2d.cpp).
++//
++// What the kernels assume, and so what the gate requires:
++//   - Q8_0 weights in the backend's flat planes (set_tensor's SoA split: a q plane of
++//     ne00 bytes a row, a d plane of ne00 / 32 halves a row, each a sub-buffer at the
++//     device's base alignment, which a 2D block surface wants 64-byte aligned); a view is
++//     never flattened, so none is taken;
++//   - 2-D: one weight matrix, one column matrix, both contiguous; the destination's
++//     columns are rows of floats (nb[0] == 4) at any nb[1];
++//   - F32 columns, at least 16 of them (fewer take the matvecs, as for the 0058 tile);
++//   - K a multiple of 256 (a super-block of eight 32-blocks: the int8 activations carry
++//     one scale per 256);
++//   - the 2D block limits: a surface at most 2^24 bytes wide and 2^24 rows high (the
++//     fp16 activations are 2 * K bytes a row);
++//   - at most `max_rows` rows (8,192 from the host): the big output head stays where it
++//     is.
++// The verdict names the first refusal; GGML_CL_Q8_2D_TAKE (0) is the only take. A
++// product that is not this path's (not Q8_0 x F32 -> F32, or under 16 columns) is
++// NOT_MINE, and a knob at 0 is OFF before anything else is looked at: with the knob off,
++// no product is taken and none is reported.
++#ifndef GGML_OPENCL_Q8_2D_H
++#define GGML_OPENCL_Q8_2D_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++// ggml_type values (ggml.h); ggml-opencl.cpp asserts them
++#define GGML_CL_Q8_2D_TYPE_F32  0
++#define GGML_CL_Q8_2D_TYPE_Q8_0 8
++#define GGML_CL_Q8_2D_Q8_BLOCK  32   // weights a block
++#define GGML_CL_Q8_2D_Q8_BYTES  34   // bytes a block (f16 scale + 32 codes)
++
++enum ggml_cl_q8_2d_verdict {
++    GGML_CL_Q8_2D_TAKE = 0,
++    GGML_CL_Q8_2D_OFF,        // GGML_OPENCL_Q8_2D=0 (the default)
++    GGML_CL_Q8_2D_NOT_MINE,   // not Q8_0 x F32 -> F32, or fewer than 16 columns
++    GGML_CL_Q8_2D_LAYOUT,     // batched, not contiguous, or a destination row not floats
++    GGML_CL_Q8_2D_VIEW,       // a view of a weight (never flattened)
++    GGML_CL_Q8_2D_SOA,        // not in the flat planes
++    GGML_CL_Q8_2D_K,          // K not a multiple of 256
++    GGML_CL_Q8_2D_ROWS,       // above the row cap
++    GGML_CL_Q8_2D_LIMIT,      // past a 2D block surface's 2^24
++    GGML_CL_Q8_2D_ALIGN,      // the device's base alignment not a multiple of 64 bytes
++};
++
++struct ggml_cl_q8_2d_in {
++    int      mode;            // GGML_OPENCL_Q8_2D: 0 off, 1 fp16, 2 int8
++    int      type0, type1, typed;
++    int64_t  ne0[4];          // the weight
++    size_t   nb0[4];
++    int64_t  ne1[4];          // the columns
++    size_t   nb1[4];
++    size_t   nbd0;            // the destination's element stride
++    bool     view0;           // src0->view_src != nullptr
++    bool     soa0;            // ggml_cl_is_q8_0_soa(src0)
++    size_t   alignment;       // the device's base alignment in bytes
++    int64_t  max_rows;
++};
++
++static inline const char * ggml_cl_q8_2d_reason(int v) {
++    switch (v) {
++        case GGML_CL_Q8_2D_TAKE:     return "take";
++        case GGML_CL_Q8_2D_OFF:      return "off";
++        case GGML_CL_Q8_2D_NOT_MINE: return "not-mine";
++        case GGML_CL_Q8_2D_LAYOUT:   return "layout";
++        case GGML_CL_Q8_2D_VIEW:     return "view";
++        case GGML_CL_Q8_2D_SOA:      return "not-soa";
++        case GGML_CL_Q8_2D_K:        return "k";
++        case GGML_CL_Q8_2D_ROWS:     return "rows";
++        case GGML_CL_Q8_2D_LIMIT:    return "limit";
++        case GGML_CL_Q8_2D_ALIGN:    return "align";
++    }
++    return "unknown";
++}
++
++// k_mult is the K multiple the kernels need (256); the unit test's red passes 32
++static inline int ggml_cl_q8_2d_gate_k(const ggml_cl_q8_2d_in & a, int64_t k_mult) {
++    if (a.mode != 1 && a.mode != 2) {
++        return GGML_CL_Q8_2D_OFF;
++    }
++    if (a.type0 != GGML_CL_Q8_2D_TYPE_Q8_0 || a.type1 != GGML_CL_Q8_2D_TYPE_F32 ||
++        a.typed != GGML_CL_Q8_2D_TYPE_F32 || a.ne1[1] < 16) {
++        return GGML_CL_Q8_2D_NOT_MINE;
++    }
++    const int64_t k = a.ne0[0], m = a.ne0[1], n = a.ne1[1];
++    // 2-D, the columns' K the weight's, both contiguous (the weight in ggml's Q8_0 rows
++    // as the graph sees it, before the backend's split), a destination row of floats
++    if (a.ne0[2] != 1 || a.ne0[3] != 1 || a.ne1[2] != 1 || a.ne1[3] != 1 || a.ne1[0] != k ||
++        k % GGML_CL_Q8_2D_Q8_BLOCK != 0 || a.nbd0 != sizeof(float)) {
++        return GGML_CL_Q8_2D_LAYOUT;
++    }
++    const size_t row0 = (size_t) (k / GGML_CL_Q8_2D_Q8_BLOCK) * GGML_CL_Q8_2D_Q8_BYTES;
++    if (a.nb0[0] != GGML_CL_Q8_2D_Q8_BYTES || a.nb0[1] != row0 || a.nb0[2] != row0 * (size_t) m ||
++        a.nb0[3] != a.nb0[2] || a.nb1[0] != sizeof(float) || a.nb1[1] != (size_t) k * sizeof(float) ||
++        a.nb1[2] != a.nb1[1] * (size_t) n || a.nb1[3] != a.nb1[2]) {
++        return GGML_CL_Q8_2D_LAYOUT;
++    }
++    if (a.view0) {
++        return GGML_CL_Q8_2D_VIEW;
++    }
++    if (!a.soa0) {
++        return GGML_CL_Q8_2D_SOA;
++    }
++    if (k % k_mult != 0) {
++        return GGML_CL_Q8_2D_K;
++    }
++    if (m < 1 || m > a.max_rows) {
++        return GGML_CL_Q8_2D_ROWS;
++    }
++    if (2 * k >= ((int64_t) 1 << 24) || m >= ((int64_t) 1 << 24) || n >= ((int64_t) 1 << 24)) {
++        return GGML_CL_Q8_2D_LIMIT;
++    }
++    if (a.alignment == 0 || a.alignment % 64 != 0) {
++        return GGML_CL_Q8_2D_ALIGN;
++    }
++    return GGML_CL_Q8_2D_TAKE;
++}
++
++static inline int ggml_cl_q8_2d_gate(const ggml_cl_q8_2d_in & a) {
++    return ggml_cl_q8_2d_gate_k(a, 256);
++}
++
++// the work-groups over the rows: sub-groups of 16 rows, at most max_sg a work-group, the
++// rows shared evenly so no work-group is mostly padding (24 or 32 rows: one of 2; 384: two
++// of 12; 3,072: twelve of 16). The kernels take the band from get_local_size(0) / 16.
++static inline void ggml_cl_q8_2d_shape(int64_t rows, int max_sg, int * sg_per_wg, int * n_wg) {
++    const int64_t nsg = (rows + 15) / 16;
++    const int64_t mx  = max_sg < 1 ? 1 : max_sg;
++    const int64_t nwg = (nsg + mx - 1) / mx;
++    *n_wg      = (int) nwg;
++    *sg_per_wg = (int) ((nsg + nwg - 1) / nwg);
++}
++
++#endif // GGML_OPENCL_Q8_2D_H
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7b04b86..13dd0cc 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -14,6 +14,7 @@
+ #include "ggml-impl.h"
+ #include "ggml-opencl-fa-paged.h"
+ #include "ggml-opencl-cpy-t01.h"
++#include "ggml-opencl-q8-2d.h"   // 0220: the dense Q8_0 2D GEMM's gate and launch shape, pure
+ #include <cstdarg>
+ #include <cstdio>
+ #include "ggml-backend-impl.h"
+@@ -745,6 +746,27 @@ static void ggml_cl_downgrade(const char * fmt, ...) {
+     }
+ }
+ 
++// 0220: GGML_OPENCL_Q8_2D, the dense Q8_0 GEMM on the 2D-block loads: 0 (unset, the
++// default) builds nothing and leaves every Q8_0 product where it was; 1 the fp16 kernel,
++// 2 the int8 one
++static_assert(GGML_CL_Q8_2D_TYPE_F32 == GGML_TYPE_F32 && GGML_CL_Q8_2D_TYPE_Q8_0 == GGML_TYPE_Q8_0,
++              "ggml-opencl-q8-2d.h's type ids");
++static int ggml_cl_q8_2d_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_OPENCL_Q8_2D");
++        if (e == nullptr) {
++            return 0;
++        }
++        const int v = atoi(e);
++        if (v < 0 || v > 2) {
++            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_Q8_2D=%s ignored (0, 1 or 2)\n", e);
++            return 0;
++        }
++        return v;
++    }();
++    return mode;
++}
++
+ size_t ggml_backend_opencl_downgrades(char * buf, size_t size) {
+     std::string out;
+     {
+@@ -924,6 +946,16 @@ struct ggml_backend_opencl_context {
+     ggml_cl_buffer prealloc_kq_ids8_q, prealloc_kq_ids8_d, prealloc_kq_ids8_s, prealloc_kq_ids8_o;
+     // what the activation buffers hold, and the graph count that dates it
+     ggml_cl_kq_act kq_q8, kq_f16, kq_few, kq_i8, kq_id8, kq_ids8, kq_fewq;
++    // 0220: the int8 activations of the Q8_0 2D GEMM in GGML_OPENCL_Q8_2D_SLOTS slots (default
++    // 4; 0: kq_i8 and the prealloc_kq2 buffers, as Q4_0's int8 arm), so a layer's inputs are
++    // quantized once each, not again whenever another input came between. Keyed as kq_i8.
++    struct q8_2d_slot {
++        ggml_cl_kq_act act;
++        uint64_t       used = 0;
++        ggml_cl_buffer xq, xd, xs;
++    };
++    std::vector<std::unique_ptr<q8_2d_slot>> q8_2d_slots;
++    uint64_t q8_2d_tick = 0, q8_2d_calls = 0, q8_2d_quants = 0, q8_2d_hits = 0;   // the counts a graph
+     // kq_ids8 also holds to one route and the output's strides (the offsets it packed)
+     uint64_t       kq_ids8_route = 0;
+     cl_ulong       kq_ids8_nb1 = 0, kq_ids8_nb2 = 0;
+@@ -1295,6 +1327,11 @@ struct ggml_backend_opencl_context {
+     int       kq40_sg8_tm = 32, kq40_sg8_wg = 8;
+     cl_kernel kernel_mul_mm_f16w_f16      = nullptr;   // F16 / BF16 weights on the XMX tiles
+     cl_kernel kernel_mul_mm_q8_0_f16     = nullptr;   // Q8_0 code+scale on the same XMX tiles (0058)
++    // 0220: dense Q8_0 on the 2D-block loads (mul_mm_kq_2d.cl, a program of its own), GGML_OPENCL_Q8_2D
++    cl_kernel kernel_mul_mm_kq2d_q8_0_i8 = nullptr;   // 2: int8 DPAS
++    cl_kernel kernel_mul_mm_kq2d_q8_0    = nullptr;   // 1: fp16 DPAS
++    cl_kernel kernel_q8_2d_quant_i8      = nullptr;   // the int8 arm's quantizer (kernel_quant_i8)
++    int       q8_2d_max_sg               = 0;         // sub-groups a work-group, at most
+     cl_kernel kernel_mul_mm_id_kq_f16[14] = {};   // null for Q3_K and Q2_K (0116, 0117)
+     // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
+     // KQ_ID2_XT pairs x KQ_ID2_XSG sub-groups of rows per work-group
+@@ -2192,6 +2229,52 @@ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_conte
+     return compile_opts;
+ }
+ 
++// 0220: the Q8_0 2D GEMM's program: mul_mm_kq_2d.cl with Q8_2D_ONLY (none of the K-quants'
++// kernels) and Q8_2D_KERNELS, the K-quant program's options otherwise (its TM / WG / AT and
++// GGML_OPENCL_KQ_2D_OPTS, through which the red cases come); GGML_OPENCL_Q8_2D_VISA=1 adds
++// the fp16 kernel's inline-vISA decode. Only the mode's kernel is created. A failure costs
++// Q8_0 alone: the 0058 tile keeps it, with a DOWNGRADE line.
++static void ggml_cl_q8_2d_build(ggml_backend_opencl_context * backend_ctx, const std::string & src,
++                                const std::string & opts, int wg) {
++    const int mode = ggml_cl_q8_2d_mode();
++    static const char * va = getenv("GGML_OPENCL_Q8_2D_VISA");
++    const bool visa = va != nullptr && atoi(va) != 0;
++    const std::string o = opts + " -DQ8_2D_ONLY -DQ8_2D_KERNELS" + (visa ? " -DQ8_2D_VISA" : "");
++    cl_program p = build_program_from_source_optional(backend_ctx, src.c_str(), o);
++    if (p == nullptr) {
++        ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "q8_2d");
++        GGML_LOG_WARN("ggml_opencl: the Q8_0 2D GEMM did not build; the tile takes Q8_0\n");
++        return;
++    }
++    cl_int err = CL_SUCCESS, err2 = CL_SUCCESS;
++    cl_kernel k = clCreateKernel(p, mode == 2 ? "kernel_mul_mm_kq2d_q8_0_i8" : "kernel_mul_mm_kq2d_q8_0", &err);
++    cl_kernel kq = mode == 2 ? clCreateKernel(p, "kernel_quant_i8", &err2) : nullptr;
++    size_t wgs = 0, wgq = 256;
++    if (err == CL_SUCCESS) {
++        CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgs), &wgs, NULL));
++    }
++    if (kq != nullptr && err2 == CL_SUCCESS) {
++        CL_CHECK(clGetKernelWorkGroupInfo(kq, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wgq), &wgq, NULL));
++    }
++    const int max_sg = std::min(wg, (int) (wgs / 16));
++    if (err != CL_SUCCESS || err2 != CL_SUCCESS || max_sg < 1 || wgq < 256) {
++        if (err == CL_SUCCESS) CL_CHECK(clReleaseKernel(k));
++        if (kq != nullptr && err2 == CL_SUCCESS) CL_CHECK(clReleaseKernel(kq));
++        ggml_cl_downgrade("path=fallback reason=%s what=%s", "no-fit", "q8_2d");
++        GGML_LOG_WARN("ggml_opencl: the Q8_0 2D GEMM does not fit a work-group; the tile takes Q8_0\n");
++    } else {
++        (mode == 2 ? backend_ctx->kernel_mul_mm_kq2d_q8_0_i8 : backend_ctx->kernel_mul_mm_kq2d_q8_0) = k;
++        backend_ctx->kernel_q8_2d_quant_i8 = kq;
++        backend_ctx->q8_2d_max_sg = max_sg;
++        // the options a red case rides on are named, so a run shows its artefact carries them
++        const char * xo = getenv("GGML_OPENCL_KQ_2D_OPTS");
++        GGML_LOG_INFO("ggml_opencl: the Q8_0 2D GEMM built: GGML_OPENCL_Q8_2D=%d (%s), up to %d sub-groups a work-group%s%s%s\n",
++                      mode, mode == 2 ? "int8" : "fp16", max_sg, visa ? ", the vISA decode" : "",
++                      xo != nullptr ? ", GGML_OPENCL_KQ_2D_OPTS=" : "", xo != nullptr ? xo : "");
++    }
++    CL_CHECK(clReleaseProgram(p));
++}
++
+ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+     if (backend_ctx->kernels_loaded) {
+         return;
+@@ -3302,6 +3385,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                             }
+                         }
+                     }
++                    // 0220: dense Q8_0, its own program from this text; nothing at GGML_OPENCL_Q8_2D=0
++                    if (fits && ggml_cl_q8_2d_mode() != 0) {
++                        ggml_cl_q8_2d_build(backend_ctx, k2_src, k2_opts, wg);
++                    }
+                     if (!fits) {
+                         for (int i = 0; i < 3; ++i) {
+                             CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d[i]));
+@@ -12416,6 +12503,8 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
+ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     backend_ctx->graph_gen++;
++    // 0220: the Q8_0 2D GEMM's counts for this graph (GGML_OPENCL_Q8_2D_STATS=1 prints them at its end)
++    backend_ctx->q8_2d_calls = backend_ctx->q8_2d_quants = backend_ctx->q8_2d_hits = 0;
+     // 0205: the depth-mix arm's count for this graph, printed at the graph's end
+     // with GGML_OPENCL_DEPTH_MIX_STATS=1
+     backend_ctx->depth_mix_calls_graph = 0;
+@@ -12752,6 +12841,19 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+         }
+     }
+ 
++    // 0220: products taken, quantizer launches and slot hits (the int8 arm), one line a graph
++    if (backend_ctx->q8_2d_calls > 0) {
++        static const bool q8s_on = [] {
++            const char * e = getenv("GGML_OPENCL_Q8_2D_STATS");
++            return e != nullptr && atoi(e) != 0;
++        }();
++        if (q8s_on) {
++            GGML_LOG_INFO("q8_2d: graph calls=%llu quants=%llu hits=%llu slots=%d\n",
++                          (unsigned long long) backend_ctx->q8_2d_calls, (unsigned long long) backend_ctx->q8_2d_quants,
++                          (unsigned long long) backend_ctx->q8_2d_hits, (int) backend_ctx->q8_2d_slots.size());
++        }
++    }
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
+@@ -33402,6 +33504,12 @@ static void ggml_cl_kq_forget(ggml_backend_opencl_context * backend_ctx, const g
+             *a = {};
+         }
+     }
++    // 0220: the Q8_0 2D GEMM's slots likewise (empty unless GGML_OPENCL_Q8_2D=2)
++    for (auto & sl : backend_ctx->q8_2d_slots) {
++        if (sl->act.src1 == tmp) {
++            sl->act = {};
++        }
++    }
+ }
+ 
+ static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1,
+@@ -35093,6 +35201,169 @@ static bool ggml_cl_mul_mat_f16_copy(ggml_backend_t backend, const ggml_tensor *
+     return true;
+ }
+ 
++// 0220: the int8 activations of a Q8_0 2D product: kernel_quant_i8's codes [token][K], scales
++// [K / 256][tp] and sums per 32 (unread here) into a slot (GGML_OPENCL_Q8_2D_SLOTS, default 4,
++// at most 16: one per distinct input of a graph, the least recently used one replaced) or, at 0,
++// into kq_i8's buffers. Returns the codes' and the scales' buffers.
++static void ggml_cl_q8_2d_quantize(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1,
++                                   int k, int ncols, int tp, const ggml_tensor * dst, cl_mem * xq, cl_mem * xd) {
++    static const int n_slots = [] {
++        const char * e = getenv("GGML_OPENCL_Q8_2D_SLOTS");
++        const int v = e != nullptr ? atoi(e) : 4;
++        return v < 0 ? 0 : v > 16 ? 16 : v;
++    }();
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *) src1->extra;
++    const cl_ulong offset1 = extra1->offset + src1->view_offs;
++    const int n_vals = k * ncols;
++    ggml_cl_kq_act * act = &backend_ctx->kq_i8;
++    ggml_cl_buffer * bq = &backend_ctx->prealloc_kq2_xq, * bd = &backend_ctx->prealloc_kq2_xd, * bs = &backend_ctx->prealloc_kq2_xs;
++    if (n_slots > 0) {
++        while ((int) backend_ctx->q8_2d_slots.size() < n_slots) {
++            backend_ctx->q8_2d_slots.emplace_back(new ggml_backend_opencl_context::q8_2d_slot());
++        }
++        ggml_backend_opencl_context::q8_2d_slot * pick = nullptr;
++        for (auto & sl : backend_ctx->q8_2d_slots) {
++            if (ggml_cl_kq_cached(sl->act, backend_ctx, src1, extra1->data_device, offset1, n_vals)) {
++                pick = sl.get();
++                break;
++            }
++        }
++        if (pick == nullptr) {
++            pick = backend_ctx->q8_2d_slots[0].get();
++            for (auto & sl : backend_ctx->q8_2d_slots) {
++                if (sl->used < pick->used) {
++                    pick = sl.get();
++                }
++            }
++        }
++        pick->used = ++backend_ctx->q8_2d_tick;
++        act = &pick->act;
++        bq = &pick->xq;
++        bd = &pick->xd;
++        bs = &pick->xs;
++    }
++    if (ggml_cl_kq_cached(*act, backend_ctx, src1, extra1->data_device, offset1, n_vals)) {
++        backend_ctx->q8_2d_hits++;
++    } else {
++        bq->allocate(backend_ctx->context, (size_t) ncols * k);
++        bd->allocate(backend_ctx->context, (size_t) (k / 256) * tp * sizeof(float));
++        bs->allocate(backend_ctx->context, (size_t) ncols * (k / 32) * sizeof(cl_half));
++        cl_kernel kq = backend_ctx->kernel_q8_2d_quant_i8;
++        CL_CHECK(clSetKernelArg(kq, 0, sizeof(cl_mem),   &extra1->data_device));
++        CL_CHECK(clSetKernelArg(kq, 1, sizeof(cl_ulong), &offset1));
++        CL_CHECK(clSetKernelArg(kq, 2, sizeof(cl_mem),   &bq->buffer));
++        CL_CHECK(clSetKernelArg(kq, 3, sizeof(cl_mem),   &bd->buffer));
++        CL_CHECK(clSetKernelArg(kq, 4, sizeof(cl_mem),   &bs->buffer));
++        CL_CHECK(clSetKernelArg(kq, 5, sizeof(int),      &k));
++        CL_CHECK(clSetKernelArg(kq, 6, sizeof(int),      &tp));
++        size_t q_local[1]  = { 256 };
++        size_t q_global[1] = { (size_t) ncols * 256 };
++        backend_ctx->enqueue_ndrange_kernel(kq, 1, q_global, q_local, dst);
++        *act = { src1, extra1->data_device, offset1, n_vals, backend_ctx->graph_gen };
++        backend_ctx->q8_2d_quants++;
++    }
++    *xq = bq->buffer;
++    *xd = bd->buffer;
++}
++
++// 0220: a dense Q8_0 product on the 2D-block GEMM when GGML_OPENCL_Q8_2D is 1 (fp16) or 2
++// (int8) and ggml_cl_q8_2d_gate takes it. False leaves it to the paths after this one, the
++// 0058 tile first; a Q8_0 product of 16 or more columns the gate refuses says why, once a key.
++static bool ggml_cl_mul_mat_q8_2d(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
++                                  const ggml_tensor * src1, ggml_tensor * dst) {
++    const int mode = ggml_cl_q8_2d_mode();
++    ggml_cl_q8_2d_in in = {};
++    in.mode  = mode;
++    in.type0 = (int) src0->type;
++    in.type1 = (int) src1->type;
++    in.typed = (int) dst->type;
++    for (int i = 0; i < 4; ++i) {
++        in.ne0[i] = src0->ne[i];
++        in.nb0[i] = src0->nb[i];
++        in.ne1[i] = src1->ne[i];
++        in.nb1[i] = src1->nb[i];
++    }
++    in.nbd0      = dst->nb[0];
++    in.view0     = src0->view_src != nullptr;
++    in.soa0      = src0->type == GGML_TYPE_Q8_0 && ggml_cl_is_q8_0_soa(src0);
++    in.alignment = backend_ctx->alignment;
++    in.max_rows  = 8192;
++    const int v = ggml_cl_q8_2d_gate(in);
++    const int ne00 = (int) src0->ne[0], ne01 = (int) src0->ne[1], ncols = (int) src1->ne[1];
++    if (v != GGML_CL_Q8_2D_TAKE) {
++        if (v > GGML_CL_Q8_2D_NOT_MINE) {
++            ggml_cl_downgrade("op=MUL_MAT type=q8_0 k=%d cols=16+ path=tile reason=q8-2d-%s", ne00, ggml_cl_q8_2d_reason(v));
++        }
++        return false;
++    }
++    cl_kernel k = mode == 2 ? backend_ctx->kernel_mul_mm_kq2d_q8_0_i8 : backend_ctx->kernel_mul_mm_kq2d_q8_0;
++    if (k == nullptr || (mode == 2 && backend_ctx->kernel_q8_2d_quant_i8 == nullptr) ||
++        (mode == 1 && backend_ctx->kernel_kq_cvt_f32_f16 == nullptr)) {
++        ggml_cl_downgrade("op=MUL_MAT type=q8_0 k=%d cols=16+ path=tile reason=q8-2d-not-built", ne00);
++        return false;
++    }
++    int sg = 0, nwg = 0;
++    ggml_cl_q8_2d_shape(ne01, backend_ctx->q8_2d_max_sg, &sg, &nwg);
++    const size_t wgn = (size_t) sg * 16;
++    ggml_tensor_extra_cl_q8_0 * e0 = (ggml_tensor_extra_cl_q8_0 *) src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
++    const cl_ulong offd = extrad->offset + dst->view_offs, nb1 = dst->nb[1];
++    static bool taken[3] = { false, false, false };
++    if (!taken[mode]) {
++        taken[mode] = true;
++        GGML_LOG_WARN("TAKEN src=opencl op=MUL_MAT type=q8_0 path=2d-%s k=%d m=%d n=%d wg=%dx%d\n",
++                      mode == 2 ? "i8" : "f16", ne00, ne01, ncols, sg, nwg);
++    }
++    backend_ctx->q8_2d_calls++;
++    // what a launch reaches: the planes (the block reads clamp to their surfaces, the scales
++    // are vector loads), the activations and the destination's furthest row
++    ggml_cl_bounds("op=MUL_MAT q8_2d", "q", e0->q, (size_t) ne01 * ne00);
++    ggml_cl_bounds("op=MUL_MAT q8_2d", "d", e0->d, (size_t) ne01 * (ne00 / 32) * sizeof(cl_half));
++    ggml_cl_bounds("op=MUL_MAT q8_2d", "dst", extrad->data_device, (size_t) offd + (size_t) (ncols - 1) * nb1 + (size_t) ne01 * sizeof(float));
++    if (mode == 2) {
++        const int tmi = 32;   // TMM of the kernel
++        const int tp = CEIL_DIV(ncols, tmi) * tmi;
++        cl_mem xq = nullptr, xd = nullptr;
++        ggml_cl_q8_2d_quantize(backend_ctx, src1, ne00, ncols, tp, dst, &xq, &xd);
++        ggml_cl_bounds("op=MUL_MAT q8_2d", "xq", xq, (size_t) ncols * ne00);
++        ggml_cl_bounds("op=MUL_MAT q8_2d", "xd", xd, (size_t) (ne00 / 256) * tp * sizeof(float));
++        cl_uint a = 0;
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e0->q));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e0->d));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &xq));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &xd));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extrad->data_device));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offd));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb1));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne00));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne01));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ncols));
++        CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &tp));
++        size_t gws[] = { (size_t) (tp / tmi) * wgn, (size_t) nwg, 1 };
++        size_t lws[] = { wgn, 1, 1 };
++        backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++        return true;
++    }
++    ggml_cl_kq_convert_src1_f16(backend_ctx, src1, ne00, ncols, dst);   // layout 0, the tile's
++    ggml_cl_bounds("op=MUL_MAT q8_2d", "xh", backend_ctx->prealloc_kq_xh.buffer, (size_t) ncols * ne00 * sizeof(cl_half));
++    ggml_cl_bounds("op=MUL_MAT q8_2d", "xscale", backend_ctx->prealloc_kq_xscale.buffer, (size_t) ncols * sizeof(float));
++    cl_uint a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e0->q));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e0->d));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xh.buffer));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xscale.buffer));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offd));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ncols));
++    size_t gws[] = { (size_t) CEIL_DIV(ncols, backend_ctx->kq2d_tm) * wgn, (size_t) nwg, 1 };
++    size_t lws[] = { wgn, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++    return true;
++}
++
+ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -35227,6 +35498,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+         }
+     }
+ 
++    // 0220: dense Q8_0 on the 2D-block GEMM (GGML_OPENCL_Q8_2D=1 fp16, 2 int8). Unset or 0,
++    // nothing below the mode test runs and the tile takes the product as before.
++    if (ggml_cl_q8_2d_mode() != 0 && ggml_cl_mul_mat_q8_2d(backend_ctx, src0, src1, dst)) {
++        return;
++    }
++
+     // Intel: Q8_0 weights times 16 or more columns on the XMX tiles (the
+     // durable image form; 0058 q8_0 XMX GEMM). Only a flattened (SoA) Q8_0
+     // tensor carries the code/scale split; a view reads its view_src's.
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+index 7f138d6..1a5bc80 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
+@@ -190,6 +190,7 @@ kernel void kernel_cvt_f32_f16_p4(global const char * src, ulong offs, global ha
+ #define ARGS global const half * xh, global const float * xscale, global char * dst, ulong offd, ulong nb1, \
+              int ne00, int ne01, int ne11
+ 
++#ifndef Q8_2D_ONLY   // 0220: the Q8_0 program (GGML_OPENCL_Q8_2D) builds only its own kernels from this text
+ // Q4_K: a mask makes two halves 1024 + q, one half subtraction (exact)
+ // and one half fma scale them
+ __attribute__((intel_reqd_sub_group_size(16)))
+@@ -538,6 +539,7 @@ kernel void kernel_mul_mm_kq2d_q4_0(global const uchar * q, global const half *
+     }
+     EPILOGUE
+ }
++#endif // Q8_2D_ONLY
+ 
+ // ---------------------------------------------------------------------------
+ // Q4_K on int8 DPAS at full rate: one i8 x i8 DPAS a sub-block, twice the
+@@ -618,6 +620,7 @@ static inline int mad16(int acc, int ir, short sc) {
+ #define AREAD8(dst, kk, gb) intel_sub_group_2d_block_read_8b_32r32x1c((const global void *)xq, ne00, ne11, ne00, \
+                                 (int2)((kk), t0 + 32 * (gb)), (dst))
+ 
++#ifndef Q8_2D_ONLY
+ __attribute__((intel_reqd_sub_group_size(16)))
+ kernel void kernel_mul_mm_kq2d_q4_K_i8(global const uchar * q, global const uchar * s, global const half * d,
+                                        global const half * dm, global const char * xq, global const float * xd,
+@@ -815,3 +818,205 @@ kernel void kernel_mul_mm_kq2d_q4_0_i8(global const uchar * q, global const half
+         }
+     }
+ }
++#endif // Q8_2D_ONLY
++
++#ifdef Q8_2D_KERNELS
++// ---------------------------------------------------------------------------
++// 0220: dense Q8_0 on the same loads (GGML_OPENCL_Q8_2D, built into a program of
++// its own with Q8_2D_ONLY, so the K-quants' program is the text it was). Q8_0's
++// flat planes (kernel_convert_block_q8_0) are already the int8 DPAS operand: q
++// holds 32 s8 codes a block, row-major, ne00 bytes a row; d one f16 scale a
++// block, row-major. One transposed block read of 8 dwords is the b operand of a
++// 32-K block as stored (lane l its row's 32 codes, dword i = codes 4i .. 4i + 3),
++// eight reads a super-block where Q4_0 takes four.
++//
++// The row band of a work-group is get_local_size(0) / 16 sub-groups, not WG: the
++// host sizes the work-group to the rows (ggml_cl_q8_2d_shape), so a 24- or 32-row
++// product runs two sub-groups rather than sixteen, fourteen of them on padding.
++//
++// Q8_2D_RED (the red cases, through GGML_OPENCL_KQ_2D_OPTS): 1 drops the codes of
++// the 8th block of every super-block (one K term in eight, NMSE ~0.125); 2 gives
++// every lane the scales of its sub-group's first row.
++#ifndef Q8_2D_RED
++#define Q8_2D_RED 0
++#endif
++
++// int8: the activations from kernel_quant_i8 (int8 per (token, 256), the f32
++// scale xd [K / 256][tp]), as for Q4_0. A block's product is at most
++// 32 * 127 * 127 = 516,128 in magnitude, exact in f32; it is scaled by the
++// block's f16 scale per lane in f32 and by the activation scale per 256.
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_kq2d_q8_0_i8(global const uchar * q, global const half * d, global const char * xq,
++                                       global const float * xd, global char * dst, ulong offd, ulong nb1,
++                                       int ne00, int ne01, int ne11, int tp) {
++    const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
++    const int r0 = (get_group_id(1) * (int)(get_local_size(0) / 16) + sg) * 16;
++    const int t0 = get_group_id(0) * TMM;
++    const int nb = ne00 / QK_K;
++    const int n = min(r0 + lane, ne01 - 1);
++#if Q8_2D_RED == 2
++    const int ns = min(r0, ne01 - 1);
++#else
++    const int ns = n;
++#endif
++    float8 acc[NGM];
++    _Pragma("unroll")
++    for (int g = 0; g < NGM; ++g) acc[g] = (float8)(0.f);
++    // the int8 activation tile of the next block, and the next block's codes
++    ushort acur[TMM / 32][32];
++    _Pragma("unroll")
++    for (int gb = 0; gb < TMM / 32; ++gb) AREAD8(acur[gb], 0, gb);
++    uint qn[8];
++    WREAD(q, 256, qn, 0, 0);
++    for (int kb = 0; kb < nb; ++kb) {
++        if (kb % KSYNC_I8 == 0) barrier(CLK_LOCAL_MEM_FENCE);
++        const float8 dv = vload_half8(0, d + (ulong)ns * nb * 8 + kb * 8);
++        const float da[8] = { dv.s0, dv.s1, dv.s2, dv.s3, dv.s4, dv.s5, dv.s6, dv.s7 };
++        float8 xv[NGM], af[NGM];
++        _Pragma("unroll")
++        for (int g = 0; g < NGM; ++g) {
++            xv[g] = vload8(0, xd + (ulong)kb * tp + t0 + 8 * g);
++            af[g] = (float8)(0.f);
++        }
++        const int kn = min(kb + 1, nb - 1);
++        _Pragma("unroll")
++        for (int sb = 0; sb < 8; ++sb) {
++            int8 bq;
++            _Pragma("unroll")
++            for (int i = 0; i < 8; ++i) bq[i] = as_int(qn[i]);
++#if Q8_2D_RED == 1
++            if (sb == 7) bq = (int8)(0);
++#endif
++            if (sb < 7) WREAD(q, 256, qn, kb, 8 * (sb + 1));
++            else        WREAD(q, 256, qn, kn, 0);
++            const int k0 = kb * QK_K + 32 * sb;
++            ushort anx[TMM / 32][32];
++            _Pragma("unroll")
++            for (int gb = 0; gb < TMM / 32; ++gb) AREAD8(anx[gb], sb < 7 ? k0 + 32 : kn * QK_K, gb);
++            _Pragma("unroll")
++            for (int gb = 0; gb < TMM / 32; ++gb) {
++                int8 ir[4];
++                _Pragma("unroll")
++                for (int u = 0; u < 4; ++u)
++                    ir[u] = intel_sub_group_i8_i8_matrix_mad_k32(as_short8(vload8(0, acur[gb] + 8 * u)), bq, (int8)(0));
++                _Pragma("unroll")
++                for (int u = 0; u < 4; ++u)
++                    af[gb * 4 + u] = fma(convert_float8(ir[u]), (float8)(da[sb]), af[gb * 4 + u]);
++            }
++            _Pragma("unroll")
++            for (int gb = 0; gb < TMM / 32; ++gb)
++                _Pragma("unroll")
++                for (int z = 0; z < 32; ++z) acur[gb][z] = anx[gb][z];
++        }
++        _Pragma("unroll")
++        for (int g = 0; g < NGM; ++g) acc[g] = fma(af[g], xv[g], acc[g]);
++    }
++    if (r0 + lane < ne01) {
++        _Pragma("unroll")
++        for (int g = 0; g < NGM; ++g) {
++            const float v[8] = { acc[g].s0, acc[g].s1, acc[g].s2, acc[g].s3, acc[g].s4, acc[g].s5, acc[g].s6, acc[g].s7 };
++            _Pragma("unroll")
++            for (int m = 0; m < 8; ++m) {
++                const int t = t0 + 8 * g + m;
++                if (t < ne11) ((global float *)(dst + offd + (ulong)t * nb1))[r0 + lane] = v[m];
++            }
++        }
++    }
++}
++
++// fp16 (the exact class): the activations as kernel_cvt_f32_f16 writes them (k in
++// order, layout 0), the weights code x scale rounded once to f16 as the 0058
++// tile rounds them (deq_q8_0: convert_float16(codes) * scale, stored as halves):
++// the f32 product of an s8 code and an f16 scale is exact, so its one rounding
++// is the tile's. Four codes of a dword give two b-operand dwords, halves
++// (k, k + 1) a dword.
++static inline uint q8_h2(char a, char b, float sc) {
++    return as_uint(convert_half2_rte((float2)((float)a, (float)b) * sc));
++}
++
++// Q8_2D_VISA (GGML_OPENCL_Q8_2D_VISA=1; off by default, the C form above is the
++// fallback): the same values in place of IGC's planar SIMD16 form of the C
++// (offline, bmg-g21: a byte extract, a byte-to-word move, a word-to-float move, a
++// multiply and a float-to-half move for every 16 of a lane's 32 codes). Here a
++// dword of codes is two b-operand dwords in three SIMD32 instructions each, the
++// hscale40 pattern: the byte pairs (0, 1) and (2, 3) of every lane as halves
++// 1024 + (code + 128) (one xor: 0x6400 | (byte ^ 0x80)), minus 1152 (exact: the
++// code), times the block's scale (one rounding of the exact product: the C
++// form's value, signed zeros included). d2 holds the scale's half twice. NoMask
++// as hscale: full sub-groups in uniform flow.
++#ifdef Q8_2D_VISA
++static inline void q8_hscale(uint p, uint d2, uint * lo, uint * hi) {
++    uint r0, r1;
++    __asm__("{\n"
++            ".decl PB v_type=G type=ub num_elts=64 align=GRF alias=<%2, 0>\n"
++            ".decl AW v_type=G type=uw num_elts=32 align=GRF alias=<%0, 0>\n"
++            ".decl AH v_type=G type=hf num_elts=32 align=GRF alias=<%0, 0>\n"
++            ".decl BW v_type=G type=uw num_elts=32 align=GRF alias=<%1, 0>\n"
++            ".decl BH v_type=G type=hf num_elts=32 align=GRF alias=<%1, 0>\n"
++            ".decl SH v_type=G type=hf num_elts=32 align=GRF alias=<%3, 0>\n"
++            "xor (M1_NM, 32) AW(0,0)<1> PB(0,0)<4;2,1> 0x6480:uw\n"
++            "xor (M1_NM, 32) BW(0,0)<1> PB(0,2)<4;2,1> 0x6480:uw\n"
++            "add (M1_NM, 32) AH(0,0)<1> AH(0,0)<1;1,0> 0xE480:hf\n"
++            "add (M1_NM, 32) BH(0,0)<1> BH(0,0)<1;1,0> 0xE480:hf\n"
++            "mul (M1_NM, 32) AH(0,0)<1> AH(0,0)<1;1,0> SH(0,0)<1;1,0>\n"
++            "mul (M1_NM, 32) BH(0,0)<1> BH(0,0)<1;1,0> SH(0,0)<1;1,0>\n"
++            "}\n" : "=rw"(r0), "=rw"(r1) : "rw"(p), "rw"(d2));
++    *lo = r0;
++    *hi = r1;
++}
++#endif
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_kq2d_q8_0(global const uchar * q, global const half * d, ARGS) {
++    const int lane = get_sub_group_local_id(), sg = get_sub_group_id();
++    const int r0 = (get_group_id(1) * (int)(get_local_size(0) / 16) + sg) * 16;
++    const int t0 = get_group_id(0) * TM;
++    const int nb = ne00 / QK_K;
++    const int n = min(r0 + lane, ne01 - 1);
++#if Q8_2D_RED == 2
++    const int ns = min(r0, ne01 - 1);
++#else
++    const int ns = n;
++#endif
++    float8 acc[NG];
++    _Pragma("unroll")
++    for (int g = 0; g < NG; ++g) acc[g] = (float8)(0.f);
++    for (int kb = 0; kb < nb; ++kb) {
++        KB_SYNC(kb)
++#ifdef Q8_2D_VISA
++        const ushort8 dv = vload8(0, (global const ushort *)d + (ulong)ns * nb * 8 + kb * 8);
++        const ushort da[8] = { dv.s0, dv.s1, dv.s2, dv.s3, dv.s4, dv.s5, dv.s6, dv.s7 };
++#else
++        const float8 dv = vload_half8(0, d + (ulong)ns * nb * 8 + kb * 8);
++        const float da[8] = { dv.s0, dv.s1, dv.s2, dv.s3, dv.s4, dv.s5, dv.s6, dv.s7 };
++#endif
++        _Pragma("unroll")
++        for (int sb = 0; sb < 8; ++sb) {
++            uint qw[8];
++            WREAD(q, 256, qw, kb, 8 * sb);
++#if Q8_2D_RED == 1
++            if (sb == 7) {
++                _Pragma("unroll")
++                for (int i = 0; i < 8; ++i) qw[i] = 0u;
++            }
++#endif
++            uint pw[16];
++#ifdef Q8_2D_VISA
++            const uint d2 = (uint)da[sb] * 0x10001u;
++            _Pragma("unroll")
++            for (int i = 0; i < 8; ++i) q8_hscale(qw[i], d2, &pw[2 * i], &pw[2 * i + 1]);
++#else
++            _Pragma("unroll")
++            for (int i = 0; i < 8; ++i) {
++                const char4 c = as_char4(qw[i]);
++                pw[2 * i]     = q8_h2(c.s0, c.s1, da[sb]);
++                pw[2 * i + 1] = q8_h2(c.s2, c.s3, da[sb]);
++            }
++#endif
++            const int8 b0 = as_int8(vload8(0, pw)), b1 = as_int8(vload8(0, pw + 8));
++            MUL32(kb * QK_K + 32 * sb)
++        }
++    }
++    EPILOGUE
++}
++#endif // Q8_2D_KERNELS
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c3ff1b1..c0d4a9d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -13324,6 +13324,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, true, 520, 512, 256));
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 520, 8, true, 512, 512, 256));
+ 
++    // 0220: Inkling 2 Mini's dense Q8_0 products (the graph export's MUL_MAT lines at ub 512 /
++    // 1024 / 2048, M rows x K): wq and wqkv_gate 3072 x 2304, wo 2304 x 3072, wk and wv 1024 x
++    // 2304, attn_rel 384 x 2304, attn_sink_proj 24 x 2304, the k/v conv projections 32 x 2304,
++    // and the fused attention bundle 6552 x 2304; then the tails: 17, 1023 and 1025 tokens (the
++    // int8 arm pads the tokens to 32, the fp16 one to 64), 255 and 257 rows (a sub-group of 16),
++    // one super-block of K (256), and K 64, which the 2D GEMM refuses (the tile keeps it)
++    for (int n : { 512, 1024, 2048 }) {
++        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 3072, 2304 }, { 2304, 3072 }, { 1024, 2304 }, { 384, 2304 },
++                                                                     { 24, 2304 }, { 32, 2304 }, { 6552, 2304 } }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }));
++        }
++    }
++    for (int n : { 17, 1023, 1025 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 3072, n, 2304, { 1, 1 }, { 1, 1 }));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 24, n, 2304, { 1, 1 }, { 1, 1 }));
++    }
++    for (int64_t m : { 255, 257 }) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 512, 2304, { 1, 1 }, { 1, 1 }));
++    }
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 512, 256, { 1, 1 }, { 1, 1 }));
++    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2304, 512, 64, { 1, 1 }, { 1, 1 }));
++
+     // multiple blocks per row: exercises the block-stride loop and the
+     // per-expert base offset, which k == 256 alone leaves untested
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
+@@ -15151,6 +15173,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_id_routed(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, bs, 2304));
+     }
+ 
++    // 0220: Inkling 2 Mini's dense Q8_0 products (M rows x K, the graph export's MUL_MAT lines) at
++    // 512, 1,024 and 2,048 tokens, for GGML_OPENCL_Q8_2D=0 / 1 / 2 against each other
++    for (int bs : {512, 1024, 2048}) {
++        for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{ { 3072, 2304 }, { 2304, 3072 }, { 1024, 2304 }, { 384, 2304 },
++                                                                     { 24, 2304 }, { 32, 2304 }, { 6552, 2304 } }) {
++            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, bs, k, { 1, 1 }, { 1, 1 }));
++        }
++    }
++
+     // Qwen3.8-Flash-Next GSQ-RCO IQ2_XS: 512 experts, 10 used, gate/up 2560 -> 640, down 640 -> 2560; decode and a verify
+     for (int bs : {1, 3}) {
+         for (ggml_type type_a : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, GGML_TYPE_IQ2_XS}) {

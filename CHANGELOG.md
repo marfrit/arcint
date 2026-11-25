@@ -18,6 +18,13 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+- llama.cpp patch 0220 (opt-in, `GGML_OPENCL_Q8_2D=1|2`, default off): dense Q8_0 prompt products on Intel Xe2 on the
+  2D-block GEMM (int8 or fp16 DPAS) in place of 0058's local-memory tile, for Inkling 2 Mini's attention projections.
+  Unset, nothing changes. Built and checked offline and on the CPU only; the card rows are owed
+  (`contrib/llama.cpp/README.md`, 0220).
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn
