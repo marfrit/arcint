@@ -1,0 +1,70 @@
+0176: test-backend-ops at the depth mix's own shapes: 2304 rows, K 1 and 6, one, three and four columns a token at 512 tokens, and the decode shape, src0 the transposed stack made contiguous as the graph passes it.
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a64b4ac..a4e7f5c 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6322,6 +6322,50 @@ struct test_mul_mat_f32_wide : public test_case {
+     }
+ };
+ 
++// the depth mix's second product: src0 the stack seen transposed (K the block count) over a
++// batched scores tensor, a row an output, the copy the model makes between them. One to four
++// columns a token, plus the decode shape.
++struct test_mul_mat_f32_mix : public test_case {
++    const int64_t m;   // rows
++    const int64_t k;   // the stack's blocks + 1
++    const int64_t n;   // query columns
++    const int64_t nb;  // tokens
++    const int64_t n_slot;
++
++    std::string vars() override { return VARS_TO_STR5(m, k, n, nb, n_slot); }
++
++    double max_nmse_err() override { return 5e-4; }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2 * m * n * k * nb;
++    }
++
++    test_mul_mat_f32_mix(int64_t m = 2304, int64_t k = 6, int64_t n = 1, int64_t nb = 512, int64_t n_slot = 8)
++        : m(m), k(k), n(n), nb(nb), n_slot(n_slot) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        // the stack: n_embd rows, n_slot slabs, a token as the batch; the mix reads a slice
++        ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, m, n_slot, nb);
++        ggml_set_name(stack, "stack");
++        ggml_tensor * states = ggml_view_3d(ctx, stack, m, k, nb, stack->nb[1], stack->nb[2], 0);
++        ggml_set_name(states, "states");
++        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, nb);
++        ggml_set_name(b, "b");
++        // mul_mat needs K on ne0 and each backend's CPU reference refuses a transposed src0
++        // (GGML_ASSERT(!ggml_is_transposed(a))), so the graph's contiguous copy stays in place
++        ggml_tensor * out = ggml_mul_mat(ctx, ggml_cont(ctx, ggml_transpose(ctx, states)), b);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t);
++        }
++    }
++};
++
+ // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+ struct test_mul_mat_id_fusion : public test_case {
+     const ggml_type type_a;
+@@ -12542,6 +12586,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_f32_wide(2304, 3, 6, 512));
+     test_cases.emplace_back(new test_mul_mat_f32_wide(2304, 1, 1, 512));
+     test_cases.emplace_back(new test_mul_mat_f32_wide(2304, 1, 6, 2048));
++    // the depth mix's batched transposed-src0 shapes: prompt (1, 3, 4 columns a token) and decode
++    test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 6, 1, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 6, 3, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 6, 4, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 6, 1, 1));
++    test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 1, 1, 512));
+ 
+     // Q2_0 rows of 20 and 12 sub-blocks (4 lanes a row in the OpenCL low-bit matvec) and of 10 (16 lanes):
+     // Flash-Next's down projections are 2560 x 640 Q2_0

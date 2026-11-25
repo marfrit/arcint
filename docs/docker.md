@@ -64,7 +64,34 @@ engine's flags. `docker/docker-compose.example.yaml` is the same thing in
 compose form; a cold OpenCL kernel cache recompiles the kernels at every
 start, so keep `GGML_OPENCL_KERNEL_CACHE_DIR` on a persistent volume.
 
-### The three services as the project runs them (0.7.12)
+**One card per model.** arcint loads a model on one card: the one `--device` names (`GPU.N`, or a name word
+such as `B70`), or GPU.0. It does not read `GGML_OPENCL_DEVICE` or `GGML_OPENCL_DEVICES`; with more than one GPU
+visible and no `--device` (and no `ZE_AFFINITY_MASK`) it logs "N GPU devices are visible (...); none chosen with
+--device: loading on GPU.0 (...)". To give the container one card, pass that card's render node instead of all of
+`/dev/dri`, or set `ZE_AFFINITY_MASK`. llama.cpp's own tools in the image (`llama-bench`, `llama-server`) split a
+model's layers over every visible card instead (a user measured Inkling 2 Mini's decode 5x slower on two B70s than on
+one); pin them with `GGML_OPENCL_DEVICE=0`.
+
+**The memory guard (1.8.1).** arcint refuses a start whose device memory would not fit the card, naming every part
+and the `--n-ctx` that would fit; `--llama-allow-spill` starts anyway with a warning. It takes the card's size from
+the xe driver through the process's own render node, so `--device /dev/dri` is enough. Without that figure (an i915
+host) it falls back to OpenCL's global memory size and says so; on a 24 GB B60 that is 23,256 MiB, less than a full
+unit uses. Not yet run inside the image.
+
+**Inkling 2 Mini** (1.8.1; every layer on the card, a partial offload faults):
+
+```bash
+# environment, the opt-in prefill paths (README, "Inkling 2 Mini"):
+#   -e GGML_OPENCL_KQ_MM_ID_I8=1 -e GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 -e GGML_OPENCL_CPY_TRANSPOSE=1 \
+#   -e GGML_OPENCL_FA_PORT=1 -e GGML_OPENCL_DEPTH_MIX=1
+--engine llama --gguf /models/Inkling-2-Mini-IQ4_NL.gguf --served-model-name inkling2-mini \
+  --device GPU.0 --n-ctx 262144 --llama-kv q8_0 --llama-swa-window --prefill-ubatch 1024
+```
+
+`--llama-swa-window` is what makes 262,144 cells fit a 24 GB card: the sliding-window layers keep the window, not
+the whole context.
+
+### The three services as the project ran them (0.7.12, historical)
 
 The command lines below are the ones the project's own services use;
 `docker/docker-compose.example.yaml` carries all three as compose profiles.
@@ -173,11 +200,59 @@ to SSE-only, which would be a silent performance cliff of its own).
 
 ## The GPU runtime
 
+What the README's numbers ran with, and what the image has:
+
+| | the numbers here | the image |
+|---|---|---|
+| OS | Debian trixie | Fedora 43 base |
+| compute runtime | 26.27.39122.11, IGC 2.38.2 (Intel's release packages) | Fedora's 26.18.38308.4, IGC 2.34.4 |
+| ggml-cpu | `GGML_NATIVE=ON` (the `.deb` recipe asserts it) | `GGML_NATIVE=OFF`, x86-64-v3 |
+| kernel | Linux 7.0.14 with an out-of-tree xe module (below) | the host's |
+| host CPU | AMD Ryzen 7 5700X (8 cores) | the host's |
+| GuC firmware | 70.65.0 on both cards (`/sys/kernel/debug/dri/<pci>/gt0/uc/guc_info`) | the host's |
+| power | the xe hwmon cap `power1_cap`: B60 165 W, B70 220 W, written at boot | — |
+| kernel cache | `GGML_OPENCL_KERNEL_CACHE_DIR` warm | keep it on a volume: a cold start compiles every kernel |
+
+A model whose experts partly live in host memory depends on the host's CPUs too: with build jobs on the same host,
+served Flash-Next (its CPU-miss path computes host-resident experts on 8 threads) decoded 27-32 t/s instead of 46-48
+(`measured-here`, 2026-11-25, B70). That is not a figure for a model fully on the card.
+
 The image takes Fedora's `intel-compute-runtime` (26.18.38308.4 with IGC
 2.34.4 in Fedora 43, 2026-10-07). The numbers in this repository were
 measured on compute-runtime 26.27.39122.11 with IGC 2.38.2 (Intel's release
 packages, on Debian trixie). Debian trixie ships no Intel compute runtime at
 all, which is why the image is Fedora-based.
+
+Image against native, the same patched llama.cpp tree built twice
+(`measured-here`, 2026-11-23, Arc Pro B70 capped at 220 W, Inkling 2 Mini
+IQ4_NL, `llama-bench -p 512 -n 128 -d 0,4096,32768 -ngl 99 -fa on -r 3`, two
+interleaved rounds; recipe builds were held off, the production agent on
+the other card was up and idle, other containers on the host kept running,
+and the load average was 6.6 at the first arm (the tail of the container image's own build)
+and 1.1-1.2 in the second round): natively (`GGML_NATIVE=ON`, runtime
+26.27) pp512 669-675 and tg128 45.3 t/s, at depth 4,096 638-643 and 41.6, at
+32,768 563-564 and 39.0; in the 1.8.0 image's builder (`GGML_NATIVE=OFF`,
+x86-64-v3) with the image's runtime 26.18, pp512 663 and tg128 44.3-44.7, at
+4,096 634 and 41.3, at 32,768 557 and 38.8. The image costs 0.5-2 % in decode
+and 1-1.5 % in prefill. Served through arcint, decode is equally close
+(43.4 against 43.2 t/s over six runs each); single runs dropped to 22-33 t/s in
+both setups while build jobs ran on the same host's CPUs, which fits decode on
+these cards being bound by the host's kernel submission (an inference, not
+measured).
+
+The host's kernel matters too: the numbers here run on Linux 7.0.14 with an
+out-of-tree xe module whose only change on the submission path against stable
+v7.0.14 is upstream 9f83c94469ff ("drm/xe: Order ring writes before ring tail
+updates", a cherry-pick of 136360290f31, in mainline from v7.2). It adds a write
+barrier before the ring tail is published: a correctness fix that, if anything,
+costs a little time, named here as a difference, not as a source of speed. The
+module's other changes against v7.0.14 are an access check for observation
+streams, two checks on imported buffers in the display code, and the trace
+headers' include path for the out-of-tree build.
+
+Keep `GGML_OPENCL_KERNEL_CACHE_DIR` on a persistent volume: with a cold cache
+the image starts in about 90 s on a B70 (14 s with the cache warm), because
+every kernel is compiled again.
 
 Served from the two-tier images of 0.7.x (`measured-here`, 2026-10-07, both
 built from this tree in a privileged Debian container with podman, the A770

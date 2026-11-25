@@ -271,6 +271,10 @@ public:
 
     size_t rows() const { return ids_.size(); }
 
+    // the head's row buffer on the card: allocated by ggml_backend_alloc_ctx_tensors, so it
+    // is not in llama_get_memory_breakdown and the spill guard counts it separately
+    size_t device_bytes() const { return buf_ != nullptr ? ggml_backend_buffer_get_size(buf_) : 0; }
+
     // `name` in `gguf` or, for a split GGUF (split.count > 1, shards named
     // <prefix>-0000k-of-0000N.gguf), in the shard that holds it; `g` stays
     // open for the caller to free
@@ -507,6 +511,9 @@ public:
     bool ok() const { return bd_ != nullptr; }
 
     size_t head_rows() const { return head_ ? head_->rows() : 0; }
+
+    llama_context* draft_context() const override { return ctx_dft_; }
+    size_t draft_head_device_bytes() const override { return head_ ? head_->device_bytes() : 0; }
 
     int decode(const int* toks, size_t n, size_t pos, int seq, bool all_logits) override {
         const SpecPart p{ seq, toks, n, pos, all_logits };

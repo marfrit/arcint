@@ -1,0 +1,217 @@
+0190: the wide int8 expert tile's kernel: one work-group a (route tile, 512-column band), 16 sub-groups of 16 lanes, two columns a lane. A 2,304-row expert is 5 bands instead of 18, so a tile's staged block is filled once for 512 columns rather than four times, and a launch's work-groups are 5 of 18. Its own program (mul_mm_kq_i8_wide.cl), built only when GGML_OPENCL_KQ_MM_ID_I8_WIDE asks; unset keeps the narrow tile. Design followed from trellis-serve xpu/csrc/exl3_moe.sycl @8f8e2fcc (MIT), no code copied.
+
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 9e22349..a1c914b 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -143,6 +143,7 @@ set(GGML_OPENCL_KERNELS
+     mul_mv_iq_q8_1
+     mul_mm_kq_f16
+     mul_mm_kq_i8
++    mul_mm_kq_i8_wide
+     mul_mm_kq_few
+     mul_mm_few_i8
+     mul_mm_kq_2d
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl
+new file mode 100644
+index 0000000..7cf4611
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl
+@@ -0,0 +1,197 @@
++// 0190: the wide int8 expert tile, for the formats the 0071 arm serves (IQ4_NL,
++// and Q8_0's prompt GEMM). One work-group a (route tile, 512-column band)
++// instead of one a (route tile, 128-column band): a 2,304-row expert then has 5
++// bands instead of 18, so a tile's staged activations are filled once for 512
++// columns rather than four times (512 over the narrow tile's 128), and a launch's
++// work-groups are 5 of the 18 it takes now.
++//
++// The design follows the reference MoE tile (trellis-serve, xpu/csrc/exl3_moe.sycl,
++// GateUpDpasKernel/DownDpasKernel @8f8e2fcc, MIT): the whole output band of a
++// 32-row block held in the work-group's per-lane accumulators, the block's
++// activations staged once, the weights decoded in-register a K step. No line of
++// that file is copied; the geometry and the OpenCL block layout here are this
++// tree's.
++//
++// Register budget: a lane holds two columns (I8W_NC) x 32 pairs = 64 float
++// accumulators, 64 GRF; with the two weight operands (8 words each), the two
++// scales and the staged-loop addresses, ~90 GRF of the 256 the program is built
++// with. The whole band would be 9 columns a lane (2,304 rows over 256 lanes) =
++// 288 floats, over that budget, so the band is split here rather than widened
++// further: GGML_OPENCL_KQ_MM_ID_I8_WIDE selects it, unset is the narrow tile.
++//
++// Helpers come from kq_i8_ops.inc and the weight tables from mul_mm_kq_f16.cl,
++// as the narrow tile's program; a failure in this text costs the wide tile only
++// (it is its own program).
++
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_local_block_io : enable
++
++#ifndef SG
++#define SG 16
++#endif
++#if SG == 16
++#ifndef I8W_XT
++#define I8W_XT 32
++#endif
++#ifndef I8W_NC
++#define I8W_NC 2
++#endif
++#ifndef I8W_XSG
++#define I8W_XSG 16
++#endif
++#define I8W_XTHR (I8W_XSG * 16)
++#define I8W_BW   (I8W_XTHR * I8W_NC)
++
++// the staged activation super-block and its scales, as the narrow tile stages
++// them ([block][pair][32 bytes], [block][pair]), over the wide group's threads
++#define I8W_STAGE                                                                                       \
++    local uchar xa[I8W_XT * 256];                                                                       \
++    local float xs[I8W_XT * 8];                                                                         \
++    for (int k0 = 0; k0 < ne00; k0 += 256) {                                                            \
++        const int nb = min((ne00 - k0) / 32, 8);                                                        \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                                   \
++        for (int u = get_local_linear_id(); u < I8W_XT * nb * 2; u += I8W_XTHR) {                       \
++            const int row = u / (nb * 2), unit = u % (nb * 2);                                          \
++            const int j = unit >> 1, hpart = unit & 1;                                                  \
++            uchar16 v = (uchar16)(0);                                                                   \
++            if (te.y + row < te.y + te.z)                                                               \
++                v = vload16(0, (global const uchar *)(xq +                                              \
++                    (ulong)kq_i8_col(pairs[te.y + row], n_used, ne11) * ne00 + (ulong)k0 +              \
++                    (ulong)j * 32 + (ulong)hpart * 16));                                                \
++            vstore16(v, 0, xa + (j * I8W_XT + row) * 32 + hpart * 16);                                  \
++        }                                                                                               \
++        for (int u = get_local_linear_id(); u < I8W_XT * nb; u += I8W_XTHR) {                           \
++            const int j = u / I8W_XT, row = u % I8W_XT;                                                 \
++            xs[j * I8W_XT + row] = te.y + row < te.y + te.z                                             \
++                ? xd[(ulong)kq_i8_col(pairs[te.y + row], n_used, ne11) * (ne00 / 32) + (k0 / 32) + j] : 0.f; \
++        }                                                                                               \
++        barrier(CLK_LOCAL_MEM_FENCE);                                                                   \
++        for (int kb = k0; kb < k0 + nb * 32; kb += 32) {                                                \
++            const int j = (kb - k0) / 32;
++
++// the band is the work-group's dimension-1 index, the grid = bands * I8W_XSG; the
++// guards are each lane's own column (r1 can pass ne01 in the last band)
++// one staged a operand (256 bytes, 8 pairs, a block) a DPAS pair: read once,
++// used by both of the lane's columns
++#define I8W_MAD                                                                                         \
++        _Pragma("unroll")                                                                               \
++        for (int g = 0; g < I8W_XT / 8; ++g) {                                                          \
++            const short8 av = as_short8(intel_sub_group_block_read_us8((local const ushort *)(xa + (j * I8W_XT + g * 8) * 32))); \
++            if (act0) {                                                                                 \
++                const int8 tf = intel_sub_group_i8_i8_matrix_mad_k32(av, bq0, (int8)(0));               \
++                acc0[g] += convert_float8(tf) * (float8)(ws0) * vload8(0, xs + j * I8W_XT + g * 8);     \
++            }                                                                                           \
++            if (act1) {                                                                                 \
++                const int8 tf = intel_sub_group_i8_i8_matrix_mad_k32(av, bq1, (int8)(0));               \
++                acc1[g] += convert_float8(tf) * (float8)(ws1) * vload8(0, xs + j * I8W_XT + g * 8);     \
++            }                                                                                           \
++        }                                                                                               \
++        }                                                                                               \
++    }
++
++// the stores: component m of the g-th accumulator is pair slot te.y + 8g + m,
++// the lane's column r0 or r1
++#define I8W_STORE                                                                                       \
++    _Pragma("unroll")                                                                                   \
++    for (int g = 0; g < I8W_XT / 8; ++g) {                                                              \
++        const float v0[8] = { acc0[g].s0, acc0[g].s1, acc0[g].s2, acc0[g].s3,                           \
++                              acc0[g].s4, acc0[g].s5, acc0[g].s6, acc0[g].s7 };                         \
++        const float v1[8] = { acc1[g].s0, acc1[g].s1, acc1[g].s2, acc1[g].s3,                           \
++                              acc1[g].s4, acc1[g].s5, acc1[g].s6, acc1[g].s7 };                         \
++        _Pragma("unroll")                                                                               \
++        for (int m = 0; m < 8; ++m) {                                                                   \
++            const int slot = te.y + 8 * g + m;                                                          \
++            if (slot >= te.y + te.z) continue;                                                          \
++            const int pp = pairs[slot], tt = pp / n_used, ii = pp % n_used;                            \
++            global float *o = (global float *)(dst + offd + (ulong)tt * nb2 + (ulong)ii * nb1);         \
++            if (act0) o[r0] = v0[m];                                                                    \
++            if (act1) o[r1] = v1[m];                                                                    \
++        }                                                                                               \
++    }
++
++#define I8W_COLS                                                                                        \
++    const int ti = get_group_id(0);                                                                     \
++    if (ti >= *n_tiles) return;                                                                         \
++    const int4 te = tiles[ti];                                                                          \
++    const int lane = get_sub_group_local_id(), sgi = get_sub_group_id();                                \
++    const int r0 = get_group_id(1) * I8W_BW + sgi * 16 + lane;                                     \
++    const int r1 = r0 + I8W_XSG * 16;                                                                   \
++    const bool act0 = r0 < ne01, act1 = r1 < ne01;                                                      \
++    float8 acc0[I8W_XT / 8], acc1[I8W_XT / 8];                                                          \
++    _Pragma("unroll")                                                                                   \
++    for (int g = 0; g < I8W_XT / 8; ++g) { acc0[g] = (float8)(0.f); acc1[g] = (float8)(0.f); }
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_id_iq4_nl_i8_wide(global const uchar * q, ulong offq, global const half * dp,
++                                            global const char * xq, global const float * xd,
++                                            global const int * pairs, global const int4 * tiles, global const int * n_tiles,
++                                            int n_used, int ne11, global char * dst, ulong offd, ulong nb1, ulong nb2,
++                                            int ne00, int ne01) {
++    I8W_COLS
++    const int n32 = ne00 / 32;
++    const ulong wrow0 = (ulong)te.x * ne01;
++    const ulong rr0 = act0 ? (ulong)r0 : 0, rr1 = act1 ? (ulong)r1 : 0;
++    I8W_STAGE
++        const kq_u32 zero = 0u;
++        kq_u32 w0[8] = { zero, zero, zero, zero, zero, zero, zero, zero };
++        kq_u32 w1[8] = { zero, zero, zero, zero, zero, zero, zero, zero };
++        float ws0 = 0.f, ws1 = 0.f;
++        if (act0) {
++            const ulong blk = (wrow0 + rr0) * n32 + (ulong)kq_i8_iq4nl_blk(kb);
++            const uint4 qd = vload4(0, (global const uint *)(q + offq + blk * 16));
++            ws0 = (float)dp[blk];
++            kq_i8_decode_iq4nl(qd.s0, qd.s1, qd.s2, qd.s3, kvalues_iq4nl, w0);
++        }
++        if (act1) {
++            const ulong blk = (wrow0 + rr1) * n32 + (ulong)kq_i8_iq4nl_blk(kb);
++            const uint4 qd = vload4(0, (global const uint *)(q + offq + blk * 16));
++            ws1 = (float)dp[blk];
++            kq_i8_decode_iq4nl(qd.s0, qd.s1, qd.s2, qd.s3, kvalues_iq4nl, w1);
++        }
++        const int8 bq0 = (int8)(as_int(w0[0]), as_int(w0[1]), as_int(w0[2]), as_int(w0[3]),
++                                as_int(w0[4]), as_int(w0[5]), as_int(w0[6]), as_int(w0[7]));
++        const int8 bq1 = (int8)(as_int(w1[0]), as_int(w1[1]), as_int(w1[2]), as_int(w1[3]),
++                                as_int(w1[4]), as_int(w1[5]), as_int(w1[6]), as_int(w1[7]));
++        I8W_MAD
++    I8W_STORE
++}
++
++// Q8_0's prompt arm on the wide tile: the block is 32 stored s8 codes and one
++// half scale, as the narrow Q8_0 kernel reads it; no decode.
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_id_q8_0_i8_wide(global const uchar * q, ulong offq, global const half * dp,
++                                          global const char * xq, global const float * xd,
++                                          global const int * pairs, global const int4 * tiles, global const int * n_tiles,
++                                          int n_used, int ne11, global char * dst, ulong offd, ulong nb1, ulong nb2,
++                                          int ne00, int ne01) {
++    I8W_COLS
++    const int n32 = ne00 / 32;
++    const ulong wrow0 = (ulong)te.x * ne01;
++    const ulong rr0 = act0 ? (ulong)r0 : 0, rr1 = act1 ? (ulong)r1 : 0;
++    I8W_STAGE
++        float ws0 = 0.f, ws1 = 0.f;
++        uint4 qa0 = (uint4)(0), qb0 = (uint4)(0), qa1 = (uint4)(0), qb1 = (uint4)(0);
++        if (act0) {
++            const ulong blk = (wrow0 + rr0) * n32 + (ulong)kq_i8_iq4nl_blk(kb);
++            qa0 = vload4(0, (global const uint *)(q + offq + blk * 32));
++            qb0 = vload4(0, (global const uint *)(q + offq + blk * 32 + 16));
++            ws0 = (float)dp[blk];
++        }
++        if (act1) {
++            const ulong blk = (wrow0 + rr1) * n32 + (ulong)kq_i8_iq4nl_blk(kb);
++            qa1 = vload4(0, (global const uint *)(q + offq + blk * 32));
++            qb1 = vload4(0, (global const uint *)(q + offq + blk * 32 + 16));
++            ws1 = (float)dp[blk];
++        }
++        const int8 bq0 = (int8)(as_int(qa0.s0), as_int(qa0.s1), as_int(qa0.s2), as_int(qa0.s3),
++                                as_int(qb0.s0), as_int(qb0.s1), as_int(qb0.s2), as_int(qb0.s3));
++        const int8 bq1 = (int8)(as_int(qa1.s0), as_int(qa1.s1), as_int(qa1.s2), as_int(qa1.s3),
++                                as_int(qb1.s0), as_int(qb1.s1), as_int(qb1.s2), as_int(qb1.s3));
++        I8W_MAD
++    I8W_STORE
++}
++#endif  // SG == 16

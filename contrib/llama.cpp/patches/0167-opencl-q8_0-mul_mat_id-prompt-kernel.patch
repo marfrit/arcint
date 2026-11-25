@@ -1,0 +1,74 @@
+0167: Q8_0's prompt MUL_MAT_ID on the int8 DPAS expert tile (I8XT 32 pairs, sub-group 16), the arm the IQ4_NL experts take, plus its gate; 0156's decode arm is unchanged.
+
+diff --git a/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc b/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
+index ffba89e..1f520c8 100644
+--- a/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
++++ b/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
+@@ -209,6 +209,19 @@ static inline int kq_i8_program_wanted(const char *env) {
+     return kq_i8_mode(env, 16, 1) != 0 ? 1 : 0;
+ }
+ 
++// ---- the Q8_0 prompt arm (host-only) ----
++// GGML_OPENCL_Q8_MM_ID: unset is ON (the prompt arm of a Q8_0 MUL_MAT_ID has
++// no other GEMM), `0` or `off` (case-insensitive) turns it off. The Q8_0
++// decode arm is separate (mul_mv_iq_q8_1.cl) and not gated by this. Both arms
++// share the int8 program, so either one wanting it builds the program.
++static inline int kq_i8_q80_wanted(const char *env) {
++    if (env == 0 || env[0] == 0) return 1;
++    if (env[0] == '0') return 0;                 // "0", "0x", anything starting 0
++    const char *c = env, *o = "off";
++    while (*c != 0 && *o != 0 && kq_i8_lower(*c) == *o) { ++c; ++o; }
++    return (c != env && *o == 0 && *c == 0) ? 0 : 1;
++}
++
+ // The group's mean routed pairs (rows) per expert. n_expert is the matrix's
+ // expert count; min(n_expert, n_pairs) is the upper bound of the experts a
+ // call touches, so the mean is never understated (Strata reads the real cnt
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8.cl
+index e8006d3..0b18c45 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8.cl
+@@ -14,6 +14,9 @@
+ // 32-block, apply to every row tile) in OpenCL; the differences are named in
+ // the patch README.
+ //
++// Q8_0's prompt arm reads its block the same way, one weight scale a block:
++// the 32 stored codes are already s8, so there is no decode (kernel_mul_mm_id_q8_0_i8).
++//
+ // The staged block layout is [block][pair][32 bytes], so a 8-pair group of a
+ // block is 256 contiguous bytes for the sub-group block read (the a operand).
+ // Scales are [block][pair], so one vload8 serves a 8-pair group a block. A
+@@ -205,4 +208,33 @@ kernel void kernel_mul_mm_id_iq4_nl_i8(global const uchar * q, ulong offq, globa
+         I8_DPAS(ws, bq)
+     I8_STORE
+ }
++
++// Q8_0's prompt MUL_MAT_ID on the same route tiles and DPAS body: the SoA
++// planes hold 32 s8 codes a 32-block (the flat q plane, 32 bytes) and one half
++// scale a block (the flat d plane), so the b operand is the block's eight
++// words as read and ws is the block's scale; no decode and no K super-block.
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_mul_mm_id_q8_0_i8(global const uchar * q, ulong offq, global const half * dp,
++                                     global const char * xq, global const float * xd,
++                                     global const int * pairs, global const int4 * tiles, global const int * n_tiles,
++                                     int n_used, int ne11, global char * dst, ulong offd, ulong nb1, ulong nb2,
++                                     int ne00, int ne01) {
++    I8_COLS
++    const int n32 = ne00 / 32;
++    const ulong rr = active ? (ulong)r : 0;
++    const ulong wrow0 = (ulong)te.x * ne01;
++    I8_STAGE
++        float ws = 0.f;
++        uint4 qa = (uint4)(0), qb = (uint4)(0);
++        if (active) {
++            const ulong blk = (wrow0 + rr) * n32 + (ulong)kq_i8_iq4nl_blk(kb);
++            qa = vload4(0, (global const uint *)(q + offq + blk * 32));
++            qb = vload4(0, (global const uint *)(q + offq + blk * 32 + 16));
++            ws = (float)dp[blk];
++        }
++        const int8 bq = (int8)(as_int(qa.s0), as_int(qa.s1), as_int(qa.s2), as_int(qa.s3),
++                               as_int(qb.s0), as_int(qb.s1), as_int(qb.s2), as_int(qb.s3));
++        I8_DPAS(ws, bq)
++    I8_STORE
++}
+ #endif  // SG == 16

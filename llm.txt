@@ -28,6 +28,11 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.8.1 (2026-11-25): FIX the q8_0 / q4_0 KV checkpoint restore on OpenCL (positions restored, bytes not;
+  Inkling's sliding-window layers read stale K/V after a resume). New defaults: the spill guard (--llama-allow-spill),
+  admission tiers, the request-field split (15 refused, 19 ignored with a warning), default-on OpenCL paths. New:
+  --llama-swa-window; Inkling's opt-in prefill switches (I8_WIDE, CPY_TRANSPOSE, FA_PORT incl. q8_0, DEPTH_MIX: pp4096
+  816.6 -> 1,171.4 t/s at q8_0 KV on the B60 with FA_PORT + DEPTH_MIX); ggml tensors +64 bytes (0193).
 - Version 1.8.0 (2026-11-22): NEW Thinking Machines' Inkling 2 Mini (inkling2_loop, 26.4B total / 3.4B active, a
   looped core, relative-position bias and sinks in flash attention: patches 0133-0146), served on the B60 (165 W) at
   pp512 429.1 / 397.4 / 337.5 and tg128 36.6 / 33.7 / 29.9 t/s at depth 0 / 4k / 32k (mainline Vulkan, same card:
@@ -245,7 +250,8 @@
   granite at the 8B geometry and dory at the 1.0-4B geometry (72 physical
   blocks; --llama-dory-loops, --llama-dory-kv, opt-in --llama-dory-max-loops:
   a loop count per request by its reasoning effort) (code: src/core/admission.cpp);
-  anything else, an untested size included, is refused at load. Dory1.0-4B
+  other architectures and unmeasured sizes are the "runs" tier: libllama loads
+  them if the spill guard passes, with no promise and a start warning. Dory1.0-4B
   is served on a card (a leg of the 1.6.2 gate); Gemma 4 E4B has card numbers (1.6.1) and no unit; Granite 4.2 8B is
   admitted, not yet run on a card. No
   allowlist (retired with the OpenVINO engine, operator 2026-10-15).

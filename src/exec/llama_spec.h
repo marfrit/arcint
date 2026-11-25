@@ -93,6 +93,13 @@ public:
         (void) n_end;
         (void) ckpts;
     }
+    // The spill guard's own accounting of the drafter's device allocations: the draft
+    // context (its model's weights, KV and compute buffers, from llama_get_memory_breakdown)
+    // and the MTP draft head's row buffer (allocated outside that breakdown). Null/0 when
+    // this drafter has none.
+    virtual llama_context* draft_context() const { return nullptr; }
+    virtual size_t draft_head_device_bytes() const { return 0; }
+
     // Named lanes: the draft context's cell windows, as the target's
     // (llama_memory_seq_windows, contrib/llama.cpp 0026); false when its
     // memory cannot take them.

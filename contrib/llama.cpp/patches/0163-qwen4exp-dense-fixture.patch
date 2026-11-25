@@ -1,0 +1,873 @@
+0163: a numpy dense qwen4exp fixture and its red-first CPU load/run check
+
+diff --git a/tools/qwen4-dense-fixture-check.sh b/tools/qwen4-dense-fixture-check.sh
+new file mode 100755
+index 0000000..9d8fe75
+--- /dev/null
++++ b/tools/qwen4-dense-fixture-check.sh
+@@ -0,0 +1,93 @@
++#!/bin/bash
++# A dense qwen4exp GGUF must load and run on the CPU. RED before the dense path
++# (the MoE-only loader divides by expert_used=0 or trips the ffn_gate_inp assert),
++# GREEN after it.
++#   LLAMA_BIN_DIR  directory holding llama-perplexity (default: build/bin)
++#   WORK            output directory (default: a fresh mktemp -d)
++set -euo pipefail
++here=$(cd "$(dirname "$0")" && pwd)
++bin=${LLAMA_BIN_DIR:-"$here/../build/bin"}
++work=${WORK:-$(mktemp -d)}
++trap 'rm -rf "$work"' EXIT INT TERM  2>/dev/null || true
++mkdir -p "$work"
++
++python3 "$here/qwen4-v-reorder-check.py"
++python3 "$here/qwen4-dense-fixture.py" --out "$work" >/dev/null
++python3 - "$work/text.txt" <<'PY'
++import sys
++open(sys.argv[1], "w").write("aaaa bbbb cccc dddd " * 100)
++PY
++
++run_arm() {
++    local name=$1 dir=$2 file=${3:-qwen4-dense-fixture.gguf}
++    local gguf="$dir/$file" log="$work/load-$name.log"
++    if ! "$bin/llama-perplexity" -m "$gguf" -f "$work/text.txt" -c 128 -b 16 -t 2 -v >"$log" 2>&1; then
++        echo "RED: the $name dense fixture did not load or run; log tail:" >&2
++        tail -5 "$log"
++        exit 1
++    fi
++    grep -Eq "0 of [0-9]+ layers are MoE, [0-9]+ dense MLP" "$log" || {
++        echo "FAIL: the $name load log does not classify the layers as dense" >&2; exit 1; }
++    local ppl
++    ppl=$(sed -n 's/.*Final estimate: PPL = \([-0-9.]*\).*/\1/p' "$log" | tail -1)
++    case "$ppl" in
++        ""|nan|inf|Inf) echo "FAIL: no finite perplexity on the $name fixture" >&2; exit 1 ;;
++    esac
++    echo "$ppl"
++}
++
++# the mixed arm: a QSA layer beside a full-attention layer without indexer tensors
++ppl_mixed=$(run_arm mixed "$work")
++grep -q "layer 4 has no QSA indexer tensors, running dense attention" "$work/load-mixed.log" || {
++    echo "FAIL: the load log does not name the layer without an indexer" >&2; exit 1; }
++
++# the no-QSA arm: no indexer keys and no indexer tensors, dense attention everywhere
++python3 "$here/qwen4-dense-fixture.py" --out "$work/no-qsa" --no-qsa >/dev/null
++cp "$work/text.txt" "$work/no-qsa/text.txt"
++ppl_noqsa=$(run_arm no-qsa "$work/no-qsa")
++
++# the MTP arm: the trunk plus one in-model nextn block, as qwen35 / Flash-Next carry it.
++# The trunk loads with the MTP tensors resident; llama-cli --spec-type draft-mtp then builds
++# and runs the MTP graph, which perplexity does not.
++python3 "$here/qwen4-dense-fixture.py" --out "$work/mtp" --mtp >/dev/null
++cp "$work/text.txt" "$work/mtp/text.txt"
++ppl_mtp=$(run_arm mtp "$work/mtp" qwen4-dense-fixture-mtp.gguf)
++grep -q "loading tensor blk.6.nextn.eh_proj.weight" "$work/load-mtp.log" || {
++    echo "FAIL: the MTP arm did not load the nextn block" >&2; exit 1; }
++grep -q "loading tensor blk.6.nextn.shared_head_norm.weight" "$work/load-mtp.log" || {
++    echo "FAIL: the MTP arm did not load the optional shared_head_norm" >&2; exit 1; }
++grep -q "n_layer_all           = 7" "$work/load-mtp.log" || {
++    echo "FAIL: the MTP arm does not count the nextn block as layer 6" >&2; exit 1; }
++
++mtp_log="$work/mtp-graph.log"
++if ! "$bin/llama-cli" -m "$work/mtp/qwen4-dense-fixture-mtp.gguf" -p "aaaa" -n 2 -c 64 \
++        --no-warmup -v --spec-type draft-mtp >"$mtp_log" 2>&1; then
++    echo "FAIL: the MTP graph did not run; log tail:" >&2; tail -5 "$mtp_log"; exit 1
++fi
++grep -q "node 'mtp_tok_embd-6'" "$mtp_log" && grep -q "node 'mtp_h_input" "$mtp_log" || {
++    echo "FAIL: the MTP arm did not build the nextn graph" >&2; exit 1; }
++
++# the converter's GGUF, when given, must give the same logits as the fixture's own GGUF.
++# Both files carry the same byte-level tokenizer and the same weights, so a reorder or a
++# key difference shows up as nonzero KL rather than a load error.
++if [ -n "${CONVERTED_GGUF:-}" ]; then
++    base_logits="$work/fixture.logits"
++    if ! "$bin/llama-perplexity" -m "$work/qwen4-dense-fixture.gguf" -f "$work/text.txt" \
++            -c 128 -b 16 -t 2 --save-all-logits "$base_logits" >"$work/logits-fixture.log" 2>&1; then
++        echo "FAIL: could not write the fixture's logits" >&2; tail -5 "$work/logits-fixture.log"; exit 1
++    fi
++    if ! "$bin/llama-perplexity" -m "$CONVERTED_GGUF" -f "$work/text.txt" \
++            -c 128 -b 16 -t 2 --kl-divergence --kl-divergence-base "$base_logits" >"$work/logits-converted.log" 2>&1; then
++        echo "FAIL: the converter's GGUF did not run; log tail:" >&2; tail -5 "$work/logits-converted.log"; exit 1
++    fi
++    kld=$(sed -n 's/^Mean    KLD: *\([-0-9.]*\).*/\1/p' "$work/logits-converted.log" | tail -1)
++    top=$(sed -n 's/^Same top p: *\([-0-9.]*\).*/\1/p' "$work/logits-converted.log" | tail -1)
++    if [ "$kld" != "0.000000" ] && [ "$kld" != "-0.000000" ]; then
++        echo "FAIL: converter GGUF mean KLD is $kld against the fixture GGUF, expected 0" >&2
++        tail -5 "$work/logits-converted.log"; exit 1
++    fi
++    case "$top" in 100*) ;; *) echo "FAIL: same top p is $top, expected 100" >&2; exit 1 ;; esac
++    echo "LOGITS: converter GGUF KLD $kld, same top p $top against the fixture GGUF"
++fi
++
++echo "GREEN: dense qwen4exp fixtures loaded and ran on the CPU, PPL $ppl_mixed (mixed) / $ppl_noqsa (no QSA) / $ppl_mtp (MTP trunk)"
+diff --git a/tools/qwen4-dense-fixture-compare.py b/tools/qwen4-dense-fixture-compare.py
+new file mode 100755
+index 0000000..4b48168
+--- /dev/null
++++ b/tools/qwen4-dense-fixture-compare.py
+@@ -0,0 +1,90 @@
++#!/usr/bin/env python3
++"""Compare a converted dense qwen4exp GGUF with the fixture script's own GGUF.
++
++Compares every tensor (names, shapes, values) and every qwen4exp.* metadata key.
++Tokenizer keys are not compared: the fixture ships a minimal byte-level BPE for
++the converter's set_vocab, while the fixture GGUF keeps the byte-fallback vocab
++the loader test uses.
++
++    python3 tools/qwen4-dense-fixture-compare.py <fixture.gguf> <converted.gguf>
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++import numpy as np
++
++REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(1, str(REPO / "gguf-py"))
++import gguf  # noqa: E402
++
++
++def load(path: Path) -> gguf.GGUFReader:
++    return gguf.GGUFReader(str(path))
++
++
++def field_value(field) -> object:
++    # GGUFReader Field.contents() handles scalar and array types
++    return field.contents()
++
++
++def main() -> int:
++    if len(sys.argv) != 3:
++        print(__doc__.strip().splitlines()[0], file=sys.stderr)
++        print("usage: qwen4-dense-fixture-compare.py <fixture.gguf> <converted.gguf>", file=sys.stderr)
++        return 2
++    a, b = load(Path(sys.argv[1])), load(Path(sys.argv[2]))
++    bad = 0
++
++    ta = {t.name: t for t in a.tensors}
++    tb = {t.name: t for t in b.tensors}
++    only_a = sorted(set(ta) - set(tb))
++    only_b = sorted(set(tb) - set(ta))
++    if only_a or only_b:
++        bad += 1
++        print(f"tensor names differ: only in fixture {only_a[:20]}, only in converted {only_b[:20]}")
++
++    for name in sorted(set(ta) & set(tb)):
++        xa, xb = ta[name], tb[name]
++        if tuple(xa.shape) != tuple(xb.shape):
++            bad += 1
++            print(f"shape {name}: fixture {xa.shape} converted {xb.shape}")
++            continue
++        da = np.asarray(xa.data)
++        db = np.asarray(xb.data)
++        if not np.allclose(da, db, rtol=1e-5, atol=1e-6, equal_nan=True):
++            bad += 1
++            diff = np.abs(da - db)
++            print(f"FAIL values {name}: max abs diff {np.max(np.abs(diff)):.6g} "
++                  f"(mean {np.mean(diff):.6g}, {np.count_nonzero(diff)}/{diff.size} elements differ)")
++            continue
++        if not np.array_equal(da, db):
++            # exactness only: torch and numpy libm can differ by one ulp, and a permutation
++            # never reaches this branch because allclose above fails it
++            print(f"note {name}: not bit-identical, within tolerance")
++
++    ka = {k: field_value(v) for k, v in a.fields.items() if k.startswith("qwen4exp.")}
++    kb = {k: field_value(v) for k, v in b.fields.items() if k.startswith("qwen4exp.")}
++    only_a = sorted(set(ka) - set(kb))
++    only_b = sorted(set(kb) - set(ka))
++    if only_a or only_b:
++        bad += 1
++        print(f"qwen4exp keys differ: only in fixture {only_a}, only in converted {only_b}")
++    for key in sorted(set(ka) & set(kb)):
++        va, vb = ka[key], kb[key]
++        same = np.array_equal(np.asarray(va), np.asarray(vb)) if isinstance(va, (list, tuple, np.ndarray)) else va == vb
++        if not same:
++            bad += 1
++            print(f"key {key}: fixture {va} converted {vb}")
++
++    if bad:
++        print(f"FAIL: {bad} difference(s)")
++        return 1
++    print(f"OK: {len(ta)} tensors, {len(ka)} qwen4exp.* keys identical")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/qwen4-dense-fixture.py b/tools/qwen4-dense-fixture.py
+new file mode 100755
+index 0000000..7755679
+--- /dev/null
++++ b/tools/qwen4-dense-fixture.py
+@@ -0,0 +1,561 @@
++#!/usr/bin/env python3
++"""Build a tiny synthetic dense qwen4exp fixture: HF safetensors + a GGUF.
++
++No weights for a dense Qwen4 27B exist yet. This writes random weights at
++scaled-down dimensions that keep the published ratios (HC 4 streams, a low
++rank, GDN with num_v_heads = 3 * num_k_heads, QSA with Q:KV = 6:1, a dense
++SwiGLU FFN) and a config.json. The GGUF is written with the same keys and
++tensor names as conversion/qwen4exp.py produces for such a checkpoint, using
++gguf-py's tensor mapping; tensor transforms mirror modify_tensors.
++
++The GGUF is for the loader test only. It is not a quantized real model.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import struct
++import sys
++from pathlib import Path
++
++import numpy as np
++
++REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(1, str(REPO / "gguf-py"))
++import gguf  # noqa: E402
++from gguf.tensor_mapping import TensorNameMap  # noqa: E402
++
++
++# published ratios, scaled down by roughly 1/10
++CFG = dict(
++    hidden_size            = 512,
++    num_hidden_layers      = 6,
++    num_attention_heads    = 12,   # Q:KV = 12:2 = the published 24:4
++    num_key_value_heads     = 2,
++    head_dim               = 32,   # published 256
++    intermediate_size      = 1408, # dense SwiGLU; published 14336/17408 unresolved
++    vocab_size             = 260,
++    # a strict Qwen4ExpTextConfig requires num_experts > 0 and positive expert widths;
++    # mlp_only_layers names every layer, so the GGUF still runs a dense MLP everywhere
++    num_experts            = 512,
++    num_experts_per_tok    = 1,
++    moe_intermediate_size  = 1408,
++    shared_expert_intermediate_size = 1408,
++    max_position_embeddings = 4096,
++    hc_count               = 4,    # published 4 streams
++    hc_lowrank             = 64,   # published 640
++    linear_key_head_dim    = 32,
++    linear_num_key_heads   = 2,
++    linear_num_value_heads = 6,    # 3 x key heads, as qwen3.5
++    linear_value_head_dim  = 32,
++    linear_conv_kernel_dim = 4,
++    indexer_n_heads        = 2,
++    indexer_head_dim       = 32,
++    indexer_budget         = 64,
++    indexer_compress_ratio = 4,
++    rms_norm_eps           = 1e-6,
++    # GDN/QSA schedule is metadata, not an assumed 3:1: QSA on layers 2 and 4.
++    # Layer 4 deliberately carries no indexer tensors, so it runs dense attention.
++    layer_types            = ["linear_attention", "linear_attention", "full_attention",
++                              "linear_attention", "full_attention", "linear_attention"],
++    qsa_layers             = [2],
++    dense_attention_layers = [4],
++    rope_theta             = 10000.0,
++    partial_rotary_factor  = 0.25,
++    mrope_section          = [3, 3, 2, 0],
++)
++
++
++def is_full_attention(kind: str) -> bool:
++    # the HF config spells a QSA layer "full_attention" (transformers rewrites it to
++    # "qwen_sparse_attention"; 5.8 called it "indexed_attention"); all mean the same layer
++    return kind in ("full_attention", "qwen_sparse_attention", "indexed_attention")
++
++
++def hf_config(no_qsa: bool, mtp: bool) -> dict:
++    cfg = dict(CFG)
++    n_rot = int(CFG["head_dim"] * CFG["partial_rotary_factor"])
++    assert sum(CFG["mrope_section"]) == n_rot
++    # the HF layout the real config uses: the multimodal outer Qwen4ExpConfig carries
++    # image ids and the text fields live under text_config (Qwen4ExpTextConfig)
++    text = {
++        "hidden_size": CFG["hidden_size"],
++        "num_hidden_layers": CFG["num_hidden_layers"],
++        "num_attention_heads": CFG["num_attention_heads"],
++        "num_key_value_heads": CFG["num_key_value_heads"],
++        "head_dim": CFG["head_dim"],
++        "intermediate_size": CFG["intermediate_size"],
++        "vocab_size": CFG["vocab_size"],
++        "num_experts": CFG["num_experts"],
++        "num_experts_per_tok": CFG["num_experts_per_tok"],
++        "moe_intermediate_size": CFG["moe_intermediate_size"],
++        "shared_expert_intermediate_size": CFG["shared_expert_intermediate_size"],
++        "mlp_only_layers": list(range(CFG["num_hidden_layers"])),
++        "decoder_sparse_step": 1,
++        "max_position_embeddings": CFG["max_position_embeddings"],
++        "hidden_act": "silu",
++        "tie_word_embeddings": False,
++        "rms_norm_eps": CFG["rms_norm_eps"],
++        "hc_count": CFG["hc_count"],
++        "hc_lowrank": CFG["hc_lowrank"],
++        "linear_key_head_dim": CFG["linear_key_head_dim"],
++        "linear_num_key_heads": CFG["linear_num_key_heads"],
++        "linear_num_value_heads": CFG["linear_num_value_heads"],
++        "linear_value_head_dim": CFG["linear_value_head_dim"],
++        "linear_conv_kernel_dim": CFG["linear_conv_kernel_dim"],
++        "layer_types": CFG["layer_types"],
++        "full_attention_interval": 2,
++        **({
++            "indexer_n_heads": CFG["indexer_n_heads"],
++            "indexer_kv_heads": 1,
++            "indexer_head_dim": CFG["indexer_head_dim"],
++            "indexer_budget": CFG["indexer_budget"],
++            "indexer_compress_ratio": CFG["indexer_compress_ratio"],
++        } if not no_qsa else {}),
++        "ple_layer_ids": [],  # no PLE: the n-gram table is optional by presence
++        **({"mtp_num_hidden_layers": 1} if mtp else {}),
++        "eos_token_id": 2,
++        "rope_parameters": {
++            "rope_type": "default",
++            "rope_theta": CFG["rope_theta"],
++            "partial_rotary_factor": CFG["partial_rotary_factor"],
++            "mrope_section": CFG["mrope_section"],
++        },
++    }
++    return {
++        "architectures": ["Qwen4ExpForConditionalGeneration"],
++        "model_type": "qwen4_exp",
++        "text_config": text,
++        "vision_config": {
++            "model_type": "qwen4_exp_vision",
++            "depth": 1, "hidden_size": 64, "hidden_act": "gelu_pytorch_tanh",
++            "intermediate_size": 128, "num_heads": 2, "in_channels": 3,
++            "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2,
++            "out_hidden_size": 512, "num_position_embeddings": 64,
++            "initializer_range": 0.02,
++        },
++        "tie_word_embeddings": False,
++        # scaled-down ids inside the fixture's 259-token vocabulary; int, as the class requires
++        "image_token_id": 250,
++        "video_token_id": 251,
++        "vision_start_token_id": 252,
++        "vision_end_token_id": 253,
++    }
++
++
++
++def rng_for(name: str, seed: int) -> np.random.Generator:
++    h = 0
++    for c in name.encode():
++        h = (h * 131 + c) & 0xFFFFFFFF
++    return np.random.default_rng(seed ^ h)
++
++
++def hf_tensors(seed: int, no_qsa: bool, mtp: bool) -> dict[str, np.ndarray]:
++    H  = CFG["hidden_size"]
++    hc = CFG["hc_count"]
++    hc_dim = H * hc
++    lr = CFG["hc_lowrank"]
++    ff = CFG["intermediate_size"]
++    nh = CFG["num_attention_heads"]
++    nkv = CFG["num_key_value_heads"]
++    hd = CFG["head_dim"]
++    vh = CFG["linear_num_value_heads"]
++    kh = CFG["linear_num_key_heads"]
++    kd = CFG["linear_key_head_dim"]
++    vd = CFG["linear_value_head_dim"]
++    conv_dim = kd * kh * 2 + vd * vh
++
++    t: dict[str, np.ndarray] = {}
++
++    def add(name: str, shape: tuple[int, ...], lo: float = -0.05, hi: float = 0.05) -> None:
++        t[name] = rng_for(name, seed).uniform(lo, hi, size=shape).astype(np.float32)
++
++    def gamma(name: str, shape: tuple[int, ...]) -> None:
++        # HF stores zero-centred gammas for q/k/indexer norms; the converter adds 1
++        t[name] = rng_for(name, seed).uniform(-0.05, 0.05, size=shape).astype(np.float32)
++
++    def norm(name: str, shape: tuple[int, ...]) -> None:
++        # qwen4exp's HC gammas are stored as 1 + w too (the converter's norm.weight rule)
++        t[name] = rng_for(name, seed).uniform(0.5, 1.5, size=shape).astype(np.float32)
++
++    def add_hc(p: str) -> None:
++        norm(f"{p}.attn_hyper_connection.hc_norm.weight", (hc, H))
++        add(f"{p}.attn_hyper_connection.input_mix_weight_down.weight", (lr, hc_dim))
++        add(f"{p}.attn_hyper_connection.input_mix_weight_up.weight",   (hc_dim, lr))
++        add(f"{p}.attn_hyper_connection.block_inject_weight.weight",   (hc, hc_dim))
++        norm(f"{p}.mlp_hyper_connection.hc_norm.weight", (hc, H))
++        add(f"{p}.mlp_hyper_connection.input_mix_weight_down.weight", (lr, hc_dim))
++        add(f"{p}.mlp_hyper_connection.input_mix_weight_up.weight",   (hc_dim, lr))
++        add(f"{p}.mlp_hyper_connection.block_inject_weight.weight",   (hc, hc_dim))
++
++    def add_full_attention(p: str, with_indexer: bool) -> None:
++        # qwen4exp's wq holds [q | gate] interleaved per head
++        add(f"{p}.self_attn.q_proj.weight", (2 * hd * nh, H))
++        add(f"{p}.self_attn.k_proj.weight", (nkv * hd, H))
++        add(f"{p}.self_attn.v_proj.weight", (nkv * hd, H))
++        add(f"{p}.self_attn.o_proj.weight", (H, hd * nh))
++        gamma(f"{p}.self_attn.q_norm.weight", (hd,))
++        gamma(f"{p}.self_attn.k_norm.weight", (hd,))
++        if with_indexer:
++            nq = CFG["indexer_n_heads"] * CFG["indexer_head_dim"]
++            idx = CFG["indexer_head_dim"]
++            add(f"{p}.self_attn.indexer.index_qk_proj.weight", (nq + idx, H))
++            gamma(f"{p}.self_attn.indexer.q_layernorm.weight", (idx,))
++            gamma(f"{p}.self_attn.indexer.k_layernorm.weight", (idx,))
++
++    def add_linear_attention(p: str) -> None:
++        add(f"{p}.linear_attn.in_proj_qkv.weight", (conv_dim, H))
++        add(f"{p}.linear_attn.in_proj_z.weight",   (vd * vh, H))
++        add(f"{p}.linear_attn.conv1d.weight",      (conv_dim, 1, CFG["linear_conv_kernel_dim"]))
++        add(f"{p}.linear_attn.dt_bias",            (vh,), -1.0, 1.0)
++        add(f"{p}.linear_attn.A_log",              (vh,), -1.0, 1.0)
++        add(f"{p}.linear_attn.in_proj_a.weight",   (vh, H))
++        add(f"{p}.linear_attn.in_proj_b.weight",   (vh, H))
++        norm(f"{p}.linear_attn.norm.weight", (vd,))
++        add(f"{p}.linear_attn.out_proj.weight", (H, vd * vh))
++
++    def add_dense_mlp(p: str) -> None:
++        add(f"{p}.mlp.gate_proj.weight", (ff, H))
++        add(f"{p}.mlp.up_proj.weight",   (ff, H))
++        add(f"{p}.mlp.down_proj.weight", (H, ff))
++
++    add("model.embed_tokens.weight", (CFG["vocab_size"], H))
++    add("lm_head.weight",           (CFG["vocab_size"], H))
++
++    norm("model.hyper_connection_mixer.hc_norm.weight", (hc, H))
++    add("model.hyper_connection_mixer.input_mix_weight_down.weight", (lr, hc_dim))
++    add("model.hyper_connection_mixer.input_mix_weight_up.weight",   (hc_dim, lr))
++
++    for il, kind in enumerate(CFG["layer_types"]):
++        p = f"model.layers.{il}"
++        add_hc(p)
++        if is_full_attention(kind):
++            add_full_attention(p, not no_qsa and il in CFG["qsa_layers"])
++        else:
++            add_linear_attention(p)
++        add_dense_mlp(p)
++
++    if mtp:
++        # the MTP block is one full-attention QSA layer, plus its own HC mixer and the
++        # eins/h eins projections that build eh_proj; the HF layout is mtp.*, remapped
++        # by _QwenMtpMixin / qwen4exp's _MTP_EXTRA to model.layers.<num_hidden_layers>.
++        mtp_p = "mtp.layers.0"
++        add_hc(mtp_p)
++        add_full_attention(mtp_p, not no_qsa)
++        add_dense_mlp(mtp_p)
++        add("mtp.fc_embedding.weight", (H, H))
++        add("mtp.fc_hidden.weight",    (H, H))
++        norm("mtp.pre_fc_norm_embedding.weight", (H,))
++        norm("mtp.pre_fc_norm_hidden.weight",    (hc, H))
++        norm("mtp.norm.weight",                  (H,))  # qwen35-style MTP head norm, accepted optional
++        norm("mtp.hyper_connection_mixer.hc_norm.weight", (hc, H))
++        add("mtp.hyper_connection_mixer.input_mix_weight_down.weight", (lr, hc_dim))
++        add("mtp.hyper_connection_mixer.input_mix_weight_up.weight",   (hc_dim, lr))
++
++    return t
++
++def reorder_v_heads(x: np.ndarray, dim: int, num_k: int, num_v_per_k: int, head_dim: int) -> np.ndarray:
++    # conversion/qwen.py _LinearAttentionVReorderBase: grouped V heads -> tiled order
++    shape = list(x.shape)
++    if dim < 0:
++        dim += len(shape)
++    new_shape = shape[:dim] + [num_k, num_v_per_k, head_dim] + shape[dim + 1:]
++    y = x.reshape(*new_shape)
++    perm = list(range(len(new_shape)))
++    perm[dim], perm[dim + 1] = perm[dim + 1], perm[dim]
++    return y.transpose(*perm).reshape(*shape).copy()
++
++
++def convert_like(hf: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
++    """Apply qwen4exp.py's tensor transforms and its gguf tensor mapping."""
++    H  = CFG["hidden_size"]
++    vh = CFG["linear_num_value_heads"]
++    kh = CFG["linear_num_key_heads"]
++    vpk = vh // kh
++    kd = CFG["linear_key_head_dim"]
++    vd = CFG["linear_value_head_dim"]
++
++    n_layer = CFG["num_hidden_layers"]
++    with_mtp = any(n.startswith("mtp.") for n in hf)
++    mp = TensorNameMap(gguf.MODEL_ARCH.QWEN4EXP, n_layer + (1 if with_mtp else 0))
++    out: dict[str, np.ndarray] = {}
++
++    # conversion/qwen4exp.py filter_tensors: the MTP head lives after the trunk and
++    # its mixer subs the model-level HC mixer; conversion/qwen.py _QwenMtpMixin remaps
++    # mtp.layers.N.* to model.layers.<num_hidden_layers>.*
++    def remap(name: str) -> str:
++        if name.startswith("mtp.layers."):
++            return f"model.layers.{n_layer}." + name.split(".", 3)[3]
++        if name.startswith("mtp.hyper_connection_mixer."):
++            return f"model.layers.{n_layer}.nextn_hc_head." + name[len("mtp.hyper_connection_mixer."):]
++        if name == "mtp.pre_fc_norm_embedding.weight":
++            return f"model.layers.{n_layer}.enorm.weight"
++        if name == "mtp.pre_fc_norm_hidden.weight":
++            return f"model.layers.{n_layer}.hnorm.weight"
++        if name == "mtp.norm.weight":
++            return f"model.layers.{n_layer}.shared_head.norm.weight"
++        return name
++
++    def mapped(name: str) -> str:
++        res = mp.get_type_and_name(name, try_suffixes=(".weight", "", ".bias"))
++        if res is None:
++            raise SystemExit(f"no GGUF tensor mapping for {name!r}; the arch's tensor list needs it")
++        return res[1]
++
++    if with_mtp:
++        eh = np.concatenate([hf["mtp.fc_embedding.weight"], hf["mtp.fc_hidden.weight"]], axis=1)
++        out[gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.NEXTN_EH_PROJ].format(bid=n_layer) + ".weight"] = eh
++
++    for name, x in hf.items():
++        if name.startswith(("mtp.fc_embedding.", "mtp.fc_hidden.")):
++            continue
++        name = remap(name)
++        if name.endswith("self_attn.indexer.index_qk_proj.weight"):
++            nq = CFG["indexer_n_heads"] * CFG["indexer_head_dim"]
++            bid = int(name.split(".")[2])
++            out[gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.INDEXER_Q_PROJ].format(bid=bid) + ".weight"] = x[:nq]
++            out[gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.INDEXER_K_PROJ].format(bid=bid) + ".weight"] = x[nq:]
++        elif name.endswith(".linear_attn.in_proj_qkv.weight"):
++            q = x[:kd * kh]
++            k = x[kd * kh:2 * kd * kh]
++            v = reorder_v_heads(x[2 * kd * kh:], 0, kh, vpk, vd)
++            out[mapped(name)] = np.concatenate([q, k, v], axis=0)
++        elif name.endswith(".linear_attn.in_proj_z.weight"):
++            out[mapped(name)] = reorder_v_heads(x, 0, kh, vpk, vd)
++        elif name.endswith((".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_b.weight")):
++            out[mapped(name)] = reorder_v_heads(x, 0, kh, vpk, 1)
++        elif name.endswith(".linear_attn.conv1d.weight"):
++            y = x.squeeze()
++            qk = y[:2 * kd * kh]
++            v = reorder_v_heads(y[2 * kd * kh:], 0, kh, vpk, vd)
++            out[mapped(name)] = np.concatenate([qk, v], axis=0)
++        elif name.endswith(".linear_attn.out_proj.weight"):
++            out[mapped(name)] = reorder_v_heads(x, 1, kh, vpk, vd)
++        elif name.endswith(".linear_attn.A_log"):
++            # converter reorders 1-D per-V-head parameters too, as (num_v, head_dim=1)
++            out[mapped(name)] = reorder_v_heads(-np.exp(x), 0, kh, vpk, 1)
++        elif name.endswith(".linear_attn.dt_bias"):
++            n2 = name.replace(".dt_bias", ".dt_proj.bias")
++            out[mapped(n2)] = reorder_v_heads(x, 0, kh, vpk, 1)
++        elif name.endswith("norm.weight") or name.endswith(("q_layernorm.weight", "k_layernorm.weight")):
++            # conversion/qwen3next adds 1 to every zero-centred gamma except linear_attn.norm;
++            # indexer q/k gammas are added in qwen4exp's own rule, same arithmetic
++            out[mapped(name)] = x if name.endswith("linear_attn.norm.weight") else x + 1.0
++        else:
++            out[mapped(name)] = x
++
++    return out
++
++
++def gpt2_byte_encoder() -> dict[int, str]:
++    """GPT-2's bytes-to-unicode map, so pre_tokenizer ByteLevel round-trips every byte."""
++    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("\u00a1"), ord("\u00ac") + 1)) + \
++         list(range(ord("\u00ae"), ord("\u00ff") + 1))
++    cs = bs[:]
++    n = 0
++    for b in range(256):
++        if b not in bs:
++            bs.append(b)
++            cs.append(256 + n)
++            n += 1
++    return dict(zip(bs, [chr(c) for c in cs]))
++
++
++# The one merge exists only so llama.cpp finds the required merges key: it joins byte 0
++# and byte 1, which no text input contains, so encoding stays one token per byte. The
++# merged string is a normal vocab entry at the last id.
++MERGE = ("\u0100", "\u0101")           # GPT-2 byte 0 and byte 1
++MERGED = MERGE[0] + MERGE[1]
++
++
++def gpt2_vocab_tokens() -> list[str]:
++    enc = gpt2_byte_encoder()
++    return ["<unk>", "<s>", "</s>"] + [enc[b] for b in range(256)] + [MERGED]
++
++
++def write_tokenizer(hf_dir: Path, vocab_size: int) -> None:
++    """A minimal byte-level BPE the converter's set_vocab can read, with no download.
++
++    Qwen2Model.set_vocab falls back to _set_vocab_gpt2() when tokenizer.model is absent,
++    which is AutoTokenizer + get_vocab_base; PreTrainedTokenizerFast is in transformers
++    and needs no remote code. The 256 byte tokens cover any input text, and the three
++    special ids match the fixture embedding rows.
++    """
++    specials = ["<unk>", "<s>", "</s>"]
++    tokens = gpt2_vocab_tokens()
++    assert vocab_size == len(tokens)
++    vocab: dict[str, int] = {t: i for i, t in enumerate(tokens)}
++    added = [
++        {"id": i, "content": t, "single_word": False, "lstrip": False,
++         "rstrip": False, "normalized": False, "special": True}
++        for i, t in enumerate(specials)
++    ]
++    tok = {
++        "version": "1.0",
++        "truncation": None,
++        "padding": None,
++        "added_tokens": added,
++        "normalizer": None,
++        # no prefix space: the single merge joins bytes 0 and 1, so encode(text) stays one
++        # token per byte and the chktxt hash in conversion/base.py recognizes pre "gpt-2"
++        "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": False,
++                          "trim_offsets": True, "use_regex": True},
++        "post_processor": None,
++        "decoder": {"type": "ByteLevel", "add_prefix_space": False,
++                    "trim_offsets": True, "use_regex": True},
++        "model": {"type": "BPE", "dropout": None, "unk_token": "<unk>",
++                  "continuing_subword_prefix": None, "end_of_word_suffix": None,
++                  "fuse_unk": True, "byte_fallback": False,
++                  "vocab": vocab, "merges": [f"{MERGE[0]} {MERGE[1]}"]},
++    }
++    (hf_dir / "tokenizer.json").write_text(json.dumps(tok) + "\n")
++    cfg = {
++        "tokenizer_class": "PreTrainedTokenizerFast",
++        "unk_token": "<unk>",
++        "bos_token": "<s>",
++        "eos_token": "</s>",
++        "pad_token": None,
++        "model_max_length": CFG["max_position_embeddings"],
++        "clean_up_tokenization_spaces": False,
++    }
++    (hf_dir / "tokenizer_config.json").write_text(json.dumps(cfg, indent=2) + "\n")
++    (hf_dir / "special_tokens_map.json").write_text(json.dumps({
++        "unk_token": "<unk>", "bos_token": "<s>", "eos_token": "</s>"}, indent=2) + "\n")
++
++
++def write_safetensors(path: Path, tensors: dict[str, np.ndarray]) -> None:
++    header: dict[str, dict] = {}
++    offset = 0
++    for name, x in tensors.items():
++        assert x.dtype == np.float32 and x.flags["C_CONTIGUOUS"]
++        nbytes = x.nbytes
++        header[name] = {"dtype": "F32", "shape": list(x.shape), "data_offsets": [offset, offset + nbytes]}
++        offset += nbytes
++    meta = json.dumps(header, separators=(",", ":")).encode()
++    meta += b" " * ((8 - len(meta) % 8) % 8)
++    with open(path, "wb") as f:
++        f.write(struct.pack("<Q", len(meta)))
++        f.write(meta)
++        for x in tensors.values():
++            f.write(x.tobytes(order="C"))
++
++
++def add_vocab(w: gguf.GGUFWriter) -> None:
++    # the same byte-level vocab the fixture tokenizer.json gives the converter: specials,
++    # the 256 GPT-2 byte tokens and the unused merged token. Both GGUFs then tokenize
++    # probe.txt to the same ids, so their logits are directly comparable.
++    tokens = gpt2_vocab_tokens()
++    types  = [gguf.TokenType.CONTROL] * 3 + [gguf.TokenType.NORMAL] * 257
++    w.add_tokenizer_model("gpt2")
++    w.add_tokenizer_pre("gpt-2")
++    w.add_token_list(tokens)
++    w.add_token_types(types)
++    w.add_token_merges([f"{MERGE[0]} {MERGE[1]}"])
++    w.add_bos_token_id(1)
++    w.add_eos_token_id(2)
++    w.add_unk_token_id(0)
++
++
++def write_gguf(path: Path, tensors: dict[str, np.ndarray], no_qsa: bool, mtp: bool) -> None:
++    H  = CFG["hidden_size"]
++    hd = CFG["head_dim"]
++    n_layer = CFG["num_hidden_layers"]
++    n_block = n_layer + (1 if mtp else 0)
++    kd = CFG["linear_key_head_dim"]
++    vh = CFG["linear_num_value_heads"]
++
++    w = gguf.GGUFWriter(path, "qwen4exp")
++    w.add_name("qwen4-dense-fixture")
++    w.add_file_type(int(gguf.LlamaFileType.ALL_F32))
++    w.add_context_length(CFG["max_position_embeddings"])
++    w.add_embedding_length(H)
++    w.add_block_count(n_block)
++    w.add_feed_forward_length(CFG["intermediate_size"])
++    w.add_head_count(CFG["num_attention_heads"])
++    w.add_head_count_kv(CFG["num_key_value_heads"])
++    w.add_key_length(hd)
++    w.add_value_length(hd)
++    w.add_rope_dimension_count(int(hd * CFG["partial_rotary_factor"]))
++    w.add_rope_dimension_sections(CFG["mrope_section"])
++    w.add_rope_freq_base(CFG["rope_theta"])
++    w.add_layer_norm_rms_eps(CFG["rms_norm_eps"])
++
++    # the MTP block is a full-attention block, so it gets the indexer ratio as well
++    layer_types = CFG["layer_types"] + (["full_attention"] if mtp else [])
++    w.add_recurrent_layers([t == "linear_attention" for t in layer_types])
++    w.add_full_attention_interval(2)
++    if not no_qsa:
++        w.add_attention_compress_ratios(
++            [CFG["indexer_compress_ratio"] if is_full_attention(t) else 0 for t in layer_types])
++        w.add_indexer_head_count(CFG["indexer_n_heads"])
++        w.add_indexer_key_length(CFG["indexer_head_dim"])
++        w.add_indexer_top_k(CFG["indexer_budget"])
++
++    w.add_hyper_connection_count(CFG["hc_count"])
++    w.add_hyper_connection_low_rank(CFG["hc_lowrank"])
++
++    w.add_ssm_conv_kernel(CFG["linear_conv_kernel_dim"])
++    w.add_ssm_state_size(kd)
++    w.add_ssm_inner_size(CFG["linear_value_head_dim"] * vh)
++    w.add_ssm_time_step_rank(vh)
++    w.add_ssm_group_count(CFG["linear_num_key_heads"])
++
++    # dense checkpoint: experts 0, decoder_sparse_step 1 (all layers follow mlp_only_layers)
++    # the validated text config is MoE-capable; every layer is in mlp_only_layers, so the
++    # loader's rule makes all of them dense (including the MTP block)
++    w.add_expert_count(CFG["num_experts"])
++    w.add_expert_used_count(CFG["num_experts_per_tok"])
++    w.add_expert_feed_forward_length(CFG["moe_intermediate_size"])
++    w.add_expert_shared_feed_forward_length(CFG["shared_expert_intermediate_size"])
++    w.add_mlp_only_layers([True] * n_block)
++    w.add_moe_every_n_layers(1)
++
++    if mtp:
++        w.add_nextn_predict_layers(1)
++
++    for name, x in tensors.items():
++        w.add_tensor(name, x, raw_dtype=gguf.GGMLQuantizationType.F32)
++
++    add_vocab(w)
++    w.write_header_to_file()
++    w.write_kv_data_to_file()
++    w.write_tensors_to_file()
++    w.close()
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--out", type=Path, required=True, help="directory to write into")
++    ap.add_argument("--seed", type=int, default=20261123)
++    ap.add_argument("--hf-only", action="store_true", help="skip the GGUF")
++    ap.add_argument("--no-qsa", action="store_true", help="a checkpoint with no QSA indexer keys or tensors")
++    ap.add_argument("--mtp", action="store_true", help="add one MTP block (nextn) as Flash-Next has it")
++    args = ap.parse_args()
++
++    out = args.out
++    hf_dir = out / "hf"
++    (hf_dir / "model").mkdir(parents=True, exist_ok=True)
++    (out).mkdir(parents=True, exist_ok=True)
++
++    hf = hf_tensors(args.seed, args.no_qsa, args.mtp)
++    cfg = hf_config(args.no_qsa, args.mtp)
++    (hf_dir / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
++    write_tokenizer(hf_dir, CFG["vocab_size"])
++    write_safetensors(hf_dir / "model.safetensors", hf)
++
++    # a byte-level tokenizer gives ~4 tokens per word; 128-word chunks are enough for -c 128
++    (out / "probe.txt").write_text("aaaa bbbb cccc dddd " * 100 + "\n")
++
++    name = "qwen4-dense-fixture" + ("-mtp" if args.mtp else "")
++    if not args.hf_only:
++        write_gguf(out / f"{name}.gguf", convert_like(hf), args.no_qsa, args.mtp)
++        print(f"wrote {out / f'{name}.gguf'}")
++
++    print(f"wrote {hf_dir} ({len(hf)} tensors)")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tools/qwen4-v-reorder-check.py b/tools/qwen4-v-reorder-check.py
+new file mode 100755
+index 0000000..3212d6a
+--- /dev/null
++++ b/tools/qwen4-v-reorder-check.py
+@@ -0,0 +1,103 @@
++#!/usr/bin/env python3
++"""Check the linear-attention V-head reorder at ratio 3 and at the frozen ratio 2.
++
++`conversion/qwen.py::_LinearAttentionVReorderBase._reorder_v_heads` turns HF's
++grouped V order [G0_v0..v{r-1}, G1_v0..v{r-1}, ...] into ggml's tiled order
++[K0, K1, ..., K0, K1, ...]. The geometry comes from the text config:
++
++  fixture           2 key / 6 value heads at 32      ratio 3
++  Flash-Next/Qwen4  16 key / 48 value heads at 128   ratio 3   (config.json text_config)
++  Qwen3.5-9B        16 key / 32 value heads at 128   ratio 2   (config.json text_config)
++
++The last row is the pre-existing ratio; its output must stay byte-identical.
++
++The torch half runs the converter's own function when torch is importable (a CPU
++run on a torch host); without torch the numpy reference is still checked.
++"""
++
++from __future__ import annotations
++
++import sys
++from pathlib import Path
++
++import numpy as np
++
++REPO = Path(__file__).resolve().parents[1]
++sys.path.insert(1, str(REPO))
++sys.path.insert(1, str(REPO / "gguf-py"))
++
++CASES = [
++    ("fixture", 2, 6, 32),
++    ("flash-next", 16, 48, 128),
++    ("qwen3.5-9b-frozen", 16, 32, 128),
++]
++
++
++def grouped_order(num_k: int, ratio: int, head_dim: int) -> list[int]:
++    # source index of tiled position (v, k, d): HF grouped as (k, v, d)
++    return [((k * ratio + v) * head_dim + d)
++            for v in range(ratio) for k in range(num_k) for d in range(head_dim)]
++
++
++def reorder_reference(x: np.ndarray, num_k: int, num_v: int, head_dim: int) -> np.ndarray:
++    ratio = num_v // num_k
++    assert ratio * num_k * head_dim == x.size
++    return x[np.asarray(grouped_order(num_k, ratio, head_dim))]
++
++
++def main() -> int:
++    bad = 0
++    for name, num_k, num_v, head_dim in CASES:
++        n = num_k * head_dim * (num_v // num_k)
++        x = np.arange(n, dtype=np.float32)
++        y = reorder_reference(x, num_k, num_v, head_dim)
++        ratio = num_v // num_k
++        # tiled order: consecutive rows are the same V head over every K head
++        for k_i in range(num_k):
++            for d in range(head_dim):
++                assert y[k_i * head_dim + d] == x[((k_i * ratio) * head_dim + d)]
++        print(f"numpy OK: {name} {num_k}K/{num_v}V ratio {ratio} head {head_dim}")
++
++        # the fixture's own numpy mirror must agree with the reference
++        import importlib.util
++        spec = importlib.util.spec_from_file_location("qwen4_dense_fixture", REPO / "tools" / "qwen4-dense-fixture.py")
++        mod = importlib.util.module_from_spec(spec)
++        spec.loader.exec_module(mod)  # type: ignore[union-attr]
++        x2 = np.arange(n * 4, dtype=np.float32).reshape(num_k * head_dim * (num_v // num_k), 4)
++        got = mod.reorder_v_heads(x2, 0, num_k, ratio, head_dim)
++        want = x2[np.asarray(grouped_order(num_k, ratio, head_dim))]
++        if not np.array_equal(got, want):
++            bad += 1
++            print(f"FAIL: fixture reorder differs at {name}")
++
++    try:
++        import torch  # noqa: E402
++        from conversion.qwen import _LinearAttentionVReorderBase  # noqa: E402
++    except Exception as e:
++        print(f"SKIP converter half: torch/conversion not importable ({e.__class__.__name__})")
++        if bad:
++            print(f"FAIL: {bad} difference(s)")
++            return 1
++        return 0
++
++    for name, num_k, num_v, head_dim in CASES:
++        n = num_k * head_dim * (num_v // num_k)
++        ratio = num_v // num_k
++        x = torch.arange(n, dtype=torch.float32)
++        got = _LinearAttentionVReorderBase._reorder_v_heads(x, 0, num_k, ratio, head_dim).numpy()
++        want = reorder_reference(np.arange(n, dtype=np.float32), num_k, num_v, head_dim)
++        if not np.array_equal(got, want):
++            bad += 1
++            print(f"FAIL: converter reorder differs at {name} ({num_k}K/{num_v}V ratio {ratio})")
++        else:
++            print(f"converter OK: {name} {num_k}K/{num_v}V ratio {ratio} head {head_dim}")
++
++    if bad:
++        print(f"FAIL: {bad} difference(s)")
++        return 1
++    print("OK: V-head reorder matches the reference at ratio 3 and the frozen ratio 2")
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

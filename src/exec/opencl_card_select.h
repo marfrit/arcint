@@ -44,4 +44,12 @@ ClPick pick_cards(const std::vector<ClDeviceDesc>& all, const std::vector<std::s
 // "P:D[,P:D]" in card order
 std::string ggml_opencl_devices_value(const std::vector<ClDeviceDesc>& cards);
 
+// The load-time warning for a host with more than one visible GPU where the
+// operator chose none: empty when no warning applies, otherwise the text.
+// Pure: the device list is faked in the unit tests; the two "was it chosen"
+// flags are read by the caller. GGML_OPENCL_DEVICES is not one of them: the
+// loader always overwrites it with this build's own pick.
+std::string unselected_multi_gpu_warning(const std::vector<ClDeviceDesc>& all, bool device_given,
+                                         bool ze_affinity_set);
+
 }  // namespace lgc

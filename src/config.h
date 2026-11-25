@@ -125,6 +125,21 @@ struct Config {
     // attention kernels of contrib/llama.cpp 0015.
     std::string llama_kv_k = "f16";
     std::string llama_kv_v = "f16";
+    // --llama-swa-window: size the sliding-window (SWA) KV layers to the model's
+    // window plus a ubatch (llama_context_params.swa_full = false) instead of the
+    // library default, which gives them the whole context. On a model with 20 SWA
+    // blocks of 24 and window 1,024 this drops the SWA cache from n_ctx cells to
+    // n_swa + n_ubatch (measured: 8k cells 1,536 -> 496 MiB, 131k 24,576 ->
+    // 4,336 MiB at f16). The cache then cannot be trimmed to an arbitrary prefix;
+    // the context checkpoints carry the SWA window, and a cut whose retained
+    // history starts above the next query's window resumes from one (core/
+    // swa_window.h). Off by default: prefix reuse is exact at the library default.
+    bool llama_swa_window = false;
+    // --llama-allow-spill: opt out of the spill guard. A start whose
+    // device demand plus the request-growth margin does not fit the card's driver
+    // figure runs anyway, with a WARN that names every part; without it such a start
+    // is refused at load. Off by default: no silent fallback.
+    bool llama_allow_spill = false;
     // --llama-checkpoints N / --llama-checkpoint-step T: per lane, up to N
     // snapshots of the state llama.cpp cannot roll back (a hybrid model's
     // recurrent layers), taken where llama.cpp's server takes its context
@@ -247,6 +262,9 @@ struct Config {
     // --device: the N-th GPU in OpenCL enumeration (GPU.N) or a device-name
     // substring; two cards, GPU.0,GPU.1, for --llama-layer-split.
     std::string device = "GPU.0";
+    // whether --device was given: the load-time multi-GPU warning fires only
+    // when the operator chose no card (the default pick is not a choice).
+    bool device_given = false;
 
     std::string host = "127.0.0.1";
     int         port = 8090;

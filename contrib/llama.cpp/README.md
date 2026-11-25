@@ -8813,3 +8813,2017 @@ Two test-backend-ops cases run the quantized pair's prompt path with the bias, I
 (16,448 keys, 128 rows). No case reached that path before: 0142's quantized bias cases have 4 rows
 (decode) and its prompt case is f16, so the whole FLASH_ATTN_EXT suite passed on 0150 even with
 64-key blocks forced (3,171 / 3,171). With the two cases: 3,173 / 3,173 on 0152 at both block sizes.
+
+## 0153-attn-seq-pos-min.patch
+
+`llama_memory_seq_pos_min` for a hybrid memory is the **max** over its attention and
+recurrent parts, and the recurrent cell sits at the newest position (one cell a sequence),
+so on a hybrid it reports that position and hides the sliding-window cache's oldest cell.
+A window-sized SWA cache (`swa_full = false`) cannot be trimmed to an arbitrary prefix:
+`llama_kv_cache_iswa::seq_rm` forwards to the SWA cache, whose `seq_rm` always returns true,
+so a cut below the retained window drops exactly the keys the next query would attend to.
+arcint had no way to ask the attention part.
+
+0153 adds `llama_memory_attn_seq_pos_min(llama_memory_t, llama_seq_id)` to `llama-ext.h`:
+the SWA cache's `seq_pos_min` for a hybrid-iswa or iswa memory, the memory's own value
+otherwise. `src/llama-context.cpp` implements it by the memory's concrete type (RTTI); it
+reads a cache, writes nothing, and is valid before and after a decode.
+
+**arcint's use** (`code`, `--llama-swa-window`): the flag sets `llama_context_params.swa_full
+= false`, so the SWA layers hold `n_swa + n_ubatch` cells padded to 256 instead of the whole
+context. `src/core/swa_window.h` decides a prefix cut: the retained history (this call)
+must start at or below the next query's oldest key (`common - n_swa + 1`, clamped at 0);
+otherwise the lane resumes from the newest context checkpoint at or below `common` and
+prefills from it, and clears if there is none. The checkpoint's
+`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` state already carries the SWA cells at the pin
+(`llama_kv_cache_iswa::state_write` calls `kv_swa->state_write`; the base cache writes
+nothing under the flag), so no state-format change was needed — only the position query.
+
+**CPU measurement** (`measured-here`, the recipe host, the pinned tree with the series,
+`-DGGML_OPENCL=OFF`, Inkling 2 Mini IQ4_NL, the 8-core CPU build, `tools/swa_ckpt_probe.cpp`):
+the partial state at 2,048 tokens is 163.7 MiB and at 512 tokens 83.7 MiB at f16 (delta 80.0
+MiB = 512 cells x 40 SWA layers x 4,096 bytes: the window is in the blob). The probe's arms,
+on the same model: a control arm prefills the same edited prompt in another ubatch split
+(mean KL 0, the CPU's batch-shape floor here), an append-only follow-up against a fresh full
+prefill has the same top token and mean KL 0, and an edited prompt below the ring resumes
+from its checkpoint with the same top token and mean KL 0.001496 (the restored SWA cells are
+re-found in the ring's slot order, so the FA sums them in another order; the model's
+batch-shape floor is 0). The pre-change trim-only arm is skipped on a hybrid (its recurrent
+refusal blocks the trim, `n_rs_seq` 0); on the attention-only SWA models below it runs and
+is the red case. The arcint unit case (`tests/test_swa_window.cpp`) is red 4 of 7 with the
+old always-true rule.
+
+**Other SWA models** (`measured-here`, same host, the same probe): Dory1.0-4B Q5_K_M,
+`per_loop` (24 global + 72 SWA cache layers, window 1,024): floor 0, append-only 0, the
+checkpoint resume same top and mean KL 0.011592; the trim-only arm keeps a hole — mean KL
+5.887903, top token differs. Gemma 4 E4B Q4_K_M (4 global + 20 SWA, window 512): floor 0,
+append-only 0, the checkpoint resume same top and mean KL 0.022537; trim-only mean KL
+22.814130, top differs. Both resumes are inside the 0.03 answer-level bar with the same top
+token; the residual is cell re-placement, not the window.
+
+**The depth cost of the full-size cache on the CPU** (`measured-here`, llama-bench on the
+same 8-thread CPU build, f16 KV, one repetition each; the `swa_full=false` arm is the stock
+tool, the `true` arm is the same tool with `cparams.swa_full` forced true, a measurement
+build only): Gemma 4 E4B at 16,384 depth pp16384 48.33 -> 61.56 t/s and tg64 8.67 -> 12.56
+t/s with the window (prefill +27 %, decode +45 %: its 20 SWA layers over 16k masked keys).
+Inkling 2 Mini at the same depth pp16384 18.79 -> 19.87 and tg16 7.34 -> 7.94 t/s: the
+single 16-token decode reads no separable effect there, its CPU token is weight-bound
+(7-8 t/s) and the two runs sat in different host-load windows; the card is where the
+effect was measured (30.4/31.9 t/s in llama-bench at depth 16,384 against 20.5 q8_0 /
+24.3 f16 served with the full-size cache). The window cache never regressed the CPU decode.
+
+**Dory's `last_loop` is refused with the flag** (`code`, arcint's load): that mode overwrites
+each loop pass's KV, so a prompt's prefill depends on where its chunk boundaries fall
+(upstream compares such a model only against the same batch; DESIGN's Dory paragraph). The
+probe measures it: the floor arm — the *same* prompt in another ubatch split — is mean KL
+0.026827 nats; the append-only follow-up 0.002890 same top, the checkpoint resume 0.008718
+same top, trim-only 6.011353 top differs. A checkpoint resume puts the continuation on other
+boundaries than the full prefill, so the window cache cannot be held to the probe's
+equivalence there; `--llama-dory-kv per_loop` serves with the flag, `last_loop` starts
+without it.
+
+## 0156-opencl-q8_0-mul_mat_id-int8-dot.patch
+
+Inkling 2 Mini's four coda layers keep their experts in Q8_0: gate_up K=2304 and down K=1152,
+128 experts, top-8. Their `MUL_MAT_ID` had no OpenCL fast path, so a decode token took the generic
+flat float kernel (`kernel_mul_mv_id_q8_0_f32_flat`, one float dot per value) with the downgrade
+line `op=MUL_MAT_ID type=q8_0 k=1152|2304 path=generic reason=no-fast-path`: 8 launches at about
+84 us each, 0.67 ms of the token, against the IQ4_NL experts' `kernel_mul_mv_id_iq4_nl_q8_1`
+(88 launches, 4.8 ms, about 330 GB/s on the same card at 1.8.0). The IQ types reach their fast
+path through `ggml_cl_kq_type_index`, which returns -1 for Q8_0, so the Q8_0 product fell through
+to the generic arm.
+
+The new arm, `ggml_cl_mul_mat_id_q8_0`, takes Q8_0's decode shapes the same way the IQ types do:
+`kernel_kq_quantize_q8_1` quantizes the activation to q8_1, and `kernel_mul_mv_id_q8_0_q8_1` in
+`mul_mv_iq_q8_1.cl` runs the int8 dot of the existing `mv_q8_0` helper on the flat Q8_0 planes,
+one work-group per (expert pair, token) on the third dimension. The pair is the group id: slot i =
+k % n_used, token t = k / n_used, the expert from `ids`, the activation column (i % ne11) + t *
+ne11, and the weight blocks at the expert's rows (e * ne01 + row), as the matvec does. Guarded to
+`n_tok < 16` (a decode batch; prefill keeps the flat kernel), Q8_0 / f32 / i32 / f32, ne00 divisible
+by 32, contiguous, the flat SoA planes (`ggml_cl_is_q8_0_soa`), not an expert cache's `.slots` /
+`.bank` (their -1 ids are not placed here), and src0's ne3 = 1. The kernel is built with `-DMV_Q8_0`
+in the one-column program, which is now always done; the q8_0 matvec above stays behind the 0115 arm.
+
+Four test-backend-ops cases take exactly the coda shapes (Q8_0, 128 experts, top-8, K 2304, 2304
+rows, 1 and 4 tokens; K 1152, 2304 rows, 1 and 4 tokens) in the test list and in the perf list, so
+perf mode times them. The CPU build's `test-backend-ops -o MUL_MAT_ID` passes, the OpenCL build
+compiles and the .cl passes the C preprocessor. On the card (`measured-here`, B60): the q8_0
+`MUL_MAT_ID` cases pass, and a red build (the kernel's dot broken) fails 29 of them.
+
+## 0157-opencl-tiny-mv-splitk.patch
+
+Developed as patch 0151 on a working branch and renumbered here (its comments still say 0151): it was written against an older base, so it
+is applied here after 0156 with offsets resolved and the logic unchanged. A one-column decode
+matvec of few output rows leaves most of the card idle: the f32 GEMV puts one work-group per
+output row (out=48 on 160 cores) and the flat q8_0 kernel one work-group every 8 rows (out=24 is
+3 work-groups). Both get a split-K variant that reduces a K slice of one (row) per work-group into
+partials, and `kernel_sum_slices_f32` sums the slices in a fixed order, so a shape sees a fixed
+slice count and a fixed order. `kernel_gemv_f32_f32_splitk` (in `mul_mm_f32_f32_l4_lm.cl`) covers
+f32 weights at one activation row, out < 512 and K >= 1024, the slices picked so out * slices
+reaches about 256 while K divides by 4 * slices; `kernel_mul_mv_q8_0_f32_splitk` (in
+`mul_mv_q8_0_f32_flat.cl`) covers the flat q8_0 planes at one column, 2D weight, out < 512 and K
+>= 1024, blocks divisible by the slice count. A multi-column step (an MTP or spec verify, ne11 > 1)
+keeps the existing kernels. `GGML_OPENCL_F32_SKINNY=0` still turns the f32 arm off.
+
+test-backend-ops carries the Inkling 2 Mini decode shapes (one activation row, K=2304, f32 and q8_0
+weights, out 2, 3, 4, 5, 24, 32, 64, 128, 384) in the test list and the perf list, and the production
+shapes the split-K reaches: the agent 27B's `ssm_alpha` / `ssm_beta` (F32 48 x 5120, and a q8_0 twin),
+the coder's routers (F32 184 x 2048 and 256 x 2048, which stay unsplit) and Flash-Next's MTP head injects
+(Q8_0 4 x 10240, split 64 ways; and 320 x 10240). Two defects were found on the card only and fixed:
+the q8_0 host set one kernel argument too many (CL_INVALID_ARG_INDEX), and the f32 kernel started each
+slice in floats on float4 pointers, so every slice past the first read the wrong rows (the 27B's KL
+went to 0.54). On the card (`measured-here`, B60): `MUL_MAT` 2965 of 2965; the red build (the slice
+bug) fails 14 f32 split-K cases.
+
+The split-K takes every model whose decode has a one-column matvec with out < 512 and K >= 1024
+of f32 or flat q8_0 weights. In the agent's Qwen3.8-27B Q4_K_M all 96 such tensors are the
+48 gated delta-net layers' `ssm_alpha.weight` and `ssm_beta.weight` (5120 x 48, five slices), whose
+F32 weights the f32 arm covers. Qwen3.8-Flash-Next's main model has none; its MTP head's two
+Q8_0 injects (4 x 10240) take the q8_0 arm. The coder's 1-D shared-expert gate (F32 [2048], a
+1 x 2048 product) takes the f32 arm, 32 slices. On the card (`measured-here`, B60/B70): KL to the
+CPU reference at micro-batch 1 the agent 0.010389 -> 0.010350, the coder 0.005796 -> 0.005664,
+Dory and Flash-Next bit-identical; Inkling decode +1.2 to +1.3 % from 0156 + 0157.
+
+## 0158-ggml-norm-clip-fused.patch
+
+Inkling 2 Mini clips three rows per layer visit: the q rows at head width 128 over 24 heads, the
+k rows at 128 over 8, and the relative rows at width 16 over 24 heads. Each clip ran as a chain
+of small ops on the row: the optional per-channel scale, sqr, sum_rows, sqrt, scale_bias(1, eps),
+fill(threshold), div, clamp(0, 1) and mul, 9 nodes with a scale and 8 without, 26 a visit, 48
+visits a decode token. The thresholds are the metadata's `attention.qk_clip` 22.627417 for q and
+k and `attention.relative_clip` 8.0 for the relative rows; the eps is the graph's 1e-6.
+
+The patch adds `GGML_OP_NORM_CLIP`: src0 the rows, src1 the per-channel scale or null, op params
+threshold and eps; `ggml_norm_clip` builds it and the Inkling graph's `clip()` emits it, so no fill
+constant is created. The CPU reference keeps the chain's order: the per-channel mul, the sum of
+squares in row order with the wide accumulator the existing `sum_rows` uses, sqrt, then the
+scale_bias order `norm*1 + eps`, then `threshold/norm`, then MIN(factor, 1) before MAX(factor, 0),
+then the mul. It is bit-identical to the unfused chain at all eight test shapes (max abs 0).
+
+`kernel_norm_clip_f32` in `norm_clip.cl` runs one 32-lane work-group a row, the row sum in a fixed
+lane order (a strided per-lane partial, then a tree with barriers), f32 throughout, and re-reads
+the scaled row for the multiply. `supports_op` admits f32 rows that are contiguous, with no scale
+or an f32 scale of the row's own channel and head count. The OpenCL build compiles and the .cl goes
+through the C preprocessor.
+
+`measured-here`, CPU tree (`test-export-graph-ops` at `-c 2048`, 0157 vs this patch) and the CPU KL
+gate on the IQ4_NL file, base logits the same window:
+
+| | base | patch |
+|---|---|---|
+| decode graph nodes (`tg`) | 10,859 | 9,755 |
+| prefill graph nodes (`pp`) | 10,979 | 9,875 |
+| mean KL vs the base logits, same top | - | 0.000000, 99.967 % |
+
+Both graphs lose 1,104 nodes: the clips' 1,248 launch nodes a token become 144 NORM_CLIP nodes.
+On the card (`measured-here`, B60): `NORM_CLIP` 8 of 8, its red build 0 of 8; Inkling decode
+34.13 -> 35.69 t/s at 4k (+4.6 %), 37.06 -> 38.93 at depth 0, KL to the CPU reference inside the bar.
+
+test-backend-ops `-o NORM_CLIP`: eight cases, the q/k/rel shapes of decode and of a 512-token
+prompt and an odd width (8/8 on the CPU build; on a card the same eight compare the kernel with
+the CPU reference). Red case, dropping MIN(factor, 1) in the CPU op (and in the kernel for the
+card tree): mean KL 3.417977, same top 38.938 %, and the unfused-chain equivalence check mismatches
+all eight shapes (max abs 0.61 to 14.5).
+
+## 0159-opencl-topk-moe-sigmoid-router.patch
+
+Patch 0064's top-k MoE fusion matched only a SOFT_MAX router. Inkling 2 Mini gates with
+`LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` and a per-expert selection bias, so its router ran
+unfused: sigmoid, reshape, bias add, argsort, view, get_rows, reshape, sum_rows, scale(sum, 1,
+1e-20), div, reshape — 11 nodes a layer, 48 layer visits a decode token.
+
+The matcher (`ggml_opencl_can_fuse_topk_moe_sigmoid`) scans the same tail after the sigmoid:
+ARGSORT, VIEW, GET_ROWS, RESHAPE, SUM_ROWS, then either `SCALE(sum, 1, eps)` + DIV or CLAMP + DIV,
+and the closing RESHAPE; the bias ADD is optional and is used only for the selection, the weights
+stay the unbiased probabilities. The fused kernel (`kernel_topk_moe_sigmoid_norm_n*`) takes one
+token a sub-group, reduces the k maxima over the lanes with descending ties to the lower expert,
+writes ids at the VIEW and weights at DIV (the closing RESHAPE is a view of DIV at the same byte
+offset, but its `nb[1]` is 4 because `ne[0] == 1`; DIV holds the contiguous k-float rows,
+`nb[1] == k*4`, which is the row stride the write needs), accumulates the selected p f32 serially
+by lane 0 in the j order SUM_ROWS uses, then adds eps or clamps and divides. Softmax arms keep
+the existing kernel and the same 9-node dispatch unchanged.
+
+`measured-here`, CPU tree (`test-export-graph-ops` at `-c 2048`, 0158 vs this patch) and the CPU KL
+gate on the IQ4_NL file, base logits the same window:
+
+| | before | after |
+|---|---|---|
+| decode graph nodes (`tg`) | 9,755 | 9,755 |
+| mean KL vs the base logits, default batch | - | 0.000000 |
+| mean KL vs a `-ub 1` base logits at `-ub 1` | - | -0.000000 |
+
+The CPU graph is unchanged by construction: the fusion is OpenCL-only, so the CPU gates cannot
+see it; the card numbers below are the evidence for the fused path. The batch base logits
+compared against the `-ub 1` decode path read 0.001989, a pre-existing path difference.
+
+`measured-here`, card (B60): KL against the CPU reference 0.001950 at the default
+batch and 0.001988 at `-ub 1` (the 0158 build reads 0.001999 / 0.002078, the path difference); KL
+against 0158's own `-ub 1` logits 0.000543, same top 99.251 %; decode d4096 35.52 -> 35.94 t/s,
+d0 38.89 -> 39.15. The 0.000543 is the sigmoid's own codegen: the fused kernel evaluates
+`1/(1+exp(-x))` inside the IQ matvec program, the unfused chain in `sigmoid.cl`'s work-item
+kernel, so p differs in the last bits and near-ties can flip an id; bit-identity of p would
+require dispatching the standalone sigmoid kernel, which deletes the fusion. Stated, not hidden.
+
+An earlier version regressed on the card: its `wnode` (10/9) wrote the closing RESHAPE,
+whose `nb[1] == 4` is not the row stride — 44 op cases failed and prefill fell to 412 t/s; its
+`k % 4` float4 sum path could not be separated from that bug and is dropped. The weight node is
+the DIV, card-proven.
+
+test-backend-ops: the builder gains the `norm_eps` arm and Inkling's router shapes, 128 experts
+top 8, n_tokens 1 and 512, with the bias pinned at +-3 (so a fused arm that writes the biased
+value as the weight fails clearly). The graph is built in the emitted node order; `validate_graph`
+asserts it on every backend, and a fused-launch counter
+(`ggml_backend_opencl_topk_moe_sigmoid_fused_count` through `get_proc_address`) fails the case
+when it did not reach the SIGMOID kernel; the card green run printed "fused arm reached" for the
+cases and `GGML_OPENCL_FUSE_TOPK_MOE=0` passes them on the unfused chain. CPU build 426/426.
+
+Architectures that set `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID` (`code`): afmoe, cohere2moe,
+glm-dsa, glm4-moe, glm5-next, hy-v3, k2-horizon, laguna, mimo2, nemotron-h-moe, nemotron-h,
+step35 and inkling2 match when metadata has `expert_weights_norm` and there is no group
+selection; deepseek2 routes through `n_expert_groups`, llama4 selects on the logits and has
+`norm_w` false, so they do not match. Production: Inkling matches; Qwen3.8 27B and Dory are
+dense; coder qwen35moe and Flash-Next qwen4exp gate by SOFT_MAX and keep the existing arm.
+
+The red case: a build whose kernel writes the biased selection value as the weight (in
+`mul_mv_iq_q8_1.cl`). The +-3 Inkling cases and the card KL then fail while the ids stay right.
+
+## 0160-card-memory-and-graph-stats.patch
+
+The spill guard's budget is the driver's figure, not OpenCL's. On the B60 the two disagree
+(`measured-here`): `DRM_XE_DEVICE_QUERY_MEM_REGIONS` says 24,480 MiB, `CL_DEVICE_GLOBAL_MEM_SIZE`
+23,256 MiB, and the agent 27B peaked at 24,196 MiB without spilling, so the allocations come out
+of the region total. The patch exposes `llama_device_card_memory(dev, out)` to `llama-ext.h`: the
+loan's existing probe (this process's xe clients by drm-pdev, then the region query on one of
+their render fds), returned as the driver's total, the device-wide used when it is a figure,
+this process's fdinfo vram0, and a reason. The bool is false when no region total is available
+(no `drm/xe_drm.h`, no client, a failed ioctl); a total with the perfmon-less used of 0 is still
+a driver figure and returns true with `used_known` false. The guard then bounds by the total
+with the other clients' share at 0 and says why. It is not part of the loan's rule, which keeps
+its own probe.
+
+It also exposes `llama_context_graph_stats(ctx, out)`: the reserved prompt and token graphs'
+node and split counts, for the "runs" tier's start warning. The values are what the reserve
+logged before, kept as members.
+
+arcint's rule is `src/core/spill_guard.h` (pure, message included) and the load path in
+`src/exec/backend_llama.cpp`. Device demand is the target context's breakdown by kind plus the
+draft context's own breakdown (the in-model MTP context: its KV 416 + reserve/compute 316 + head
+rows 172 = 904 MiB at the agent's 262,144; a separate `--llama-mtp-gguf`/`--llama-dflash`
+drafter adds its own model), the expert cache's own on-card bytes (slots, Q8_0 banks, gather
+mirror, loan tail), and this process's fdinfo bytes above the known demand (a projector, the KV
+stream, lazily grown scratch). Deliberate host bytes — a pinned expert bank, host buffers — are
+a separate line and never a refusal term. Other clients (`used - fdinfo`) count.
+
+The margin is `kSpillGrowthMarginBytes` = 422 MiB = the worst measured growth beyond the full
+prediction (agent 294 at a 255k needle, Inkling 231 with the switch, Flash-Next 184 and 172 on
+two measured first-request legs, Inkling 65,536 full SWA 226) + 128 MiB headroom. A 512 MiB headroom would refuse
+the agent, which is measured to run; 128 keeps it. The card's lazy allocations are inside the
+draft breakdown and the expert-cache bytes, not in this margin.
+
+The Inkling 65,536 full-SWA start fits: breakdown 23,460, predicted 23,459 before the margin,
+23,585 after the first request, a 60,000-token needle answered with VRAM peak 23,686 and GTT at
+most 308 MiB — no spill. Inkling 131,072 full SWA is above the card by its breakdown alone
+(30,372 MiB) and is the red case; Flash-Next `--llama-expert-cache 40000` is the other red case.
+The cross-check is after the first request: `|M2 - G| <= 422 MiB` and `M2 <= card`.
+
+## 0161-qwen4exp-dense-layer-rule.patch
+
+Qwen3.8-Flash-Next's own model card calls it "an experimental preview of the architecture that
+will underpin Qwen4" (`model_type qwen4_exp`), so `qwen4exp` is the code a dense Qwen4 27B will
+serve through. It was MoE-only: every layer built a router and expert tensors, and the graph's
+`GGML_ASSERT(ffn_gate_inp != nullptr)` rejected any layer without one. A dense GGUF could not load.
+
+The per-layer rule is vLLM's reading of the config, now from metadata: a layer is **MoE** iff it is
+not in `mlp_only_layers`, `num_experts > 0`, and `(il+1) % decoder_sparse_step == 0`; otherwise it
+is a dense MLP(`feed_forward_length`). The patch adds `{arch}.mlp_only_layers` as a per-layer bool
+vector (true = mlp-only, the converter translates HF's index list and pads the MTP block: false,
+or true for a checkpoint without expert tensors, whose MTP block is then dense too), and reuses `{arch}.moe_every_n_layers` for `decoder_sparse_step` with 1 as the absent
+default. Dense layers load `ffn_gate`/`ffn_up`/`ffn_down` only; MoE layers take the unchanged
+router/expert/shared-expert code, and the dense branch in `build_layer_ffn` is gated on
+`ffn_gate_inp == nullptr`, so an existing MoE GGUF builds today's graph.
+
+Two assumptions left the loader. The GDN/QSA schedule is read from
+`attention.recurrent_layers`; if that key is absent, `full_attention_interval` is now required
+instead of defaulting to 4 (the 3:1 schedule is not known for Qwen4). The indexer is optional by
+presence: a full-attention layer with none of the four indexer tensors runs dense attention, the
+memory filter allocates the indexer cache only for layers that carry it, and the load log says
+`layer N has no QSA indexer tensors, running dense attention`; a partial set (1-3 of 4) is an
+error, and a file with no indexer key group at all allocates no indexer cache. The load log also names each dense MLP layer and the MoE/dense counts. HC low rank and the
+HC stream count stay metadata-only (a 320 rank is nowhere hard-coded).
+
+`measured-here`, CPU: the dense fixture (0163) fails on the pre-patch build (integer divide by
+`expert_used = 0` in the expert width) and loads and runs after it (PPL 292.9699,
+`llama-perplexity -c 128 -b 16 -t 2`); a synthetic qwen4exp MoE model saved with the new build keeps the old
+build's logits at mean KLD 0.000000 and same top p 100.000 (0165). The real Flash-Next GGUF's
+CPU KL is owed on a host that holds it.
+
+## 0162-qwen4exp-converter-dense-metadata.patch
+
+The converter now accepts a dense qwen4_exp config (`num_experts` 0 or absent) and keeps the arch
+name **qwen4exp**: the runtime decides MoE or dense per layer, so a second dense arch or a
+different GGUF name would split one model family across two code paths for no gain. The same
+converter serves the current Flash-Next file; the new keys are defaults that reproduce today's
+all-MoE graph (step 1, mlp_only false).
+
+`set_gguf_parameters` writes `mlp_only_layers` as the per-layer bool vector (HF's indices, padded
+over `block_count - num_hidden_layers` with false, or with true for a checkpoint without expert
+tensors) and `moe_every_n_layers` from
+`decoder_sparse_step` (default 1, 0 refused). The indexer key group is written only when the
+config carries `indexer_n_heads`, so a checkpoint without QSA carries no indexer keys. `FFN_GATE`,
+`FFN_UP` and `FFN_DOWN` join the arch's tensor list, so `mlp.gate_proj`/`up_proj`/`down_proj`
+map to the dense tensors 0161 asks for; an MoE layer's `mlp.experts.*` and shared-expert names are
+unchanged. Which of the two published dense widths (14336, 17408) is real stays the config's
+`intermediate_size`; the loader reads it, nothing is baked in.
+
+A checkpoint with no MTP block now converts. `_QwenMtpMixin.__init__` used to assert
+`opt_num_mtp_layers != 0`; the count comes from `mtp_num_hidden_layers` or the indexed
+`mtp.layers.N` tensors, and zero now logs `no MTP layers in the checkpoint, converting the
+trunk only` and writes no `nextn_predict_layers` key. One MTP block (`--mtp`, below) still takes
+the shared remapper: `mtp.layers.N.*` to `model.layers.<num_hidden_layers>.*`,
+`mtp.pre_fc_norm_*` to `enorm`/`hnorm`, and qwen4exp's `_MTP_EXTRA` sends
+`fc_embedding`/`fc_hidden` through the `eh_proj` concatenation and `hyper_connection_mixer` to
+`nextn_hc_head`.
+
+The GDN geometry had come from the wrong config layer. `AutoConfig` resolves
+`model_type: qwen4_exp` to the multimodal outer `Qwen4ExpConfig`, which carries only the image
+ids; the text fields live under `text_config`. A checkpoint that spells the GDN counts at the
+root therefore gets `Qwen4ExpTextConfig`'s defaults - 16 key heads, 32 value heads - and
+`_reorder_v_heads` reshapes a 6-element `A_log` into `[16, 2, 1, 1]`. qwen4exp now registers a
+raw `config.json` hparams loader, bypassing `AutoConfig` for this model type; `TextModel`
+merges `text_config` afterwards, so the nested layout (the real one) and a flat text-only
+layout both keep their own `linear_num_key_heads` / `linear_num_value_heads`. The indexed-layer
+spelling is accepted as `full_attention`, `indexed_attention` (transformers 5.8's name) or
+`qwen_sparse_attention` (5.17's canonical name after the text config's `__post_init__`
+rewrite), so compress ratios are written for QSA layers in the real layout too. Evidence: `code` and the transformers source
+(`transformers/models/qwen4_exp/configuration_qwen4_exp.py`, fetched 2026-11-23: defaults 16/32,
+`model_type = "qwen4_exp"`, `sub_configs_defaults.text_config = Qwen4ExpTextConfig`);
+Flash-Next's `text_config` at `de4b8e4d43` has 16/48/128, Qwen3.5-9B's 16/32/128.
+
+The converter keeps the raw-config path for the text model and should: the outer
+`Qwen4ExpConfig` is vision+text and its text class enforces `num_experts > 0` and drops keys
+it does not declare (`intermediate_size`, `mlp_only_layers`, `decoder_sparse_step`,
+`mtp_num_hidden_layers`), which a dense text-only model needs. The fixture's config is still
+authored so transformers accepts it: integer `image_token_id`, `video_token_id`,
+`vision_start_token_id`, `vision_end_token_id` inside the fixture vocabulary, a minimal
+`vision_config`, and a strict-valid text config - `num_experts` 512, `num_experts_per_tok` 1,
+positive `moe_intermediate_size`/`shared_expert_intermediate_size`, `indexer_kv_heads` 1,
+`indexer_budget` divisible by `indexer_compress_ratio`, and `full_attention` entries. Every
+trunk layer is in `mlp_only_layers`, so the runtime still selects the dense path for all of
+them; a checkpoint with no `.mlp.experts` tensors makes the converter pad the MTP block dense
+too (Flash-Next has expert tensors, so its MTP stays MoE). This round-trips through
+`AutoConfig` under transformers 5.17 as well as through the raw path.
+
+The fixture now writes that nested layout (the real checkpoint's `full_attention` spelling),
+and its GDN ratio is 3 (2 key / 6 value heads at 32), the Qwen4 27B's reported 16/48 ratio. `tools/qwen4-v-reorder-check.py` asserts the
+permutation against an explicitly built reference index at ratio 3 (fixture and Flash-Next
+16/48) and at the pre-existing ratio 2 (Qwen3.5-9B 16/32); with torch it runs the converter's
+own `_reorder_v_heads` at all three and fails unless the ratio-2 output equals the old
+permutation. Without torch it checks the numpy reference and says the converter half is
+skipped.
+
+The torch run found the fixture's own writer missing the converter's 1-D reorder: `ssm_a` (the
+converter's `A_log`) and `ssm_dt.bias` are per-V-head tensors, and the converter reorders them
+as `(num_v, head_dim=1)` like `in_proj_a`/`in_proj_b`. The llama.cpp GDN graph consumes the
+tiled V order that the converter emits (the same order `in_proj_z` and `out_proj` carry), so the
+fixture writer now applies the same reorder to `A_log` and `dt_bias`; the earlier 1.4-1.7 max
+diffs were permutations, not rounding. The compare tool now prints a `FAIL values ...` line
+with the element count and only prints the one-ulp note when the tensor is within tolerance.
+`qwen4exp.vocab_size` is removed from the fixture GGUF: the generic loader reads `n_vocab` from
+`tokenizer.ggml.tokens` when the key is absent, and the converter does not write it for a GPT-2
+vocab. `CONVERTED_GGUF=<converted.gguf> tools/qwen4-dense-fixture-check.sh` now runs the
+loader-level gate: the fixture's logits saved by `llama-perplexity`, then the converter's GGUF
+with `--kl-divergence` against them, requiring mean KLD 0 and same top p 100.
+
+The fixture also ships a tokenizer, so `Qwen2Model.set_vocab` runs without an override: a
+minimal byte-level BPE (`tokenizer.json`, `tokenizer_config.json`) with the 256 GPT-2 byte
+tokens and no prefix space. It carries one merge, joining byte 0 and byte 1, so llama.cpp finds
+the merges key a GPT-2 vocab requires; no text contains that pair, so encoding stays one token
+per byte and `get_vocab_base_pre` sees the same sequence; the patch adds its `chkhsh` branch
+mapping to the `gpt-2` pre-tokenizer (the only structural match in llama.cpp). The merged
+string is a normal vocab entry at the last id, so it stays out of the emitted token ids. This
+branch is for the synthetic fixture alone - a real Qwen4 tokenizer keeps its own pre hash.
+The fixture GGUF now writes the same GPT-2 vocab and merges, so the converter's GGUF and the
+fixture's GGUF tokenize `probe.txt` identically and can be compared at the logits; tokenizer
+keys themselves stay outside the comparison.
+
+**Evidence class**: `code` for the converter change, `measured-here` for the torch run (0163).
+That run first found the MTP assert before any file was written; this patch removes it, and the
+fixture gained its tokenizer for the run. The 0163
+fixture writes the same checkpoint as safetensors + `config.json` + tokenizer for that run, and
+its GGUF is written through gguf-py's qwen4exp tensor mapping with the same transforms as
+`modify_tensors`, so the loader test exercises the names and shapes the converter produces. The
+two commands are in 0163; a torch host runs them on the no-MTP and MTP variants.
+
+## 0163-qwen4exp-dense-fixture.patch
+
+No dense Qwen4 weights exist, so the plumbing is built against a synthetic fixture:
+`tools/qwen4-dense-fixture.py` writes random weights with numpy (no transformers model classes,
+no `trust_remote_code`, no Python model loader) at scaled-down published ratios - hidden 512,
+Q 12 : KV 2 heads at head 32 (the 24:4 ratio), HC 4 streams with low rank 64 (640/5120), GDN
+key value 2:6 heads at 32 (16:48), QSA on layers 2 and 4, layer 4 deliberately without indexer
+tensors, a dense SwiGLU MLP of 1408 on all six layers, no PLE keys - as safetensors +
+`config.json`, a minimal byte-level BPE tokenizer, a `probe.txt` for perplexity, and a GGUF.
+A fixed seed makes it reproducible.
+
+`config.json` is the HF layout: outer `model_type` `qwen4_exp`, the text fields under
+`text_config`, as the real checkpoint has them. `--mtp` writes the MTP variant: `mtp_num_hidden_layers` 1 in the text config and one nextn block in
+the qwen35 / Flash-Next layout - a full-attention QSA layer at `mtp.layers.0`, `fc_embedding` +
+`fc_hidden` (concatenated to `eh_proj` as the converter does), `pre_fc_norm_embedding` /
+`pre_fc_norm_hidden`, and a `hyper_connection_mixer` with the down/up pair. The GGUF gets
+`block_count` 7, `nextn_predict_layers` 1 and one extra indexer compress ratio. It also
+carries `mtp.norm`, the qwen35-style `shared_head_norm`: 0161 adds that tensor to the arch's
+list and loads it optional (`TENSOR_NOT_REQUIRED`) because a Qwen4 checkpoint may ship it, but
+`graph_mtp` does not consume it - the head norm the graph uses is `nextn_hc_head_norm`. The
+check asserts both are loaded.
+
+`tools/qwen4-dense-fixture-check.sh` runs the V-head reorder test, generates the fixture, runs
+`llama-perplexity` on the CPU and asserts the indexer-fallback log line, the dense-MLP classification and a finite PPL. It
+runs three arms at `measured-here`, CPU, `-c 128 -b 16 -t 2`: the mixed one above (PPL
+292.9699) and `--no-qsa`, a checkpoint with no indexer keys and no indexer tensors at all
+(dense attention everywhere, PPL 297.9606), and `--mtp` (trunk PPL 292.9699; the same trunk
+weights). RED on the pre-0161 build (integer divide by zero before the loader reaches the
+assert); GREEN after it. The mixed arm runs one dense-attention layer without an indexer
+beside a QSA layer, and no PLE, in the same forward; the no-QSA arm exercises the absent key
+group and the absent cache. The MTP arm loads the nextn tensors (`n_layer_all = 7`) and
+`llama-cli --spec-type draft-mtp` builds and runs the in-model MTP graph (`mtp_tok_embd-6`,
+`mtp_h_input` nodes), which perplexity does not exercise; `nextn.shared_head_norm` loads
+optional when the checkpoint carries it.
+
+**Converter comparison** (a torch host, CPU only, after `convert_hf_to_gguf.py` runs end to end -
+no `set_vocab` override). The reorder check first, then both variants:
+
+```
+python3 tools/qwen4-v-reorder-check.py
+
+python3 tools/qwen4-dense-fixture.py --out <dir> && \
+python3 convert_hf_to_gguf.py <dir>/hf --outtype f32 --outfile <dir>/converted.gguf && \
+python3 tools/qwen4-dense-fixture-compare.py <dir>/qwen4-dense-fixture.gguf <dir>/converted.gguf
+CONVERTED_GGUF=<dir>/converted.gguf bash tools/qwen4-dense-fixture-check.sh
+
+python3 tools/qwen4-dense-fixture.py --out <dir-mtp> --mtp && \
+python3 convert_hf_to_gguf.py <dir-mtp>/hf --outtype f32 --outfile <dir-mtp>/converted.gguf && \
+python3 tools/qwen4-dense-fixture-compare.py <dir-mtp>/qwen4-dense-fixture-mtp.gguf <dir-mtp>/converted.gguf
+```
+
+`qwen4-dense-fixture-compare.py` checks the tensor name set, every shape, every value within
+1e-5 (bit-exactness is reported but not required: torch and numpy libm may differ by one ulp),
+and every `qwen4exp.*` key; tokenizer keys are excluded by design.
+
+`measured-here`, a torch host (CPU only, transformers 5.17): both variants convert end to end and
+match the fixture's GGUF: the plain one 123 tensors and 31 `qwen4exp.*` keys, the MTP one 151
+tensors and 32 keys, every name and shape equal and every value within 1e-5. The V-head reorder
+check passes at ratio 3 (the fixture and Flash-Next's 16/48) and keeps the earlier permutation at
+ratio 2 (Qwen3.5-9B's 16/32).
+
+## 0164-test-backend-ops-dense-qwen4-shapes.patch
+
+Four real-shape groups are added to the eval (and where the GDN cases sit, the perf) list:
+- HC `4 x 5120` with low rank 640, 1 and 4 tokens;
+- QSA attention, 24 query heads on 4 KV heads at head size 256, over the selected 2048 cells,
+  1 decode row and 6 verify rows;
+- GDN 16 key/value heads at 128 with 48 V heads (v_repeat 3), 1 and 4 tokens;
+- a dense SwiGLU FFN at 5120 hidden with intermediate 14336 and the disputed 17408, gate/up and
+  down, a 4-token activation.
+
+`measured-here`, CPU: `HC_MIX` 2/2, `GATED_DELTA_NET -p head_count=16` 21/21 (the group's other
+cases included), `FLASH_ATTN_EXT -p kv=2048` 26/26, and the four FFN `MUL_MAT` cases 4/4 pass. `measured-here`,
+card (B60, OpenCL): `HC_MIX` 2/2, `GATED_DELTA_NET` 21/21, `FLASH_ATTN_EXT` 26/26, the FFN
+`MUL_MAT` groups 21/21 and 2/2, nothing unsupported. The commands:
+
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o HC_MIX -p 'n_embd=5120'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o GATED_DELTA_NET -p 'head_count=16'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o FLASH_ATTN_EXT -p 'kv=2048'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o MUL_MAT -p 'm=(14336|17408)'
+    LLAMA_BIN=<opencl build> ./bin/test-backend-ops -b <card> -o MUL_MAT -p 'm=5120,n=4,k=(14336|17408)'
+
+## 0165-qwen4exp-moe-frozen-check.patch
+
+The serving qwen4exp (Flash-Next) path is frozen: its MoE behaviour and its logits must stay
+bit-identical. `tools/qwen4exp-moe-frozen-check.sh` takes `BASE_BIN_DIR` (the pre-change build)
+and `NEW_BIN_DIR`, saves a synthetic qwen4exp MoE model at a fixed seed with the new build,
+writes the base build's logits and compares the new build's logits with `--kl-divergence`. The
+gate is mean KLD 0 and same top p 100 %.
+
+`measured-here`, CPU, pre-0161 against this tree: mean KLD 0.000000, same top p 100.000, PPL
+126.5492 both (evidence: the per-layer rule leaves every MoE layer's `ffn_gate_inp` path and its
+indexer cache in place). The real Flash-Next GGUF's CPU arm (and its KL) is still owed.
+
+`measured-here`, card (B60, OpenCL) against the CPU, the fixture's logits at `-c 128`: the mixed
+fixture mean KLD 0.000137 (same top p 97.18 %) at the default batch and 0.000133 at `-ub 1`;
+`--no-qsa` 0.000001 and 0.000000; the MTP variant's trunk equals the mixed fixture's. The fixture's
+weights are F32 at hidden 512, so its few fallback lines (small-K F32/F16 products) are the
+fixture's shapes, not the 27B's. The commands, at the published dense shapes and the context the
+unit serves:
+
+    # fixture CPU vs OpenCL logits (KL), the same file on both arms
+    tools/qwen4-dense-fixture.py --out <dir>
+    <cpu build>/bin/llama-perplexity -m <dir>/qwen4-dense-fixture.gguf \
+        -f <dir>/probe.txt -c 128 -b 16 --save-all-logits <dir>/cpu.logits
+    <opencl build>/bin/llama-perplexity -m <dir>/qwen4-dense-fixture.gguf \
+        -f <dir>/probe.txt -c 128 -b 16 --kl-divergence \
+        --kl-divergence-base <dir>/cpu.logits
+    # the shapes on the card: the 0164 commands above, and `perf` for the same -o/-p sets
+    # the memory line for the HC model at the served 262,144 context: the load's KV cache,
+    # compute buffer and model MiB, plus the guard's figures (the card's used/total, the
+    # process's fdinfo vram0 and GTT) at `--n-ctx 262144`; the real GGUF is owed
+
+
+## 0167-opencl-q8_0-mul_mat_id-prompt-kernel.patch
+
+Inkling 2 Mini's four coda layers (20-23) keep their experts in Q8_0 while layers 0-19 hold
+IQ4_NL: gate_up K=2304 -> 2 x 2304 rows and down K=1152 -> 2304 rows, 128 experts, top-8.
+0156 serves their **decode** batch (`n_tok < 16`) on the int8 dot; a **prompt** batch had no
+GEMM and fell to `kernel_mul_mv_id_q8_0_f32_flat`, the flat float matvec — one float dot per
+value, at 512 tokens about 800 ms a layer for gate_up against 87 ms for an IQ4_NL layer on the
+same card (`measured-here`, B60, 23.2 % of a pp4096 ub512 profile).
+
+0167 adds `kernel_mul_mm_id_q8_0_i8` to `mul_mm_kq_i8.cl`, beside the IQ3_S and IQ4_NL kernels
+of 0071: one work-group takes I8XT = 32 route pairs of one expert and I8XSG = 8 sub-group
+groups of 16 output rows, stages the pairs' int8 activations a 256-weight super-block in local
+memory, and runs the s8 8x16x32 DPAS a 32-block per 8-pair group, K ascending, scaled by the
+weight block's `d` and the activation's per-32 scale — the IQ4_NL kernel's body and macros
+(`I8_COLS`, `I8_STAGE`, `I8_DPAS`, `I8_STORE`) unchanged. The difference is the weight read:
+a Q8_0 block holds its 32 codes as s8 already, so the b operand is the flat plane's 32 bytes
+read as eight words (no decode, no grid table, no K super-block), and `ws` is the block's half
+scale. The block's index is `(expert * ne01 + row) * (ne00 / 32) + kb / 32`, the flat plane's
+layout 0156's decode kernel uses.
+
+`kq_i8_ops.inc` gains `kq_i8_q80_wanted(GGML_OPENCL_Q8_MM_ID)`: unset is **on** (a Q8_0 prompt
+MUL_MAT_ID has no other GEMM), `0` and `off` (case-insensitive) turn it off. The Q8_0 decode arm
+is not gated by it. The program gate is the union — the int8 program is built when either the
+K-quant arm's `GGML_OPENCL_KQ_MM_ID_I8` or this arm wants it, so the default path pays the
+program compile a unit start. One limitation stays: the kernel is the SG16 s8
+DPAS, so it runs on Intel only (Adreno's SG8 arm is 0156's and the K-quant tile's).
+
+## 0168-opencl-q8_0-mul_mat_id-prompt-dispatch.patch
+
+`ggml_cl_mul_mat_id_q8_0_prompt` takes a prompt batch the way the IQ experts take theirs:
+`kernel_moe_route_tiles` sorts the (token, slot) pairs by expert into 32-pair tiles (the IQ
+arm's route, and its per-ids cache), `kernel_kq_mm_id_quant_i8` quantizes src1's columns to the
+q8_1-style int8 form the tile kernel stages (one activation a column — the frozen gate/up
+broadcast serves one column a token, not one a pair), and `kernel_mul_mm_id_q8_0_i8` runs the
+tile. Guards: `n_tok >= 16`, ne12 == n_tok, src0's ne3 == 1, ne00 a multiple of 32, ne01 a multiple of 16,
+at most 512 experts (the route kernel's local arrays), contiguous, the flat Q8_0 SoA planes, not an expert cache's `.slots` / `.bank`, and the int8 kernels built.
+Anything else keeps the generic arm, so the card's fallback is exactly today's.
+
+The dispatch sits after 0156's decode arm in `ggml_cl_mul_mat_id`; 0156's function and its
+guards are byte-identical.
+
+## 0169-opencl-q8_0-mul_mat_id-prompt-tests.patch
+
+Six test-backend-ops `MUL_MAT_ID` cases in the coda shapes: 128 experts, top-8, 2304 rows, the
+gate/up K 2304 with a broadcast b and the down K 1152 with a column a pair (ne11 = 8), at 16
+tokens (the arm's floor), 512 and 2048 (the prefill chunks). They are in the eval list; the perf
+list keeps 0156's decode cases, which stay as they were.
+
+CPU: `test-backend-ops -b CPU -o MUL_MAT_ID` 1038/1038, the Q8_0 arms 84/84 and the six new
+cases OK; `test-opencl-kq-i8` is all OK device-free.
+
+`measured-here`, card (B60 at its 165 W cap, Inkling 2 Mini IQ4_NL with the Q8_0 coda):
+- `MUL_MAT_ID` 542/616, the 74 failures all `mxfp4` (known, before this patch); the red build
+  (the kernel's `ws` scale dropped) fails 47 Q8_0 cases.
+- `llama-bench -fa 1 -p 4096 -b 4096`, two rounds: `-ub 512` 410.6 -> 522.4 t/s (+27.2 %). The
+  prompt profile's Q8_0 MUL_MAT_ID share falls from 23.2 % on the flat matvec to 2.1 % on the tile.
+- KL against the CPU reference: 0.001952 (same top p 98.50 %) against the baseline's 0.001950
+  (98.34 %) at the default batch; 0.001988 at `-ub 1`, identical to the baseline (the decode
+  batch does not take this arm).
+
+## 0170-opencl-f32-wide-n-gemm.patch
+
+Two of Inkling 2 Mini's three generic-matvec shapes go to the tiled F32 GEMM
+(`kernel_mul_mm_f32_f32_l4_lm`) that `ggml_cl_mul_mat_f32_skinny` already runs: the relative
+bias table (K 16, 1025 rows, a 2-D weight over a 3-D src1 whose ne[2] is the tokens) and the
+controller pairs (K 64, 2304 rows, 512-2048 columns). The GEMV arm's row bound (256 above 8
+columns) is a one-column-shape bound, so the GEMM branch takes any row count; K need only be a
+multiple of the kernel's BK 16 (a single block at K 16, four at K 64, ks stays 1, no slice
+sum). A batched src1 keeps one K slice and advances a batch per 64-column block: the kernel's
+`i13 / r3`, `i12 / r2` split gets r2 = b's batches and r3 = 1, and `batch_stride_b` becomes a
+batch's columns (`ne00 * ne11`) where it was a slice's K. The f16-copy GEMM (0110) declines
+these: it requires a 2-D src1, and it would multiply through an f16 copy of the weight, where
+the l4 path is exact F32. Shapes the arm already accepted are unchanged: for them `kslice` and
+`ne00 * ne11` coincide only when ks == 1 and the batch is flat, and the 2-D case keeps
+`kslice`.
+
+## 0171-opencl-f32-tiny-k-batched.patch
+
+The depth mix's second product — src0 an activation [K <= 8, 2304, tokens], src1 the scores
+[K, 1-3, tokens] — fits none of the existing paths: the tiled GEMM needs K a multiple of BK 16,
+the GEMV arm K % 64, and the f16 copy a 2-D src1. `kernel_mul_mat_f32_f32_smallk` takes it
+batched: a lane a row (a 64-row block), the K loop (1-8) in registers, one work-item a column
+of a batch, the batch on the second dimension. `GGML_OPENCL_F32_SMALLK=0` turns it off and
+leaves the generic matvec.
+
+## 0172-opencl-f32-wide-n-tests.patch
+
+test-backend-ops at the graph's shapes: `MUL_MAT` f32/f32 1025 x 512 and 2048 columns at K 16,
+2304 x the same columns at K 64, and a new `test_mul_mat_f32_wide` (a 2-D weight, a 3-D b) at
+2304 rows, K 1 / 6, one or three columns a token, 512 and 2048 tokens. CPU: 8/8 OK, the CPU
+MUL_MAT suite unchanged; the OpenCL build compiles and the matvec kernel file passes `cpp -P`.
+
+## 0173-expert-cache-projected-bytes.patch
+
+The spill guard's cache suggestion needs on-card bytes for a flag it has not started. The
+cache's own accounting is here: `llama_expert_cache::project_device_bytes(budget)` replays the
+init's slot plan over the stored ranking, recomputes the lend set at that budget, and sizes the
+slot buffer, Q8_0 banks, tables, lend tail, the candidate layers' spare buffers and the gather
+mirror with `ggml_backend_alloc_ctx_tensors_from_buft_size` on the cache's own buffer type, the
+same functions load uses. No allocation is made. `llama_model_expert_cache_projected_bytes`
+exposes it for one cache. arcint walks down from the refused flag (coarse steps, then refined upward) to the largest flag
+whose projected bytes fit the free bytes beside the other terms; the projection is not
+monotonic at low budgets, where a Q8_0 bank holds every expert. The suggestion is a flag value,
+so following it starts. `ARCINT_GUARD_TRACE=1` logs every probe (flag, projected bytes, free
+bytes, verdict).
+
+`measured-here`, B70, Flash-Next on its unit's flags with `--llama-expert-cache 40000`: refused,
+the projection at 40,000 is 40,409 MiB (the load's own figure), the suggestion is 19,107; the
+restart with 19,107 starts (cache 19,437 MiB on the card) and measures 32,402 of 32,656 MiB after
+the first request, against 32,192 predicted.
+
+## 0175-opencl-f32-tiny-k-batched-guard.patch / 0176-opencl-f32-tiny-k-batched-tests.patch
+
+A card profile put [2304, 1|3|4, 512] of the depth mix's second product on the generic F32 matvec:
+1,408 + 384 + 128 calls at 1.078 / 1.667 / 1.498 ms, 4.7 MB of output a call, 22-75 GB/s against
+the card's 456. The arm declined every one of them: it compared src0's rows (ne1 = 2304) with
+dst's *columns* (ne1 = 1..4) instead of dst's ne0. Corrected, with the tensors' own strides
+(src0's K and row steps, src1's, dst's) so a transposed src0 view is in reach, and one lane a
+row, the K loop in registers, a column a block of 64 lanes. At decode the shape [2304, 1, 1] is
+one launch a mix and launch-bound, so a faster kernel does not help there — the launch count
+does, and the transposed copy is the launch to fold: `ggml_cont` of a `ggml_transpose` feeding
+this product. A CPU reference refuses a transposed mul_mat src0
+(`GGML_ASSERT(!ggml_is_transposed(a))`, seen locally), so the fold has to be the backend's own
+read and the graph keeps the copy for now; the fusion of CONT(TRANSPOSE(x)) into this arm is the
+way to take it without a copy.
+
+0171 shipped the tiny-K arm on when unset and 0170's wide-N GEMM unconditional; 0175 put them
+behind `GGML_OPENCL_F32_SMALLK=1` (the mix shapes) and `GGML_OPENCL_F32_WIDE_N=1` (the K 16 / 64
+wide-N ones), and 0180 then made the tiny-K and small-M arms default on. `GGML_OPENCL_F32_WIDE_N` stays default **off** — a card run showed no
+measurable gain from it, so the default tree is the 0175/0176/0178 build on, not 0170's. The
+wide-N GEMM no longer takes shapes the old selection already served (its row bound, or K a
+multiple of the GEMV's 64), and its slice sum runs only above one K slice: unconditional, it
+copied 12,595,200 elements a call, 218 ms of a prompt window, and gained nothing.
+
+The permuted `kernel_cpy_f32_f32_pack` of [24, 1025, 512] (1.33 ms a call, ~75 GB/s each way) is
+producer `ggml_cont(ggml_permute(table, 1, 0, 2, 3))` after the relative-bias table product and
+consumer `ggml_get_rows(table, rel_pos)`: the permute exists because the gather walks the
+distance axis, which get_rows only does on ne1, so folding it needs a gather that walks ne0, not
+a GEMM read.
+
+
+## 0177-opencl-f32-tiny-k-batched-batch-stride.patch
+
+A card run of 0175/0176 with `GGML_OPENCL_F32_SMALLK=1` gave KLD 10.38 at the default batch (top-p
+agreement 0.07 %) and op `MUL_MAT(m=2304,k=6,n=1..4,nb=512,n_slot=8)` ERR ~2.0 — the four shapes
+whose src0 is a 3-D view over the depth-mix stack; the plain 2-D ones and the decode shape
+(nb = 1) passed. Cause: a 3-D src0 is a slab a token at its own nb[2] (the view keeps the stack's
+stride), and the kernel's address had only the K and row steps, so every column read slab 0. The
+batch step is an argument now (0 for a shared 2-D weight), and the arm requires a contiguous 3-D
+src0 so a slab's step is the tensor's own. The CPU cannot show it: the arm is Intel OpenCL only
+and the CPU reference computes the batched product with its own kernel, so only a device run (or
+the op test's CPU comparison on the device) sees the layout.
+
+The card then put the n=3 and n=4 cases on the fault: `MUL_MAT(m=2304,k=6,n=3,nb=512,n_slot=8)`
+read out of bounds ("Engine memory CAT error" and a timed-out job, `clWaitForEvents -14`), which
+is 0179's subject; n=1 was correct from 0177 on.
+
+## 0178-opencl-f32-split-k-gemv-batched.patch / 0179-opencl-f32-tiny-k-batched-column-stride.patch
+
+Two independent F32 arms, both behind their own knob and both off by default.
+
+0178 is the depth mix's **first** product: `scores = mul_mat(states, queries)` in
+`src/models/inkling2.cpp:216`, src0 the `rms_norm` of a `view_3d` of the bank stack (K 2,304 on
+ne0, M the block count 2 on ne1, the 512 tokens on ne2), src1 `msg_query` [2,304, 4] repeated over
+the tokens, dst [2, 4, 512]. The profile put `kernel_mul_mm_f32_f32_l4_lm` at 128x1x512 for exactly
+this dst: the tiled GEMM's column tile is 64, so a call ran 512 batches of a 64x64 tile holding
+8 outputs, each work-group the whole 144-block K loop — 2.0 ms a call, 384 calls, 4.9 % of a
+prompt window (measured-here, B60, pp4096 ub 512). `kernel_gemv_f32_f32_splitk_batch` is its own
+layout: one work-group a (token, column, row), the K split into 16-aligned slices and summed. The
+split is **36, a slice 64** floats: 2,304 = 36 * 64, and a 64-way split would leave 36-long slices,
+off the 16 alignment, so the largest aligned slice is 64. Target: 9.44 MB of src0, 18.87 MB of
+src1 (4.72 MB unique; the repeat is materialized), 16 KB of dst — 28.3 MB, **~71 us at 400 GB/s**
+against 2.0 ms. `GGML_OPENCL_F32_SMALL_M=1` turns it on; unset keeps 0175-0177's selection.
+
+0179 fixes the tiny-K arm's OOB: a batch's columns were flattened as (token, column) and b and
+dst were stepped by the flattened index, so a token's slab step was multiplied by the column
+count (`dst[c*rd]`, `src1[c*rb]`, and src0's slab by `c*ba`). n=1 has one column a token and was
+correct; n=3 and n=4 read src0 3x and 4x past its buffer (src1 and dst are contiguous, so their
+flattened index stayed in range). The column is split into its extents now
+(`nc1 = src1->ne[1]` binds it, b and dst advance a token by their own nb[2], src0's slab by the
+token index), so every read stays inside.
+
+The red series cannot reach the K=1 case by construction: its mutation (0175/0177's K sum cut to
+its first term) is the *whole* sum when K=1, so `MUL_MAT(m=2304,k=1,n=1,nb=512,n_slot=8)` passes
+there and only the K>1 cases fail. What failed the K=1 case on the card was 0177's stride defect
+— the slab-0 read — at ERR 1.999, which is why 0177's own red is the right one for it.
+
+Both arms also compute, before the enqueue, the furthest byte each kernel can reach from the
+global size and the strides handed to it (a view's offset included) and compare it with the
+allocation of the backend buffer the tensor lives in (`CL_MEM_SIZE` of its `data_device`):
+`GGML_OPENCL_BOUNDS=1` aborts a violation, and the check is what an op run on the card exercises
+first. It catches a read or write past the allocation, not one into a neighbouring tensor of the
+same buffer; in the op cases below each tensor is its buffer, so there the max byte equals the
+buffer exactly. 0170's wide-N arm (off by default) has no such check:
+
+0179's cases (the mix layout, src0 a contiguous copy of the transposed slice, k a block count,
+n a query count, nb 512 tokens, n_slot 8):
+- k=6, n=1: src0 6 * 2304 * 512 * 4 = 28.31 MB, src1 1 * 6 * 512 * 4 = 49.2 KB, dst
+  2304 * 1 * 512 * 4 = 4.72 MB — max bytes 28,311,552 / 49,152 / 4,718,592, each equal to its
+  buffer;
+- k=6, n=3: src1 3 * 6 * 512 * 4 = 147.5 KB (max 147,456), dst 2304 * 3 * 512 * 4 = 14.16 MB
+  (max 14,155,776);
+- k=6, n=4: src1 4 * 6 * 512 * 4 = 196.6 KB (max 196,608), dst 2304 * 4 * 512 * 4 = 18.87 MB
+  (max 18,874,368);
+- k=1, n=1: src0 1 * 2304 * 512 * 4 = 4.72 MB (max 4,718,592), dst 4.72 MB.
+0178's shape (k 2304, m 2, n 4, nb 512): src0 2 * 2304 * 512 * 4 = 9,437,184, src1
+4 * 2304 * 512 * 4 = 18,874,368, dst 2 * 4 * 512 * 4 = 16,384, partials 36 * 4096 * 4 = 589,824 —
+each is its buffer's size, read and written to its last float.
+
+
+**Card, measured-here (B60, Inkling 2 Mini IQ4_NL, the series through 0179):** op
+`MUL_MAT` green 2,980/2,980 with `GGML_OPENCL_BOUNDS=1`; the red series fails 6 of the 7 targeted
+cases, and the kernel log shows no fault either way. pp4096 at ub 512: 0167-0169 alone 522.5 t/s,
+`SMALL_M` 538.1 (+3.0 %), `SMALLK` 606.9 (+16.2 %), both 628.2 (+20.2 %), both with the int8
+expert arm 676.6 (+29.5 %); ub 1024 with both and the int8 arm 712.2. Decode at d4096 36.0 ->
+36.4 t/s. KL against the CPU reference with both arms: default batch 0.001979 (0167-0169's baseline
+0.001952), `-ub 1` 0.001949. 0178's kernel reaches ~1.6 ms a call — its gain is mostly the
+`l4_lm` node it removes, not the new arm's own throughput.
+
+**0178's 1.6 ms a call:** the tensors are 28.3 MB (71 us at 400 GB/s), the traffic 75.5 MB (189 us).
+The launch is 36 slices x 4,096 outputs, 147,456 work-groups of which 16 lanes work at a 64-float
+slice. Each work-group reads 256 B of an src0 row and 256 B of an src1
+column and writes one float, so the traffic is 75.5 MB — src0 four times (one per query column,
+9.44 MB each time) and src1 twice (one per slot row, 18.87 MB each time) — and a call is 921
+work-groups a core in 1.6 ms, 1.7 us a group. The time is the barrier tree, not the bytes: four
+steps of the 16-lane reduction and a store per work-group, 36 work-groups a output. The next
+step, not written: one work-group a token, its eight outputs (2 rows x 4 columns) as four
+subgroups of 16 lanes with the K loop inside the subgroup and no split-K or slice-sum launch —
+a token's src0 2 x 9 KB read four times and its src1 4 x 9 KB twice, the same 75.5 MB at a
+barrier-free reduction. Beyond that the repeat is the observation: src1's four query columns are
+the same rows for all 512 tokens (18.9 MB of repeated data, 4.7 MB unique), and reading one slab
+would need the graph to hand the arm the 2-D parent, which the dispatch cannot see.
+
+## 0180-opencl-f32-arms-on-by-default.patch
+
+`GGML_OPENCL_F32_SMALLK` and `GGML_OPENCL_F32_SMALL_M` are on unless set to `0` (`off` also works);
+`GGML_OPENCL_F32_WIDE_N` stays off, its arm having shown no measured gain (0170/0172 stay in the
+series because 0175, 0176 and 0178 are built on their hunks). Unset, the tree takes 0175-0179's
+arms and 0167-0169's dispatch otherwise.
+
+Evidence that no other production model reaches the arms (`measured-here`, the arms on against off
+on the same card, `GGML_OPENCL_BOUNDS=1`): Qwen3.8 27B on the B60, mean KLD 0.000000 between the
+two runs, same top p 100 %; Flash-Next IQ3_S on the B70 (experts on the CPU), 0.000000 and 100 %;
+no bounds abort. That matches the code: both arms take only F32 x F32 products, and no node of
+those models has K <= 8 (SMALLK) or a 3-D activation on both sides with at most 8 rows and columns
+(SMALL_M); their F32 tensors are 2-D weights with K of 128 and more, or 1-D scales.
+
+## 0190-opencl-q8_iq4-mul_mat_id-wide-tile.patch / 0191-...-wide-dispatch.patch / 0192-...-wide-tests.patch
+
+The int8 expert tile (0071, and 0167-0169's Q8_0 prompt arm on it) runs one work-group a (route tile, 128-column band), and a launch is
+`CEIL_DIV(ne01, 128)` bands deep: 18 for a 2,304-row expert, 36 for one of 4,608. Every one of those
+work-groups stages the same tile's 32 pairs of int8 activations into local memory, so a tile's block
+is filled 18 times over. The wide tile takes a 512-column band a work-group instead, 16 sub-groups
+of 16 lanes with two columns a lane, 5 bands over 2,304 rows: the staged block is filled once for
+512 columns, and the launch has 5 bands for the narrow tile's 18.
+
+The model behind it, from the card's per-launch fit (`measured-here`, profiling build, Inkling, I8
+on, pp4096, 44 IQ4_NL visits, 8 chunks at ub 512 = 352 launches a kernel): gate/up `0.71 ms + 6.1
+us a token` and down `0.21 ms + 3.6 us a token`. The floor is launch and empty-tile work (~324 ms a
+run at ub 512, ~80 at 2048); the slope is per-tile work, and a real 32-pair tile is ~1.35 us at
+gate/up and ~0.8 us at down for 248 KB and 124 KB of traffic — weight blocks read a tile once, the
+staged activations read once a band, 18 times a tile. Down's ratio to the reference is worse (1.72x
+a visit against 1.23x) because its staged activation is a larger share of a work-group's bytes: the
+fill's 16-byte loads step 1,152 bytes apart across 32 pairs, 4 sectors to a useful read, while the
+reference's down reads its activation contiguous (trellis-serve, `xpu/csrc/exl3_moe.sycl:559`
+`DownDpasKernel`, `ablk` `[b][r][MB][16]`, and `:432` `GateUpDpasKernel`, `acc = NT*MB*16` at `:466`,
+`MB` 32 at `:795`, `T1` 72 at `:807`, @8f8e2fcc, MIT). The wide tile attacks both terms: bands
+18 -> 5 per tile, so the staging slope falls and the empty/launch floor falls with the work-group
+count. The predicted numbers it has to meet at ub 512 are gate/up 1,378 -> ~1,050 ms and down 742 ->
+~510 ms a run; at ub 2048, gate/up 1,149 -> ~870 and down 671 -> ~470 (the slope coefficient is the
+same a token at both, the floor differs).
+
+Register budget: a lane holds two columns by 32 pair slots = 64 float accumulators, 64 GRF, plus the
+two weight operands (8 words each), two scales and the staged-loop addresses, about 90 GRF of the
+256 the program is built with (`-cl-intel-256-GRF-per-thread`, as the narrow program). The whole
+2,304-row band would be 9 columns a lane, 288 floats, over the budget, and 4,608 rows 576; that is
+why the band is 512 rather than the expert, and the split is the knob's geometry. Whether IGC spills was not
+read from a build log. On the card the kernel times land above the prediction by 11 % (gate/up) and 17 % (down) at ub 512
+and by 7 % and 3 % at ub 2048, not the several-fold a
+rolled K loop gives (inference).
+
+The tile is its own program (`mul_mm_kq_i8_wide.cl`, the helpers and the mm tables prepended as the
+narrow one's), so with `GGML_OPENCL_KQ_MM_ID_I8_WIDE` unset nothing new is compiled and both int8
+paths — the IQ4_NL arm and Q8_0's prompt arm — take the narrow tile and grid exactly as today. The
+knob (`1` or `on`) reaches both. Both kernels keep every buffer the same and add no scratch: the
+route's pairs, tiles and tile count, the int8 activation buffer and its scales, the weight planes and
+dst. Under `GGML_OPENCL_BOUNDS=1` a wide launch checks the furthest byte of each of them
+(`ggml_cl_bounds("int8 wide", ...)`), including `blkmax` over the last expert's last row and last K
+block (on the planes or the stage the kernel reads; see below for a USM bank), `n_cols * ne00` on the activation, `max_tiles * sizeof(cl_int4)` on the tiles, and
+`offsetd + (n_tok-1)*nb2 + (n_used-1)*nb1 + ne01*4` on dst.
+
+Licence: the reference file is MIT; no line of it is copied here — the geometry is followed, the
+code is this tree's OpenCL form of the narrow tile — so no NOTICE entry is owed. A later port that
+copies lines would owe the MIT notice in the file header, a `THIRD_PARTY.md` row, and the repo and
+commit (`trellis-serve` @8f8e2fcc) in the commit message.
+
+Tests: `test-opencl-kq-i8` reads the knob's parse (unset/off/0 off, 1/on on) and assembles the wide
+program as the backend does, text-checking it and compiling it when a clang exists. `test-backend-ops`
+carries Inkling's real expert shapes, 128 experts top-8, at 512 and 2048 tokens. The correctness and perf lists carry
+IQ4_NL gate/up as 2,304 rows at K 2,304, both projections in one tensor, 4,608 rows at K 2,304 (the 9-band launch), and
+down as 2,304 rows at K 1,152 (4.5 super-blocks, so the staging loop's last group is partial); the 4,608-row and skew
+cases are IQ4_NL only. 0192 adds 12 correctness cases: 10 IQ4_NL, 6 real-shape (the three shapes at two batch sizes)
+and 4 skew (two shapes at two batch sizes), and two Q8_0 cases that take 0168's fallback (520 rows, not a multiple of 16;
+520 experts, more than 512). The Q8_0 real-shape cases are 0169's six (two shapes at 16, 512 and 2048 tokens), so the
+two patches carry 16 distinct real-shape cases and the two fallback cases. The perf list has six a batch size: the
+three IQ4_NL shapes, two Q8_0 (2,304 rows K 2,304 and 2,304 rows K 1,152), timed next to the narrow tile, and one skew. It also carries
+`test_mul_mat_id_skew`, every slot of every token on expert 0 (2,304 rows at K 2,304 and at K 1,152; the perf list has
+the K 1,152 one), so one expert takes a whole chunk and
+the rest are empty tiles. A tile is 32 pairs. Uniform top-8 over 128 experts gives ~32 pairs an expert at 512 tokens (one
+tile) and ~128 at 2048 (four). The skew case gives 128 and 512 tiles to expert 0. The band loop, the last band's second
+column past `ne01`, the partial super-block and the empty-tile tail are all reached. Red tree, the named mutation: in
+`mul_mm_kq_i8_wide.cl`, `acc1[g] +=` becomes `acc0[g] +=` in `I8W_MAD`, so column 0 accumulates both products and column
+1 stays zero.
+
+Bounds under `GGML_OPENCL_BOUNDS=1` follow the weight arguments the kernel is given (`ggml_cl_kq_weight_args`): the SoA
+planes with their offset, or the gathered stage an expert cache hands the kernel. The helper carries no branch for a
+Q8_0 tensor stored as it came (not in SoA planes): unreachable (`code`), the wide int8 arm is IQ4_NL only (its
+kernel exists only for type index 5), and the Q8_0 prompt arm returns before the call unless
+`ggml_cl_is_q8_0_soa(src0)` holds, under `ggml_cl_mul_mat_id`'s `GGML_ASSERT(src0->extra)`. An expert bank in USM host memory
+would be a pointer argument with no buffer size to compare against; the helper returns without bounding it and logs
+nothing. For the wide tile that route does not occur (`code`): an IQ4_NL bank in USM is always gathered first, and the
+Q8_0 arm refuses an expert cache's `.slots` and `.bank` tensors.
+
+Card evidence (`measured-here`, the B60 at a 165 W cap unless the B70 (220 W) is named, Inkling 2 Mini IQ4_NL,
+`GGML_OPENCL_KQ_MM_ID_I8=1` in every arm):
+
+- Op cases with `GGML_OPENCL_BOUNDS=1`, on this revision built from the series itself (apply-series.sh on the pin; the
+  applied tree's `git write-tree` is a5610fc1):
+  - Inkling's 16 distinct real-shape MUL_MAT_ID cases (128 experts, top-8: 0192's 10 IQ4_NL, 0169's six Q8_0) pass 16/16
+    with the knob on and with it off; without the knob, no wide program is built. 0192's two Q8_0 fallback cases (520
+    rows; 520 experts) pass 2/2. The run logs the generic path once for their shared key (`DOWNGRADE src=opencl
+    op=MUL_MAT_ID type=q8_0 k=256 path=generic reason=no-fast-path`, logged once a key), so a per-case path is not
+    shown.
+  - The MUL_MAT_ID suite gives 554 of 628 with the knob on; the 74 failures are the known mxfp4 set.
+  - The red tree, knob on, fails all 16 (10 IQ4_NL, 6 Q8_0).
+  - KL to the CPU reference (`-c 2048 --chunks 3`), knob off / on: ub 512 0.001932 / 0.001932 (same top p 98.208 %
+    both), ub 1024 0.001917 / 0.001917 (98.403 % both).
+  - No bounds abort in any of these.
+  - The earlier rows (the 4,608-row single case 1/1, the suite 556 of 630 with four duplicate cases counted, and
+    everything below) ran on a development worktree, not the applied series. It differed in two refusal conditions of
+    0168 (`ne01 % 16`, more than 512 experts), which pass for every shape it ran, in patches 0161-0165 (the Qwen4
+    converter and model files and their test cases), and in a comment.
+- The kernel time, speed, served and logit rows below were measured on that worktree's earlier revision of these patches
+  and were not re-measured on the applied series. Since
+  then the bounds check follows the kernel's arguments and the test shapes were corrected. The kernel text changed only in its
+  comments, and the dispatch only in the bounds helper (`code`).
+- Kernel time, profiling build, pp4096, per visit (44 IQ4_NL visits a pass; the reference's figures are per visit over its
+  48; the reference's are `measured-here` too: trellis-serve @8f8e2fcc on the same B60 at 165 W, a PTI profile over
+  the same 4,096-token fixture), narrow -> wide:
+
+  | ub | gate/up | down | the reference's gate/up / down |
+  |---|---|---|---|
+  | 512 | 31.32 -> 26.46 ms | 16.87 -> 13.56 ms | 25.4 / 9.8 ms |
+  | 2048 | 26.12 -> 21.21 ms | 15.26 -> 11.03 ms | 20.3 / 7.5 ms |
+
+  The prediction above was missed: gate/up landed at 1,164 / 933 ms a pass (predicted ~1,050 / ~870), down at 597 / 485
+  (predicted ~510 / ~470). Gate/up is within 4-5 % of the reference a visit; down is 1.38x / 1.47x.
+- llama-bench pp4096, knob off -> on: ub 512 676.5 -> 722.2 t/s, ub 1024 712.1 -> 765.7, ub 2048 672.4 -> 723.4.
+- Served, the planned Inkling unit flags (262,144 cells, `--llama-swa-window`, q8_0 KV, `--prefill-ubatch 1024`), a fixed
+  4,096-token prompt three times with `cache_prompt: false`: prefill 671.4 -> 718.4 t/s. Decode is unchanged: 35.17 t/s at a
+  4,096-token depth, 38.94 at 0.
+- Logits, knob on against off:
+  - Inkling: mean KLD 0.000000 and the same top p at 512-token ubatches; against the CPU reference the same 0.001917 /
+    98.403 % at ub 1024 and 0.001968 / 98.012 % at 2048.
+  - The red reaches the tile through `llama-perplexity` at ub 512, 1024 and 2048: KL 3.18 against 0.0019.
+  - Flash-Next IQ3_S on the B70 (no expert cache), with layers 28-47's experts on the card (`-ncmoe 28`, 512-token ubatches): 0.000000. Its
+    down projections are IQ4_NL in 39 of 48 layers, and the red there gives 0.96, so the tile is reached and changes nothing.
+  - Flash-Next on its unit's flags with the expert cache (13,000 MiB, `GGML_OPENCL_BANK_STREAM=1`, MTP 3), knob off
+    against knob on with `GGML_OPENCL_BOUNDS=1`: the same greedy text (same md5) for three prompts of 12, 3,129 and
+    8,391 tokens, and no bounds abort. A red build was not run on this route, so reach on it is not shown.
+  - The agent's Qwen3.8 27B: 0.000000. It is dense; no MUL_MAT_ID node.
+  - `-ub 1` takes the mat-vec, not the tiles.
+- The "512-column band built" load line is printed by `test-backend-ops`. `llama-perplexity` does not print it even when
+  the tile runs, so a red build, not the line, shows reach there.
+
+## 0187-opencl-cpy-transpose.patch
+
+The card's profile joins two slow `kernel_cpy_f32_f32_pack` copies: the bias table's
+`ggml_cont(ggml_permute(table, 1, 0, 2, 3))` (`src/models/inkling2.cpp:390`, 1,353 us at
+`[1025, 24, 512]`, 5,330 at 2048) and the depth mix's `ggml_cont(ggml_transpose(states))`
+(`mix()` line 219, `[2304, k, T]` -> `[k, 2304, T]`, 8-20 B a destination row). Both swap dims 0
+and 1: the source's fastest dimension is dim 1, the destination's is dim 0, so the pack kernel
+gathers one side at a 4,100-B (or 96-B) stride and reaches 74-76 GB/s against a plain copy's
+823-1,016 GB/s at the same bytes (`measured-here`, B60, constant data - the compression was in
+that pair of numbers; on random data the plain rate is 360-390 GB/s).
+
+This patch adds `kernel_cpy_f32_f32_t01`: a 16 x 16 tile of (dim 0, dim 1) through local memory,
+`reqd_work_group_size`, reads coalesced over the source's fastest dimension, a tile barrier, and
+writes coalesced over the destination's. Partial tiles on both edges are guarded per element (the
+bias table's 24 heads and 1,025 bins are not multiples of 16). `ggml_cl_cpy` takes it only when
+`GGML_OPENCL_CPY_TRANSPOSE=1`, only for F32 x F32 copies whose source and destination have the
+same shape, the source's `nb[1] == 4` and `nb[0] == ne[1]*4`, the destination contiguous, and the
+source's dim-2 stride covering the slab with dim 3 stepping by dim 2 (the exact terms are in the
+next paragraph) - **unset, the pack kernel runs exactly as before**. Both
+buffers' furthest byte is checked under `GGML_OPENCL_BOUNDS=1`. The red is a build option,
+`GGML_OPENCL_CPY_TRANSPOSE_RED=1` (`-DCPY_T_RED`): the write guard becomes `bin_w < d1 - 1`, which
+loses the last dim-1 edge - visible on 1,025 bins and on the `[33, 17, 3]` tile case.
+
+**The first card window's finding and the fix.** The first eligibility used `nb02 == nb10 * ne00` and
+`nb03 == nb02 * ne01`, both false for every real source: the token slab's stride is
+`ne00 * ne01 * sizeof(float)` (4 * 1025 * 24 = 98,400 for the bias table), not `4 * ne00`, and
+dim 3 steps by the dim-2 count. The path was therefore never taken (80/80 CONT cases passing off
+and on, the red passing, identical perf and pp) - a stride predicate that was wrong, invisible to
+a CPU test. The predicate is now a **pure function** in `ggml-opencl-cpy-t01.h`
+(`ggml_cl_cpy_t01_eligible`, no cl_ calls): F32 x F32, the same shape, a contiguous destination,
+the source's dim-1 step one float, its **dim-0 step one full fast row (`ne[1]*4`)**, its token
+stride covering the slab (`>= ne[0]*ne[1]*4`), dim-3 stepping by dim 2 - the form the kernel
+actually indexes (`src + gz*s_nb2 + dim0*s_nb0 + dim1*s_nb1`, `dst + gz*d_nb2 + dim1*d_nb1 +
+dim0*4`). `tests/test_opencl_cpy_t01.cpp` (arcint, `opencl-cpy-t01`, unit) feeds it the real
+strides derived from the graph: the bias table's view `[24, 1025, T]` with
+`nb = {4*1025, 4, 4*1025*24, ...}` from `inkling2.cpp:386/390`'s product and permute, and the
+depth mix's transpose view `[k, 2304, T]` with `nb = {9,216, 4, 9,216*slots, ...}` from `mix()`
+line 219 - and the negatives (a contiguous source, a slow step that is not one fast row, a
+non-contiguous destination, an f16 pair). Run here: all pass; **with the old terms put back,
+both real cases FAIL** (`eligible=0, want 1`, exit 1) - that is the red, on the CPU, no card.
+
+**The card can see the path ran** two ways, both in the script: the once-a-process stderr line
+`0187 cpy-transpose taken ne=[24,1025,512,1]` (GGML_LOG_INFO), and the red arm failing - it can
+only fail if the kernel ran. `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` adds
+`0187 cpy-transpose rejected: ... nb00==ne01*4 ...` naming which term failed.
+
+Tests: `test_cont_t01` cases in the correctness list (`[1025, 24, 512]`, `[1025, 24, 2048]`,
+`[2304, 4, 512]` with permute (1,0,2) and (0,2,1), the one-token `[1025, 24, 1]`, the partial
+`[33, 17, 3]`, the one-head `[1, 1025, 64]` and `[24, 1025, 7]`) and the perf list (the three
+measured shapes plus `[33, 17, 3]`). Random data, and the eval compares the destination against
+the CPU; every line names `data=random-uniform,checked=out-vs-cpu`.
+
+**Prediction, written before the card run** (`inferred`): against a plain copy's 360-390 GB/s on
+random data - the 16 x 16 tile moves 64 B a read row (16 bins) and 96 B a write row (24 heads),
+so the copy is tile-bound rather than stride-bound; `[1025, 24, 512]` should land at
+**320-360 GB/s = 280-350 us** (3.9-4.8x the 1,353 us), `[1025, 24, 2048]` at **~1,300-1,600 us**
+(3.3-4.1x the 5,330), and `[2304, 4, 512]` at only **~1.6-2x (200-330 us)**: its destination's
+fastest dimension is 4 floats, so 12 of the tile's 16 lanes in dim 0 idle; a `CPY_T_TILE=8` build
+or a narrow-dimension path is the follow-up if that one stays below 2x. Not measured when written;
+the card numbers are below, and the prediction missed on all three shapes.
+
+Gate on the card (`GGML_OPENCL_BOUNDS=1` where the op runs; run, the results are under "Card
+evidence" below, except step (f) for Inkling at ub 512, which is still owed):
+
+    # (a) the single case, knob on, bounds first
+    GGML_OPENCL_BOUNDS=1 GGML_OPENCL_CPY_TRANSPOSE=1 test-backend-ops -b GPUOpenCL -o CONT \
+        -p 'ne=\[1025,24,512,1\]'
+    # (b) the CONT suite, knob off then on
+    GGML_OPENCL_BOUNDS=1 test-backend-ops -b GPUOpenCL -o CONT
+    GGML_OPENCL_BOUNDS=1 GGML_OPENCL_CPY_TRANSPOSE=1 test-backend-ops -b GPUOpenCL -o CONT
+    # (c) the red: the 1,025-bin and 33x17 cases must FAIL
+    GGML_OPENCL_BOUNDS=1 GGML_OPENCL_CPY_TRANSPOSE=1 GGML_OPENCL_CPY_TRANSPOSE_RED=1 \
+        test-backend-ops -b GPUOpenCL -o CONT -p '1025|33,17'
+    # (d) the perf shapes, knob off vs on
+    test-backend-ops perf -b GPUOpenCL -o CONT -p '1025,24' ; GGML_OPENCL_CPY_TRANSPOSE=1 \
+        test-backend-ops perf -b GPUOpenCL -o CONT -p '1025,24'
+    test-backend-ops perf -b GPUOpenCL -o CONT -p '2304,4,512' ; GGML_OPENCL_CPY_TRANSPOSE=1 \
+        test-backend-ops perf -b GPUOpenCL -o CONT -p '2304,4,512'
+    # (e) the prompt, at the Inkling standard arm (`GGML_OPENCL_KQ_MM_ID_I8=1`
+    # GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`, `--llama-swa-window`, ub 1024 the main batch size, 512 and
+    # 2048 as extra columns; decode is unaffected, the wide tile is a prefill path). Reference
+    # (B60, measured-here): pp4096 with WIDE=1 = 722.2 / 765.7 / 723.4 t/s at ub
+    # 512 / 1024 / 2048
+    export GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1
+    llama-bench -m <pinned IQ4_NL>.gguf -fa on -p 4096 -ub 1024 --llama-swa-window -r 3
+    GGML_OPENCL_CPY_TRANSPOSE=1 llama-bench -m <pinned IQ4_NL>.gguf -fa on -p 4096 -ub 1024 --llama-swa-window -r 3
+    # the extra columns, knob off vs on
+    for U in 512 2048; do llama-bench -m <pinned IQ4_NL>.gguf -fa on -p 4096 -ub $U --llama-swa-window -r 3; \
+        GGML_OPENCL_CPY_TRANSPOSE=1 llama-bench -m <pinned IQ4_NL>.gguf -fa on -p 4096 -ub $U --llama-swa-window -r 3; done
+    # (f) KL at ub 512, knob off vs on
+    GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 \
+    llama-perplexity -m <pinned IQ4_NL>.gguf -f <gate.txt> -c 2048 --chunks 3 -fa on -ub 512 \
+        --kl-divergence --kl-divergence-base <base.logits>
+    GGML_OPENCL_CPY_TRANSPOSE=1 llama-perplexity ...  (same line)
+
+(`llama-bench` has no `--llama-swa-window`; its default `swa_full=false` is the same window. The card
+runs below used plain `llama-bench`.)
+
+Card evidence (`measured-here`, the B60 at a 165 W cap, the card-tested applied series with the kernel still
+inside the guard, git write-tree `b7ea4eea617993d5cbeab0452ab636983fe068a6`, `GGML_OPENCL_KQ_MM_ID_I8=1
+GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
+- The path runs. Step (a) printed `0187 cpy-transpose taken ne=[24,1025,512,1]`, and the red (c)
+  failed on 5 cases. The CONT suite passed knob off and on.
+- Op perf, knob off -> on. **The prediction missed: the kernel is slower than predicted on all
+  three shapes.**
+  - `[1025, 24, 512]`: 1,334 -> 415 us (70 -> 227 GB/s as `test-backend-ops` prints it, 2^30 bytes: 75 -> 243 in
+    decimal GB/s; predicted 280-350 us).
+  - `[1025, 24, 2048]`: 5,306 -> 1,660 us (predicted 1,300-1,600).
+  - `[2304, 4, 512]`: 441 -> 356 us, 1.24x (predicted 200-330). The 4-float destination leaves 12
+    of the tile's 16 dim-0 lanes idle.
+
+  The plain copy reaches 360-390 GB/s on random data, so 227 GB/s leaves room. What limits the
+  tile there is not yet known (open).
+- pp4096 t/s, knob off -> on, three interleaved rounds on an idle host (the card host's other
+  model server held, the recipe host quiet):
+
+  | ub | off | on | gain |
+  |---|---|---|---|
+  | 512 | 720.65 / 720.53 / 720.63 | 769.67 / 769.83 / 769.60 | +6.8 % |
+  | 1024 | 763.59 / 763.56 / 763.81 | 816.11 / 815.95 / 816.43 | +6.9 % |
+  | 2048 | 718.39 / 718.66 / 718.49 | 764.40 / 764.21 / 764.33 | +6.4 % |
+
+  At ub 512 that is 5,684 -> 5,322 ms for the 4,096 tokens. The bias-table copy alone accounts for about
+  384 x 919 us = 353 ms of that (`inferred` from the op times); the depth-mix copies give the rest.
+- Reach. The proof is the export: the predicate applied to CPU graph-op exports
+  (`test-export-graph-ops`, every CPY / CONT / DUP line) finds 0 eligible copies in each model:
+  - Qwen3.8-Flash-Next (IQ3_S, q8_0 KV) at its served ub 8192 and at 512: 0 of 27;
+  - the 27B: 0 of 9;
+  - Dory: 0 of 2.
+
+  The Flash-Next MTP head is arcint's own GGUF, not a llama graph, and is not covered by the
+  export. **No effect on them; Inkling only.** (An earlier `llama-bench` run with
+  `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` printed no taken and no rejected lines for the 27B and Dory. That
+  is not evidence: `llama-bench` mutes every backend log line unless it runs with `-v`. A check that
+  reads printed lines first asserts that the log is not muted, by counting a line known to print at
+  that verbosity.) A CPU graph-op
+  export of Inkling lists the eligible copies: the bias table `[24, 1025, T]` and the depth-mix
+  stacks `[k, 2304, T]` (k 2..5), at T = 1 as well. So the path is also taken in decode
+  (`inferred` from the CPU export; no decode run on the card printed the line, and the decode
+  rate knob off vs on is not measured).
+- Logits, knob off as the KL base, knob on (Mean KLD / Max KLD / top p):
+
+  2 chunks each: 1,024 tokens at ub 512 / 1024, 512 at ub 1.
+
+  | model | ub 512 | ub 1024 | ub 1 |
+  |---|---|---|---|
+  | Inkling 2 Mini | 0 / 6.2e-5 / 100 % | 0 / 5.6e-5 / 100 % | 0 / 3.7e-5 / 100 % |
+  | Qwen3.8-27B | 0 / 4.4e-5 / 100 % | 0 / 5.0e-5 / 100 % | 0 / 4.1e-5 / 100 % |
+  | Dory 4B | 0 / 5.2e-5 / 100 % | 0 / 5.8e-5 / 100 % | 0 / 4.8e-5 / 100 % |
+
+  The 27B and Dory never take the path, yet their Max KLD is the same 4-6e-5: that is the card's
+  run-to-run floor, not this patch. Inkling's KL against the CPU reference at ub 1024 was 0.001917
+  / 98.403 % in both arms.
+- The pushed patch differs from the card-tested tree in one place: `kernel_cpy_f32_f32_t01` moved below
+  `#endif // GGML_CL_NO_CPY_PACK` in `cpy.cl`. Its creation is unconditional, so a device that defines the
+  guard would have failed to load the program. Only Adreno A6X defines it (`ggml-opencl.cpp`, `no_cpy_pack`),
+  so on Arc the same kernels compile from the same source. Applied series of this commit: write-tree
+  `182258aeb0f232cdbfc5db9eec26f236347e3969`; offline gate 3/3 (default, `GGML_CL_NO_CPY_PACK`, the red;
+  128 GRF, scratch 0).
+- `llama-perplexity` filters ggml's INFO lines at its default verbosity, so the taken line shows only
+  with `-lv 4`. With `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` alone it printed 0 taken lines and 644 rejected
+  ones (the model's other copies, e.g. `ne=[3,1024,1,1]` failing `same_shape` and `nb01==4`). With `-lv 4`
+  it printed the taken line, in the Inkling ub 512 identity run too. A per-call counter would still
+  give the count; it belongs to the follow-up on the narrow destination.
+
+- At q8_0 KV (the Inkling units' cache type) the gain holds: Inkling pp4096 ub 1024 763.5 (`GGML_OPENCL_CPY_TRANSPOSE` off) ->
+  816.3 t/s (on), +6.9 % (`measured-here`, llama-bench; not at the units' `--llama-swa-window` / 262,144 context).
+
+## 0193-flash-attn-port-op-sources.patch / 0194-flash-attn-port-sink-positions.patch / 0198-opencl-flash-attn-port-kernel.patch / 0199-flash-attn-port-tests.patch
+
+Inkling 2 Mini's prompt attention after trellis-serve's `fa::Kern<128>` (MIT; `THIRD_PARTY.md`), as an opt-in arm of the
+OpenCL backend: `GGML_OPENCL_FA_PORT=1`. Unset, the dispatch and the model's graph are what they were. The full record -
+the reference kernel, the plan, each card run, the reviews and the design of the next step - is
+`contrib/refkernels/trellis-fa/README.md`.
+
+- **0193** (`ggml.h`, `ggml-impl.h`, `ggml.c`): the op's new sources and their setters - `kpos` / `qpos` (I32), one class a
+  16-key group and one flag a 8-row group (I8), the per-query sink logits (F32 `[n_head, rows]`, src 18) and the window
+  (op param 16). `GGML_MAX_SRC` 14 -> 20 and `GGML_MAX_OP_PARAMS` 64 -> 80: **64 bytes more a tensor, with the knob or
+  without**. The indexed-bias setter accepts the table as `[n_bins, n_head, rows]` too.
+- **0194** (`ops.cpp`, `llama-graph.*`, `llama-kv-cache.*`, `inkling2.cpp`): for a prompt batch (flash attention, causal,
+  the standard window, more than 8 rows, one stream) on a layer whose backend declares the port's sources, the sink is
+  not folded into the table (the table is the bias only, bin-fastest as the MUL_MAT emits it) and rides as src 18; the
+  kv-cache walk fills the positions and classes; the sources are on the op before the backend's `supports_op` is asked.
+  The CPU's kernel reads both table layouts and the per-query sink. Any other graph is today's.
+- **0198** (`fa_port_gate.h`, `ggml-opencl.cpp`, `kernels/flash_attn_port.cl`): the gate as pure functions (the strides the
+  kernel indexes, the 2D block read's alignment, the work-group, the paged forms refused), one decision for `supports_op`
+  and the launch, the port taken first in the dispatch, a bounds check of every buffer under `GGML_OPENCL_BOUNDS=1`, a
+  DOWNGRADE line a refusal, one TAKEN line a process. The kernel: one sub-group a (head, 8-row) tile over 32-key blocks,
+  K/V by 2D block reads, a class a key group and a skip a block, the bias run as one block read and a shuffle, the pad
+  bin read once a tile, the online softmax with the sink as its initial state, Q held in registers at 256 GRF.
+- **0199** (`test-backend-ops.cpp`): the port's cases in the model's layout (the graph export's prompt lines), their twins
+  for the indexed-bias kernels of today on the same data, the pad case, the perf rows, and three device-free checks
+  (`GGML_TEST_FA_PORT_TWINS`, `_DECISIONS`, `_GUARD`), each with a red.
+
+Knobs: `GGML_OPENCL_FA_PORT` (the arm), `_GRF=128|256` (256), `_QHOIST`, `_QF32`, `_SKIP`, `_UNIFORM`, `_QTW`,
+`_RED=1|2|4` (each must fail), `_PROBE=nobias` (a timing probe with wrong answers).
+
+`measured-here`, the card host, B60 at 165 W. The op, us a call, window 1,024, 24 heads on 8, head 128, 1,025 bins:
+
+| shape | the port, 256 GRF | the kernel it replaces (the twin) |
+|---|---|---|
+| q512 x kv1536 | 746 | 2,263 |
+| q2048 x kv2048 | 2,092 | 9,577 |
+| q2048 x kv3072 | 2,926 | 12,645 |
+
+Inkling pp4096, t/s, the port off / on: 769.2 / 909.8 (ub 512), 816.0 / 973.9 (ub 1024), 763.9 / 980.8 (ub 2048), 749.5 /
+975.7 (ub 4096). Mean KL at ub 1024 against the CPU base 0.001917 -> 0.001965, top p 98.40 -> 98.47 %. The op suite is
+complete with the knob on (3,190 cases) and off (3,179); the reds fail every case they run; with the knob unset three
+models match the development build. Not through a release gate.
+
+**Limits, read before any unit uses the knob.** Every number above is at f16 KV (llama-bench's default). This
+revision refused a q8_0 KV cache, which the Inkling units serve: at q8_0 `GGML_OPENCL_FA_PORT` changed nothing then
+(`measured-here`, pp4096 ub 1024 with `GGML_OPENCL_CPY_TRANSPOSE=1`: 816.3 with the port off, 816.6 with it on and 7
+refusals logged; 974 at f16 KV with the port taken). Since 0199q1 / 0199q2 (below) the port reads a q8_0 cache in
+place. At the
+units' own flags (262,144 context, `--llama-swa-window`) f16 KV does not fit the 24 GB card beside the model: arcint's
+load-time spill guard refuses it (`measured-here`: context 8,516 MiB at f16 against 4,526 MiB at q8_0, which loads). So the port helps a served Inkling only once it reads
+a q8_0 cache. Not verified: a partial offload (`-ngl` below all layers). At `-ngl 12` the run faulted (`measured-here`). The
+cause, by code reading and the fault's arithmetic (not reproduced): Inkling's depth-mix stacks are graph leaves written
+through views from layers on both devices, which faults or silently loses rows at a CPU / card boundary. The code
+involved is byte-identical on the development build without the port (`code`). Serve Inkling fully offloaded.
+
+**0199q1 / 0199q2: the port reads a q8_0 K/V cache (on the card: 817.2 -> 945.8 t/s at q8_0 KV).** The same knob. The
+kernel has a second build (`-DPORT_KV8=1`) that reads ggml's q8_0 blocks in place: nothing is staged (the reference
+stages an f16 copy every call, 1,074 MB for one global layer at 262,144 keys - a deviation, named and priced in the
+record). K by five transposed dword reads a 16-key group, V by transformed byte reads on the 4-byte grid the extension
+defines (a third read and a lane splice for the blocks that start 2 bytes off it); the codes become
+f16 by integer operations on the dwords (`1152 + code`, the 1152 taken out through the accumulator's start), K's scale
+multiplies the f32 sum once a block, V's scale goes into P (`f16(p d 128)`). 256 GRF, scratch 0 (`measured-here`, ocloc
+bmg-g21, 9 of 9 variants). The gate accepts K and V both f16 or both q8_0 (`nb[0]` 34, head stride and view offset
+multiples of 4, pitch a multiple of 16 and at least 196); its unit reads the model's export with `-ctk q8_0 -ctv q8_0`
+(K/V nb `[34, 1088, 136]`), red with the rule before and with a wrong stride rule. A CPU model of the read path on
+the cases' own bytes: NMSE 9e-8 against a double-precision attention, every 2D read inside the extension's stated limits,
+four reds 0.012 to 0.5 and a fifth on the 4-byte rule (`measured-here`, the
+recipe host). Red on the card: `GGML_OPENCL_FA_PORT_RED=6` (K's scale twice), `=7` (V's scale from the next block).
+`TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0 …` once a process. Prediction (`inference`): pp4096 ub 1,024 at
+q8_0 KV 816 -> 953 t/s (range 935 to 974); the op 930 / 2,630 / 3,720 us at the three shapes against the f16 port's
+736 / 2,078 / 2,906. The record, the prediction's arithmetic and the card commands:
+`contrib/refkernels/trellis-fa/README.md` §q8. **The card** (`measured-here`, B60 at 165 W, applied tree `59732cfe…`): pp4096
+ub 1,024 at q8_0 KV 817.2 t/s off, 945.8 on (+15.7 %), three interleaved rounds; the five q8_0 op cases at nmse
+1.93e-6 .. 2.17e-6 (bound 1e-5), the four reds failing all of them; KL at q8_0 KV 0.002464 off, 0.002545 on, top p
+98.240 / 98.273 %: inside the bar. The op prediction above missed: the op is 3,946 us at q2048 x kv2048 with the
+test's rebuild, about 1.6 to 1.8 x the f16 port without it. So with these two patches the port does take a q8_0
+cache; "refuses q8_0" above describes the build before them. Still not measured: the units' own flags (262,144
+context, `--llama-swa-window`). §q8-card of the record has the figures and what follows from them.
+
+**Both knobs at q8_0 KV, the combined tree** (`measured-here`, the card host, B60 at 165 W, the test merge of the depth
+mix and this read path, applied tree `a52a4c2a…`, pp4096 ub 1,024, `GGML_OPENCL_KQ_MM_ID_I8`, `_WIDE` and
+`GGML_OPENCL_CPY_TRANSPOSE` on every arm, three interleaved rounds): off 816.55, `GGML_OPENCL_DEPTH_MIX=1` 980.46,
+`GGML_OPENCL_FA_PORT=1` 945.74, both **1,171.43 t/s** (1,172.51 / 1,171.43 / 1,170.08). The savings add: 1,171 was
+predicted from the two arms alone, and the window's own additive figure is 1,172.8. Answer level against the CPU
+base, 6 chunks: off 0.002464 ± 0.000073, the depth mix 0.002470 ± 0.000085, the port 0.002545 ± 0.000088, both
+0.002571 ± 0.000087. Paired against the off arm's own logits on the card: the depth mix 0.002041 ± 0.000060, the
+port 0.002083 ± 0.000089, both 0.002125 ± 0.000077, one-ulp noise 0.002031 .. 0.002161 over four seeds (mean
+0.002069, sd 0.000062), a second off run 0.000000: every arm inside the noise. Not at the units' own flags.
+
+Paired against
+the off arm's own logits on the card (6 chunks) the port moves the answer by 0.002083 ± 0.000089 nats, a one-ulp noise
+control by 0.002031 .. 0.002161 over four seeds: inside the noise (§q8-paired).
+
+Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
+(`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
+
+## 0208-test-backend-ops-inkling-expert-projection-perf.patch
+
+The expert DOWN projection next to the fused GATE_UP as perf cases, so one card run compares them, plus
+one correctness case each so the CPU reference runs both. The shapes, strides and ids layout are the
+Inkling 2 Mini graph export's MUL_MAT_ID lines, named in the ub 512 / 1024 / 2048 exports:
+`ffn_moe_down-0` (IQ4_NL weights `[1152, 2304, 128]`, nb 18 / 648 / 1,492,992; a token's F32
+activations `[1152, 8, n]`, nb 4 / 4,608 / 36,864) and `ffn_moe_gate_up-0` (`[2304, 2304, 128]`,
+nb 18 / 1,296 / 2,985,984; gate and up fused, so b is one broadcast column, `[2304, 1, n]`, nb
+4 / 9,216 / 9,216). The ids are the constructor's own view: a token's 128-wide I32 row with the
+8 used columns, nb1 512. 128 experts, top-8, F32 activations, at 512, 1,024 and 2,048 tokens; 2,304
+rows both ways, K 1,152 for down and K 2,304 for gate/up. The routing is fixed (seed 20261124), each
+token's eight slots eight distinct experts over the 128, not the base case's random re-draw: per-expert
+pair counts 20..51 (mean 32) at 512, 46..91 (64) at 1,024, 100..166 (128) at 2,048, no expert empty.
+`test_mul_mat_id_routed` keeps the routing between perf iterations, so the two arms time the same work.
+
+Prediction before the card (inference): at 512 tokens the wide-tile per-visit figures of 0190 (26.46 ms
+gate/up, 13.56 ms down over 8 ub chunks) are 3,310 and 1,700 us a call; the narrow tile gives 3,915 and
+2,110. Down's narrow-to-wide difference is 0.41 ms a call, which is the 0.43 ms a call the 2026-11-24
+pass reading gives over 384 calls (165 ms); the int8 floor is about 0.11 ms a call. At 1,024 and 2,048
+the weights are re-read once a 512-column band, 2 and 4 times, so about 3.3 / 6.6 ms a call for down and
+6.5 / 12.9 for gate/up, before the empty-tile floor.
+
+Card commands, perf mode:
+```
+GGML_OPENCL_KQ_MM_ID_I8=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
+GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
+```
+
+CPU gate: `test-backend-ops -b CPU -o MUL_MAT_ID -p 'routed=1'` gives 2/2 OK (the two new correctness
+cases). The whole `-o MUL_MAT_ID` family did not finish here within a 30-minute cap (163 OK, 0 fail before
+the cap; the suite's large 512-expert cases dominate), so the full-family CPU row is open.
+- Open: `llama-perplexity` does not print the once-a-process INFO line. The KL runs therefore do
+  not themselves show the path was taken, although the `llama-bench` runs on the same binary and
+  env do. Inkling's ub 512 logits arm (gate step (f) as written) was not run. Owed: a `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` perplexity run, or a per-call counter.
+## 0204-0207: Inkling 2 Mini's depth mix as one op
+
+**Status: card-proven (2026-11-25).** This section is chronological and nothing in it was edited
+away: the plan as written before any card run comes first, then the card results and the
+defects they named, with retractions on the record. The current numbers are under "Card result
+3" and the tables after it (the op rows, pp4096, the profile, the answer-level arms, the task
+battery, the rows with the FA port); what is still open is the list at the section's end.
+
+**The plan, written before any card run.**
+
+A native DEPTH-MIX kernel for the prefill, ported from the reference's Triton `_mix_kernel`
+(the trellis-serve project, `xpu/exl3xpu/inkling2/fused.py:41`, "a token a program, fp32"; the model's
+`_mix` is `sgl_model.py:52` and the call sites `:612`, `:620`, `:644`, `:658`). The reference's
+form is one launch a mix call: it reads the S states and cur once per chunk, normalizes them per
+state, takes `q . v` as one sum over the embedding width, softmaxes over the states and writes
+`sum_s p v_s`, optionally with an output RMSNorm and per-output weights folded in.
+
+**The sites in the applied tree** (`src/models/inkling2.cpp`, lines as the series through 0192
+has them, i.e. the chain the table below ran; patch 0206 moves them by its own added block):
+`mix()` is `:191`; its chain is the cpy of cur into the store's last row `:213`, the states
+`view_3d` of the store `:216`, the `rms_norm` over the k+1 states `:217`, the `repeat` of the
+query over the tokens `:219-221`, `mul_mat(states, queries)` `:224`, `soft_max_ext` with
+`1/sqrt(n_embd)` `:225`, `cont(transpose(states))` `:227` and `mul_mat(that, scores)` `:227`.
+The call sites are the attn mix `:328` (an SWA layer without messages norms one column and the
+arm folds it; full-attention layers norm three with three separate 1-D weights, kept as nodes)
+and its per-column `ggml_cont` `:330`, the ffn mix `:421` (folded) and the output mix `:456`
+(folded). `write_res_block` `:184` keeps its cpy: it fills the store's block rows, which later
+mix calls read. The controllers (`control()` `:269`) are not part of the chain: they run
+between a cross-pass message and the norm, so those visits keep the message merge, the three
+norms and the ffn norm. The permute-conts that 0187 also takes are `:390` (the relative-bias
+table) and `:394` (`kq_b`), both attention.
+
+**The four probed parts, mapped** (measured-here, B60, one pp4096 pass at ub 512, `I8=1`,
+`WIDE` off; the F32 arms are 0180's default-on):
+
+| part | ms a pass | launches | site | kernel |
+|---|---|---|---|---|
+| stack copies | 341 | 961 | `:227` `ggml_cont(ggml_transpose(states))` | the pack kernel (a transposed view) |
+| first product | 309 | ~960 | `:224` `mul_mat(states, queries)`, dst [k, nq, 512] | `kernel_gemv_f32_f32_splitk_batch` (0178) |
+| weighted sum | 82 | 961 | `:227` `mul_mat(cont(transpose(states)), scores)`, dst [2304, nq, 512] | `kernel_mul_mat_f32_f32_smallk` (0171/0175) |
+| query repeats | 33 | ~960 | `:219-221` `ggml_repeat(queries)` | the repeat kernel |
+| total | 765 | | 12.7 % of the 6,042 ms pass | |
+
+Not in the table and taken by the arm as well (`inference` from the node kinds): the states'
+`rms_norm` `:217`, the cur cpy `:213` and the per-column cont `:357` - one read and one write of
+4.72 MB each a call, plus 4.72 MB an output column.
+
+**The form: a new ggml op with a CPU reference, not a backend fusion.** Both were priced:
+
+- *A backend fusion of the existing nodes* (0049/0051 style; this backend's own `ggml_opencl_can_fuse`
+  patterns for rms_norm+mul+add): the members are not adjacent - the store's block cpy
+  (`write_res_block`) and the cur cpy sit between them, and the output's norm nodes sit after -
+  so it needs `ggml_can_fuse_subgraph_ext` with an explicit skip mask and a whole-subgraph
+  interceptor, and it cannot change a member's layout: the `cont(transpose)` node would have to
+  be *skipped* as a member, and then the fusion must read the transposed view itself. Cost: a
+  matcher that depends on the graph's node order and on every other patch's nodes, no CPU
+  reference (so no op case against a second implementation), no eligibility unit test and no
+  refusal reason; the gain is the same only if the skip mask is right.
+- *A new op* (`GGML_OP_DEPTH_MIX`): an op id, a constructor, a CPU reference, an OpenCL kernel, a
+  dispatch, a test case; `tests/python/test_gdn_replay.py`'s `GGML_OP_COUNT` gate moves with
+  the table, 104 -> 105. Cost: +1 op in `ggml.c`'s tables, the CPU path (mechanical, 0158's
+  shape). Gain: the model emits it behind the knob, so the matcher cannot drift from the graph;
+  the eligibility rule is one pure function (`ggml_depth_mix_refuse`) shared by the model, the
+  dispatch and the CPU op, unit-testable on the graph's own strides; the transpose copy is not
+  a node at all; the dst layout can be chosen ([n_embd, n_tokens, nq], a column's token block
+  contiguous) so the per-column cont goes.
+
+**Kernel layout** (`depth_mix.cl`): a token a work-group of 256 lanes; `n_embd/256` floats of
+each of the k+1 states a lane, read once from global into registers and never written back
+(n_embd <= 2304 keeps that at 9 floats a state, 63 for 7 states). Sum of squares a state and
+the query dots are partials in local memory, reduced in one round of 8 quantities (8
+sub-groups of 32 lanes, a 5-step tree each); the scores, the softmax and the weighted sum run
+on the register copy; the folded norm is a second reduction over the output columns. The
+state/element loops are unrolled over their maxima with runtime guards, which keeps the
+register array's indices compile-time - a dynamic index would spill to scratch, the 0190
+lesson. `k` 1..6 and `nq` 1..4 bound the reduction's local buffer (35 KB at worst, sized at the
+launch), `T > 1` (decode stays with today's chain; the FUSE session's decode block is the other
+half of this chain). The offline gate (`ocloc` 26.27.1 + IGC 2.38.2, the B60 `bmg-g21`, the
+backend's options plus `-cl-intel-256-GRF-per-thread`, base and the red variant): both variants
+compile, `grf 256 simd 32 slm 1024 scratch 0 stack_calls -`, no ISA call, no retry dump - the
+register array stays in GRF (no spill), and 256 GRF is the program's ceiling, so occupancy is
+one work-group's worth; if the card's rate lands at the copies' rather than at the reference's,
+the fallback is the two-pass form (states read twice from global, no register array) that the
+same rule and kernel arguments allow (`inference`, not run).
+
+**Bytes and the rate the reference implies.** One state row of a 512-token chunk is
+2304 x 512 x 4 = 4.72 MB; at k=4 (5 states) a call reads 23.6 MB of states, 9.44 MB of query
+rows (2 columns; 18.4 KB unique, so L2 after the first token) and writes 9.44 MB. The arm moves
+~33 MB of DRAM a call. The reference costs 398.96 ms over ~960 calls, 415 us a call, and its
+kernel reads the states three times (the dots pass, the NORM pass, the output pass): ~89.7 MB a
+call, so 216 GB/s - 47 % of the card's 456 GB/s, `inference` from the operator's trace. The
+arm's traffic is 0.37 of that; at the reference's own rate a call is ~153 us and a pass ~147 ms.
+
+**Prediction** (`inference`, to be checked by the card runs below; nothing was run here, this
+host has no OpenCL ICD):
+
+| ubatch | today's chain, ms a pass | arm, ms a pass | us a call (k 2..5, nq 1..3) |
+|---|---|---|---|
+| 512 | 765 | 120-160 | 110-160 |
+| 1024 | ~765 (bytes the same, launches halved) | 120-160 | 220-320 |
+| 2048 | ~765 | 110-150 | 440-560 |
+
+Against the reference level of 399 ms the arm's *traffic* is below it by construction (one state
+read against three, no copy, no repeat materialization); going further below it needs the rate,
+not less work: at 456 GB/s the 33 MB a call would be 72 us, and the reduction's barriers are
+what stands between 153 and 72 us a call. Said plainly: the arm beats 399 ms if it reaches the
+reference's bytes-per-second; it does not need to reach it to beat 765 ms.
+
+**What 0187 does and what remains of it.** 0187 (another session) speeds the transposed copy
+`kernel_cpy_f32_f32_pack`. Its estimate was 128-171 ms of the same 341 ms; the card measured
+**1.24x** on this copy (441 -> 356 us at k=4, 66 ms of the 341, `measured-here`), so the depth
+mix's share of it is ~66 ms and the rest of 0187's estimate is elsewhere (see the card row
+below). The two gains must not be counted twice:
+
+| arm | `GGML_OPENCL_CPY_TRANSPOSE` unset | `=1` |
+|---|---|---|
+| knob off | 765 ms (today) | ~699 ms (0187's measured 1.24x on this copy) |
+| knob on | 120-160 ms | 120-160 ms - unchanged |
+
+With the arm on, 0187's depth-mix target has nothing left: the [k, 2304, 512] cont of a
+transposed view does not exist (the states are read by the kernel from the store's view and
+cur, and no copy is materialized). What 0187 also takes and the arm does not touch: the
+`[24, 1025, 512]` permute-cont after the relative-bias table product (`:390`) feeding the gather,
+and the `[n_head, n_kv, tokens]` permute-cont of `kq_b` (`:394`) - attention, not depth mix, so
+those shapes remain 0187's.
+
+**The wide int8 tile does not move these numbers** (`code`): `GGML_OPENCL_KQ_MM_ID_I8_WIDE` is
+read only by `ggml_cl_mul_mat_id`'s int8 route, so `MUL_MAT_ID`-only; no depth-mix node is one.
+The card arms below still run with `GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`,
+the deploy setting.
+
+**Rules the arm carries.** Opt-in (`GGML_OPENCL_DEPTH_MIX=1`; unset, `0`, `off` are off and the
+model emits the chain node for node, decode untouched, other models untouched - they never emit
+the op). One fixed stderr line when the path is taken: `depth_mix: TAKEN opencl f32
+token-a-group`, once a process. A shape, type or stride the rule does not cover leaves
+`DOWNGRADE src=llama op=DEPTH_MIX path=chain reason=<rule>` at the model and `DOWNGRADE
+src=opencl op=DEPTH_MIX path=cpu reason=<rule>` at the dispatch, once a key each.
+`GGML_OPENCL_DEPTH_MIX_STATS=1` prints one line a graph: `depth_mix: graph nodes=<n> calls=<c>
+of <nodes>`. Every buffer is bounded before the launch under `GGML_OPENCL_BOUNDS=1` (blocks,
+cur, queries, norm_w, dst; the furthest byte from the global size and the strides handed to the
+kernel, a view's offset included).
+
+**Correctness.** f32 accumulation as the reference. One summation order changes: the chain
+normalizes a state first and accumulates normalized values in the dot; the kernel accumulates
+raw values and scales the finished dot by `1/sqrt(mean(v^2) + eps)` - the same value, a
+different rounding (`code`). The softmax, the weighted sum and the folded norm keep the chain's
+order. Bit-identity is not claimed; the operator's bar is mean KL <= 0.03 nats worse than
+baseline and top p down <= 1 point.
+
+**Tests.** `test-depth-mix` (device-free, `code`): `ggml_depth_mix_refuse`/`ggml_depth_mix_switch`
+on Inkling's own prefill nodes, built with the graph's constructors at its GGUF sizes (n_embd
+2304, attn_res_block_size 4, store `[2304, 7, 512|2048]`, block view at the store's strides -
+row step 2304 floats, slab step 7 x 2304 floats, k 2..5, nq 1 and 3), and eight red variants
+that must each be refused by name. `test-backend-ops`: Inkling's shapes, k 2..5, 512 and 2048
+tokens, nq 1 and 3, with and without the folded norm, random data; the perf list has k 2, 4, 5
+at both sizes. Red option: `GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED` drops the softmax
+denominator in the kernel only (the CPU op stays right, so the op cases must fail).
+
+**Card result, 2026-11-24 (B60, the series cdd7db8d, `measured-here`): the path never ran.**
+`test-backend-ops -o DEPTH_MIX` printed `not supported [OpenCL]` for every case (0 of 0 executed;
+"2/2 backends passed" was two skips), the red therefore "passed" with 0 failures, and a
+`llama-bench pp4096` at ub 512 with `GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_DEPTH_MIX_STATS=1`
+printed no TAKEN line, no stats line and no DOWNGRADE line - the model's node went to the CPU
+silently. Cause (`code`, the applied tree's `supports_op`, `case GGML_OP_DEPTH_MIX`): it also
+required `op->src[i]->extra != nullptr` and `op->extra != nullptr`. `supports_op` is asked
+before any tensor is allocated (test-backend-ops, and the scheduler when it assigns nodes), so
+`extra` was always null: the op was refused everywhere. The rule was right; the dispatch
+disagreed with it behind an allocation-dependent test.
+
+The fix (0205, and 0206/0207 follow): the decision is `ggml_depth_mix_refuse` plus the dst
+layout and the knob - types, shapes and strides only, as the other ops do; device storage is
+the dispatch's invariant (an assert, not a condition). Every refusal logs a DOWNGRADE line
+(`switch-off`, the rule's reason, `dst-layout`, `not-built`), and a graph that hands the arm
+nodes and takes fewer of them logs `reason=not-taken nodes=N taken=T` at WARN once, so a
+silent fallback cannot happen again. `GGML_OPENCL_DEPTH_MIX_STATS=1` prints the graph's node
+and call counts.
+
+Why the device-free test missed it and what now guards it: `test-depth-mix` tested the rule
+and the switch, and the defect was in the backend's own additional condition - the two agreed
+on nothing a device-free harness could see. The test now reads the `supports_op` case out of
+`ggml-opencl.cpp` (`DEPTH_MIX_OPENCL_SRC`) and fails if that segment mentions `->extra`, if it
+does not decide through `ggml_depth_mix_refuse(`, or if it has no `ggml_cl_downgrade(` - the
+shape of the defect, checked as text.
+
+**The real graph's strides** (`measured-here` by the graph export, `inkling-ub{512,
+1024,2048}.txt`, `test-export-graph-ops` at c 4096, fa on; source tensors of the depth-mix
+lines, op 25 `RMS_NORM` into op 29 `MUL_MAT` and op 34 `CPY`): the block store is
+`[2304, 5, tokens]` - attn_res_block_size **6**, so `(24 + 5)/6 + 1 = 5` rows, not the 7 this
+README first assumed - with `nb[1]` 9216 and `nb[2]` 5 * 9216 = **46080**; the states view
+keeps them, 2..5 rows (k = 1..4 block rows, so the observed `k` range of the copies is the
+states' 2..5), and at fewer rows the token slab step exceeds the states' extent; `cur` is
+`[2304, tokens]` with `nb[1]` 9216; the query parent is `[2304, nq]` (nq 1 and 3) with
+`nb[1]` 9216. The rule accepts these (a slab step >= the rows' extent, the rows back to
+back), and `test-depth-mix` now builds exactly them - `[2304, 5, 512|2048]`, row step 9216,
+slab step 46080, k 1..4, nq 1 and 3 - and asserts the literals; the op case set is k 1..4
+(2..5 states) at 512 and 2048 tokens.
+
+**Against 0187, now measured** (`measured-here`, the operator's card row): 0187's tiled
+transpose takes the `[k, 2304, 512]` copies at **1.24x**, 441 -> 356 us at k=4, and pp4096
+at ub 512 from **719.7 to 768.8 t/s** (`I8=1 WIDE=1`). The two gains are not additive; the
+arm's prediction either way:
+
+| baseline | depth-mix parts, ms a pass | arm on, ms a pass | pp4096 ub 512 |
+|---|---|---|---|
+| 0187 off | 765 | 120-160 | 805-815 t/s (from 719.7: 5.69 s a pass, -605..-645 ms saved) |
+| 0187 on | ~699 (341 -> 275) | 120-160 | the same 805-815 - 0187's depth-mix share is subsumed |
+
+With the arm on, 0187's depth-mix target has nothing left in either baseline: the copy is not a
+node. What 0187 still takes and the arm does not touch stays as listed above (`:390`, `:394`).
+A correction to the earlier table's "0187 off/on" row: the off/on pair is 765 against ~699 (not
+594-637, which assumed all of 0187's 128-171 ms came from the depth mix; the measured 1.24x on
+this copy is 66 ms of it).
+
+**Card result 2, 2026-11-24 (mix-on-dev 475cebfb, applied series 4c8f94ba, B60, `measured-here`).**
+The fix ran: the suite executed 19 cases, 16 OK; the red failed 19 (good). **The 3 failures are
+exactly the folded-norm cases**, ERR ~2: `DEPTH_MIX(k=1,nt=512,nq=1,with_norm=1)` ERR 1.990,
+`(k=4,nt=2048,nq=1,with_norm=1)` 1.931, `(k=3,nt=512,nq=3,with_norm=1)` 2.010. Every case
+without the norm passes. The model run (`llama-bench pp4096 ub512`, knob on, `BOUNDS` unset)
+then caused a **GPU page fault** (`clWaitForEvents -14`, 446 fault responses, an engine reset, a
+devcoredump; the card recovered): all 446 are reads, one row each at the start of ~58 slabs
+4,718,592 bytes apart (`inference` from the operator's kernel-log fit) - a [2304, 512] f32 slab
+spacing, which is the compute buffer's per-token tensors (`dst`, `cur`) and equals the folded
+norm calls' count a chunk (~57).
+
+**Named defect #1 (code, fixed): the folded-norm path's local slots aliased the dot results.**
+The first reduction left its results at `red[p*LS]` for `p = 0..ns*(1+nq)-1`; the norm's partial
+sums were written at `red[q*LS + lane]`. For (k=1,nq=3) the norm partials [512..767] cover the
+dot result read at 512, for (k=2,nq=4) [768..1023] covers 768 - writes from one sub-group
+overwriting a result another sub-group may still read (a race; sub-groups do not run in
+lockstep). Verified as an interval overlap (`aliascheck`: 4 overlaps) and fixed by moving the
+norm's quantities past the first reduction's: `red[(np+q)*LS]` with `np = ns*(1+nq)`, the
+reduce taking a base `off`, the dynamic local sized `(np+nq)*256*4`; the same check now finds 0
+overlaps. This does **not** explain the three card failures (their (k,nq) do not overlap).
+
+**Named defect #2 (code, withheld): a norm weight through a view is not covered.** The model's
+norm weights are 1-D tensors, and the fold reached the op as a `reshape_2d` view, whose storage
+resolves through the parent's extra (the backend's own comment flags that path for weight
+tensors). Every folded-norm op case fails on the card while every no-norm case passes, and the
+fault's slab spacing/count matches the folded calls; a host replay of the kernel's index math on
+the graph's strides (`port3`: `blocks` rows + `cur` + `queries` + `dst`, ASan, every access
+range-checked) is clean and agrees with the CPU op to fp32 rounding, so the strides are not the
+fault's cause and the weight's storage is the one argument that replay cannot see. The rule now
+refuses `norm_w->view_src != nullptr` (`nw-view`), the dispatch asserts the weight is the tensor
+itself, and **the model no longer folds the norm**: the norms stay the chain's nodes, exactly as
+today (no behaviour change), and the op suite carries no `with_norm` case until the path has its
+own card evidence. The op's CPU reference and kernel keep the capability for a later patch.
+
+**The arm's bounds are now always on** (not only under `GGML_OPENCL_BOUNDS=1`): the five
+arguments (blocks, cur, queries, norm_w, dst) are checked against their buffers before the
+launch and a violation aborts with the buffer's name and the byte it would reach - a fault
+becomes a diagnosis. The op cases and the model run can therefore be run with `BOUNDS` unset and
+still name any past-buffer launch.
+
+**Card commands** (to run on the B60; `llama-bench` and the op cases need the arm's env):
+
+```
+# 1. one case first, the bounds check on
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops -o DEPTH_MIX -p 'k=2 nt=512 nq=1'
+# 2. the whole op set, then the TAKEN line on a model run
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops -o DEPTH_MIX
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 \
+  llama-bench -m <Inkling IQ4_NL> -fa 1 -p 4096 -b 4096 -ub 512 -r 2 2>&1 | grep 'depth_mix: TAKEN'
+# 3. the red: the op cases must fail
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED \
+  test-backend-ops -o DEPTH_MIX
+# 4. op perf, one launch against the CPU op
+GGML_OPENCL_DEPTH_MIX=1 test-backend-ops perf -o DEPTH_MIX
+# 5. llama-bench pp4096, knob off then on, ub 512 / 1024 / 2048
+for ub in 512 1024 2048; do
+  for dm in 0 1; do
+    GGML_OPENCL_DEPTH_MIX=$dm GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 \
+      llama-bench -m <Inkling IQ4_NL> -fa 1 -p 4096 -b 4096 -ub $ub -r 2
+  done
+done
+```
+
+**Card result 2, the causes named (2026-11-24; `code`, and `measured-here` on the recipe host
+for the replays - no card run is behind this paragraph).** Both failures of card result 2 have
+a named line, and neither is one of the two defects named above. The retractions first, on the
+record:
+
+- *"Named defect #2" above is retracted.* A norm weight seen through `reshape_2d` was never the
+  problem: a view shares its parent's extra and the offset is `extra->offset + view_offs`, as
+  for every other source of every op. The `nw-view` refusal, the dispatch's assert and the
+  withheld fold are gone again.
+- *The fault paragraph's inference is retracted* ("the compute buffer's per-token tensors,
+  equals the folded norm calls' count"). The fold had no part in the fault, and withholding it
+  would not have stopped it: the faulting read is on a path that never folds.
+- "Named defect #1" (the local-slot alias) stands as a real race and its fix is kept; as its
+  own text says, it explains neither card failure.
+
+**The page fault: `src/models/inkling2.cpp`, the loop model's `message()`** (the lambda at
+the top of `build_layer`; the line `ggml_cont(ggml_view_2d(messages, n_embd, n_tokens,
+messages->nb[2], ctrl*messages->nb[1]))`). Inkling 2 Mini is the loop model
+(`inkling2-loop.cpp`): from the second pass on, every core layer gets `messages = mix(bank,
+bank_out, loop.msg_query, bank_stack)` - a mix over the previous pass's bank store (2 rows:
+one block and cur) with four query columns, one a controller. That call is eligible (k 1,
+nq 4), so with the knob on `mix()` returned the arm's dst, `[n_embd, n_tokens, 4]`, and
+`message()` went on reading it with the chain's layout, `[n_embd, 4, n_tokens]`: a row step of
+`messages->nb[2]`, which on the arm's dst is `n_embd * n_tokens * 4` = **4,718,592 bytes** at
+ub 512 - one 2,304-float row (three pages) at the start of each `[2304, 512]` slab, 512 rows
+far, in a tensor that ends after four. The copy kernel behind the `ggml_cont` read them: reads
+only, one row a group, gaps of 0x480000, exactly the kernel log's fit. `ggml_view_2d` did not
+object because it checks a view's contiguous size, not its strides. The attention call site
+had been given the arm's layout (`took ? ... : ...`); `message()` had not, and the device-free
+test and the op cases covered nq 1 and 3 on the 5-row store only - the export's nq 4 call on
+the 2-row bank store (`node_3060`, `node_3064`) was in neither.
+
+The fix (0204, 0206): every reader of a mix result's columns goes through one function,
+`inkling2_mix_column`, which returns `ggml_depth_mix_column` (a contiguous view, column `c` at
+`c * nb[2]`) for the arm's dst and the chain's strided view plus `ggml_cont` otherwise - the
+expression the graph always had, so the knob unset is today's graph node for node. Both
+branches assert `ggml_view_within_src` (new in ggml.h: a view's furthest byte, strides and
+offset included, against its source), so a wrong layout aborts at graph build with no device
+involved.
+
+The replay (`tests/test_depth_mix.cpp`, `measured-here` on the recipe host): the loop's
+message path at the export's ub 512 shapes on the CPU backend. `arcint-depth-mix
+fault-before` computes the old read: `SEGV ... caused by a READ memory access` in
+`ggml_compute_forward_dup_bytes` under ASan, signal 11 without it. `fault-after` computes the
+fixed read: clean, the four columns equal to the op's. In the unit run the same shapes are
+checked without computing: the old view's row step is asserted to be `2304 * T * 4` and the
+view to leave its source (12 views over the three ubatch sizes), red first against a reach
+check that passes everything (12 failures).
+
+**The three folded-norm op failures: `depth_mix.cl` never added the norm weight's offset.**
+The kernel adjusted `blk`, `cur`, `qry` and `dst` by their offsets and not `nw`: the dispatch
+passed `offn` and the kernel read the weights from the start of their buffer - in
+test-backend-ops, whatever tensor the buffer begins with, hence ERR ~2 on every `with_norm`
+case and none elsewhere; in the model, the start of the weights' buffer. One line: `nw = nw +
+offn`. The handed-over host port could not see it because it gave every argument its own
+buffer at offset 0.
+
+**What now tests it** (`tests/test_depth_mix.cpp` in this repository, a `unit` ctest of the
+recipe; all `measured-here` on the recipe host, device-free):
+
+1. *The rule on the export's lines.* `tests/depth_mix_export_lines.inc` holds 69 lines of the
+   exported graph verbatim (23 a ubatch size: the states' `RMS_NORM` lines `node_91`,
+   `node_1108`, `node_2118`, `node_8944` on the 5-row store and `node_3060` on the bank's 2-row
+   store, at T and at 1; the `MUL_MAT` lines `node_95` .. `node_9639` that pair states with 1,
+   3 and 4 query columns; the two `CPY` lines of cur into a store row; the two `CONT` lines of
+   a chain column read). The 39 prefill calls they describe are built with the model's
+   constructors, compared with the lines' ne and nb, and must be accepted: k 1..4 with nq 1
+   and 3, the nq 1 calls again with a view-backed norm weight, and the bank's k 1, nq 4. The
+   15 decode lines and ten out-of-scope variants must be refused, each by its reason. Red
+   first, on every run: the handed-over rule (`nw-view`) fails exactly the 12 folded calls, a
+   rule that accepts everything fails 25 checks.
+2. *The launch plan.* `ggml_depth_mix_plan_make` (pure; the dispatch binds its strides, counts,
+   local size and bounds from it) on every call: each argument's reach equals its tensor.
+3. *The kernel's own text.* `depth_mix.cl` is compiled as C++ into the test (256 lanes as
+   threads, `barrier()` a real barrier, the local memory shared) and run at the plan's
+   arguments with every source at its own non-zero offset of one buffer, as on the backend,
+   against the CPU op: nmse 2e-15 .. 2e-14 on the 13 calls of ub 512 and 4 of ub 2048. The red
+   build of the same text (`-DDEPTH_MIX_RED_NW`, the offset dropped again) must not match and
+   does not (nmse > 100 on all five folded calls).
+4. *The fault's read*, as above.
+
+`test-backend-ops` (0207) now has the exported shapes only, 45 cases: a ubatch size (512,
+1024, 2048) has the 5-row store's k 1..4 at nq 1, nq 1 with the folded norm, and nq 3; the
+2-row bank store's k 1 at nq 4; and two `cols` cases that add the columns' readers as the
+model has them (a column view, an RMS norm, summed) on the bank's four columns and on a
+full-attention layer's three. The case string is
+`DEPTH_MIX(n_slot=..,k=..,nt=..,nq=..,with_norm=..,cols=..)`.
+
+**The fold is back, with its own switch.** `GGML_OPENCL_DEPTH_MIX=1` folds the output norm
+where the chain norms one mixed column with one weight and no controller sits between (an SWA
+layer's attention in the prelude and the first pass, the ffn mix without messages, the output
+mix). `GGML_OPENCL_DEPTH_MIX=nofold` takes the arm and leaves every norm a node: the card
+bisect of the fold against the mix.
+
+**Bounds.** The arm's five buffers are checked before every launch, always (the plan's reach
+plus the tensor's offset against `CL_MEM_SIZE`); a violation aborts with the buffer's name.
+`GGML_OPENCL_BOUNDS=1` adds the other arms' checks to the same run. Note what this check does
+not see and never could have: the fault was a *different* node's launch (the copy of a bad
+view), which is why the view is now refused where it is built.
+
+**Offline gate** (`measured-here`, ocloc 26.27.1, bmg-g21, the backend's options plus
+`-cl-intel-256-GRF-per-thread`): base, `DEPTH_MIX_RED` and `DEPTH_MIX_RED_NW` compile, each
+`grf 256 simd 32 slm 1024 scratch 0 stack_calls -`, no ISA call, no retry dump: `ocloc 3/3
+variants`.
+
+**Prediction, revised before any card run of this revision (`inference`).** The earlier
+120-160 ms a pass priced the bytes at the reference's rate and nothing else. The kernel also
+passes 15 barriers a work-group at k 4, nq 1 (two reduction rounds of seven, one before), 23
+with the fold, and a 256-lane group at SIMD32 is 8 hardware threads. Assumed, not measured:
+~80 groups in flight at 256 GRF (640 threads), so a 512-token call is ~6.4 waves, and a group
+at 25-45 us (the loads, ~200 flops a lane, the barriers at 1-2 us each):
+
+| ubatch | us a call (k 4, nq 1) | ms a pass (~960 / 480 / 240 calls) | against |
+|---|---|---|---|
+| 512 | 150-300 | 145-290 | the chain 765 (699 with 0187), the reference 399 |
+| 1024 | 300-600 | 145-290 | |
+| 2048 | 600-1200 | 145-290 | |
+
+pp4096 at ub 512, from the measured rows: 0187 on, 768.8 t/s is 5.33 s a pass, less 409-554 ms
+= **833-858 t/s**; 0187 off, 719.7 t/s is 5.69 s, less 475-620 ms = 785-808 t/s. Not priced
+and on top (`inference`): the states' `rms_norm`, the cur copy, the column copies and, with the
+fold, one `rms_norm` and one `mul` a folded call. What would falsify it: `test-backend-ops
+perf` above 300 us a call at `n_slot=5,k=4,nt=512,nq=1`; above ~415 us a call the arm is
+behind the reference and the barriers are the first suspect (the two-pass form without the
+register array, or the reduction in one round, is then the next step - and the place where an
+inline-vISA reduction would be judged, from the ISA dump and that measured gap, not before).
+
+**Card commands for this revision, in order** (the B60; `<dev>` the card's backend name as
+test-backend-ops lists it; every step stops the sequence if it fails):
+
+```
+# 0. the arm's op cases are found at all: must list 45 cases, none "not supported"
+GGML_OPENCL_DEPTH_MIX=1 test-backend-ops support -b <dev> -o DEPTH_MIX
+# 1. ONE model-shaped case, bounds on: the loop's messages with their readers
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> \
+  -o "DEPTH_MIX(n_slot=2,k=1,nt=512,nq=4,with_norm=0,cols=1)"
+#    then one folded case
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> \
+  -o "DEPTH_MIX(n_slot=5,k=4,nt=512,nq=1,with_norm=1,cols=0)"
+# 2. the suite: 45 cases, 0 FAIL
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> -o DEPTH_MIX
+# 3. the reds: every case must FAIL; then only the 12 with_norm=1 cases must FAIL
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED \
+  test-backend-ops test -b <dev> -o DEPTH_MIX
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED_NW \
+  test-backend-ops test -b <dev> -o DEPTH_MIX
+# 4. the model, bounds on, one short pass first (-p 512 -r 1), then pp4096: one TAKEN line,
+#    a stats line a graph with calls == nodes > 0, no "DOWNGRADE ... op=DEPTH_MIX", and the
+#    kernel log clean (no fault, no CAT error) before anything else is run
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_STATS=1 \
+GGML_OPENCL_CPY_TRANSPOSE=1 GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 \
+  llama-bench -m <Inkling IQ4_NL> -fa 1 -p 512 -n 0 -b 4096 -ub 512 -r 1 2>&1 | \
+  grep -E "depth_mix:|DOWNGRADE|reaches"
+#    (repeat with -p 4096)
+# 5. the answer-level bar: llama-perplexity's KL against the knob-off arm's logits on the same
+#    card and window (-b 512 so the prefill path runs), then the same with =nofold if it moves
+# 6. op perf, the prediction's check
+GGML_OPENCL_DEPTH_MIX=1 test-backend-ops perf -b <dev> -o DEPTH_MIX
+# 7. pp4096, 0187 on, the arm off / on, ub 512 / 1024 / 2048
+for ub in 512 1024 2048; do
+  for dm in 0 1; do
+    GGML_OPENCL_DEPTH_MIX=$dm GGML_OPENCL_CPY_TRANSPOSE=1 \
+    GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 \
+      llama-bench -m <Inkling IQ4_NL> -fa 1 -p 4096 -n 0 -b 4096 -ub $ub -r 3
+  done
+done
+```
+
+The command list further up (written for the previous revision) is superseded by this one: its
+`-p 'k=2 nt=512 nq=1'` matches no case (the params string is comma-separated, and has
+`n_slot` and `cols` now), and its model run read no bounds or stats line.
+
+**The model's own graph, before and after** (`measured-here` on the recipe host:
+`test-export-graph-ops` on the CPU, c 4096, fa on, ub 512, with `GGML_OPENCL_DEPTH_MIX=1`, so
+the lines are what `src/models` emits, not a reconstruction). The handed-over tree's export has
+the faulting node as a line: a `CONT` to `[2304, 512]` whose source is `[2304, 512]` with nb
+`4, 4718592, 2415919104` - a row step of one slab, a 2.4 GB span over an 18.9 MB tensor. This
+revision's export has no source with that row step at any of ub 512, 1024, 2048, and no copy of
+a mix column at all. It has 12 distinct `DEPTH_MIX` lines a ubatch size, the shapes the op
+cases and the unit test use: the 5-row store's k 1..4 at nq 1 (three sources, and four with
+the norm weight) and nq 3, and the bank store's k 1 at nq 4 (`[2304, 1, T]` at slab step
+18432, cur `[2304, T]`, queries `[2304, 4]`). `test-backend-ops --test-file <that export> -o
+DEPTH_MIX` replays exactly those 12 lines (12/12 on the CPU backend here), which is step 2b of
+the card list: the card's op cases from the graph's own lines.
+
+**State of this revision** (`measured-here`, the recipe host): the series applies from the pin
+in byte order, 150 patches, applied tree `92f3a0347c66d7001b160ae950493fd47a6037a8`; the
+recipe (package build and the `unit` set) is green, 51 of 51, `depth-mix` among them;
+test-backend-ops lists 45 `DEPTH_MIX` cases and passes them CPU against CPU (the graphs
+build and the readers run; it says nothing about the card).
+
+```
+# 2b. after step 2: the graph's own DEPTH_MIX lines replayed (12 a file, 0 FAIL)
+for ub in 512 1024 2048; do
+  GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 test-backend-ops test -b <dev> \
+    --test-file <knob-on export, ub $ub> -o DEPTH_MIX
+done
+```
+
+**Review of the revision above, and a third defect it found (2026-11-24; `code`, and
+`measured-here` on the recipe host; still no card run).** An independent code read confirmed
+the fault's cause and the offset, and found what neither the op cases nor the replay could
+see, because both compared the op with its own CPU twin:
+
+**The op mixed RAW states; the chain and the reference mix NORMALIZED ones.** In the chain,
+`states = ggml_rms_norm(states)` overwrites the variable, so both products read the normalized
+states: the scores and the weighted sum. The reference's kernel says the same in one line,
+`pw = p / sum(p) * inv`. `depth_mix.cl` and the CPU op used each state's `1/rms` for the score
+and then accumulated `p[s] * v_s` on the raw rows. A norm after the mix hides a global scale,
+not this: it is a per-state reweighting. It was in every revision the card ran, and the
+card's 16 green op cases were green against the same arithmetic.
+
+- Red first (`measured-here`): the unit test now builds **the model's chain** node for node
+  (cpy, rms_norm, repeat, mul_mat, soft_max_ext, cont(transpose), mul_mat, and the column's
+  rms_norm and mul where the call folds) on the exported shapes, with the store's rows at
+  different scales (0.25 .. 4, cur at 3), and compares the op with it. Against the previous
+  revision's library and kernel text: 16 of 16 replayed calls fail on both, nmse 0.0091 to
+  0.64 (0.249 at k 1, nq 1; 0.0096 with the norm folded - the norm hides most of it at k 1, not
+  all).
+- The fix: the weights on the raw rows are `p / sum(p) * inv_s`, in the kernel (both branches)
+  and in the CPU op. Green: the CPU op against the chain over all tokens nmse 2e-14 .. 1e-13,
+  the kernel's text against the chain 7e-15 .. 2e-13, on the 13 calls of ub 512 and 4 of ub
+  2048. The red build `-DDEPTH_MIX_RED_RAW` (the weights without `inv_s`) is kept in the test
+  and must miss the chain: 0.0091 .. 0.68.
+- The op cases (0207) now set the store's rows and cur at those different scales too, so the
+  same red is visible on the card.
+
+**The knob-on model against the knob-off model on the CPU** (`measured-here`, the recipe host,
+no GPU: llama-perplexity, Inkling 2 Mini IQ4_NL, c 256, b 256, 3 chunks, 381 scored tokens,
+the knob-off logits as the base; the CPU backend serves the op with its reference):
+
+| arm | mean KL, nats | max KL | same top p | PPL (base 2.5907) |
+|---|---|---|---|---|
+| knob off again | 0.000000 | 0.000024 | 100.000 % | 2.5974* |
+| `GGML_OPENCL_DEPTH_MIX=1` | 0.001537 ± 0.000238 | 0.0596 | 98.950 ± 0.523 % | 2.5915 |
+| `=nofold` | 0.001549 ± 0.000219 | 0.0364 | 99.213 ± 0.453 % | 2.5877 |
+
+(* the tool's final estimate line of that run; its KL columns are the comparison.) The mean KL
+is a twentieth of the 0.03-nat bar. The top-p agreement of the folded arm is 1.05 points down
+on 381 tokens (4 tokens), which is AT the 1-point bar and inside its own ±0.52: this run does
+not decide that cell, a longer one on the card does (card step 5, both arms). The op agrees
+with the chain to 1e-7 relative a call in the unit test; that a difference of that size
+reaches 1.5e-3 nats at the logits through ~110 mix calls and the expert routing is
+`inference`, not measured. This check was not run on the raw-state revision, so its
+discrimination is not measured either; the chain comparison above is what failed that revision.
+
+**The reds, and which cases each must fail** (45 op cases; the unit test has the last two
+compiled in):
+
+| build option (`GGML_OPENCL_DEPTH_MIX_OPTS`) | what it breaks | must FAIL |
+|---|---|---|
+| `-DDEPTH_MIX_RED` | the first state's weight doubled: the mix's direction, not its scale | all 45 |
+| `-DDEPTH_MIX_RED_RAW` | the weights without `inv_s` (the third defect) | all 45 |
+| `-DDEPTH_MIX_RED_NW` | the norm weight's offset dropped (the second defect) | the 12 `with_norm=1` cases only |
+
+The previous `-DDEPTH_MIX_RED` (the softmax denominator dropped) is gone: it was a per-column
+scale, and on the 12 folded cases the norm cancelled it, so it could not fail them. Offline
+gate for the four builds: `ocloc 4/4 variants`, each `grf 256 simd 32 slm 1024 scratch 0`.
+
+**The knob is the model's, on every backend** (`code`). `GGML_OPENCL_DEPTH_MIX` is read by
+`src/models/inkling2.cpp`, not by the OpenCL backend alone: set, the graph carries
+`GGML_OP_DEPTH_MIX` whatever the backend. The CPU backend serves it with the reference (the
+table above is that), the OpenCL backend with the kernel, and any other GPU backend would send
+the node to the CPU. It is not gated to OpenCL because the CPU arm is the device-free
+model-level check.
+
+**Card step 3 above gains one line** (after the two reds there):
+
+```
+GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_BOUNDS=1 GGML_OPENCL_DEPTH_MIX_OPTS=-DDEPTH_MIX_RED_RAW \
+  test-backend-ops test -b <dev> -o DEPTH_MIX      # all 45 must FAIL
+```
+
+**State of this revision** (`measured-here`, the recipe host): supersedes the state paragraph
+above. The series applies from the pin in byte order, 150 patches, applied tree
+`e564f5b5366b9f871bf74a0b5dfe7295c3476cbf`; the recipe result is in the commit that adds this
+paragraph. The knob-on exports are unchanged by this revision (the graph is the same; the
+op's arithmetic changed).
+
+**Where the CPU model difference comes from: the first node that differs** (`measured-here`,
+the recipe host, CPU, one 64-token prompt in one ubatch, every node's output dumped through
+llama's eval callback, knob off twice and knob on; tools in `contrib/llama.cpp/replay/`:
+`mix_node_dump.cpp`, `mix_node_cmp.py`). Knob off against knob off: 1,301 named nodes, none
+above nmse 1e-10 (the CPU is deterministic). Knob on against knob off:
+
+- the first arm mix (layer 0's ffn mix, k 1, nq 1, folded) has inputs bit-identical to the
+  chain run's (block row nmse 0, cur nmse 0);
+- its output, read as the activation of the first expert product, differs from the chain's by
+  nmse 8.6e-15 - a relative rms of 9.3e-8, under one float ulp (the router's logits from the same
+  activation: 2.5e-14);
+- **the first node above 1e-10 is `ffn_moe_gate_up-0`**, `MUL_MAT_ID`, `[2304, 8, 64]`, built by
+  `build_moe_ffn` (`src/llama-graph.cpp`, the `ggml_mul_mat_id` on the gate/up experts): nmse
+  2.5e-9 from an input at 8.6e-15, a factor of 2.9e5 at one node. `code`: the CPU kernel
+  (`ggml_compute_forward_mul_mat_id`, `ggml-cpu.c`) quantizes the activation to the weight
+  type's `vec_dot_type`, Q8_0 for IQ4_NL, so a sub-ulp change flips int8 steps;
+- from there the difference grows with depth: 5.5e-8 at `ffn_moe_out-0`, 5.7e-3 at `l_out-23`;
+- an unfolded arm mix checked in place (float64 chain arithmetic on the node's own dumped
+  inputs): 6e-15.
+
+So no node under the knob reads a wrong store row, a wrong stride or a wrong precision in this
+run; the op's output differs from the chain's at rounding level and the next quantized product
+amplifies it. That the amplification, and not something else, accounts for the 0.0015 nats is
+still `inference` until the noise control has run: knob off, every chain mix result the arm
+would replace moved one ulp up or down at random (`mix_noise_control.diff`, a test-only diff
+that is NOT in the series), three seeds, against the unperturbed chain on the same tokens,
+beside knob on (fold and nofold), on 381 and on 2,032 scored tokens. **Owed; not run yet.**
+
+The unit test also runs T = 256 now (the CPU check's batch; not an exported size): op and
+kernel text against the chain 2e-14 .. 8e-14 on six calls, the raw-state red 0.016 .. 0.64;
+the chain thresholds are 1e-11. Applied tree `c83de73e1fb7d15c44436481ec667d8280b5091c`
+(a comment in the dispatch); the recipe was last run on the previous tip.
+
+**The noise control: the knob's CPU difference is one-ulp amplification** (`measured-here`, the
+recipe host, CPU, llama-perplexity, Inkling 2 Mini IQ4_NL, c 256, b 256, the knob-off logits as
+the base; 16 chunks = 2,032 scored tokens, whose first 3 chunks are the 381-token set of the
+table above). The control is the knob OFF with every chain mix result the arm would replace
+moved one ulp up or down at random (`contrib/llama.cpp/replay/mix_noise_control.diff`, test
+only, not in the series; relative change 6e-8 .. 1.2e-7, the size measured at the first mix):
+
+| arm | tokens | mean KL, nats | max KL | same top p |
+|---|---|---|---|---|
+| knob on (fold) | 381 | 0.00154 ± 0.00024 | | 98.950 ± 0.523 % |
+| noise, seed 1 | 381 | 0.00253 ± 0.00096 | | 99.213 ± 0.453 % |
+| knob on (fold) | 2,032 | 0.00234 ± 0.00062 | 1.229 | 98.376 ± 0.280 % |
+| noise, seed 1 | 2,032 | 0.00213 ± 0.00027 | 0.357 | 98.081 ± 0.304 % |
+
+A one-ulp perturbation of the unchanged chain moves the logits as far as the arm does: the same
+mean KL within the spread, and a top-p agreement 0.3 points LOWER than the arm's on 2,032
+tokens. The arm's CPU difference is therefore the amplification named above (the quantized
+expert product and what follows), not a defect in the graph under the knob. It also says what
+this CPU check can and cannot gate: any rounding change at these sites costs ~0.002 nats and
+~1.6-1.9 points of top p against a bit-fixed base here, so the 1-point cell of the answer-level
+bar has to be read against a baseline arm's own spread on the card, as the bar says
+(comparative), not against a deterministic CPU base. Owed, after the card window: the nofold
+arm and noise seeds 2 and 3 on the same tokens.
+
+**The bars for the card window, stated before it** (the operator's rule, 2026-11-25).
+
+*Primary: the op level.* Every op case on the card against the model's chain, with a bound:
+
+- what is compared: `test-backend-ops` runs the op on the card and on the CPU and compares the
+  outputs (the 45 cases at the export's shapes, and the 12 lines a ubatch size of the knob-on
+  export through `--test-file`). The CPU op is tied to the CHAIN by the unit test, on the same
+  shapes: all 39 exported calls (13 a ubatch size at 512, 1024, 2048) and six at T = 256, the CPU
+  op against the chain built node for node over all tokens, nmse 2e-14 .. 1.1e-13
+  (`measured-here`, the recipe host), gated at 1e-11;
+- **the bound: nmse <= 1e-10 a case**, card against CPU op - now the cases' own tolerance
+  (`max_nmse_err`, in place of the tool's 1e-7), so a case above it prints FAIL with its ERR.
+  With the CPU op within 1.1e-13 of the chain, a passing case is within ~1.1e-10 of the chain;
+- why 1e-10 (`inference`): the kernel is the CPU op's arithmetic in fp32 with the device's
+  `exp` and `rsqrt` under fast-relaxed-math. Its own text on host threads reaches 7e-15 .. 2e-13
+  against the chain; a device `rsqrt` or `exp` off by a few ulp moves a score by ~1e-6 relative
+  and the output by ~1e-12. 1e-10 leaves a factor of 100 over that and is still a relative rms
+  of 1e-5. Every defect this arm has had sat far above: the raw-state mix 9e-3 .. 0.64 against
+  the chain, the dropped weight offset ERR ~2;
+- the reds, as in the table above: `-DDEPTH_MIX_RED` and `-DDEPTH_MIX_RED_RAW` must fail all 45
+  cases, `-DDEPTH_MIX_RED_NW` the 12 `with_norm=1` cases and no other;
+- a row worse than its bound fails the arm. No KL result rescues it.
+
+*Secondary: the answer level.* Knob on against knob off on the card, read comparatively: beside
+it the chain with the one-ulp noise control on the same tokens, or the card's own run-to-run
+arm. A ~2e-3 KL is what one ulp costs here, so this bar cannot see a defect of that size - which
+is why it is secondary.
+
+**The noise control, all arms** (`measured-here`, the recipe host, CPU, llama-perplexity as
+above, the knob-off logits as the base; mean KL in nats, same top p):
+
+| arm | 381 tokens | 2,032 tokens | max KL (2,032) |
+|---|---|---|---|
+| knob on (fold) | 0.00154 ± 0.00024, 98.95 ± 0.52 % | 0.00234 ± 0.00062, 98.38 ± 0.28 % | 1.229 |
+| knob on (`=nofold`) | 0.00155 ± 0.00022, 99.21 ± 0.45 % | 0.00212 ± 0.00049, 98.13 ± 0.30 % | 0.971 |
+| chain + one-ulp noise, seed 1 | 0.00253 ± 0.00096, 99.21 ± 0.45 % | 0.00213 ± 0.00027, 98.08 ± 0.30 % | 0.357 |
+| chain + one-ulp noise, seed 2 | 0.00191 ± 0.00032, 98.69 ± 0.58 % | 0.00194 ± 0.00018, 98.33 ± 0.29 % | 0.266 |
+| chain + one-ulp noise, seed 3 | 0.00204 ± 0.00034, 98.95 ± 0.52 % | 0.00272 ± 0.00091, 98.33 ± 0.29 % | 1.840 |
+
+On 2,032 tokens the three noise seeds span 0.00194 .. 0.00272 nats and 98.08 .. 98.33 % top p;
+the arm sits inside that span with the fold (0.00234, 98.38 %) and without it (0.00212,
+98.13 %). The fold and the nofold arm do not separate. The single-token maxima are as large
+under noise (1.84) as under the arm (1.23). This closes the CPU question: the knob's
+difference from the chain is what one ulp at these sites costs.
+
+**Rebased onto development with the FA port (2026-11-25).** The series is development's
+through 0199, then 0204-0207, then 0208: 155 patches, applied in byte order from the pin;
+0204-0207 are regenerated against the tree before each (no hunk of the port's patches
+conflicted; 0208 applies on top of 0207 unchanged). The FA port's knob
+(`GGML_OPENCL_FA_PORT`) is off by default and the arm's card window runs with it off unless
+stated otherwise.
+Applied tree `4c5f2df145477470efc0f8f4e7294c2d59db4060` (`measured-here`, the recipe host).
+
+**The bound covers the replays, and every depth-mix row prints its error** (0207, test only;
+found by the delta review, `code`). The `--test-file` replays run as the tool's generic case,
+whose tolerance was the default 1e-7, and the tool printed an error only for a failing
+comparison. Two changes in `tests/test-backend-ops.cpp`, nothing else: the generic case's
+tolerance switch has `GGML_OP_DEPTH_MIX` at 1e-10, and the comparison prints
+`[DEPTH_MIX] nmse = <value> (bound <bound>)` for every depth-mix output, pass or fail. So the
+45 cases and the 36 replayed lines all sit under 1e-10 and each row carries the number it
+passed with. Applied tree `13ab33b8232fac4b4fddd2cf6ed414e8328f1868`.
+
+**Card result 3, 2026-11-25: the arm on the B60** (`measured-here`, the operator's window; tree
+`13ab33b8`, `GGML_OPENCL_KQ_MM_ID_I8=1`, `GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`,
+`GGML_OPENCL_CPY_TRANSPOSE=1`, `GGML_OPENCL_FA_PORT` unset; Inkling 2 Mini IQ4_NL; f16 KV unless
+a row says otherwise). The window's script is the command list above in body form; it ran to its
+end without a stop.
+
+*Op level (the primary bar).* The 45 cases and the three replays of the knob-on export (12
+lines each) ran under the 1e-10 bound with no failing row, the two single cases under
+`GGML_OPENCL_BOUNDS=1` first. Every row printed its nmse, card against the CPU op:
+
+| rows | n | nmse, lowest .. worst | bound |
+|---|---|---|---|
+| the 45 cases | 45 of 45 OK | 1.04e-14 .. **1.83e-14** | 1e-10 |
+| the replayed export, ub 512 / 1024 / 2048 | 12 of 12 OK each | 7.15e-15 .. 1.74e-14 | 1e-10 |
+| red `-DDEPTH_MIX_RED` | 45 of 45 FAIL | 0.074 .. 0.20 | must fail all |
+| red `-DDEPTH_MIX_RED_RAW` | 45 of 45 FAIL | 0.026 .. 0.44 | must fail all |
+| red `-DDEPTH_MIX_RED_NW` | the 12 `with_norm=1` FAIL, 33 OK | 2.97 .. 3.25; the 33 at most 1.83e-14 | must fail those 12 only |
+
+The worst row is 5,000 times inside the bound, and at the level the kernel's text reached on
+host threads (2e-13 against the chain); the bound's reasoning allowed for a device `exp` or
+`rsqrt` a few ulp off and none showed.
+
+*The model takes it.* `llama-bench -v`, bounds on: pp512 1,023.1 t/s over 2 graphs; pp4096 907.3
+t/s over 16 graphs, 120 nodes and 120 calls a graph, one TAKEN line, no `DEPTH_MIX` downgrade.
+
+*Prefill, pp4096, knob off -> on:*
+
+| ubatch | chain | arm | gain |
+|---|---|---|---|
+| 512 | 771.1 t/s | 908.1 t/s | +17.8 % |
+| 1024 | 818.6 | 982.1 | +20.0 % |
+| 2048 | 770.0 | 917.4 | +19.1 % |
+
+At the serving unit's settings (ub 1024, three rounds): q8_0 KV 816.4 -> 979.2 t/s with the fold
+and 978.5 with `=nofold`; f16 KV 815.8 -> 978.6.
+
+*The profile, one pp4096 pass at ub 512 (a profiling build; read the ms, not its t/s):* all
+kernels 5,229 ms with the chain, 4,431 ms with the arm; `kernel_depth_mix_f32` **99.1 ms over
+960 launches, 103 us a launch**. The reference's own mix kernel is 399 ms a pass on this card
+(`measured-here` on the reference stack, a trace of its 4,096-token prefill at chunk 512, first
+recorded in this section's plan as 398.96 ms; the reference run's commit is not recorded here),
+the chain's four probed parts were 765 ms (699 with 0187).
+
+*The prediction's miss, on the record.* Predicted 150-300 us a call and 145-290 ms a pass;
+measured 103 us and 99 ms. The barrier cost the revision added to the first estimate was
+overpriced: the first estimate's low end (110 us, bytes at the reference's rate) was nearer.
+The pass saves 798 ms where the four probed parts priced 600-700: the rest is what the
+prediction listed as unpriced (the states' `rms_norm`, the cur copy, the column copies, the
+folded norms). pp4096 at ub 512 was predicted at 833-858 t/s and measured 908.1.
+
+*Answer level (the secondary bar), llama-perplexity against the 3-chunk CPU base made from the
+card's own file (the published GGUF, knob off), 3 chunks of 2,048:*
+
+| arm | mean KL, nats | same top p |
+|---|---|---|
+| chain (twice, identical) | 0.001932 | 98.208 % |
+| arm, fold | 0.001982 | 98.436 % |
+| arm, `=nofold` | 0.002043 | 98.240 % |
+| chain + one-ulp noise, two seeds | 0.002104, 0.001921 | 98.273 %, 98.306 % |
+
+The arm is +0.00005 nats and +0.23 points against the chain with the fold, +0.00011 and +0.03
+without it: inside the answer-level bar (0.03 nats, 1 point) by two orders of magnitude, and
+inside the span of the chain with one-ulp noise. The same arms on 6 chunks and the task
+battery (the capital, an arithmetic chain, a JSON extraction, the binary-search completion) are
+further down.
+
+The README is not part of the applied tree: these paragraphs leave `13ab33b8` as it is.
+
+**Provenance of the numbers in this section.** The card rows (card result 3) ran the published
+Inkling 2 Mini IQ4_NL file (`output.weight` and `token_embd.weight` Q8_0). The recipe host's CPU
+arms above (the first knob-on / knob-off KL, the per-node dump, the noise control) ran a
+re-quantized variant of the same model whose output tensor is Q6_K: they compare arms of one
+file with each other and are not comparable with the card's KL against its CPU base. The CPU
+base for the card's 6-chunk KL is made from the published file (2,456,010,284 bytes, 6 chunks of
+2,048 on the gate text, knob off, tree `13ab33b8`).
+
+**With the FA port, and the 6-chunk answer-level arms** (`measured-here`, B60, tree `13ab33b8`, f16
+KV - on that tree the port refused a q8_0 KV cache; with 0199q1 / 0199q2 it reads one, and the q8_0 row
+of both knobs is in the port's section and below -, int8 expert tile + wide + 0187 on; `GGML_OPENCL_FA_PORT=1` is
+development's opt-in port, another patch set). pp4096 at ub 1024 (`-b 2048`, three interleaved
+rounds):
+
+| arm | t/s, three rounds | device ms a pass (profiling build) |
+|---|---|---|
+| chain, port off | 815.86, 815.77, 815.02 | 4,923.4 |
+| the arm (fold) | 978.48, 978.43, 978.05 | 4,091.8 |
+| the FA port alone | 973.64, 971.71, 972.10 | 4,110.2 |
+| the arm and the port | **1,215.69, 1,215.12, 1,214.52** | 3,275.2 |
+
+Every arm's log carried its own TAKEN lines and none of the other's. The two savings add: 831.6
+ms for the arm and 813.2 ms for the port are 1,644.8 ms, both together save 1,648.2 - an overlap of
+-3.4 ms, on disjoint launches. The reference stack's row on this card is 1,220 t/s
+(`measured-here` on the reference stack; this is the row's first record in the repository, and
+the reference run's commit is not recorded here). At the unit's
+q8_0 KV the arm alone is 979.2 t/s (above); the arm with the port at q8_0 KV is the last table
+of this section.
+
+llama-perplexity against the CPU base of the published file, 6 chunks of 2,048 (`-b 512`; about
+6,100 scored tokens), every arm's path shown by its TAKEN line in the same log:
+
+| arm | mean KL, nats | same top p |
+|---|---|---|
+| chain (twice, identical) | 0.002256 | 98.27 % |
+| the arm, fold | 0.002261 | 98.34 % |
+| the arm, `=nofold` | 0.002266 | 98.26 % |
+| the FA port alone | 0.002237 | 98.49 % |
+| the arm and the port | 0.002172 | 98.49 % |
+| chain + one-ulp noise, two seeds | 0.002346, 0.002270 | 98.16 %, 98.37 % |
+
+The arm is +0.000005 nats and +0.07 points against the chain with the fold, +0.000010 and -0.01
+without it: inside the answer-level bar, and inside the two noise seeds. The answer-level bar
+is met on more than 5,000 tokens.
+
+**The task battery** (`measured-here`, B60, tree `13ab33b8`, the unit's q8_0 KV, all layers on
+the card, temperature 0, `-b 2048 -ub 512`, int8 expert tile + wide + 0187 on; each answer saved
+in full and judged by a script against its known answer; identical text across arms is not
+required at a batched prefill):
+
+| task | prompt tokens | chain | the arm (fold) | text against the chain |
+|---|---|---|---|---|
+| the capital of France, one word | 27 | right | right | identical |
+| an arithmetic chain of six steps (88) | 73 | right | right | differs from char 171 of 548 / 512 |
+| a JSON object of four fields from a 100-record order log | 4,394 | right | right | identical |
+| a binary search completed after 139 code samples, run on 300 random cases | 4,095 | right | right | differs from char 161 of 829 / 752 |
+
+8 of 8 right. The script is the battery in `contrib/llama.cpp/replay/mix_task_battery.sh` (a
+measurement body: it needs `llama-completion`, the model, and three helpers; rehearsed on the CPU
+with a short prompt set first, 8 of 8 there too).
+
+**The arm with the FA port at the unit's q8_0 KV** (`measured-here`, B60, a combined tree that
+adds another patch set's q8_0 support for the port, applied tree `a52a4c2a`; pp4096, medians):
+chain 816.55 t/s, the arm 980.46, the port 945.74, both **1,171.43** (the additive prediction was
+1,171). llama-perplexity against the CPU base on that tree: chain 0.002464 ± 0.000073 nats, the
+arm 0.002470 ± 0.000085.
+
+No measurement in this section is owed any more.
+
+**Open list** (from the final review; none of it changes a result above, and no patch file is
+touched for it now, because that would move the card-proven tree `13ab33b8`):
+
+- the launch (`ggml_cl_depth_mix`) does not call `ggml_depth_mix_refuse` again - it relies on
+  `supports_op` having decided - and the dst-layout check (`F32`, contiguous) sits in
+  `supports_op` beside the pure rule, not inside it;
+- with the knob off the dispatch still counts `GGML_OP_DEPTH_MIX` nodes once a graph (a loop
+  over the graph's nodes; no kernel, no launch);
+- two comments in 0205 are wrong: "0178's bounds helper" at the forward declarations (the helper
+  is 0198's), and "the card run of 0.5.1", which names a version where it means this arm's
+  first card result;
+- the two reference readings in this section (399 ms a pass for its mix kernel, 1,220 t/s for
+  its pp4096 row) are `measured-here` on the reference stack, but no document in the repository
+  names the tree and commit of those runs: they need that line, from the runs' own record;
+- `GGML_OPENCL_DEPTH_MIX_OPTS` (the reds' route: extra compiler options for `depth_mix.cl`) is a
+  test hook that lives in the production dispatch.

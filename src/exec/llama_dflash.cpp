@@ -219,6 +219,9 @@ public:
     bool ok() const { return bd_ != nullptr; }
     int  n_draft() const { return n_draft_; }
 
+    llama_context* draft_context() const override { return ctx_dft_; }
+    size_t draft_head_device_bytes() const override { return 0; }   // shares the target's head
+
     int decode(const int* toks, size_t n, size_t pos, int seq, bool all_logits) override {
         const SpecPart p{ seq, toks, n, pos, all_logits };
         return decode_multi(&p, 1);

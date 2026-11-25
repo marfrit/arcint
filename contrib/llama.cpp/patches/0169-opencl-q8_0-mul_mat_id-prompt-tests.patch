@@ -1,0 +1,21 @@
+0169: test-backend-ops at the coda shapes for 0167's prompt arm: Q8_0, 128 experts, top-8, gate/up K 2304 and down K 1152 at 2304 rows, 16 / 512 / 2048 tokens.
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f8b7aa3..ec33f35 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -12485,6 +12485,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 2040, 33, 512));
+     }
+ 
++    // patch 0167: Q8_0's prompt MUL_MAT_ID on the int8 DPAS tile (a prompt batch, 16 tokens and up): Inkling 2 Mini's
++    // coda layers, 128 experts, top-8, gate/up K 2304 -> 2304 rows with a broadcast b, down K 1152 -> 2304 rows with a
++    // column a pair (ne11 = 8), at 16 tokens (the arm's floor), 512 and 2048 (the prefill chunks)
++    for (int n : {16, 512, 2048}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
++    }
++
+     // Q2_0 rows of 20 and 12 sub-blocks (4 lanes a row in the OpenCL low-bit matvec) and of 10 (16 lanes):
+     // Flash-Next's down projections are 2560 x 640 Q2_0
+     for (int k : {640, 384, 320}) {

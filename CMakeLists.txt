@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(arcint VERSION 1.8.0 LANGUAGES CXX)
+project(arcint VERSION 1.8.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -81,6 +81,7 @@ add_library(arcint_core STATIC
   src/util/utf8.cpp
   src/util/text.cpp
   src/core/admission.cpp
+  src/core/spill_guard.cpp
   src/core/dory.cpp
   src/core/reasoning.cpp
   src/core/renderer_material.cpp
@@ -208,6 +209,31 @@ if(ARCINT_LLAMA)
   else()
     message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0111: a weight the card declines at load is not reported")
   endif()
+  # contrib/llama.cpp 0160: the driver's card figure (llama_device_card_memory) and the
+  # reserved graph stats (llama_context_graph_stats). The backend uses the patch's types
+  # outside the #ifdef, so a tree without it cannot compile: refused at configure.
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_device_card_memory")
+    message(STATUS "contrib/llama.cpp 0160 present: the driver's card figure is built")
+  else()
+    message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0160 (llama_device_card_memory): the spill guard's backend needs its types")
+  endif()
+  # contrib/llama.cpp 0173: the expert cache's projected bytes at a budget; the guard's cache
+  # suggestion searches it. The backend calls it outside the #ifdef, so a missing patch refuses.
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_model_expert_cache_projected_bytes")
+    message(STATUS "contrib/llama.cpp 0173 present: the expert cache projection is built")
+  else()
+    message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0173 (llama_model_expert_cache_projected_bytes): the guard's cache suggestion needs it")
+  endif()
+  # contrib/llama.cpp 0153: the attention part's own oldest retained position
+  # (llama_memory_attn_seq_pos_min in llama-ext.h), which a window-sized SWA
+  # cache needs to decide whether a prefix trim is exact; without it
+  # the build stops (the backend's prefix cuts call it)
+  if(ARCINT_LLAMA_EXT_H MATCHES "llama_memory_attn_seq_pos_min")
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_SWA_WINDOW=1)
+    message(STATUS "contrib/llama.cpp 0153 present: --llama-swa-window is built")
+  else()
+    message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0153 (llama_memory_attn_seq_pos_min): apply the series")
+  endif()
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
     # 0024: an expert cache per card under the layer split
@@ -286,9 +312,11 @@ if(ARCINT_TESTS)
     tests/test_sampling.cpp
     tests/test_stop.cpp
     tests/test_chat.cpp
+    tests/test_minja_empty.cpp
     tests/test_chat_render.cpp
     tests/test_text.cpp
     tests/test_config.cpp
+    tests/test_swa_window.cpp
     tests/test_verify_walk.cpp
     tests/test_mtp_trace.cpp
     tests/test_mtp_capture.cpp
@@ -312,6 +340,7 @@ if(ARCINT_TESTS)
     tests/test_raw_trace.cpp
     tests/test_stream_golden.cpp
     tests/test_admission.cpp
+    tests/test_spill_guard.cpp
     tests/test_dory.cpp
     tests/test_dory_request.cpp
     tests/test_gemma4.cpp
@@ -333,6 +362,12 @@ if(ARCINT_TESTS)
     tests/test_reqid.cpp
     tests/test_tokenize.cpp
     tests/test_opencl_card_select.cpp
+    tests/test_cache_prompt.cpp
+    tests/test_completion_timings.cpp
+    tests/test_ignored_fields.cpp
+    tests/test_request_defaults.cpp
+    tests/test_refusal_table.cpp
+    tests/test_request_shapes.cpp
     tests/test_template_file.cpp
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
@@ -364,6 +399,14 @@ if(ARCINT_TESTS)
     add_executable(arcint-tool-grammar-probe tools/tool_grammar_probe.cpp)
     target_link_libraries(arcint-tool-grammar-probe PRIVATE arcint_core)
     target_compile_options(arcint-tool-grammar-probe PRIVATE -Wall -Wextra -Wpedantic)
+    # --llama-swa-window on a real model: a window-sized SWA cache's
+    # checkpoint resume against a fresh full prefill, and its red arms (the
+    # trim-only cut, a checkpoint without the SWA part). Not a ctest case: it
+    # needs a GGUF; run by hand, CPU is enough (tools/swa_ckpt_probe.cpp).
+    add_executable(arcint-swa-ckpt-probe tools/swa_ckpt_probe.cpp)
+    target_link_libraries(arcint-swa-ckpt-probe PRIVATE arcint_core)
+    target_include_directories(arcint-swa-ckpt-probe PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/include")
+    target_compile_options(arcint-swa-ckpt-probe PRIVATE -Wall -Wextra -Wpedantic)
     # Renders a chat template read from a file with the engine's own minja setup,
     # over a matrix of tools / thinking / exchange shapes (tools/template_probe.cpp).
     # Not a ctest case: it needs a template taken from a GGUF, which is never
@@ -824,6 +867,25 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_gqa_i8.py")
     set_tests_properties(fa-gqa-i8-gate PROPERTIES LABELS unit)
+    # patch 0187's eligibility: a host-side test of the pure predicate against the real strides of
+    # Inkling's bias-table copy and the depth mix's transpose (cp39: the card never took the path)
+    add_executable(arcint-opencl-cpy-t01 tests/test_opencl_cpy_t01.cpp)
+    target_include_directories(arcint-opencl-cpy-t01 PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl")
+    target_compile_options(arcint-opencl-cpy-t01 PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME opencl-cpy-t01 COMMAND arcint-opencl-cpy-t01)
+    set_tests_properties(opencl-cpy-t01 PROPERTIES LABELS unit)
+    # patches 0204-0207's device-free cell: the depth mix's eligibility rule on the exported
+    # graph's lines (red first), the launch plan, depth_mix.cl itself replayed on host threads
+    # against the CPU op (and its red build), and the message read behind the card's page fault
+    add_executable(arcint-depth-mix tests/test_depth_mix.cpp)
+    target_link_libraries(arcint-depth-mix PRIVATE arcint_core)
+    target_include_directories(arcint-depth-mix PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/include"
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/kernels")
+    target_compile_options(arcint-depth-mix PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME depth-mix COMMAND arcint-depth-mix)
+    set_tests_properties(depth-mix PROPERTIES LABELS unit)
   endif()
 endif()
 

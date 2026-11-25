@@ -51,7 +51,7 @@ class OpAndCPU(unittest.TestCase):
         self.assertRegex(h, r"GGML_OP_GATED_DELTA_NET_REPLAY,\s*\n\s*GGML_OP_COUNT")
         self.assertIn("ggml_gated_delta_net_replay(", h)
         c = read("ggml/src/ggml.c")
-        self.assertRegex(c, r'"GATED_DELTA_NET_REPLAY",\s*\n\};\s*\n\s*static_assert\(GGML_OP_COUNT == 103')
+        self.assertRegex(c, r'"GATED_DELTA_NET_REPLAY",\s*\n\};\s*\n\s*static_assert\(GGML_OP_COUNT == 105')
         self.assertIn("R = H * (2 * S_v + 1)", c)
         self.assertRegex(c, r"result->src\[7\] = ctrl")
         cpu = read("ggml/src/ggml-cpu/ops.cpp")

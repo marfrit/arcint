@@ -1,0 +1,212 @@
+0192: the wide tile's tests: the knob's parse, the assembled wide program, and the shapes in the constructor's own order (rows m, tokens n, K k), 128 experts top-8 at 512 and 2048 tokens: ten IQ4_NL correctness cases (gate/up 2,304 rows K 2,304, a 4,608-row expert K 2,304 (the 9-band launch), down 2,304 rows K 1,152 (the partial super-block), and test_mul_mat_id_skew at 2,304 rows K 2,304 and K 1,152), two Q8_0 cases that take 0168's fallback (rows not a multiple of 16, more than 512 experts), no other Q8_0 correctness case (those are 0169's), and a perf list of the three IQ4_NL shapes, the two Q8_0 shapes and the K 1,152 skew.
+
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 9320206..33e79ea 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -200,6 +200,8 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     target_compile_definitions(test-opencl-kq-i8 PRIVATE
+         KQ_I8_INC_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc"
+         KQ_I8_KR_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8.cl"
++        KQ_I8_WIDE_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl"
++        KQ_I8_WIDE_ASSEMBLED_PATH="${CMAKE_CURRENT_BINARY_DIR}/kq_i8_wide_assembled.cl"
+         KQ_I8_F16_PATH="${PROJECT_SOURCE_DIR}/ggml/src/ggml-opencl/kernels/mul_mm_kq_f16.cl"
+         KQ_I8_ASSEMBLED_PATH="${CMAKE_CURRENT_BINARY_DIR}/kq_i8_assembled.cl")
+     add_test(NAME test-opencl-kq-i8 COMMAND $<TARGET_FILE:test-opencl-kq-i8>)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 701982d..f7e1cdc 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6252,6 +6252,29 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
+     }
+ };
+ 
++// MUL_MAT_ID where one expert takes the whole batch: every token's every slot
++// routes to expert 0, so one expert's rows are a whole chunk and the rest are
++// empty. The route's tile count and the wide tile's band split are exercised at
++// their worst skew (a tile list of one expert's tiles, the rest of the grid empty).
++struct test_mul_mat_id_skew : public test_mul_mat_id {
++    using test_mul_mat_id::test_mul_mat_id;
++    std::string vars() override { return test_mul_mat_id::vars() + ",skew=1"; }
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->type == GGML_TYPE_I32) {
++                if (ggml_is_view_op(t->op)) { continue; }
++                std::vector<int32_t> data(t->ne[0], 0);   // expert 0 in every slot
++                if (ids_offset) data[0] = (int32_t) n_mats - 1;   // the offset slot's id, as the dup case does
++                for (int64_t r = 0; r < ggml_nrows(t); r++) {
++                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
++                }
++            } else {
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
+ struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
+     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
+@@ -12820,6 +12843,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         }
+     }
+ 
++    // 0190: the wide int8 tile's served shapes, correctness mode. The constructor
++    // takes (rows m, tokens n, K k), so the wide tile's own geometry is the one
++    // named here. Inkling 2 Mini's IQ4_NL expert layers, 128 experts, top-8 (its Q8_0
++    // coda's cases are 0169's, not repeated here): gate/up 2304 rows with K 2304 (a
++    // broadcast b), 4608 rows with K 2304 (a 9-band launch, both in one tensor), down 2304 rows
++    // with K 1152 (4.5 super-blocks, so the staged fill's last group has nb < 8) and
++    // a column a pair (b=false); at the prefill chunks 512 and 2048, and the same at
++    // the route's worst skew (one expert a chunk, the rest empty). Uniform top-8 over
++    // 128 experts puts ~32 pairs on an expert at 512 tokens (one tile) and ~128 at
++    // 2048 (four tiles); the skew puts 4096 and 16384 pairs on one expert, 128 and
++    // 512 tiles, so the band loop, its tail column and the empty-tile tail are all
++    // reached.
++    for (int n : {512, 2048}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  4608, n, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
++    }
++    for (int n : {512, 2048}) {
++        test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, n, 2304));
++        test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
++    }
++
++    // 0168's Q8_0 prompt arm refuses rows that are not a multiple of 16 and more
++    // than 512 experts; these two take its fallback, so that text is run too.
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, true, 520, 512, 256));
++    test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 520, 8, true, 512, 512, 256));
++
+     // multiple blocks per row: exercises the block-stride loop and the
+     // per-expert base offset, which k == 256 alone leaves untested
+     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
+@@ -14499,6 +14549,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false, 640, bs, 2560));
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, bs, 640));
+     }
++    // 0190: the wide int8 tile's served shapes (rows m, tokens n, K k as the
++    // constructor takes them), timed next to the narrow tile: Inkling's 128 experts,
++    // top-8, 512 and 2048 tokens, gate/up 2304 rows K 2304 and 4608 rows K 2304, and
++    // down 2304 rows K 1152 (IQ4_NL; the first and last also Q8_0), plus the worst skew
++    for (int bs : {512, 2048}) {
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, bs, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  4608, bs, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,  GGML_TYPE_F32, 128, 8, true,  2304, bs, 2304));
++        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,  GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
++        test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
++    }
+ 
+     // Qwen3.8-Flash-Next GSQ-RCO IQ2_XS: 512 experts, 10 used, gate/up 2560 -> 640, down 640 -> 2560; decode and a verify
+     for (int bs : {1, 3}) {
+diff --git a/tests/test-opencl-kq-i8.cpp b/tests/test-opencl-kq-i8.cpp
+index f66d63c..70cf464 100644
+--- a/tests/test-opencl-kq-i8.cpp
++++ b/tests/test-opencl-kq-i8.cpp
+@@ -260,6 +260,21 @@ static void check_program(void) {
+     CHECK(kq_i8_program_wanted("auto") == 1, "program: auto -> built");
+ }
+ 
++// 0190: the wide tile's knob. Unset is OFF, which is the whole point of the
++// patch: with the knob unset no wide program is built and the narrow tile runs
++// as today.
++static void check_wide(void) {
++    CHECK(kq_i8_wide_wanted(nullptr) == 0, "wide: unset -> off");
++    CHECK(kq_i8_wide_wanted("") == 0, "wide: empty -> off");
++    CHECK(kq_i8_wide_wanted("0") == 0, "wide: =0 -> off");
++    CHECK(kq_i8_wide_wanted("off") == 0, "wide: off -> off");
++    CHECK(kq_i8_wide_wanted("OFF") == 0, "wide: OFF -> off");
++    CHECK(kq_i8_wide_wanted("1") == 1, "wide: =1 -> on");
++    CHECK(kq_i8_wide_wanted("on") == 1, "wide: on -> on");
++    CHECK(kq_i8_wide_wanted("ON") == 1, "wide: ON -> on");
++    CHECK(kq_i8_wide_wanted("yes") == 0, "wide: an unparsable word -> off");
++}
++
+ // ---- the activation's column mapping ----
+ // the fp16 tile kernel's column, (i % ne11) + t * ne11, not the route pair: a
+ // broadcast b (ne11 = 1, the served gate/up) holds one activation a token.
+@@ -580,6 +595,71 @@ static void check_opencl_text(void) {
+     }
+ }
+ 
++// 0190: the wide tile's own text, assembled as the backend assembles it (the
++// helpers, the mm source's tables, the wide kernels) and compiled when a clang
++// is present. Its geometry is the dispatch's: 16 sub-groups of 16 lanes, two
++// columns a lane, so 512 columns a work-group.
++static void check_wide_text(void) {
++    bool ok_w = false, ok_inc = false, ok_f16 = false;
++    const std::string w   = read_text(KQ_I8_WIDE_PATH, &ok_w);
++    const std::string inc = read_text(KQ_I8_INC_PATH, &ok_inc);
++    const std::string f16 = read_text(KQ_I8_F16_PATH, &ok_f16);
++    CHECK(ok_w,   "opencl-wide: mul_mm_kq_i8_wide.cl is readable");
++    if (!ok_w || !ok_inc || !ok_f16) return;
++    const std::string cl = strip_comments(w);
++    for (const char * arg : { "#define I8W_XSG 16", "#define I8W_NC 2", "#define I8W_XT 32" }) {
++        const bool has = cl.find(arg) != std::string::npos || w.find(arg) != std::string::npos;
++        CHECK(has, "opencl-wide: the geometry the dispatch assumes is in the source");
++    }
++    // both kernels of the file exist: the IQ4_NL one the int8 arm takes and the
++    // Q8_0 one its prompt arm takes
++    CHECK(has_ident(cl, "kernel_mul_mm_id_iq4_nl_i8_wide"), "opencl-wide: the IQ4_NL wide kernel");
++    CHECK(has_ident(cl, "kernel_mul_mm_id_q8_0_i8_wide"),   "opencl-wide: the Q8_0 wide kernel");
++    // every kq_i8_* helper it calls is defined in the .inc's OpenCL part
++    const std::string inc_cl = strip_comments(opencl_part(inc));
++    std::vector<std::string> called;
++    for (size_t at = 0; (at = cl.find("kq_i8_", at)) != std::string::npos; ) {
++        size_t e = at + 6;
++        while (e < cl.size() && (std::isalnum((unsigned char)cl[e]) || cl[e] == '_')) ++e;
++        const std::string nm = cl.substr(at, e - at);
++        if (std::find(called.begin(), called.end(), nm) == called.end()) called.push_back(nm);
++        at = e;
++    }
++    CHECK(!called.empty(), "opencl-wide: the wide kernels call kq_i8_* helpers");
++    for (const std::string & nm : called) {
++        const bool defined = has_ident(inc_cl, nm);
++        if (!defined) std::printf("FAIL: opencl-wide: the kernel calls %s, not defined in the .inc\n", nm.c_str());
++        CHECK(defined, "opencl-wide: every kq_i8_* the wide kernels call is in the OpenCL part");
++    }
++    for (const char * tok : { "nullptr", "std::", "template<", "constexpr", "static_cast", "reinterpret_cast" }) {
++        const bool bad = cl.find(tok) != std::string::npos;
++        if (bad) std::printf("FAIL: opencl-wide: C++-only token %s in the OpenCL source\n", tok);
++        CHECK(!bad, "opencl-wide: no C++-only token");
++    }
++    for (const char * nm : { "half", "float", "double", "int", "char", "short", "long",
++                             "uchar", "ushort", "uint", "ulong", "bool", "void" }) {
++        const bool bad = reserved_ident(cl, nm);
++        if (bad) std::printf("FAIL: opencl-wide: reserved type name %s used as an identifier\n", nm);
++        CHECK(!bad, "opencl-wide: no reserved type name used as an identifier");
++    }
++    const std::string cc = find_clang();
++    if (cc.empty()) {
++        std::printf("note: no clang; the wide program's compile is skipped\n");
++        return;
++    }
++    std::FILE * f = std::fopen(KQ_I8_WIDE_ASSEMBLED_PATH, "wb");
++    CHECK(f != nullptr, "opencl-wide: the assembled wide program is writable");
++    if (f == nullptr) return;
++    const std::string all = std::string(kq_i8_prelude) + inc + f16 + w;
++    std::fwrite(all.data(), 1, all.size(), f);
++    std::fclose(f);
++    const std::string cmd = cc + " -target spir64 -x cl -cl-std=CL3.0 -DSG=16" +
++                            " -fsyntax-only \"" + KQ_I8_WIDE_ASSEMBLED_PATH + "\" >/dev/null 2>&1";
++    const int rc = std::system(cmd.c_str());
++    if (rc != 0) std::printf("FAIL: opencl-wide: the assembled wide program does not compile (%s)\n", cc.c_str());
++    CHECK(rc == 0, "opencl-wide: the assembled wide program compiles as OpenCL C");
++}
++
+ int main() {
+     std::mt19937 rng(11);
+     check_iq3s(rng, 400);
+@@ -589,9 +669,11 @@ int main() {
+     check_dispatch();
+     check_formats();
+     check_program();
++    check_wide();
+     check_columns();
+     check_opencl_part();
+     check_opencl_text();
++    check_wide_text();
+     if (g_bad == 0) std::printf("test-opencl-kq-i8: all OK\n");
+     return g_bad == 0 ? 0 : 1;
+ }

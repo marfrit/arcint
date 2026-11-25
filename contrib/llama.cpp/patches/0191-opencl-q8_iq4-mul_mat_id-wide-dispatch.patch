@@ -1,0 +1,224 @@
+0191: the wide tile's knob, program build, dispatch and bounds: GGML_OPENCL_KQ_MM_ID_I8_WIDE (unset off), grid {max_tiles * sg, CEIL_DIV(ne01, 512) * 16} at {sg, 16}, the IQ4_NL int8 arm and the Q8_0 prompt arm; the bounds check follows ggml_cl_kq_weight_args to the mem objects the kernel is given (a gathered or streamed stage, or a SoA extra's q/d planes), and a USM bank, a pointer argument with no cl_mem (unreachable for this tile), is not bounded.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index baf85d9..2ca5d9d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1290,6 +1290,11 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mm_id_iq4_nl_i8 = nullptr;
+     cl_kernel kernel_mul_mm_id_q8_0_i8   = nullptr;   // the Q8_0 prompt arm on the same tile (32 s8 codes a block)
+     cl_kernel kernel_kq_mm_id_quant_i8   = nullptr;   // q8_1-style int8 activation per (column, 32)
++    // 0190: the wide int8 tile (512-column band a work-group, 16 sub-groups of
++    // 16 lanes, two columns a lane) in its own program (mul_mm_kq_i8_wide.cl),
++    // built only when GGML_OPENCL_KQ_MM_ID_I8_WIDE asks for it.
++    cl_kernel kernel_mul_mm_id_iq4_nl_i8_wide = nullptr;
++    cl_kernel kernel_mul_mm_id_q8_0_i8_wide   = nullptr;
+     // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
+     // up and down share their ids tensor, so it is computed once a layer
+     struct {
+@@ -3509,6 +3514,39 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+                         CL_CHECK((backend_ctx->kernel_mul_mm_id_q8_0_i8 = clCreateKernel(i8_prog, "kernel_mul_mm_id_q8_0_i8", &err), err));
+                         CL_CHECK(clReleaseProgram(i8_prog));
+                         GGML_LOG_INFO("ggml_opencl: int8 DPAS expert GEMM (MUL_MAT_ID) built\n");
++                        // 0190: the wide tile (512-column band a work-group), its
++                        // own program (mul_mm_kq_i8_wide.cl), built only when the
++                        // switch asks for it: with the knob unset no wide text is
++                        // compiled and both int8 formats take the narrow tile.
++                        const bool wide_wanted = kq_i8_wide_wanted(getenv("GGML_OPENCL_KQ_MM_ID_I8_WIDE")) != 0;
++                        if (wide_wanted) {
++#ifdef GGML_OPENCL_EMBED_KERNELS
++                            const std::string wide_src {
++                                #include "mul_mm_kq_i8_wide.cl.h"
++                            };
++                            const std::string wide_ops_src {
++                                #include "kq_i8_ops.inc.h"
++                            };
++#else
++                            const std::string wide_src = read_file("mul_mm_kq_i8_wide.cl");
++                            const std::string wide_ops_src = read_file("kq_i8_ops.inc");
++#endif
++                            if (wide_src.empty()) {
++                                ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "id_i8_wide"), GGML_LOG_WARN("ggml_opencl: the wide int8 expert tile is not built (mul_mm_kq_i8_wide.cl missing or empty); the narrow tile stays\n");
++                            } else {
++                                const std::string wide_prog_src = wide_ops_src + mm_src + wide_src;
++                                const std::string wide_opts = compile_opts + " -cl-intel-256-GRF-per-thread -DSG=16";
++                                cl_program wide_prog = build_program_from_source_optional(backend_ctx, wide_prog_src.c_str(), wide_opts);
++                                if (wide_prog == nullptr) {
++                                    ggml_cl_downgrade("path=fallback reason=%s what=%s", "not-built", "id_i8_wide"), GGML_LOG_WARN("ggml_opencl: the wide int8 expert tile is not built; the narrow tile stays\n");
++                                } else {
++                                    CL_CHECK((backend_ctx->kernel_mul_mm_id_iq4_nl_i8_wide = clCreateKernel(wide_prog, "kernel_mul_mm_id_iq4_nl_i8_wide", &err), err));
++                                    CL_CHECK((backend_ctx->kernel_mul_mm_id_q8_0_i8_wide = clCreateKernel(wide_prog, "kernel_mul_mm_id_q8_0_i8_wide", &err), err));
++                                    CL_CHECK(clReleaseProgram(wide_prog));
++                                    GGML_LOG_INFO("ggml_opencl: int8 DPAS expert GEMM (MUL_MAT_ID, 512-column band) built\n");
++                                }
++                            }
++                        }
+                     }
+                 }
+             }
+@@ -33835,6 +33873,37 @@ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, siz
+         GGML_ABORT("%s: a launch past its buffer", arm);
+     }
+ }
++// 0191: the weight planes a MUL_MAT_ID launch reads, bound as ggml_cl_kq_weight_args
++// actually passes them: a gathered/streamed stage buffer, a SoA extra's q/d (offsets
++// included), and nothing at a USM bank, which is a pointer argument and has no cl_mem
++// to compare a size against. Returns 1 when a plane was checked.
++static int ggml_cl_kq_plane_bounds(const ggml_tensor * src0, const char * arm,
++                                   size_t q_upto, size_t d_upto) {
++    const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
++    if (g_kq_stage_q != nullptr) {
++        ggml_cl_bounds(arm, "q", g_kq_stage_q, q_upto);
++        ggml_cl_bounds(arm, "d", g_kq_stage_d != nullptr ? g_kq_stage_d : g_kq_stage_q, d_upto);
++        return 1;
++    }
++    const ggml_backend_opencl_buffer_context * bctx = (const ggml_backend_opencl_buffer_context *) soa0->buffer->context;
++    if (bctx->usm) {
++        return 0;   // the kernel reads the bank's base through a pointer argument
++    }
++    if (src0->type == GGML_TYPE_Q8_0 && src0->extra != nullptr) {
++        const ggml_tensor_extra_cl_q8_0 * e = (const ggml_tensor_extra_cl_q8_0 *) soa0->extra;
++        ggml_cl_bounds(arm, "q", e->q, q_upto);
++        ggml_cl_bounds(arm, "d", e->d, d_upto);
++        return 1;
++    }
++    if (src0->type == GGML_TYPE_IQ4_NL) {
++        const ggml_tensor_extra_cl_iq4_nl * e = (const ggml_tensor_extra_cl_iq4_nl *) soa0->extra;
++        ggml_cl_bounds(arm, "q", e->q, q_upto);
++        ggml_cl_bounds(arm, "d", e->d, d_upto);
++        return 1;
++    }
++    return 0;
++}
++
+ 
+ // a batched F32 product of a tiny K (1-8 rows) over a wide N: Inkling 2 Mini's depth mix
+ // (2304 rows, K = a block count 1-6, one or three columns a token, a column a token as the
+@@ -37162,6 +37231,16 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     const bool id2_default = backend_ctx->kq_mm_sg != 8;
+     const bool id2 = gemm && (id2_env == nullptr ? id2_default : atoi(id2_env) != 0) && backend_ctx->kernel_mul_mm_id2_kq_f16[ti] != nullptr;
+     cl_kernel i8_kernel = ti == 10 ? backend_ctx->kernel_mul_mm_id_iq3_s_i8 : backend_ctx->kernel_mul_mm_id_iq4_nl_i8;
++    // 0190: the wide tile (512-column band a work-group) of the same program's
++    // format, when GGML_OPENCL_KQ_MM_ID_I8_WIDE asks for it. Unset is off, so the
++    // narrow tile and its grid are what runs; both are bit-identical there.
++    static const char * i8w_env = getenv("GGML_OPENCL_KQ_MM_ID_I8_WIDE");
++    static const bool   i8w_on  = kq_i8_wide_wanted(i8w_env) != 0;
++    cl_kernel i8w_kernel = ti == 5 ? backend_ctx->kernel_mul_mm_id_iq4_nl_i8_wide : nullptr;
++    const bool i8_wide = i8 && i8w_on && i8w_kernel != nullptr;
++    if (i8_wide) {
++        i8_kernel = i8w_kernel;
++    }
+     cl_kernel kernel = ids8 ? ids8_kernel :
+                        i8 ? i8_kernel :
+                        id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
+@@ -37485,6 +37564,35 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne00));
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+     if (i8) {
++        if (i8_wide) {
++            // 0190: a work-group a (route tile, 512-column band): 16 sub-groups of
++            // 16 rows, two columns a lane (mul_mm_kq_i8_wide.cl). A 2,304-row
++            // expert is 5 bands, a 4,608-row one 9; the last band's second column
++            // may pass ne01 and that lane returns. Every buffer this launch
++            // touches, to the furthest byte the kernel can read or write: the
++            // weight planes, the quantized activation and its scales, the route
++            // (pairs, tiles, the tile count) and dst.
++            const int    w_xsg  = 16;
++            const int    w_nc   = 2;
++            const int    w_bw   = w_xsg * sg * w_nc;
++            const int    n32w   = ne00 / 32;
++            const size_t blkmax = (size_t) ((src0->ne[2] - 1) * ne01 + ne01 - 1) * n32w + n32w - 1;
++            const size_t ncolsw = (size_t) ne11 * ne12;
++            // the planes the weight arguments carry: a gathered or streamed stage, the
++            // SoA extra's q/d with its offsets, or a USM bank's pointer (nothing to bound)
++            ggml_cl_kq_plane_bounds(src0, "int8 wide", blkmax * 16 + 16, blkmax * 2 + 2);
++            ggml_cl_bounds("int8 wide", "xq",      backend_ctx->prealloc_kq_id8_q.buffer, ncolsw * ne00);
++            ggml_cl_bounds("int8 wide", "xd",      backend_ctx->prealloc_kq_id8_d.buffer, ncolsw * n32w * sizeof(float));
++            ggml_cl_bounds("int8 wide", "pairs",    pairs,   (size_t) n_pairs * sizeof(cl_int));
++            ggml_cl_bounds("int8 wide", "tiles",    tiles,   (size_t) max_tiles * sizeof(cl_int4));
++            ggml_cl_bounds("int8 wide", "ntiles",   ntiles,  sizeof(cl_int));
++            ggml_cl_bounds("int8 wide", "dst",      extrad->data_device,
++                           (size_t) offsetd + (size_t) (n_tok - 1) * nb2 + (size_t) (n_used - 1) * nb1 + (size_t) ne01 * sizeof(float));
++            size_t global_work_size[] = { (size_t) max_tiles * sg, (size_t) CEIL_DIV(ne01, w_bw) * w_xsg, 1 };
++            size_t local_work_size[]  = { (size_t) sg, (size_t) w_xsg, 1 };
++            backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
++            return true;
++        }
+         // I8XSG = 8 sub-groups of 16 rows a work-group (mul_mm_kq_i8.cl)
+         const int i8_xsg = 8;
+         size_t global_work_size[] = { (size_t)max_tiles * sg, (size_t)CEIL_DIV(ne01, i8_xsg * sg) * i8_xsg, 1 };
+@@ -37700,6 +37808,14 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
+     }
+ 
+     cl_kernel kernel = backend_ctx->kernel_mul_mm_id_q8_0_i8;
++    // 0190: the wide tile (512-column band a work-group) when
++    // GGML_OPENCL_KQ_MM_ID_I8_WIDE asks for it; unset is this kernel and this grid.
++    static const char * w_env = getenv("GGML_OPENCL_KQ_MM_ID_I8_WIDE");
++    const bool w_on = kq_i8_wide_wanted(w_env) != 0;
++    const bool w_wide = w_on && backend_ctx->kernel_mul_mm_id_q8_0_i8_wide != nullptr;
++    if (w_wide) {
++        kernel = backend_ctx->kernel_mul_mm_id_q8_0_i8_wide;
++    }
+     cl_uint a = 0;
+     const cl_ulong offq = 0;   // the flat planes' extra starts at the tensor's base (the decode arm's offq)
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(cl_mem),   &e0->q));
+@@ -37720,6 +37836,26 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
+     CL_CHECK(clSetKernelArg(kernel, a++, sizeof(int),      &ne01));
+     size_t global_work_size[] = { (size_t) max_tiles * sg, (size_t) CEIL_DIV(ne01, i8_xsg * sg) * i8_xsg, 1 };
+     size_t local_work_size[]  = { (size_t) sg, (size_t) i8_xsg, 1 };
++    if (w_wide) {
++        // 0190: the wide tile's grid and its buffers' furthest bytes, as the IQ4_NL
++        // launch above bounds them: the flat q/d planes, the quantized activation
++        // and its scales, the route, and dst.
++        const int    w_xsg  = 16;
++        const int    w_bw   = w_xsg * sg * 2;
++        const size_t blkmax = (size_t) ((src0->ne[2] - 1) * ne01 + ne01 - 1) * n32 + n32 - 1;
++        ggml_cl_kq_plane_bounds(src0, "int8 wide", blkmax * 32 + 32, blkmax * 2 + 2);
++        ggml_cl_bounds("int8 wide", "xq",     backend_ctx->prealloc_kq_id8_q.buffer, (size_t) n_vals);
++        ggml_cl_bounds("int8 wide", "xd",     backend_ctx->prealloc_kq_id8_d.buffer, (size_t) n_cols * n32 * sizeof(float));
++        ggml_cl_bounds("int8 wide", "pairs",   pairs,  (size_t) n_pairs * sizeof(cl_int));
++        ggml_cl_bounds("int8 wide", "tiles",   tiles,  (size_t) max_tiles * sizeof(cl_int4));
++        ggml_cl_bounds("int8 wide", "ntiles",  ntiles, sizeof(cl_int));
++        ggml_cl_bounds("int8 wide", "dst",     extrad->data_device,
++                       (size_t) offsetd + (size_t) (n_tok - 1) * nb2 + (size_t) (n_used - 1) * nb1 + (size_t) ne01 * sizeof(float));
++        global_work_size[0] = (size_t) max_tiles * sg;
++        global_work_size[1] = (size_t) CEIL_DIV(ne01, w_bw) * w_xsg;
++        local_work_size[0]  = (size_t) sg;
++        local_work_size[1]  = (size_t) w_xsg;
++    }
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+     return true;
+ }
+diff --git a/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc b/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
+index 1f520c8..5adebad 100644
+--- a/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
++++ b/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
+@@ -222,6 +222,28 @@ static inline int kq_i8_q80_wanted(const char *env) {
+     return (c != env && *o == 0 && *c == 0) ? 0 : 1;
+ }
+ 
++// ---- the wide tile (host-only) ----
++// GGML_OPENCL_KQ_MM_ID_I8_WIDE: the int8 expert tile at a 512-column band a
++// work-group (mul_mm_kq_i8_wide.cl) instead of 128. Unset is OFF: with the knob
++// unset no wide program is built and both int8 formats keep the narrow tile,
++// bit-identical. `1` or `on` (case-insensitive) turns it on; any other value,
++// `0` and `off` leave it off.
++static inline int kq_i8_wide_wanted(const char *env) {
++    if (env == 0 || env[0] == 0) return 0;
++    if (env[0] == '0') return 0;                 // "0", "0x", anything starting 0
++    if (kq_i8_lower(env[0]) == 'o') {
++        const char *c = env, *o = "off";
++        while (*c != 0 && *o != 0 && kq_i8_lower(*c) == *o) { ++c; ++o; }
++        if (c != env && *o == 0 && *c == 0) return 0;
++    }
++    if (kq_i8_lower(env[0]) == 'o') {
++        const char *c = env, *o = "on";
++        while (*c != 0 && *o != 0 && kq_i8_lower(*c) == *o) { ++c; ++o; }
++        if (c != env && *o == 0 && *c == 0) return 1;
++    }
++    return env[0] == '1' ? 1 : 0;                // "1", "1..." on; anything else off
++}
++
+ // The group's mean routed pairs (rows) per expert. n_expert is the matrix's
+ // expert count; min(n_expert, n_pairs) is the upper bound of the experts a
+ // call touches, so the mean is never understated (Strata reads the real cnt

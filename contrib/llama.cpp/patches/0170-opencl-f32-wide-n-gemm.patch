@@ -1,0 +1,57 @@
+0170: the F32 wide-N products of a 2-D shared weight onto the tiled GEMM: no row bound above 8 columns, K a multiple of the tile's BK 16, and a batched (3-D) src1 with one K slice.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index ec685b0..df35ce9 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -33816,9 +33860,13 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     // up to 8 columns take the GEMV up to 1,024 rows (an MTP step's F32 router,
+     // 512 x 2,560, went to the tiled GEMM: 0.37 ms at 2 tokens, B60, profiled);
+     // more columns the split-K kernel up to 256
++    // a GEMM (more than 8 columns) has no row bound and takes a 2-D shared weight with a
++    // batched src1; its K is the tiled kernel's BK multiples (16), not the GEMV's 64
++    const bool gemm  = ne11 > 8 && ne00 % 16 == 0 && backend_ctx->kernel_mul_mm_f32_f32_l4_lm != nullptr;
+     if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_sum_slices_f32 == nullptr ||
+         src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+-        ne01 > (ne11 <= 8 ? 1024 : 256) || ne00 % 64 != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
++        (ne11 <= 8 ? ne01 > 1024 : !gemm && ne01 > 256) || (ne00 % 64 != 0 && !gemm) ||
++        src0->ne[2] != 1 || src0->ne[3] != 1 || (!gemm && (src1->ne[2] != 1 || src1->ne[3] != 1)) ||
+         !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+         return false;
+     }
+@@ -33914,6 +33962,14 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     }
+     const int kslice = ne00 / ks;
+     const int n_out  = ne01 * ne11;
++    // the launch's third dim is one axis: a batched src1 (a 2-D shared weight) needs one K
++    // slice, so b and dst advance a batch and not a slice
++    const int b_batches = (int) (src1->ne[2] * src1->ne[3]);
++    if (b_batches > 1 && ks != 1) {
++        return false;
++    }
++    const int n_b  = b_batches > 1 ? b_batches : ks;
++    const int bslc = b_batches > 1 ? ne00 * ne11 : kslice;
+     backend_ctx->prealloc_f32_splitk.allocate(backend_ctx->context, (size_t)ks * n_out * sizeof(float));
+     cl_kernel k = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
+     const int one = 1;
+@@ -33929,16 +33985,16 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     CL_CHECK(clSetKernelArg(k,  7, sizeof(int),      &ne01));
+     CL_CHECK(clSetKernelArg(k,  8, sizeof(int),      &ks));       // ne02
+     CL_CHECK(clSetKernelArg(k,  9, sizeof(int),      &ne11));
+-    CL_CHECK(clSetKernelArg(k, 10, sizeof(int),      &ks));       // ne12
++    CL_CHECK(clSetKernelArg(k, 10, sizeof(int),      &n_b));      // ne12: batches, or K slices
+     CL_CHECK(clSetKernelArg(k, 11, sizeof(int),      &ne00));     // stride_a
+     CL_CHECK(clSetKernelArg(k, 12, sizeof(int),      &ne00));     // stride_b
+     CL_CHECK(clSetKernelArg(k, 13, sizeof(int),      &ne01));     // stride_d
+     CL_CHECK(clSetKernelArg(k, 14, sizeof(int),      &kslice));   // batch_stride_a
+-    CL_CHECK(clSetKernelArg(k, 15, sizeof(int),      &kslice));   // batch_stride_b
++    CL_CHECK(clSetKernelArg(k, 15, sizeof(int),      &bslc));     // batch_stride_b: a batch, or a slice
+     CL_CHECK(clSetKernelArg(k, 16, sizeof(int),      &n_out));    // batch_stride_d
+-    CL_CHECK(clSetKernelArg(k, 17, sizeof(int),      &one));      // r2
++    CL_CHECK(clSetKernelArg(k, 17, sizeof(int),      &b_batches)); // r2
+     CL_CHECK(clSetKernelArg(k, 18, sizeof(int),      &one));      // r3
+-    size_t gws[3] = { (size_t)CEIL_DIV(ne01, 64) * 128, (size_t)CEIL_DIV(ne11, 64), (size_t)ks };
++    size_t gws[3] = { (size_t)CEIL_DIV(ne01, 64) * 128, (size_t)CEIL_DIV(ne11, 64), (size_t)ks * (size_t)b_batches };
+     size_t lws[3] = { 128, 1, 1 };
+     backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
+ 

@@ -623,3 +623,56 @@ TEST(props_reports_the_chat_template_kwarg_defaults) {
     CHECK(d.value("force_nonempty_content", nlohmann::json()) == nlohmann::json(true));
     CHECK(d.value("tone", nlohmann::json()) == nlohmann::json("warm"));
 }
+
+TEST(props_carries_the_checkpoint_state) {
+    // 1.8.1: a client can see that checkpoints are off and why (red: the key absent)
+    Config      cfg;
+    FakeBackend backend;
+    SlotPool    slots(1);
+    Context     ctx{&cfg, &backend, &slots};
+    CHECK(lgc::api::props(ctx).at("checkpoints").is_null());   // the stub says nothing
+    backend.st.checkpoints = "off: a q8_0 / q4_0 sliding-window cache cannot be restored on OpenCL in this release";
+    const nlohmann::json j = lgc::api::props(ctx);
+    CHECK(j.at("checkpoints").get<std::string>().rfind("off: ", 0) == 0);
+}
+
+TEST(props_carries_the_admission_tier_and_the_spill_verdict) {
+    // 1.8.1: the tier decision and the guard's verdict are readable without the log.
+    Config      cfg;
+    FakeBackend backend;
+    SlotPool    slots(1);
+    Context     ctx{&cfg, &backend, &slots};
+    backend.st.admission_tier      = "runs";
+    backend.st.has_chat_template   = false;
+    backend.st.mem_card            = 24480ull * 1024 * 1024;
+    backend.st.mem_card_from_driver = true;
+    backend.st.mem_spill_fits      = true;
+    backend.st.mem_spill_refused   = false;
+    backend.st.mem_spill_verdict   = "fits";
+    backend.st.mem_fit_n_ctx       = 49152;
+    backend.st.mem_fit_cache_flag_mib = 19107;
+    backend.st.mem_fit_cache       = 19439ull * 1024 * 1024;
+    const nlohmann::json j = lgc::api::props(ctx);
+    CHECK_EQ(j.at("admission_tier").get<std::string>(), std::string("runs"));
+    CHECK(!j.at("chat_template").at("present").get<bool>());
+    const nlohmann::json& dm = j.at("device_memory");
+    CHECK_EQ(dm.at("card_source").get<std::string>(), std::string("driver"));
+    CHECK_EQ(dm.at("verdict").at("state").get<std::string>(), std::string("fits"));
+    CHECK(dm.at("verdict").at("fits").get<bool>());
+    CHECK_EQ(dm.at("verdict").at("fit_n_ctx").get<int>(), 49152);
+    CHECK_EQ(dm.at("verdict").at("fit_cache_mib").get<int>(), 19107);
+    CHECK_EQ(dm.at("verdict").at("fit_cache_bytes").get<long long>(), static_cast<long long>(19439) * 1024 * 1024);
+    // a split reports the worst card's verdict
+    backend.st.mem_spill_verdict = "allowed-spill";
+    backend.st.mem_spill_fits    = false;
+    backend.st.mem_worst_card    = 1;
+    backend.st.mem_cards.clear();
+    backend.st.mem_cards.push_back(lgc::CardMemoryStatus{24480ull * 1024 * 1024, 1, 2, 3, 4, 5, 6, 0, true, true, 49152, 0, 0, "fits"});
+    backend.st.mem_cards.push_back(lgc::CardMemoryStatus{24480ull * 1024 * 1024, 7, 8, 9, 10, 11, 12, 0, true, false, 49152, 0, 0, "allowed-spill"});
+    const nlohmann::json j2 = lgc::api::props(ctx);
+    CHECK_EQ(j2.at("device_memory").at("verdict").at("state").get<std::string>(), std::string("allowed-spill"));
+    CHECK_EQ(j2.at("device_memory").at("verdict").at("worst_card").get<int>(), 1);
+    CHECK_EQ(j2.at("device_memory").at("cards").size(), 2u);
+    CHECK_EQ(j2.at("device_memory").at("cards").at(1).at("state").get<std::string>(), std::string("allowed-spill"));
+}
+

@@ -1,0 +1,70 @@
+0172: test-backend-ops at the shapes 0170/0171 serve: the bias table (16 x 1025) and the controller pairs (64 x 2304) over 512 and 2048 columns, and the depth mix's batched product (1-6 rows of K over a 3-D b).
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index ec33f35..a64b4ac 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6285,6 +6285,43 @@ struct test_mul_mat_id_w4a4 : public test_mul_mat_id {
+     }
+ };
+ 
++// a 2-D shared F32 weight over a batched (3-D) F32 src1: Inkling 2 Mini's depth mix, a row an
++// output (2304), K the residual-block count (1-6) and a column a token as the batch
++struct test_mul_mat_f32_wide : public test_case {
++    const int64_t m;   // rows of a
++    const int64_t n;   // columns of a batch
++    const int64_t k;
++    const int64_t nb;  // batches, columns laid back to back
++
++    std::string vars() override { return VARS_TO_STR4(m, n, k, nb); }
++
++    double max_nmse_err() override { return 5e-4; }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2 * m * n * k * nb;
++    }
++
++    test_mul_mat_f32_wide(int64_t m = 2304, int64_t n = 1, int64_t k = 6, int64_t nb = 512)
++        : m(m), n(n), k(k), nb(nb) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, m);
++        ggml_set_name(a, "a");
++        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, nb);
++        ggml_set_name(b, "b");
++        ggml_tensor * out = ggml_mul_mat(ctx, a, b);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t);
++        }
++    }
++};
++
+ // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+ struct test_mul_mat_id_fusion : public test_case {
+     const ggml_type type_a;
+@@ -12493,6 +12530,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 128, 8, false, 2304, n, 1152));
+     }
+ 
++    // patch 0170/0171: the F32 shapes Inkling 2 Mini's prompt graph put on the generic matvec.
++    // The bias table (16 x 1025, a 2-D weight) and the controller pairs (64 x 2304) over 512 and
++    // 2048 columns, and the depth mix's batched product (a 2-D 2304-row weight with K 1-6 over a
++    // 3-D b, one or three columns a token)
++    for (int n : {512, 2048}) {
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 1025, n, 16, {1, 1}, {1, 1}));
++        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, 2304, n, 64, {1, 1}, {1, 1}));
++    }
++    test_cases.emplace_back(new test_mul_mat_f32_wide(2304, 1, 6, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_wide(2304, 3, 6, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_wide(2304, 1, 1, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_wide(2304, 1, 6, 2048));
++
+     // Q2_0 rows of 20 and 12 sub-blocks (4 lanes a row in the OpenCL low-bit matvec) and of 10 (16 lanes):
+     // Flash-Next's down projections are 2560 x 640 Q2_0
+     for (int k : {640, 384, 320}) {

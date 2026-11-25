@@ -474,6 +474,15 @@ std::string usage_text() {
         "  --llama-kv K[:V]          the attention cache types, f16, q8_0 or q8_0:q4_0\n"
         "                            (default f16): q8_0 takes the cache to 53 %,\n"
         "                            q8_0:q4_0 to 41 %\n"
+        "  --llama-allow-spill       run a start whose device demand plus the\n"
+        "                            request-growth margin does not fit the card, with a\n"
+        "                            warning that names every part; without it the start is\n"
+        "                            refused at load (default off: no silent fallback)\n"
+        "  --llama-swa-window        size the sliding-window KV layers to the model's\n"
+        "                            window + a ubatch, not the whole context (opt-in;\n"
+        "                            default off: prefix reuse is exact at the library\n"
+        "                            default). Context checkpoints carry the window, so a\n"
+        "                            cut below it resumes from one instead of re-prefilling\n"
         "  --llama-kv-resident MiB    the KV window (opt-in, experimental): K/V pages resident in VRAM\n"
         "                            up to MiB, the rest in host RAM, copied in per attention layer\n"
         "                            (refused unless LLAMA_KV_STREAM_UNSAFE=1; below 4096; the 24 GB\n"
@@ -670,6 +679,10 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             const std::string& vt = cfg.llama_kv_v;
             if (!(k == vt && (k == "f16" || k == "q8_0")) && !(k == "q8_0" && vt == "q4_0"))
                 return fail("--llama-kv takes f16, q8_0 or q8_0:q4_0");
+        } else if (arg == "--llama-swa-window") {
+            cfg.llama_swa_window = true;
+        } else if (arg == "--llama-allow-spill") {
+            cfg.llama_allow_spill = true;
         } else if (arg == "--gguf") {
             if (!value(v)) return fail("--gguf needs a path");
             cfg.gguf_path = std::string(v);
@@ -690,6 +703,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
         } else if (arg == "--device") {
             if (!value(v)) return fail("--device needs a value");
             cfg.device = std::string(v);
+            cfg.device_given = true;
         } else if (arg == "--host") {
             if (!value(v)) return fail("--host needs a value");
             cfg.host = std::string(v);
@@ -1037,12 +1051,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_mtp_policy ||
             !cfg.llama_mtp_cost_seed.empty() || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
-            cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
+            cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_swa_window || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
             cfg.llama_dory_loops > 0 || !cfg.llama_dory_kv.empty() || cfg.llama_dory_max_loops > 0 || cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
             cfg.tts_gen_device != "gpu" || !cfg.mmproj_path.empty())
             return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch, "
-                        "--llama-kv, --llama-checkpoints/-step, "
+                        "--llama-kv, --llama-swa-window, --llama-checkpoints/-step, "
                         "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-dory-loops/-kv/-max-loops, --llama-reserve-cells, --mmproj and --tts "
                         "(-profiles/-lang/-gen-device) are options of "
                         "the libllama engine (--gguf), not of --stub");

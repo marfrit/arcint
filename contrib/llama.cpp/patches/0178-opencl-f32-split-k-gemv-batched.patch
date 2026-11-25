@@ -1,0 +1,296 @@
+0178: the depth mix's first product (K 2,304, M 2, N 4, batch 512) leaves the tiled F32 GEMM for the split-K GEMV: one work-group a (token, column, row), K split into 16-aligned slices (36 slices of 64 floats), a token's slab the tensor's own step, the slices summed. Behind GGML_OPENCL_F32_SMALL_M (unset: off). A launch's furthest byte is checked against the buffer's allocation (GGML_OPENCL_BOUNDS=1 aborts a violation).
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index f446fc2..2fd7496 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1565,6 +1565,7 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_mul_mm_f32_f32_l4_lm;
+     cl_kernel kernel_gemv_f32_f32_mc;  // multi-column (small-N) f32 GEMV for spec/MTP verify
+     cl_kernel kernel_gemv_f32_f32_splitk = nullptr;  // 0151: one column, few rows, K split over work-groups
++    cl_kernel kernel_gemv_f32_f32_splitk_batch = nullptr;   // 0178: the same, a token a batch slab
+     cl_kernel kernel_sum_slices_f32 = nullptr;   // split-K slices of kernel_mul_mm_f32_f32_l4_lm summed
+     // ARC-LAB 0095: fast Walsh-Hadamard transforms for MUL_MAT with GGML_HINT_SRC0_IS_HADAMARD
+     cl_kernel kernel_fwht_f32_64 = nullptr, kernel_fwht_f32_128 = nullptr;
+@@ -4038,6 +4039,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         CL_CHECK((backend_ctx->kernel_mul_mm_f32_f32_l4_lm = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_mul_mm_f32_f32_l4_lm", &err), err));
+         CL_CHECK((backend_ctx->kernel_gemv_f32_f32_mc = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_mc", &err), err));
+         CL_CHECK((backend_ctx->kernel_gemv_f32_f32_splitk = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_splitk", &err), err));
++        CL_CHECK((backend_ctx->kernel_gemv_f32_f32_splitk_batch = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_gemv_f32_f32_splitk_batch", &err), err));
+         CL_CHECK((backend_ctx->kernel_sum_slices_f32 = clCreateKernel(backend_ctx->program_mul_mm_f32_f32_l4_lm, "kernel_sum_slices_f32", &err), err));
+         GGML_LOG_CONT(".");
+     }
+@@ -33810,6 +33812,30 @@ static int ggml_cl_flat_cols(const ggml_tensor * src0, const ggml_tensor * src1,
+     return (int) (src1->ne[1] * src1->ne[2] * src1->ne[3]);
+ }
+ 
++// every new arm's launch is bounded before it runs: the furthest byte a kernel can read or
++// write from its global size and the strides it is given, against the buffer's allocation.
++// A view's offset is in that sum. GGML_OPENCL_BOUNDS=1 makes a violation abort (a card with a
++// production service has no room for a fault); unset, the check stays silent and the arm's
++// test-backend-ops cases carry it.
++static bool ggml_cl_bounds_on() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_OPENCL_BOUNDS");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto) {
++    if (!ggml_cl_bounds_on()) {
++        return;
++    }
++    size_t size = 0;
++    CL_CHECK(clGetMemObjectInfo(buf, CL_MEM_SIZE, sizeof(size), &size, nullptr));
++    if (upto > size) {
++        GGML_LOG_ERROR("%s: %s reaches %zu bytes of a %zu byte buffer\n", arm, which, upto, size);
++        GGML_ABORT("%s: a launch past its buffer", arm);
++    }
++}
++
+ // a batched F32 product of a tiny K (1-8 rows) over a wide N: Inkling 2 Mini's depth mix
+ // (2304 rows, K = a block count 1-6, one or three columns a token, a column a token as the
+ // batch). The tiled GEMMs' BK is 16 and the GEMV's K is 64, so both decline it and the
+@@ -33874,10 +33900,109 @@ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor
+     return true;
+ }
+ 
++// 0178: the depth mix's first product. K is the embedding width (2,304), M a block count
++// (1-8), N the query columns (1-8), and the tokens are a batch: both sides are activations,
++// and a token's slab steps by its own stride. The tiled GEMM serves it as a 64x64 tile per
++// 64 columns, so each work-group runs the whole 144-block K loop for a handful of outputs
++// (2.0 ms a call, 384 calls, 4.9 % of a prompt window, B60, profiled). Its own layout is the
++// split-K GEMV: one work-group a (token, column, row), the K split into 16-aligned slices,
++// the slices summed. GGML_OPENCL_F32_SMALL_M=1 turns it on; unset keeps today's selection.
++static bool ggml_cl_mul_mat_f32_small_m(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
++    static const char * env = getenv("GGML_OPENCL_F32_SMALL_M");
++    static const bool   on  = env != nullptr && atoi(env) != 0;
++    const int ne00 = (int) src0->ne[0], ne01 = (int) src0->ne[1], ne11 = (int) src1->ne[1];
++    const int ntok = (int) (src0->ne[2] * src0->ne[3]);
++    if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_gemv_f32_f32_splitk_batch == nullptr ||
++        backend_ctx->kernel_sum_slices_f32 == nullptr ||
++        src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        src0->ne[0] != src1->ne[0] || ne00 % 16 != 0 || ne01 < 1 || ne01 > 8 || ne11 < 1 || ne11 > 8 ||
++        src0->ne[1] != dst->ne[0] || dst->ne[1] != src1->ne[1] ||
++        src0->ne[2] != src1->ne[2] || dst->ne[2] != src1->ne[2] || ntok < 16 ||
++        src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 ||
++        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    // the K splits into 16-aligned slices of at most 64, the largest such slice: 2,304 is
++    // 36 * 64 (a 64-way split would leave 36-long slices, off the 16 alignment), so the
++    // split is 36 and a slice 64 — one float4 stride a work-group's read
++    int kslice = 0;
++    for (int sl = 64; sl >= 16; sl -= 16) {
++        if (ne00 % sl == 0) { kslice = sl; break; }
++    }
++    if (kslice == 0) {
++        return false;
++    }
++    const int nslices = ne00 / kslice;
++    if (nslices < 2) {
++        return false;   // one slice is the plain product, not this path's
++    }
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *)src0->extra;
++    ggml_tensor_extra_cl * extra1 = (ggml_tensor_extra_cl *)src1->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    cl_ulong offset0 = extra0->offset + src0->view_offs;
++    cl_ulong offset1 = extra1->offset + src1->view_offs;
++    cl_ulong offsetd = extrad->offset + dst->view_offs;
++    if (offset0 % 16 != 0 || offset1 % 16 != 0 || offsetd % 16 != 0) {
++        return false;   // the kernel reads float4, and a token's slab must stay aligned
++    }
++    const int n_out = ne01 * ne11 * ntok;
++    backend_ctx->prealloc_f32_splitk.allocate(backend_ctx->context, (size_t)nslices * n_out * sizeof(float));
++    cl_kernel ks = backend_ctx->kernel_gemv_f32_f32_splitk_batch;
++    cl_ulong zero = 0;
++    const int stride_a = (int) (src0->nb[1] / sizeof(float)), stride_b = (int) (src1->nb[1] / sizeof(float));
++    const int stride_as = (int) (src0->nb[2] / sizeof(float)), stride_bs = (int) (src1->nb[2] / sizeof(float));
++    // the furthest byte a (token, column, row) can reach on either side, plus the partials
++    {
++        const size_t upto0 = offset0 + (size_t) (ne00 - 1) * sizeof(float) + (size_t) (ne01 - 1) * stride_a * sizeof(float) + (size_t) (ntok - 1) * stride_as * sizeof(float) + sizeof(float);
++        const size_t upto1 = offset1 + (size_t) (ne00 - 1) * sizeof(float) + (size_t) (ne11 - 1) * stride_b * sizeof(float) + (size_t) (ntok - 1) * stride_bs * sizeof(float) + sizeof(float);
++        const size_t uptod = offsetd + (size_t) n_out * sizeof(float);
++        ggml_cl_bounds("F32 small-M", "src0", extra0->data_device, upto0);
++        ggml_cl_bounds("F32 small-M", "src1", extra1->data_device, upto1);
++        ggml_cl_bounds("F32 small-M", "dst",  extrad->data_device, uptod);
++        ggml_cl_bounds("F32 small-M", "partials", backend_ctx->prealloc_f32_splitk.buffer, (size_t) nslices * n_out * sizeof(float));
++    }
++    CL_CHECK(clSetKernelArg(ks,  0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(ks,  1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(ks,  2, sizeof(cl_mem),   &extra1->data_device));
++    CL_CHECK(clSetKernelArg(ks,  3, sizeof(cl_ulong), &offset1));
++    CL_CHECK(clSetKernelArg(ks,  4, sizeof(cl_mem),   &backend_ctx->prealloc_f32_splitk.buffer));
++    CL_CHECK(clSetKernelArg(ks,  5, sizeof(cl_ulong), &zero));
++    CL_CHECK(clSetKernelArg(ks,  6, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(ks,  7, sizeof(int),      &ne01));
++    CL_CHECK(clSetKernelArg(ks,  8, sizeof(int),      &ne11));
++    CL_CHECK(clSetKernelArg(ks,  9, sizeof(int),      &stride_a));
++    CL_CHECK(clSetKernelArg(ks, 10, sizeof(int),      &stride_b));
++    CL_CHECK(clSetKernelArg(ks, 11, sizeof(int),      &stride_as));
++    CL_CHECK(clSetKernelArg(ks, 12, sizeof(int),      &stride_bs));
++    CL_CHECK(clSetKernelArg(ks, 13, sizeof(int),      &n_out));
++    CL_CHECK(clSetKernelArg(ks, 14, sizeof(int),      &nslices));
++    CL_CHECK(clSetKernelArg(ks, 15, sizeof(int),      &kslice));
++    const int wl = kslice / 4 >= 32 ? 32 : 16;
++    size_t gws[3] = { (size_t)wl, (size_t)nslices, (size_t)n_out };
++    size_t lws[3] = { (size_t)wl, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(ks, 3, gws, lws, dst);
++
++    cl_kernel kr = backend_ctx->kernel_sum_slices_f32;
++    CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &backend_ctx->prealloc_f32_splitk.buffer));
++    CL_CHECK(clSetKernelArg(kr, 1, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(kr, 2, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(kr, 3, sizeof(int),      &n_out));
++    CL_CHECK(clSetKernelArg(kr, 4, sizeof(int),      &nslices));
++    size_t rgws[1] = { (size_t)CEIL_DIV(n_out, 64) * 64 };
++    size_t rlws[1] = { 64 };
++    backend_ctx->enqueue_ndrange_kernel(kr, 1, rgws, rlws, dst);
++    return true;
++}
++
+ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     static const char * env = getenv("GGML_OPENCL_F32_SKINNY");
+     static const bool   on  = env == nullptr || atoi(env) != 0;
++    // 0178 ahead of the tiled launch: the batched tiny-M product has its own arm
++    if (ggml_cl_mul_mat_f32_small_m(backend, src0, src1, dst)) {
++        return true;
++    }
+     const int ne00 = (int)src0->ne[0], ne01 = (int)src0->ne[1], ne11 = (int)src1->ne[1];
+     // up to 8 columns take the GEMV up to 1,024 rows (an MTP step's F32 router,
+     // 512 x 2,560, went to the tiled GEMM: 0.37 ms at 2 tokens, B60, profiled);
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl b/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
+index 5b0a2fd..24f57f6 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mm_f32_f32_l4_lm.cl
+@@ -247,6 +247,61 @@ kernel void kernel_gemv_f32_f32_splitk(
+     if (lane == 0) dst[(ulong)slice * (uint)n_out + out] = red[0];
+ }
+ 
++// a batch of the split-K GEMV above: the model's depth mix first product, src0's rows
++// (token, row) and src1's columns (token, column), a token's slab the tensor's own step.
++// The tile is gone: one work-group per (token, column, row) reduces its K slice, W lanes a
++// group, the slices summed by kernel_sum_slices_f32. W*nslices*n_out work-items.
++kernel void kernel_gemv_f32_f32_splitk_batch(
++    global float * src0, ulong offset0,   // rows: token at token*stride_as, row m at m*stride_a
++    global float * src1, ulong offset1,   // columns: token at token*stride_bs, col n at n*stride_b
++    global float * dst,  ulong offsetd,   // partials [nslices * n_out], slice-major
++    int ne00,        // K
++    int ne01,        // M
++    int ne11,        // N a token
++    int stride_a,    // a row's step (elements) = K
++    int stride_b,    // a column's step (elements) = K
++    int stride_as,   // a token's step of src0 (elements)
++    int stride_bs,   // a token's step of src1 (elements)
++    int n_out,       // ne01 * ne11 * tokens: the partials' extent
++    int nslices,
++    int kslice)      // K of one slice, a multiple of 4
++{
++    src0 = (global float*)((global char*)src0 + offset0);
++    src1 = (global float*)((global char*)src1 + offset1);
++    dst  = (global float*)((global char*)dst  + offsetd);
++
++    const uint W     = get_local_size(0);
++    const uint lane  = get_local_id(0);
++    const uint out   = get_global_id(2);   // (token, column, row): token*ne11*ne01 + n*ne01 + m
++    const uint slice = get_global_id(1);
++    if (out >= (uint)n_out) return;
++    const uint m  = out % (uint)ne01;
++    const uint nc = out / (uint)ne01;
++    const uint bt = nc / (uint)ne11;   // the token: a slab, not a float a row
++    const uint n  = nc % (uint)ne11;
++
++    global float4 * wrow = (global float4*)(src0 + (ulong)bt * (uint)stride_as + (ulong)m * (uint)stride_a);
++    global float4 * xcol = (global float4*)(src1 + (ulong)bt * (uint)stride_bs + (ulong)n * (uint)stride_b);
++    const uint k4 = (uint)kslice >> 2;
++    const uint k0 = slice * k4;          // in float4 units, as wrow and xcol are float4 pointers
++
++    float acc = 0.0f;
++    for (uint k = lane; k < k4; k += W) {
++        float4 w = wrow[k0 + k];
++        float4 x = xcol[k0 + k];
++        acc += w.s0*x.s0 + w.s1*x.s1 + w.s2*x.s2 + w.s3*x.s3;
++    }
++
++    local float red[64];
++    red[lane] = acc;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (uint s = W >> 1; s > 0; s >>= 1) {
++        if (lane < s) red[lane] += red[lane + s];
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++    if (lane == 0) dst[(ulong)slice * (uint)n_out + out] = red[0];
++}
++
+ // The K slices of a split-K product summed: src holds nslices slices of n
+ // floats, slice s at s * n; dst[i] = the sum over s.
+ kernel void kernel_sum_slices_f32(
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index a4e7f5c..701982d 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -6366,6 +6366,53 @@ struct test_mul_mat_f32_mix : public test_case {
+     }
+ };
+ 
++// the depth mix's first product: the states are a rms_norm of a view_3d of the stack (a token
++// a slab, the slab the stack's own stride, so nb[2] = n_slot * k), the query weight a 2-D
++// tensor repeated over the tokens. K is the embedding width, M the slots a token, N the query
++// columns, the tokens a batch on both sides. The tiled GEMM ran it as a 64x64 tile per 64
++// columns (2.0 ms a call); the split-K GEMV's own layout is a work-group a (token, column, row).
++struct test_mul_mat_f32_prompt_m : public test_case {
++    const int64_t k;   // the embedding width, the product's K
++    const int64_t m;   // the slots a token (a block count + 1)
++    const int64_t n;   // the query columns
++    const int64_t nb;  // tokens
++    const int64_t n_slot;
++
++    std::string vars() override { return VARS_TO_STR5(k, m, n, nb, n_slot); }
++
++    double max_nmse_err() override { return 5e-4; }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2 * k * m * n * nb;
++    }
++
++    test_mul_mat_f32_prompt_m(int64_t k = 2304, int64_t m = 2, int64_t n = 4, int64_t nb = 512, int64_t n_slot = 8)
++        : k(k), m(m), n(n), nb(nb), n_slot(n_slot) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * stack = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n_slot, nb);
++        ggml_set_name(stack, "stack");
++        ggml_tensor * states = ggml_view_3d(ctx, stack, k, m, nb, stack->nb[1], stack->nb[2], 0);
++        ggml_set_name(states, "states");
++        ggml_tensor * norm = ggml_rms_norm(ctx, states, 1e-5f);
++        ggml_set_name(norm, "norm");
++        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
++        ggml_set_name(w, "w");
++        ggml_tensor * queries = ggml_repeat(ctx, w, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, n, nb));
++        ggml_set_name(queries, "queries");
++        ggml_tensor * out = ggml_mul_mat(ctx, norm, queries);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            init_tensor_uniform(t);
++        }
++    }
++};
++
+ // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
+ struct test_mul_mat_id_fusion : public test_case {
+     const ggml_type type_a;
+@@ -12592,6 +12639,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 6, 4, 512));
+     test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 6, 1, 1));
+     test_cases.emplace_back(new test_mul_mat_f32_mix(2304, 1, 1, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_prompt_m(2304, 2, 4, 512));
++    test_cases.emplace_back(new test_mul_mat_f32_prompt_m(2304, 2, 1, 512));
+ 
+     // Q2_0 rows of 20 and 12 sub-blocks (4 lanes a row in the OpenCL low-bit matvec) and of 10 (16 lanes):
+     // Flash-Next's down projections are 2560 x 640 Q2_0

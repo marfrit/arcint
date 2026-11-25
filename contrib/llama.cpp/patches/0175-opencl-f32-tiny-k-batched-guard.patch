@@ -1,0 +1,146 @@
+0175: the depth mix's batched tiny-K arm, corrected and gated: rows against dst's ne0 (not its columns), the tensors' own strides, the K=16 wide-N GEMM on shapes the old selection declined with its slice sum only above one slice, and both arms off by default behind GGML_OPENCL_F32_SMALLK / GGML_OPENCL_F32_WIDE_N.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index df35ce9..28c4f48 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -33814,18 +33814,24 @@ static int ggml_cl_flat_cols(const ggml_tensor * src0, const ggml_tensor * src1,
+ // (2304 rows, K = a block count 1-6, one or three columns a token, a column a token as the
+ // batch). The tiled GEMMs' BK is 16 and the GEMV's K is 64, so both decline it and the
+ // generic matvec runs one work-group a (row block, column): the weight is an activation, so
+-// one lane a row and the K loop in registers is the shape's own path. One launch, and no
+-// buffer: the output is dst's row.
++// one lane a row and the K loop in registers is the shape's own path. One launch, no buffer,
++// and the strides are the tensors' own: a transposed src0 view is read as it lies, so the
++// model's depth mix needs no copy on the row axis. GGML_OPENCL_F32_SMALLK=1 turns it on.
+ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+     static const char * env = getenv("GGML_OPENCL_F32_SMALLK");
+-    static const bool   on  = env == nullptr || atoi(env) != 0;
++    static const bool   on  = env != nullptr && atoi(env) != 0;
++    // rows of the product are src0's ne1 and dst's ne0; the columns of a batch are src1's ne1
+     if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_mul_mat_f32_f32_smallk == nullptr ||
+         src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+-        src0->ne[0] != src1->ne[0] || src0->ne[0] < 1 || src0->ne[0] > 8 || src0->ne[1] != dst->ne[1] ||
+-        src0->ne[1] < 256 || src0->ne[2] != src1->ne[2] || src0->ne[3] != 1 || src1->ne[3] != 1 || dst->ne[3] != 1 ||
+-        dst->ne[1] != src1->ne[1] || dst->ne[2] != src1->ne[2] ||
+-        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++        src0->ne[0] != src1->ne[0] || src0->ne[0] < 1 || src0->ne[0] > 8 ||
++        src0->ne[1] != dst->ne[0] || src0->ne[1] < 256 ||
++        dst->ne[1] != src1->ne[1] || dst->ne[2] != src1->ne[2] || dst->ne[3] != 1 ||
++        src0->ne[3] != 1 || src1->ne[3] != 1 ||
++        (src0->ne[2] != 1 && src0->ne[2] != src1->ne[2]) ||
++        src0->nb[0] % sizeof(float) != 0 || src0->nb[1] % sizeof(float) != 0 || src0->nb[2] % sizeof(float) != 0 ||
++        src1->nb[0] % sizeof(float) != 0 || src1->nb[1] % sizeof(float) != 0 ||
++        !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
+         return false;
+     }
+     const int ne00 = (int) src0->ne[0], ne01 = (int) src0->ne[1];
+@@ -33843,9 +33849,20 @@ static bool ggml_cl_mul_mat_f32_smallk(ggml_backend_t backend, const ggml_tensor
+     CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &offset1));
+     CL_CHECK(clSetKernelArg(k, 4, sizeof(cl_mem),   &extrad->data_device));
+     CL_CHECK(clSetKernelArg(k, 5, sizeof(cl_ulong), &offsetd));
++    // the tensors' own steps in floats: a transposed view (the model's depth mix, src0 a
++    // view_3d of the stack transposed) has K a long stride and rows one float apart
++    const int ka = (int) (src0->nb[0] / sizeof(float)), ra = (int) (src0->nb[1] / sizeof(float));
++    const int kb = (int) (src1->nb[0] / sizeof(float)), rb = (int) (src1->nb[1] / sizeof(float));
++    const int kd = (int) (dst->nb[0] / sizeof(float)),  rd = (int) (dst->nb[1] / sizeof(float));
+     CL_CHECK(clSetKernelArg(k, 6, sizeof(int),      &ne00));
+     CL_CHECK(clSetKernelArg(k, 7, sizeof(int),      &ne01));
+     CL_CHECK(clSetKernelArg(k, 8, sizeof(int),      &n_cols));
++    CL_CHECK(clSetKernelArg(k, 9, sizeof(int),      &ka));
++    CL_CHECK(clSetKernelArg(k, 10, sizeof(int),     &ra));
++    CL_CHECK(clSetKernelArg(k, 11, sizeof(int),     &kb));
++    CL_CHECK(clSetKernelArg(k, 12, sizeof(int),     &rb));
++    CL_CHECK(clSetKernelArg(k, 13, sizeof(int),     &kd));
++    CL_CHECK(clSetKernelArg(k, 14, sizeof(int),     &rd));
+     size_t gws[2] = { (size_t)CEIL_DIV(ne01, 64) * 64, (size_t)n_cols };
+     size_t lws[2] = { 64, 1 };
+     backend_ctx->enqueue_ndrange_kernel(k, 2, gws, lws, dst);
+@@ -33862,7 +33879,12 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     // more columns the split-K kernel up to 256
+     // a GEMM (more than 8 columns) has no row bound and takes a 2-D shared weight with a
+     // batched src1; its K is the tiled kernel's BK multiples (16), not the GEMV's 64
+-    const bool gemm  = ne11 > 8 && ne00 % 16 == 0 && backend_ctx->kernel_mul_mm_f32_f32_l4_lm != nullptr;
++    // the GEMM arm is behind GGML_OPENCL_F32_WIDE_N (unset: off, today's selection) and takes
++    // only what that selection declined: more than 256 rows, or a K that is not the GEMV's 64
++    static const char * we   = getenv("GGML_OPENCL_F32_WIDE_N");
++    static const bool   w_on = we != nullptr && atoi(we) != 0;
++    const bool gemm  = w_on && ne11 > 8 && ne00 % 16 == 0 && backend_ctx->kernel_mul_mm_f32_f32_l4_lm != nullptr &&
++                        (ne01 > 256 || ne00 % 64 != 0);
+     if (!on || backend_ctx->gpu_family != INTEL || backend_ctx->kernel_sum_slices_f32 == nullptr ||
+         src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+         (ne11 <= 8 ? ne01 > 1024 : !gemm && ne01 > 256) || (ne00 % 64 != 0 && !gemm) ||
+@@ -33970,7 +33992,9 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     }
+     const int n_b  = b_batches > 1 ? b_batches : ks;
+     const int bslc = b_batches > 1 ? ne00 * ne11 : kslice;
+-    backend_ctx->prealloc_f32_splitk.allocate(backend_ctx->context, (size_t)ks * n_out * sizeof(float));
++    if (ks > 1) {
++        backend_ctx->prealloc_f32_splitk.allocate(backend_ctx->context, (size_t)ks * n_out * sizeof(float));
++    }
+     cl_kernel k = backend_ctx->kernel_mul_mm_f32_f32_l4_lm;
+     const int one = 1;
+     cl_ulong zero = 0;
+@@ -33979,8 +34003,8 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     CL_CHECK(clSetKernelArg(k,  1, sizeof(cl_ulong), &offset0));
+     CL_CHECK(clSetKernelArg(k,  2, sizeof(cl_mem),   &extra1->data_device));
+     CL_CHECK(clSetKernelArg(k,  3, sizeof(cl_ulong), &offset1));
+-    CL_CHECK(clSetKernelArg(k,  4, sizeof(cl_mem),   &backend_ctx->prealloc_f32_splitk.buffer));
+-    CL_CHECK(clSetKernelArg(k,  5, sizeof(cl_ulong), &zero));
++    CL_CHECK(clSetKernelArg(k,  4, sizeof(cl_mem),   ks == 1 ? &extrad->data_device : &backend_ctx->prealloc_f32_splitk.buffer));
++    CL_CHECK(clSetKernelArg(k,  5, sizeof(cl_ulong), ks == 1 ? &offsetd : &zero));
+     CL_CHECK(clSetKernelArg(k,  6, sizeof(int),      &kslice));   // ne00: K of one slice
+     CL_CHECK(clSetKernelArg(k,  7, sizeof(int),      &ne01));
+     CL_CHECK(clSetKernelArg(k,  8, sizeof(int),      &ks));       // ne02
+@@ -33997,6 +34021,9 @@ static bool ggml_cl_mul_mat_f32_skinny(ggml_backend_t backend, const ggml_tensor
+     size_t gws[3] = { (size_t)CEIL_DIV(ne01, 64) * 128, (size_t)CEIL_DIV(ne11, 64), (size_t)ks * (size_t)b_batches };
+     size_t lws[3] = { 128, 1, 1 };
+     backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++    if (ks == 1) {
++        return true;   // one slice: the tiled kernel's buffers were dst's own
++    }
+ 
+     cl_kernel kr = backend_ctx->kernel_sum_slices_f32;
+     CL_CHECK(clSetKernelArg(kr, 0, sizeof(cl_mem),   &backend_ctx->prealloc_f32_splitk.buffer));
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+index f8fbfa6..7c27ef7 100644
+--- a/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
++++ b/ggml/src/ggml-opencl/kernels/mul_mv_f32_f32.cl
+@@ -119,24 +119,27 @@ kernel void kernel_mul_mat_f32_f32(
+ 
+ // a batched F32 product of a tiny K over a wide N: out[r] of column c = sum_k a[k][r] * b[k][c],
+ // with a's rows the wide N (an activation, not a weight) and a column a token as the batch.
+-// One work-item a row, the K loop (1-8) in registers; a broadcast weight would read a's row
+-// once a column, the shape reads it once a row block.
++// One work-item a row, the K loop (1-8) in registers; the strides are the tensors' own, so a
++// transposed view is read in place and no copy is spent on the row axis (the depth mix).
+ kernel void kernel_mul_mat_f32_f32_smallk(
+         global char * src0,
+         ulong offset0,
+         global char * src1,
+         ulong offset1,
+-        global float * dst,
++        global char * dst,
+         ulong offsetd,
+         int ne00,
+         int ne01,
+-        int n_cols) {
++        int n_cols,
++        int ka, int ra,   // a's K step and row step, floats (nb[0], nb[1] / 4)
++        int kb, int rb,   // b's K step and column step
++        int kd, int rd) { // dst's row step and column step
+     const int c = get_global_id(1), r = get_global_id(0);
+     if (r >= ne01 || c >= n_cols) return;
+-    global const float * a = (global const float *)(src0 + offset0) + (ulong) r;
+-    global const float * b = (global const float *)(src1 + offset1) + (ulong) c * ne00;
++    global const float * a = (global const float *)(src0 + offset0);
++    global const float * b = (global const float *)(src1 + offset1);
+     float s = 0.f;
+-    for (int k = 0; k < ne00; ++k) s += a[(ulong) k * ne01] * b[k];
+-    global float * d = (global float *)((global char *) dst + offsetd);
+-    d[(ulong) c * ne01 + r] = s;
++    for (int k = 0; k < ne00; ++k) s += a[(ulong) k * ka + (ulong) r * ra] * b[(ulong) k * kb + (ulong) c * rb];
++    global float * d = (global float *)(dst + offsetd);
++    d[(ulong) c * rd + (ulong) r * kd] = s;
+ }

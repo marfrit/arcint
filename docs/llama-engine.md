@@ -715,7 +715,7 @@ The dense model's 20-run sampled arm with that configuration scored 11 of
 
 ## Context checkpoints (`--llama-checkpoints N`, `--llama-checkpoint-step T`)
 
-A count above 0 on a model that is neither hybrid nor recurrent is refused at start: an attention cache trims, so there is nothing to snapshot. The default of 32 is not a request.
+A count above 0 on a model that is neither hybrid nor recurrent, and whose SWA cache is not window-sized (`--llama-swa-window`), is refused at start: a full-size attention cache trims, so there is nothing to snapshot. The default of 32 is not a request.
 
 The Qwen 3.x models are hybrid: their GatedDeltaNet layers carry a recurrent
 state that llama.cpp cannot cut back to an earlier token (it refuses the
@@ -731,16 +731,39 @@ mechanism (`tools/server/server-context.cpp` at the pin, `code`):
   4 + n_ubatch and 4 tokens before the prompt's end. The batches break
   there;
 - **what**: the `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` state (the recurrent
-  part), in host memory, with the MTP drafter's carried row (llama.cpp
-  stashes the draft state with each, `common_speculative_get_state`);
+  part, and the sliding window when `--llama-swa-window` sizes the SWA cache),
+  in host memory, with the MTP drafter's carried row (llama.cpp stashes the
+  draft state with each, `common_speculative_get_state`);
 - **how many**: at most N (32) a lane. When full, llama.cpp's eviction
   applies: first those within T of an earlier one that an earlier request
   made, then the oldest;
 - **restore**: the newest at or below the shared prefix. The attention KV
   is then trimmed there;
-- **which models**: only hybrid and recurrent ones. An attention-only cache
-  trims instead, and its partial state would be the whole KV (Cydonia: none
-  taken, its follow-up reused 5,346 of 5,353 tokens by trimming).
+- **which models**: hybrid and recurrent ones, and an attention-only model
+  whose SWA cache is window-sized (`--llama-swa-window`): its partial state is
+  the window, not the whole KV. At the library's full-size SWA default a
+  trim is exact and a partial state would be the whole KV, so no checkpoint is
+  taken (Cydonia: none, its follow-up reused 5,346 of 5,353 tokens by trimming).
+
+**The window-sized SWA cache (`--llama-swa-window`).** The library's default
+sizes the sliding-window layers to the whole context (`swa_full`, DESIGN §3.4).
+The flag sets `swa_full = false`: the SWA layers hold `n_swa + n_ubatch` cells
+(padded to 256), the rest of the KV as before. llama.cpp's `seq_rm` on such a
+cache always returns true and drops the cells from the cut on, so a prefix cut
+below the retained window would leave a hole under the next query's window.
+arcint reads the attention cache's own oldest retained position
+(`llama_memory_attn_seq_pos_min`, patch 0153) before the cut and resumes from
+the newest checkpoint when that history starts above the window; with no
+checkpoint it clears and re-prefills. The rule is `src/core/swa_window.h`; the
+probe is `tools/swa_ckpt_probe.cpp`.
+
+Measured (`measured-here`, CPU, 2026-11-22, f16): the KV at 131,072 cells is
+Inkling 24,576 -> 4,336 MiB, Dory `per_loop` 49,152 -> 12,720, Gemma 4 E4B
+7,168 -> 2,088; a full-window checkpoint is 163.7 / 288.0 / 20.0 MiB. The
+prefill-only arms and the checkpoint resume on the probe are in DESIGN §7.1.
+`--llama-dory-kv last_loop` with the flag is refused at load: that mode's
+prefill is chunk-boundary dependent (the probe's same-prompt floor is 0.026827
+nats mean KL), so a resume cannot be held to the same logits; `per_loop` takes it.
 
 User messages are found by the text that opens one, derived from the GGUF's
 template by rendering it twice (ChatML: the start-of-turn marker followed by `user`, trimmed as llama.cpp trims it). llama.cpp's
@@ -751,8 +774,10 @@ Two deviations from the reference:
 - llama.cpp supersedes a checkpoint at the same token count, while arcint
   keeps the existing one. The tokens below it are unchanged, so is its
   state, and keeping it saves a 150 MiB copy.
-- llama.cpp also checkpoints sliding-window models; arcint serves none on
-  this engine, so that case is not built.
+- llama.cpp's checkpoint reuse criterion (`pos_min_thold`, a `pos_min`/`pos_max`
+  pair it marks as wrong for SWA models, `[TAG_CHECKPOINTS_FIX_POS_MIN]`) is
+  not copied: arcint tests the SWA cache's retained position against the next
+  query's window directly (patch 0153, `src/core/swa_window.h`).
 
 Measured (`measured-here`, 2026-10-05). Each run is a 24.3k-token
 conversation at temperature 0 with thinking on: t1 asks a question, t2

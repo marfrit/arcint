@@ -1,0 +1,632 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 4bb4448..2e4e2cb 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1246,6 +1246,11 @@ struct test_case {
+         return max_nmse_err(backend);
+     }
+ 
++    // 0199q2: a case that names a tag has its error printed whether it passes or not
++    virtual const char * err_tag() {
++        return nullptr;
++    }
++
+     virtual double err(const float * a, const float * b, size_t n) {
+         return nmse(a, b, n);
+     }
+@@ -1563,6 +1568,9 @@ struct test_case {
+             }
+ 
+             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
++            if (ud->tc->err_tag() != nullptr) {
++                printf("[%s] nmse = %.3g (bound %.3g) ", ud->tc->err_tag(), err, ud->tc->max_err(ud->backend1));
++            }
+             if (err > ud->tc->max_err(ud->backend1)) {
+                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+                 //for (int i = 0; i < (int) f1.size(); i++) {
+@@ -9541,9 +9549,21 @@ struct test_flash_attn_ext : public test_case {
+     }
+ 
+     double max_nmse_err() override {
++        // 0199q2: the port's q8_0 cases have the bound their prediction states: the CPU
++        // reference quantizes Q to q8_0 and stands 2e-6 from a double-precision attention on
++        // the same blocks (GGML_TEST_FA_PORT_KV8), the kernel 1e-7. The f16 cases keep 5e-4:
++        // no such figure was stated for them before they ran on the card.
++        if (port == 1 && type_K == GGML_TYPE_Q8_0) {
++            return 1e-5;
++        }
+         return 5e-4;
+     }
+ 
++    // 0199q2: "[FA_PORT] nmse = <v> (bound <b>)" for every port case and twin, pass or fail
++    const char * err_tag() override {
++        return port != 0 ? "FA_PORT" : nullptr;
++    }
++
+     uint64_t op_flops(ggml_tensor * t) override {
+         GGML_UNUSED(t);
+         // Just counting matmul costs:
+@@ -9640,10 +9660,17 @@ struct test_flash_attn_ext : public test_case {
+             // with nb [2, Hk*D*2, D*2] (permute {0, 2, 1, 3}, kv_view off). A case that
+             // builds another layout is not the port's case.
+             GGML_ASSERT(q->nb[0] == 4 && q->nb[2] == (size_t) q->ne[0]*4 && q->nb[1] == (size_t) q->ne[2]*q->nb[2]);
+-            if (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {   // (a refused-shape test builds a q8_0 cache)
++            if (type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) {   // (a refused-shape test builds a q4_0 cache)
+                 GGML_ASSERT(k->nb[0] == 2 && k->nb[2] == (size_t) k->ne[0]*2 && k->nb[1] == (size_t) k->ne[2]*k->nb[2]);
+                 GGML_ASSERT(v->nb[0] == 2 && v->nb[2] == (size_t) v->ne[0]*2 && v->nb[1] == (size_t) v->ne[2]*v->nb[2]);
+             }
++            if (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0) {
++                // 0199q2: the q8_0 cache as the model's graph has it (the export with -ctk q8_0
++                // -ctv q8_0, fixtures/inkling-q8kv-ub*.txt lines 222 / 223): K/V [128, n_kv, 8]
++                // with nb [34, 1088, 136] - a block is 34 bytes, a head 4 blocks, a key row 8 heads
++                GGML_ASSERT(k->nb[0] == 34 && k->nb[2] == (size_t) k->ne[0]/32*34 && k->nb[1] == (size_t) k->ne[2]*k->nb[2]);
++                GGML_ASSERT(v->nb[0] == 34 && v->nb[2] == (size_t) v->ne[0]/32*34 && v->nb[1] == (size_t) v->ne[2]*v->nb[2]);
++            }
+             // the port's inputs; the mask and the bins are built from these positions
+             // in initialize_tensors, so the CPU's indexed-bias path is the same attention
+             ggml_tensor * pk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
+@@ -9676,6 +9703,9 @@ struct test_flash_attn_ext : public test_case {
+         return (float) (x >> 40) * (1.0f / 16777216.0f);
+     }
+ 
++    // 0199q2: the quantized K / V bases whose uniform init was skipped and whose fill is still owed
++    std::vector<const ggml_tensor *> port_q_bases;
++
+     // 0199: every tensor of a port case (port 1) or of its twin (port 2)
+     void init_port_tensor(ggml_tensor * t) {
+         GGML_ASSERT(nr23[1] == 1);
+@@ -9702,6 +9732,33 @@ struct test_flash_attn_ext : public test_case {
+             ggml_tensor * base = tv->view_src ? tv->view_src : tv;
+             const size_t off = tv->view_src ? tv->view_offs : 0;
+             std::vector<uint8_t> buf(ggml_nbytes(base), 0);
++            if (tv->type == GGML_TYPE_Q8_0) {
++                // 0199q2: a q8_0 cache. The same values by logical index, times an amplitude
++                // that depends on (head, key, q8_0 block) - 0.25 .. 2, so that neighbouring
++                // blocks have different scales and a scale taken from the wrong block, or
++                // applied twice, moves the answer - then ggml's own quantizer, a (key, head) a
++                // call, written where the view has that row. GGML_TEST_FA_PORT_FLAT_AMP=1 fills
++                // without the amplitude (every scale about 1/127): the wrong-block red of the
++                // read-path model then moves the answer by 0.002 instead of 0.5
++                static const bool flat = getenv("GGML_TEST_FA_PORT_FLAT_AMP") != nullptr;
++                GGML_ASSERT(tv->ne[3] == 1 && tv->ne[0] % 32 == 0);
++                std::vector<float> row(tv->ne[0]);
++                const size_t rb = ggml_row_size(GGML_TYPE_Q8_0, tv->ne[0]);
++                for (int64_t i2 = 0; i2 < tv->ne[2]; ++i2) for (int64_t i1 = 0; i1 < tv->ne[1]; ++i1) {
++                    for (int64_t i0 = 0; i0 < tv->ne[0]; ++i0) {
++                        const float amp = flat ? 1.0f : 0.25f * powf(2.0f, 3.0f * det01(salt + 16, (uint64_t) ((i2*tv->ne[1] + i1)*(tv->ne[0]/32) + i0/32)));
++                        row[i0] = amp * (-1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0)));
++                    }
++                    ggml_quantize_chunk(GGML_TYPE_Q8_0, row.data(), buf.data() + off + i1*tv->nb[1] + i2*tv->nb[2], 0, 1, tv->ne[0], nullptr);
++                    GGML_ASSERT(off + i1*tv->nb[1] + i2*tv->nb[2] + rb <= buf.size());
++                }
++                // the base's only write, and all of it: offset 0, its full byte size (zero where
++                // the view has no row); only then may the base go without its uniform init
++                GGML_ASSERT(buf.size() == ggml_nbytes(base));
++                ggml_backend_tensor_set(base, buf.data(), 0, ggml_nbytes(base));
++                port_q_bases.erase(std::remove(port_q_bases.begin(), port_q_bases.end(), (const ggml_tensor *) base), port_q_bases.end());
++                return;
++            }
+             GGML_ASSERT(tv->ne[3] == 1 && (tv->type == GGML_TYPE_F32 || tv->type == GGML_TYPE_F16));
+             for (int64_t i2 = 0; i2 < tv->ne[2]; ++i2) for (int64_t i1 = 0; i1 < tv->ne[1]; ++i1) for (int64_t i0 = 0; i0 < tv->ne[0]; ++i0) {
+                 const float x = -1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0));
+@@ -9779,6 +9836,14 @@ struct test_flash_attn_ext : public test_case {
+             // the per-head sink: zero. The port reads src[18]; the twin's sink is in its table
+             std::vector<float> z(ggml_nelements(t), 0.0f);
+             ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
++        } else if (t->view_src == nullptr && ggml_is_quantized(t->type)) {
++            // 0199q2: the base of a q8_0 K / V view. It gets ONE write: fill_view's, through the
++            // view that comes after it, which sets every byte of the base. A backend that
++            // repacks a quantized tensor at set_tensor (OpenCL: planes, and the tensor's extra
++            // replaced) cannot take a second set_tensor of the same tensor - the card stopped
++            // there with CL_INVALID_MEM_OBJECT, a sub-buffer of the first write's sub-buffer.
++            // The base is noted, and initialize_tensors asserts that a fill_view wrote it whole
++            port_q_bases.push_back(t);
+         } else if (t->view_src == nullptr) {
+             // anything else: the base of a view above (overwritten through the view, which
+             // comes after it), the output, or the harness's sentinels, which it compares
+@@ -9787,9 +9852,13 @@ struct test_flash_attn_ext : public test_case {
+     }
+ 
+     void initialize_tensors(ggml_context * ctx) override {
++        port_q_bases.clear();
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+             if (port) {
+                 init_port_tensor(t);
++                // 0199q2: after the last tensor, no quantized base may be left without its fill
++                GGML_ASSERT((ggml_get_next_tensor(ctx, t) != NULL || port_q_bases.empty()) &&
++                            "a quantized K / V base was skipped by the uniform init and never filled");
+                 continue;
+             }
+             if (strcmp(t->name, "s") == 0) {
+@@ -14134,6 +14203,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
+             1, (int32_t) c[2], (int32_t) c[3], c[4]));
+     }
++    // 0199q2: the port on a q8_0 K/V cache (the kernel's PORT_KV8 build), in the model's layout
++    // from the q8_0 export's FLASH_ATTN_EXT prompt lines (K/V nb [34, 1088, 136]): the two
++    // export shapes at ub 512, the ub 1024 ring, a last tile of 4 rows with a mixed and an
++    // empty key group, and a short one. Red on the card: GGML_OPENCL_FA_PORT_RED=6 (K's block
++    // scale applied twice) and =7 (V's scale from the next block) must FAIL each of them, as
++    // =1 and =2 must. Then the twins (port=2) of the first two for today's q8_0 kernels.
++    for (auto c : std::vector<std::array<int64_t, 5>>{
++            { 1536,  512, 2, 1024,    0 }, { 4096,  512, 0,    0, 2560 }, { 2048, 1024, 1, 1024,    0 },
++            { 1040,   20, 0,    0,   17 }, {  160,   12, 0,    0,   60 },
++        }) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++            1, (int32_t) c[2], (int32_t) c[3], c[4]));
++    }
++    for (auto c : std::vector<std::array<int64_t, 5>>{ { 1536, 512, 2, 1024, 0 }, { 4096, 512, 0, 0, 2560 } }) {
++        test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++            2, (int32_t) c[2], (int32_t) c[3], c[4]));
++    }
+     // 0199: a table whose pad bin is not zero, with keys far past the extent (2,200 keys, no
+     // window): the port must read the bin (GGML_OPENCL_FA_PORT_RED=4 assumes zero and must
+     // FAIL this case), and its twin gives today's kernels the same table
+@@ -14521,6 +14609,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+             GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
+             port, 0, 0, 2560));
+     }
++    // 0199q2: the same three shapes on a q8_0 K/V cache, the port (port=1) and today's q8_0
++    // kernels on the same data (port=2), the model's layout. A q8_0 tensor this harness
++    // writes is stored as planes, so each of these calls also pays the rebuild of its blocks
++    // (both arms; the f16 cases above do not): compare q8_0 with q8_0 here, and q8_0 with f16
++    // on the served model only
++    for (auto c : std::vector<std::array<int64_t, 2>>{ { 1536, 512 }, { 2048, 2048 }, { 3072, 2048 } }) {
++        for (int32_t port : { 1, 2 }) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++                GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++                port, 0, 1024, 0));
++        }
++    }
+ 
+     // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
+     // 27B's geometry (head size 256, 24 query heads on 4)
+@@ -15368,6 +15468,12 @@ static const int FA_PORT_EVAL_PORT1     = 11;
+ static const int FA_PORT_EVAL_PORT1_PAD = 1;
+ static const int FA_PORT_EVAL_PORT2     = 5;       // 4 with pad_bias=0 and the pad's twin
+ static const int FA_PORT_EVAL_PORT2_PAD = 1;
++// 0199q2: the q8_0 cases are counted apart (the rows above are the f16 cases, unchanged):
++// 5 port=1 cases the knob runs (unset: not supported), 2 twins for today's q8_0 kernels.
++// Whether the card's dispatch of today serves the twins is read from `test-backend-ops
++// support` on the card, not from here.
++static const int FA_PORT_EVAL_PORT1_Q8  = 5;
++static const int FA_PORT_EVAL_PORT2_Q8  = 2;
+ 
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+ 
+@@ -15380,17 +15486,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+ static bool test_fa_port_decisions() {
+     const bool red = getenv("GGML_TEST_FA_PORT_ROUTE_RED") != nullptr;
+     auto cases = make_test_cases_eval();
+-    int n1 = 0, n1_pad = 0, n2 = 0, n2_pad = 0, n_fail = 0;
++    int n1 = 0, n1_pad = 0, n2 = 0, n2_pad = 0, n1_q8 = 0, n2_q8 = 0, n_fail = 0;
+     for (auto & tc : cases) {
+         auto * fa = dynamic_cast<test_flash_attn_ext *>(tc.get());
+         if (fa == nullptr || fa->port == 0) {
+             continue;
+         }
++        const bool q8 = fa->type_K == GGML_TYPE_Q8_0;
+         if (fa->port == 2) {
++            if (q8) { n2_q8++; continue; }
+             n2++; n2_pad += fa->pad_bias != 0.0f;
+             continue;
+         }
+-        n1++; n1_pad += fa->pad_bias != 0.0f;
++        if (q8) { n1_q8++; } else { n1++; n1_pad += fa->pad_bias != 0.0f; }
+         ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
+         ggml_context * ctx = ggml_init(params);
+         ggml_tensor * op = fa->build_graph(ctx);
+@@ -15402,16 +15510,17 @@ static bool test_fa_port_decisions() {
+             lau[gqa_wide] = fa_port_gate_at_launch(op, red ? 0 : 1, gqa_wide, 1, 4096, 256, 1, &wl[gqa_wide]);
+             ok = ok && sup != 0 && lau[gqa_wide] == sup;
+         }
+-        printf("  kv=%lld nb=%lld wrap=%d window=%d n_empty=%lld pad_bias=%g: supports_op %s%s | launch %s%s (wide verify: %s%s): %s\n",
+-               (long long) fa->kv, (long long) fa->nb, fa->wrap, fa->window, (long long) fa->n_empty, (double) fa->pad_bias,
++        printf("  %s kv=%lld nb=%lld wrap=%d window=%d n_empty=%lld pad_bias=%g: supports_op %s%s | launch %s%s (wide verify: %s%s): %s\n",
++               ggml_type_name(fa->type_K), (long long) fa->kv, (long long) fa->nb, fa->wrap, fa->window, (long long) fa->n_empty, (double) fa->pad_bias,
+                sup ? "ACCEPT" : "refuse ", sup ? "" : ws, lau[0] ? "ACCEPT" : "refuse ", lau[0] ? "" : wl[0],
+                lau[1] ? "ACCEPT" : "refuse ", lau[1] ? "" : wl[1], ok ? "OK" : "FAIL");
+         n_fail += !ok;
+         ggml_free(ctx);
+     }
+     const bool counts = n1 == FA_PORT_EVAL_PORT1 && n1_pad == FA_PORT_EVAL_PORT1_PAD &&
+-                        n2 == FA_PORT_EVAL_PORT2 && n2_pad == FA_PORT_EVAL_PORT2_PAD;
+-    printf("  eval cases: port=1 %d (pad %d), port=2 %d (pad %d): %s\n", n1, n1_pad, n2, n2_pad,
++                        n2 == FA_PORT_EVAL_PORT2 && n2_pad == FA_PORT_EVAL_PORT2_PAD &&
++                        n1_q8 == FA_PORT_EVAL_PORT1_Q8 && n2_q8 == FA_PORT_EVAL_PORT2_Q8;
++    printf("  eval cases: f16 port=1 %d (pad %d), port=2 %d (pad %d); q8_0 port=1 %d, port=2 %d: %s\n", n1, n1_pad, n2, n2_pad, n1_q8, n2_q8,
+            counts ? "as the table says" : "FAIL, the table above is stale");
+     printf("  port decisions%s: %s\n", red ? " (the old dispatch order)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
+     return n_fail == 0 && counts;
+@@ -15457,7 +15566,8 @@ static bool test_fa_port_guard() {
+ 
+ // 0199: GGML_TEST_FA_PORT_REFUSED=1 (no device needed): an op the port's gate refuses does
+ // not keep the port's sources. For each shape - the port's eval cases (accepted), and
+-// refused ones: 8 rows and 1 row (a decode or verify step), a q8_0 K/V cache, two streams -
++// refused ones: 8 rows and 1 row (a decode or verify step), a q4_0 K/V cache (0199q2: a q8_0
++// cache is accepted, the kernel's PORT_KV8 build reads it), two streams -
+ // the op is built with the port's sources, the gate is asked (fa_port_gate_op, the function
+ // supports_op calls), and what the graph builder does with the answer is done: a refusal
+ // drops the sources and gives the op today's table (ggml_flash_attn_ext_drop_port_sources).
+@@ -15474,7 +15584,9 @@ static bool test_fa_port_refused() {
+         { "9 rows",                           160,   9, GGML_TYPE_F16,  1, true  },
+         { "8 rows (a verify step)",           160,   8, GGML_TYPE_F16,  1, false },
+         { "1 row (a decode step)",            160,   1, GGML_TYPE_F16,  1, false },
+-        { "a q8_0 K/V cache, 512 rows",      1536, 512, GGML_TYPE_Q8_0, 1, false },
++        { "a q8_0 K/V cache, 512 rows",      1536, 512, GGML_TYPE_Q8_0, 1, true  },
++        { "a q8_0 K/V cache, 8 rows",         160,   8, GGML_TYPE_Q8_0, 1, false },
++        { "a q4_0 K/V cache, 512 rows",      1536, 512, GGML_TYPE_Q4_0, 1, false },
+     };
+     int n_fail = 0;
+     for (const shape & sh : shapes) {
+@@ -15512,7 +15624,8 @@ static bool test_fa_port_refused() {
+ // (fa_port_settle, what build_attn_mha calls after it attached the port's sources) with a
+ // mock backend that declares the port's sources and answers supports_op with the port's
+ // gate - so it refuses what the real backend refuses. Rows: an accepted shape on the layer's
+-// backend keeps the sources; a refused shape (8 rows, a q8_0 K/V cache) loses them; an
++// backend keeps the sources (0199q2: a q8_0 K/V cache among them); a refused shape (8 rows,
++// a q4_0 K/V cache) loses them; an
+ // accepted shape whose layer has no scheduler backend (the op would run on the CPU fallback)
+ // loses them. A dropped op has no port source, window 0 and today's table.
+ // GGML_TEST_FA_PORT_SETTLE_RED=1 skips the step (the builder before it): the refused and the
+@@ -15540,7 +15653,8 @@ static bool test_fa_port_settle() {
+         { "512 rows, the layer's backend",            1536, 512, GGML_TYPE_F16,  1, true  },
+         { "9 rows, the layer's backend",               160,   9, GGML_TYPE_F16,  1, true  },
+         { "8 rows, the layer's backend",               160,   8, GGML_TYPE_F16,  1, false },
+-        { "a q8_0 K/V cache, the layer's backend",    1536, 512, GGML_TYPE_Q8_0, 1, false },
++        { "a q8_0 K/V cache, the layer's backend",    1536, 512, GGML_TYPE_Q8_0, 1, true  },
++        { "a q4_0 K/V cache, the layer's backend",    1536, 512, GGML_TYPE_Q4_0, 1, false },
+         { "512 rows, no scheduler backend for layer", 1536, 512, GGML_TYPE_F16,  0, false },
+     };
+     int n_fail = 0;
+@@ -15596,15 +15710,19 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+         ggml_free(ctx);
+     };
+     int n_fail = 0;
+-    for (auto c : std::vector<std::array<int64_t, 5>>{
+-            { 1536, 512, 0, 1024, 0 }, { 2048, 2048, 0, 1024, 0 }, { 3072, 2048, 0, 1024, 0 },
+-            { 4096, 512, 0, 0, 2560 }, { 1536, 512, 2, 1024, 0 }, { 160, 12, 0, 0, 60 },
+-            { 2200, 24, 0, 0, 0 } /* with a pad bin of 2.5 */ }) {
++    // 0199q2: the last three rows are a q8_0 K/V cache (c[5] = 1): the port's q8_0 case against
++    // its twins, which hold the same blocks
++    for (auto c : std::vector<std::array<int64_t, 6>>{
++            { 1536, 512, 0, 1024, 0, 0 }, { 2048, 2048, 0, 1024, 0, 0 }, { 3072, 2048, 0, 1024, 0, 0 },
++            { 4096, 512, 0, 0, 2560, 0 }, { 1536, 512, 2, 1024, 0, 0 }, { 160, 12, 0, 0, 60, 0 },
++            { 2200, 24, 0, 0, 0, 0 } /* with a pad bin of 2.5 */,
++            { 1536, 512, 2, 1024, 0, 1 }, { 4096, 512, 0, 0, 2560, 1 }, { 160, 12, 0, 0, 60, 1 } }) {
+         std::vector<float> out[3];
+         std::vector<uint8_t> mask[3];
++        const ggml_type tkv = c[5] ? GGML_TYPE_Q8_0 : GGML_TYPE_F16;
+         for (int i = 0; i < 3; ++i) {
+             const bool model_layout = i < 2;
+-            test_flash_attn_ext tc(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
++            test_flash_attn_ext tc(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0, GGML_PREC_F32, tkv, tkv,
+                                    model_layout ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3},
+                                    !model_layout, false, 0, true, 1025, false,
+                                    i == 0 ? 1 : 2, (int32_t) c[2], (int32_t) c[3], c[4], c[0] == 2200 ? 2.5f : 0.0f);
+@@ -15621,8 +15739,8 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+             // the same attention up to rounding: the twin's bins carry bias - sink (magnitude
+             // ~10 against the port's ~4), and the CPU kernel rounds scores through f16
+             const bool ok = same_mask && out[i].size() == out[0].size() && nmse < 1e-5;
+-            printf("  twin kv=%lld nb=%lld wrap=%lld window=%lld n_empty=%lld %s: mask %s, nmse %.3g vs the port case: %s\n",
+-                   (long long) c[0], (long long) c[1], (long long) c[2], (long long) c[3], (long long) c[4],
++            printf("  twin %s kv=%lld nb=%lld wrap=%lld window=%lld n_empty=%lld %s: mask %s, nmse %.3g vs the port case: %s\n",
++                   ggml_type_name(tkv), (long long) c[0], (long long) c[1], (long long) c[2], (long long) c[3], (long long) c[4],
+                    i == 1 ? "model layout" : "contiguous, kv view", same_mask ? "identical" : "DIFFERS", nmse, ok ? "OK" : "FAIL");
+             n_fail += !ok;
+         }
+@@ -15631,11 +15749,312 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+     return n_fail == 0;
+ }
+ 
++
++// 0199q2: GGML_TEST_FA_PORT_KV8=1 (the CPU backend; no device): flash_attn_port.cl's q8_0
++// read path (-DPORT_KV8=1), transcribed statement for statement and run on the bytes of the
++// port's q8_0 cases - the tensors test-backend-ops builds from the export's strides (K/V
++// [128, n_kv, 8], nb [34, 1088, 136]) and the CPU backend holds. What it transcribes:
++//   the surface base (a head's first byte rounded down to 64) and the x offset;
++//   K: the five transposed dword reads of a key row (dwords 0, 8, 16, 24, 26 of the head),
++//      the scales' places, the two splices of the blocks that start 2 bytes off a dword,
++//      the eight 4-dword sets, B16 (the codes as f16 1152 + code by integer operations),
++//      Q's lane order (KV8_ORD), the accumulator's start (-1152 sum q) and the scale a block;
++//   V: the transformed byte reads (lane = byte column, 32 key rows) at V8X's columns, the
++//      third read and lane splice of a block that starts 2 bytes off a dword, the output's
++//      dim map (KV8_ODIM), the scales gathered a key in B16's key order, pe = f16(f16(p) d
++//      128), the start -1152 sum pe, and the 1/128.
++// Every modelled 2D read is also held to cl_intel_subgroup_2d_block_io's stated limits
++// ("behavior is undefined unless"): a base on 64 bytes, the first coordinate a multiple of
++// 4 for 8-bit data (of 2 for 16-bit), a width of 64 to 2^24 bytes and a multiple of 4 for
++// 8- and 16-bit data (of the element size otherwise), a height of 1 to 2^24 rows, a pitch not
++// below the width and a multiple of 16.
++// What it does not: the DPAS and the block reads themselves (modelled as what the kernel
++// assumes of them: lane = row for the transposed read, lane = column and the rows in byte
++// order for the transformed one - the card run is what proves that), the online softmax
++// (a direct one here; port_kernel_model.py has the kernel's), register allocation.
++// Every modelled read is checked against the surface it names and against the tensor's own
++// bytes, so a read that leaves the head's 136 bytes or the buffer fails the test.
++// Three results a case, on a sample of tiles:
++//   model vs exact   the transcription against a double-precision attention on ggml's own
++//                    dequantized K/V and the f32 Q: must be below 1e-6 (the f16 rounding of
++//                    Q and P is all that separates them);
++//   CPU vs exact     the CPU backend's op, which quantizes Q to q8_0 for its dot product:
++//                    what a correct kernel's NMSE against the CPU reference will be about;
++//   model vs CPU     must be inside the bound the q8_0 port cases run at (1e-5).
++// Red: GGML_TEST_FA_PORT_KV8_RED=1 K's scale applied twice, =2 V's scale from the next
++// block, =3 the two splices left out (a block that starts 2 bytes off a dword read as if
++// it started on one), =4 Q in dim order instead of KV8_ORD. Each must FAIL every case.
++// =5 is the V read as first written - at the code's own byte column, 2 mod 4 for blocks 0
++// and 2: the same numbers (the model reads any byte), and half of the V reads off the grid
++// the extension defines. It must FAIL on the rule count alone.
++static bool test_fa_port_kv8(ggml_backend_t backend) {
++    const char * red_env = getenv("GGML_TEST_FA_PORT_KV8_RED");
++    const int red = red_env != nullptr ? atoi(red_env) : 0;
++    auto f16r = [](float x) { return ggml_fp16_to_fp32(ggml_fp32_to_fp16(x)); };
++    auto b16 = [](const uint32_t w[4], float out[16]) {
++        // B16: bytes 0 and 2 of each dword, then bytes 1 and 3, each as the f16 0x6400 | (byte ^ 0x80)
++        uint32_t t[8];
++        for (int i = 0; i < 4; ++i) {
++            t[i]     = (w[i] & 0x00FF00FFu) ^ 0x64806480u;
++            t[4 + i] = ((w[i] >> 8) & 0x00FF00FFu) ^ 0x64806480u;
++        }
++        for (int h = 0; h < 16; ++h) {
++            out[h] = ggml_fp16_to_fp32((ggml_fp16_t) (h & 1 ? t[h >> 1] >> 16 : t[h >> 1] & 0xFFFFu));
++        }
++    };
++    auto kv8_ord = [](int h) { return 4 * ((h & 7) >> 1) + 2 * (h & 1) + (h >> 3); };
++    int n_fail = 0;
++    for (auto c : std::vector<std::array<int64_t, 5>>{
++            { 1536, 512, 2, 1024, 0 }, { 4096, 512, 0, 0, 2560 }, { 1040, 20, 0, 0, 17 }, { 160, 12, 0, 0, 60 } }) {
++        test_flash_attn_ext tc(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,
++                               {0, 2, 1, 3}, false, false, 0, true, 1025, false, 1, (int32_t) c[2], (int32_t) c[3], c[4]);
++        ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++        ggml_context * ctx = ggml_init(params);
++        ggml_tensor * op = tc.build_graph(ctx);
++        ggml_cgraph * gf = ggml_new_graph(ctx);
++        ggml_build_forward_expand(gf, op);
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++        GGML_ASSERT(buf != nullptr);
++        tc.initialize_tensors(ctx);
++        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++        const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * mask = op->src[3];
++        const ggml_tensor * bt = op->src[FA_PORT_SRC_TABLE], * bi = op->src[FA_PORT_SRC_IDX], * sq = op->src[FA_PORT_SRC_SINK_Q];
++        const char * why = "";
++        bool ok = fa_port_gate_op(op, 64, 256, 1, &why) != 0 && fa_port_kv_q8(op) != 0;
++        if (!ok) printf("  the gate refuses the case: %s\n", why);
++        const int n_q = (int) q->ne[1], n_kv = (int) k->ne[1], n_head = (int) q->ne[2], hkv = (int) k->ne[2], D = 128, HB8 = 136;
++        const int G = n_head / hkv, n_bins = (int) bt->ne[0];
++        float scale; memcpy(&scale, op->op_params, sizeof scale);
++        std::vector<float> cpu(ggml_nelements(op));
++        ggml_backend_tensor_get(op, cpu.data(), 0, ggml_nbytes(op));
++
++        // a tensor's own bytes: a modelled read outside them is a failure
++        auto owns = [&](const ggml_tensor * t, const uint8_t * p, size_t n) {
++            const ggml_tensor * b = t->view_src ? t->view_src : t;
++            return p >= (const uint8_t *) b->data && p + n <= (const uint8_t *) b->data + ggml_nbytes(b);
++        };
++        int n_oob = 0, n_rule = 0, n_reads = 0;
++        // cl_intel_subgroup_2d_block_io, "behavior is undefined unless": w1 / h1 / p1 are width - 1 / height - 1 / pitch - 1
++        auto rules = [&](uintptr_t base, int w1, int h1, int p1, int x, int bits) {
++            const int w = w1 + 1, h = h1 + 1, pitch = p1 + 1;
++            n_reads++;
++            if (base % 64 != 0 || (bits == 8 && x % 4 != 0) || (bits == 16 && x % 2 != 0) || w < 64 || w > (1 << 24) ||
++                w % (bits <= 16 ? 4 : bits / 8) != 0 || h < 1 || h > (1 << 24) || pitch < w || pitch % 16 != 0) n_rule++;
++        };
++        // intel_sub_group_2d_block_read_transpose_32b_16r8x1c as the kernel assumes it: 16 rows
++        // from y (clamped to the surface height), 8 dwords from dword x; lane = row
++        auto rd_t32 = [&](const ggml_tensor * t, uintptr_t base, int w1, int h1, int p1, int x, int y, uint32_t out[16][8]) {
++            rules(base, w1, h1, p1, x, 32);
++            for (int lane = 0; lane < 16; ++lane) {
++                const int row = std::min(y + lane, h1);
++                const uint8_t * p = (const uint8_t *) base + (size_t) row * (p1 + 1) + 4 * (size_t) x;
++                if (4 * x + 32 > w1 + 1 || !owns(t, p, 32)) { n_oob++; memset(out[lane], 0, 32); continue; }
++                memcpy(out[lane], p, 32);
++            }
++        };
++        // intel_sub_group_2d_block_read_transform_8b_32r16x1c as the kernel assumes it: 16
++        // columns of bytes from byte x; lane = column, its 32 bytes the rows from y in order
++        auto rd_f8 = [&](const ggml_tensor * t, uintptr_t base, int w1, int h1, int p1, int x, int y, uint8_t out[16][32]) {
++            rules(base, w1, h1, p1, x, 8);
++            for (int lane = 0; lane < 16; ++lane) for (int i = 0; i < 32; ++i) {
++                const int row = std::min(y + i, h1);
++                const uint8_t * p = (const uint8_t *) base + (size_t) row * (p1 + 1) + x + lane;
++                if (x + lane + 1 > w1 + 1 || !owns(t, p, 1)) { n_oob++; out[lane][i] = 0; continue; }
++                out[lane][i] = *p;
++            }
++        };
++        // the mask, the bias and the sink of (row, head, key), as the CPU op reads them
++        auto hidden = [&](int r, int key) {
++            const ggml_fp16_t m = ((const ggml_fp16_t *) ((const char *) mask->data + (size_t) r * mask->nb[1]))[key];
++            return (m & 0x7C00) == 0x7C00 || m == 0xFBFF;
++        };
++        auto bias = [&](int r, int h, int key) {
++            const int32_t bin = ((const int32_t *) bi->data)[(size_t) r * bi->ne[0] + key];
++            return (uint32_t) bin < (uint32_t) n_bins ? ((const float *) bt->data)[((size_t) r * n_head + h) * n_bins + bin] : 0.0f;
++        };
++        auto sink = [&](int r, int h) { return ((const float *) ((const char *) sq->data + (size_t) r * sq->nb[1]))[h]; };
++        const ggml_to_float_t to_float = ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float;
++
++        double num_me = 0, den_e = 0, num_ce = 0, num_mc = 0, den_c = 0;
++        const int ntiles = (n_q + 7) / 8;
++        int n_tiles_run = 0;
++        std::vector<float> S((size_t) 8 * n_kv), kdq((size_t) n_kv * D), vdq((size_t) n_kv * D);
++        std::vector<double> ex((size_t) 8 * D), sc(n_kv);
++        std::vector<float> ph((size_t) 8 * n_kv), mo((size_t) 8 * D);
++        for (int head = 0; head < n_head; head += 5) {            // heads 0, 5, .. 20: kv heads 0, 1, 3, 5, 6
++            const int kvh = head / G;
++            const uintptr_t ka = (uintptr_t) k->data + (size_t) kvh * k->nb[2], va = (uintptr_t) v->data + (size_t) kvh * v->nb[2];
++            const uintptr_t kb = ka & ~(uintptr_t) 63, vb = va & ~(uintptr_t) 63;
++            const int kx = (int) (ka & 63), vx = (int) (va & 63);
++            if (kx % 4 != 0) { printf("  a K head off the dword grid\n"); ok = false; break; }
++            const int kp = (int) k->nb[1], vp = (int) v->nb[1];
++            // ggml's own dequantization of this kv head, for the exact reference
++            for (int key = 0; key < n_kv; ++key) {
++                to_float((const char *) k->data + (size_t) key * k->nb[1] + (size_t) kvh * k->nb[2], kdq.data() + (size_t) key * D, D);
++                to_float((const char *) v->data + (size_t) key * v->nb[1] + (size_t) kvh * v->nb[2], vdq.data() + (size_t) key * D, D);
++            }
++            for (int qt = 0; qt < ntiles; qt += (qt + 9 < ntiles ? 9 : 1)) {     // every ninth tile, and the last ones
++                const int q0 = qt * 8, nrow = std::min(8, n_q - q0);
++                n_tiles_run++;
++                auto qrow = [&](int r) { return (const float *) ((const char *) q->data + (size_t) head * q->nb[2] + (size_t) std::min(q0 + r, n_q - 1) * q->nb[1]); };
++                // ---- Q in the kernel's lane order, and the accumulators' start
++                float qa[8][16][8], nq[4][8];
++                for (int cset = 0; cset < 8; ++cset) for (int lane = 0; lane < 16; ++lane) {
++                    const int ko = kv8_ord(lane);
++                    const int e1 = ko < 12 ? 18 + ko : (ko < 14 ? ko - 12 : ko + 16);
++                    int code = ((cset / 2) & 1) ? 16 * (cset & 1) + ko : ((cset & 1) ? e1 : 2 + ko);
++                    if (red == 4) code = 16 * (cset & 1) + lane;
++                    for (int r = 0; r < 8; ++r) qa[cset][lane][r] = f16r(qrow(r)[32 * (cset / 2) + code]);
++                }
++                for (int b = 0; b < 4; ++b) for (int r = 0; r < 8; ++r) {
++                    float sum = 0.0f;
++                    for (int lane = 0; lane < 16; ++lane) sum += qa[2 * b][lane][r];
++                    for (int lane = 0; lane < 16; ++lane) sum += qa[2 * b + 1][lane][r];
++                    nq[b][r] = -1152.0f * sum;
++                }
++                // ---- S = Q K^T, a 16-key group at a time
++                for (int y = 0; y < n_kv; y += 16) {
++                    uint32_t r0[16][8], r1[16][8], r2[16][8], r3[16][8], r4[16][8];
++                    rd_t32(k, kb, kx + HB8 - 1, n_kv - 1, kp - 1, kx / 4 + 0, y, r0);
++                    rd_t32(k, kb, kx + HB8 - 1, n_kv - 1, kp - 1, kx / 4 + 8, y, r1);
++                    rd_t32(k, kb, kx + HB8 - 1, n_kv - 1, kp - 1, kx / 4 + 16, y, r2);
++                    rd_t32(k, kb, kx + HB8 - 1, n_kv - 1, kp - 1, kx / 4 + 24, y, r3);
++                    rd_t32(k, kb, kx + HB8 - 1, n_kv - 1, kp - 1, kx / 4 + 26, y, r4);
++                    for (int lane = 0; lane < 16 && y + lane < n_kv; ++lane) {
++                        const float kd[4] = { ggml_fp16_to_fp32((ggml_fp16_t) r0[lane][0]), ggml_fp16_to_fp32((ggml_fp16_t) (r1[lane][0] >> 16)),
++                                              ggml_fp16_to_fp32((ggml_fp16_t) r2[lane][1]), ggml_fp16_to_fp32((ggml_fp16_t) (r3[lane][1] >> 16)) };
++                        uint32_t x0 = (r0[lane][0] >> 16) | (r1[lane][0] << 16), x2 = (r2[lane][1] >> 16) | (r3[lane][1] << 16);
++                        if (red == 3) { x0 = r1[lane][0]; x2 = r3[lane][1]; }
++                        const uint32_t ks[8][4] = {
++                            { r0[lane][1], r0[lane][2], r0[lane][3], r0[lane][4] }, { r0[lane][5], r0[lane][6], r0[lane][7], x0 },
++                            { r1[lane][1], r1[lane][2], r1[lane][3], r1[lane][4] }, { r1[lane][5], r1[lane][6], r1[lane][7], r2[lane][0] },
++                            { r2[lane][2], r2[lane][3], r2[lane][4], r2[lane][5] }, { r2[lane][6], r2[lane][7], r3[lane][0], x2 },
++                            { r4[lane][0], r4[lane][1], r4[lane][2], r4[lane][3] }, { r4[lane][4], r4[lane][5], r4[lane][6], r4[lane][7] } };
++                        float acc[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++                        for (int b = 0; b < 4; ++b) {
++                            float h0[16], h1[16];
++                            b16(ks[2 * b], h0); b16(ks[2 * b + 1], h1);
++                            for (int r = 0; r < 8; ++r) {
++                                float t = nq[b][r];
++                                for (int h = 0; h < 16; ++h) t += qa[2 * b][h][r] * h0[h];
++                                for (int h = 0; h < 16; ++h) t += qa[2 * b + 1][h][r] * h1[h];
++                                acc[r] += t * (red == 1 ? kd[b] * kd[b] : kd[b]);
++                            }
++                        }
++                        for (int r = 0; r < 8; ++r) S[(size_t) r * n_kv + y + lane] = acc[r];
++                    }
++                }
++                // ---- the softmax (direct), p to f16
++                float lsum[8];
++                for (int r = 0; r < 8; ++r) {
++                    const int row = std::min(q0 + r, n_q - 1);
++                    double mx = sink(row, head);
++                    for (int key = 0; key < n_kv; ++key) {
++                        sc[key] = hidden(row, key) ? -INFINITY : (double) S[(size_t) r * n_kv + key] * scale + bias(row, head, key);
++                        mx = std::max(mx, sc[key]);
++                    }
++                    double l = exp(sink(row, head) - mx);
++                    for (int key = 0; key < n_kv; ++key) {
++                        const float p = f16r((float) exp(sc[key] - mx));
++                        ph[(size_t) r * n_kv + key] = p;
++                        l += p;
++                    }
++                    lsum[r] = (float) l;
++                }
++                // ---- O = P V, a 32-key block and a q8_0 block at a time
++                std::fill(mo.begin(), mo.end(), 0.0f);
++                for (int t0 = 0; t0 < n_kv; t0 += 32) {
++                    for (int b = 0; b < 4; ++b) {
++                        float pe[2][16][8], ns[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
++                        for (int gb = 0; gb < 2; ++gb) for (int lane = 0; lane < 16; ++lane) {
++                            const int vord = lane < 8 ? 2 * lane : 2 * lane - 15;
++                            const int key = t0 + gb * 16 + vord, kr = std::min(key, n_kv - 1);
++                            const uint8_t * dp = (const uint8_t *) va + (size_t) kr * v->nb[1] + 34 * (red == 2 ? (b + 1) % 4 : b);
++                            ggml_fp16_t dh = 0;
++                            if (owns(v, dp, 2)) memcpy(&dh, dp, 2); else n_oob++;
++                            const float ds = std::min(128.0f * ggml_fp16_to_fp32(dh), 65504.0f);
++                            for (int r = 0; r < 8; ++r) {
++                                pe[gb][lane][r] = key < n_kv ? f16r(ph[(size_t) r * n_kv + key] * ds) : 0.0f;
++                                ns[r] += pe[gb][lane][r];
++                            }
++                        }
++                        for (int cc = 2 * b; cc < 2 * b + 2; ++cc) {
++                            uint8_t vr[16][32];
++                            // V8X: an odd block's codes are on the 4-byte grid; an even block's read starts at its code 2
++                            const int v8x = 34 * (cc / 2) + (((cc / 2) & 1) ? 2 : 4) + 16 * (cc & 1);
++                            rd_f8(v, vb, vx + HB8 - 1, n_kv - 1, vp - 1, vx + (red == 5 ? 34 * (cc / 2) + 2 + 16 * (cc & 1) : v8x), t0, vr);
++                            if (red != 5 && (cc & 3) == 1) {
++                                // lanes 14, 15 (the next block's scale) take lanes 2, 3 of a read at the block's first byte
++                                uint8_t v0[16][32];
++                                rd_f8(v, vb, vx + HB8 - 1, n_kv - 1, vp - 1, vx + 34 * (cc / 2), t0, v0);
++                                memcpy(vr[14], v0[2], 32); memcpy(vr[15], v0[3], 32);
++                            }
++                            for (int lane = 0; lane < 16; ++lane) for (int gb = 0; gb < 2; ++gb) {
++                                // KV8_ODIM: the dim this lane's column is
++                                const int odim = red == 5 ? 16 * cc + lane
++                                               : 32 * (cc / 2) + (((cc / 2) & 1) ? 16 * (cc & 1) + lane : ((cc & 1) ? (lane < 14 ? 18 + lane : lane - 14) : 2 + lane));
++                                uint32_t w[4]; float hv[16];
++                                memcpy(w, vr[lane] + 16 * gb, 16);
++                                b16(w, hv);
++                                for (int r = 0; r < 8; ++r) {
++                                    float a = gb == 0 ? -1152.0f * ns[r] : 0.0f;
++                                    for (int h = 0; h < 16; ++h) a += pe[gb][h][r] * hv[h];
++                                    mo[(size_t) r * D + odim] += a;
++                                }
++                            }
++                        }
++                    }
++                }
++                // ---- the exact reference, and the three comparisons
++                for (int r = 0; r < nrow; ++r) {
++                    const int row = q0 + r;
++                    const float * qr = qrow(r);
++                    double mx = sink(row, head);
++                    for (int key = 0; key < n_kv; ++key) {
++                        double d = 0.0;
++                        for (int i = 0; i < D; ++i) d += (double) qr[i] * kdq[(size_t) key * D + i];
++                        sc[key] = hidden(row, key) ? -INFINITY : d * scale + bias(row, head, key);
++                        mx = std::max(mx, sc[key]);
++                    }
++                    double l = exp(sink(row, head) - mx);
++                    for (int i = 0; i < D; ++i) ex[(size_t) r * D + i] = 0.0;
++                    for (int key = 0; key < n_kv; ++key) {
++                        if (sc[key] == -INFINITY) continue;
++                        const double p = exp(sc[key] - mx);
++                        l += p;
++                        for (int i = 0; i < D; ++i) ex[(size_t) r * D + i] += p * vdq[(size_t) key * D + i];
++                    }
++                    for (int i = 0; i < D; ++i) {
++                        const double e = ex[(size_t) r * D + i] / l;
++                        const double m = (double) mo[(size_t) r * D + i] * (1.0 / 128.0) / lsum[r];
++                        const double cv = cpu[((size_t) row * n_head + head) * D + i];
++                        num_me += (m - e) * (m - e); num_ce += (cv - e) * (cv - e); num_mc += (m - cv) * (m - cv);
++                        den_e += e * e; den_c += cv * cv;
++                    }
++                }
++            }
++        }
++        const double me = den_e > 0 ? num_me / den_e : 1.0, ce = den_e > 0 ? num_ce / den_e : 1.0, mc = den_c > 0 ? num_mc / den_c : 1.0;
++        ok = ok && n_oob == 0 && n_rule == 0 && me < 1e-6 && mc < 1e-5;
++        printf("  q8_0 kv=%lld nb=%lld wrap=%lld window=%lld n_empty=%lld (K/V nb [%zu, %zu, %zu], %d tiles): 2D reads %d, off the extension's rules %d, "
++               "outside %d, NMSE model vs exact %.3g, CPU vs exact %.3g, model vs CPU %.3g: %s\n", (long long) c[0], (long long) c[1], (long long) c[2],
++               (long long) c[3], (long long) c[4], k->nb[0], k->nb[1], k->nb[2], n_tiles_run, n_reads, n_rule, n_oob, me, ce, mc, ok ? "OK" : "FAIL");
++        n_fail += !ok;
++        ggml_backend_buffer_free(buf);
++        ggml_free(ctx);
++    }
++    printf("  port q8_0 read path%s: %s\n", red ? " (a bent transcription)" : "", n_fail ? "FAIL" : "OK");
++    return n_fail == 0;
++}
++
+ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mode mode, const char * op_names_filter, const char * params_filter,
+                          printer * output_printer, const char * test_file_path, int parallel_workers) {
+     if (getenv("GGML_TEST_FA_PORT_TWINS") != nullptr) {
+         return test_fa_port_twins(backend);
+     }
++    if (getenv("GGML_TEST_FA_PORT_KV8") != nullptr) {
++        return test_fa_port_kv8(backend);
++    }
+     if (getenv("GGML_TEST_FA_PORT_DECISIONS") != nullptr) {
+         return test_fa_port_decisions();
+     }

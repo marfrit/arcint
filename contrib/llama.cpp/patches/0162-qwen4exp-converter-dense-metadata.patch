@@ -1,0 +1,165 @@
+0162: the qwen4exp converter writes the dense/MoE per-layer metadata and dense FFN tensors
+
+diff --git a/conversion/base.py b/conversion/base.py
+index efb7ea7..33a3a8f 100644
+--- a/conversion/base.py
++++ b/conversion/base.py
+@@ -1818,6 +1818,10 @@ class TextModel(ModelBase):
+         # NOTE: if you get an error here, you need to update the convert_hf_to_gguf_update.py script
+         #       or pull the latest version of the model from Huggingface
+         #       don't edit the hashes manually!
++        if chkhsh == "7d572d1dd72e0a834ce8be06261538ae348bc122aa9683accc44c5c6596abcd5":
++            # a minimal byte-level BPE with no merges: the dense qwen4exp fixture's tokenizer,
++            # which encodes every byte as one token, so the GPT-2 pre-tokenizer applies
++            res = "gpt-2"
+         if chkhsh == "b6e8e1518dc4305be2fe39c313ed643381c4da5db34a98f6a04c093f8afbe99b":
+             # ref: https://huggingface.co/THUDM/glm-4-9b-chat
+             res = "chatglm-bpe"
+diff --git a/conversion/qwen.py b/conversion/qwen.py
+index 43d2fb4..7a15bd2 100644
+--- a/conversion/qwen.py
++++ b/conversion/qwen.py
+@@ -299,10 +299,13 @@ class _QwenMtpMixin:
+         self.block_count = self.hparams["num_hidden_layers"]
+         if not self.no_mtp:
+             n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
+-            # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config.
++            # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config, so the
++            # count comes from the `mtp.layers.N` tensors indexed before this point.
++            # A checkpoint without an MTP block has n_mtp 0 and converts as trunk-only.
+             if n_mtp == 0:
+-                assert self.opt_num_mtp_layers != 0
+                 n_mtp = self.opt_num_mtp_layers
++            if n_mtp == 0:
++                logger.info("gguf: no MTP layers in the checkpoint, converting the trunk only")
+             self.block_count += n_mtp
+         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+ 
+diff --git a/conversion/qwen4exp.py b/conversion/qwen4exp.py
+index 7ca26c2..e6b46fa 100644
+--- a/conversion/qwen4exp.py
++++ b/conversion/qwen4exp.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import json
+ from typing import Iterable, cast
+ 
+ import torch
+@@ -13,6 +14,29 @@ from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
+ from .qwen3vl import Qwen3VLVisionModel
+ 
+ 
++# The transformers outer Qwen4ExpConfig is a multimodal wrapper: its text fields live
++# under `text_config` and the text defaults are Qwen4ExpTextConfig's (16 key heads,
++# 32 value heads), which AutoConfig would inject when a checkpoint spells the text
++# fields at the root. Return the raw config.json instead; TextModel merges
++# `text_config` after this point, so both layouts keep their own values.
++def _is_qwen4exp_checkpoint(dir_model) -> bool:
++    cfg_path = dir_model / "config.json"
++    if not cfg_path.is_file():
++        return False
++    try:
++        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
++    except Exception:
++        return False
++    return cfg.get("model_type") in ("qwen4_exp", "qwen4_exp_text") or \
++        any(a in ("Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration", "Qwen4ExpTextModel")
++            for a in cfg.get("architectures", []))
++
++
++@ModelBase.register_hparams_loader(_is_qwen4exp_checkpoint)
++def _load_qwen4exp_hparams(dir_model) -> dict:
++    return json.loads((dir_model / "config.json").read_text(encoding="utf-8"))
++
++
+ @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+ @ModelBase.example("Qwen/Qwen3.8-Flash-Next")
+ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+@@ -77,16 +101,39 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
+         self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
+ 
+         n_layer = hp["num_hidden_layers"]
+-        self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
+-        self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
+-        self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
+-        ratio = hp["indexer_compress_ratio"]
+-        layer_types = hp["layer_types"]
+-        # the MTP block is a full-attention QSA layer too
+-        self.gguf_writer.add_attention_compress_ratios(
+-            [ratio if layer_types[i] == "full_attention" else 0 for i in range(n_layer)]
+-            + [ratio] * (self.block_count - n_layer)
++        # the indexer is optional by presence: a dense checkpoint without QSA carries no indexer keys
++        if "indexer_n_heads" in hp:
++            self.gguf_writer.add_indexer_head_count(hp["indexer_n_heads"])
++            self.gguf_writer.add_indexer_key_length(hp["indexer_head_dim"])
++            self.gguf_writer.add_indexer_top_k(hp["indexer_budget"])
++            ratio = hp["indexer_compress_ratio"]
++            layer_types = hp["layer_types"]
++            # the HF text config spells an indexed layer "full_attention"/"indexed_attention"
++            # or the canonical "qwen_sparse_attention"; Qwen4ExpTextConfig.__post_init__
++            # rewrites the first to the last, so accept all three spellings.
++            # The MTP block is a full-attention QSA layer too.
++            def is_indexed(t: str) -> bool:
++                return t in ("full_attention", "indexed_attention", "qwen_sparse_attention")
++            self.gguf_writer.add_attention_compress_ratios(
++                [ratio if is_indexed(layer_types[i]) else 0 for i in range(n_layer)]
++                + [ratio] * (self.block_count - n_layer)
++            )
++
++        # the dense/MoE rule, as vLLM reads it; absent keys mean all-MoE when experts exist
++        mlp_only = {int(i) for i in hp.get("mlp_only_layers", [])}
++        if mlp_only and any(i < 0 or i >= n_layer for i in mlp_only):
++            raise ValueError(f"mlp_only_layers {sorted(mlp_only)} is out of range for {n_layer} layers")
++        # the MTP block follows the checkpoint: a dense checkpoint carries no routed expert
++        # tensors, so its MTP block is dense too (the HF mlp_only_layers list is trunk-only)
++        has_experts = any(".mlp.experts" in name for name in self.model_tensors)
++        mtp_dense = not has_experts
++        self.gguf_writer.add_mlp_only_layers(
++            [i in mlp_only for i in range(n_layer)] + [mtp_dense] * (self.block_count - n_layer)
+         )
++        step = int(hp.get("decoder_sparse_step", 1))
++        if step < 1:
++            raise ValueError(f"decoder_sparse_step must be at least 1, got {step}")
++        self.gguf_writer.add_moe_every_n_layers(step)
+ 
+         # ple_layer_ids is 1-based in the HF config; empty means no n-gram table,
+         # so emit no PLE keys rather than optional ones
+diff --git a/gguf-py/gguf/constants.py b/gguf-py/gguf/constants.py
+index 2df26bb..6626944 100644
+--- a/gguf-py/gguf/constants.py
++++ b/gguf-py/gguf/constants.py
+@@ -131,6 +131,7 @@ class Keys:
+         EXPERT_LATENT_LENGTH              = "{arch}.expert_latent_length"
+         EXPERTS_PER_GROUP                 = "{arch}.experts_per_group"
+         MOE_EVERY_N_LAYERS                = "{arch}.moe_every_n_layers"
++        MLP_ONLY_LAYERS                   = "{arch}.mlp_only_layers"
+         MOE_LATENT_SIZE                   = "{arch}.moe_latent_size"
+         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
+         NUM_DEEPSTACK_LAYERS              = "{arch}.n_deepstack_layers"
+@@ -3183,6 +3184,10 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
+         MODEL_TENSOR.SSM_BETA,
+         MODEL_TENSOR.SSM_ALPHA,
+         MODEL_TENSOR.SSM_OUT,
++        # dense SwiGLU layers (mlp_only_layers / decoder_sparse_step)
++        MODEL_TENSOR.FFN_GATE,
++        MODEL_TENSOR.FFN_UP,
++        MODEL_TENSOR.FFN_DOWN,
+         MODEL_TENSOR.FFN_GATE_INP,
+         MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+         MODEL_TENSOR.FFN_UP_SHEXP,
+diff --git a/gguf-py/gguf/gguf_writer.py b/gguf-py/gguf/gguf_writer.py
+index cc2bd8e..8ce3126 100644
+--- a/gguf-py/gguf/gguf_writer.py
++++ b/gguf-py/gguf/gguf_writer.py
+@@ -857,6 +857,10 @@ class GGUFWriter:
+     def add_recurrent_layers(self, value: Sequence[bool]) -> None:
+         self.add_array(Keys.Attention.RECURRENT_LAYERS.format(arch=self.arch), value)
+ 
++    # true means the layer's MLP is dense (mlp_only_layers), false means it follows decoder_sparse_step
++    def add_mlp_only_layers(self, value: Sequence[bool]) -> None:
++        self.add_array(Keys.LLM.MLP_ONLY_LAYERS.format(arch=self.arch), value)
++
+     def add_rope_pattern(self, value: Sequence[bool]) -> None:
+         self.add_array(Keys.Attention.ROPE_PATTERN.format(arch=self.arch), value)
+ 

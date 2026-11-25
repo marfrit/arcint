@@ -56,6 +56,10 @@ struct ChatRequest {
 
     bool stream = false;
 
+    // llama.cpp server's cache_prompt (default true). False: this request's
+    // prompt is evaluated in full, no prefix reuse and no checkpoint resume.
+    bool cache_prompt = true;
+
     // stream_options.include_usage. Defaults on: DESIGN.md §3.7 requires usage
     // in the final chunk, so opting out is the client's explicit choice.
     bool stream_include_usage = true;
@@ -102,6 +106,11 @@ struct CompletionRequest {
     bool             stream = false;
     bool             echo   = false;
     bool             stream_include_usage = true;
+    // llama.cpp server's cache_prompt (default true); false evaluates the
+    // prompt in full for this request only.
+    bool             cache_prompt = true;
+    // arcint.timings: the per-response timing object, as on the chat route.
+    bool             timings = false;
     SamplerOverrides sampler;
 };
 
@@ -120,6 +129,28 @@ struct SpeechRequest {
 };
 
 // Both return an error message on rejection and leave the output untouched.
+// One request field that this build does not serve at a non-default value, and
+// what the server does with it. `refused` rows answer HTTP 400 with the reason:
+// a silently ignored value would change the answer the client expects (a
+// grammar, a token ban, a prompt truncation). The other rows are accepted and
+// ignored, with one warning per field per process naming the field and the
+// reason: the answer is the model's own text either way (sampler shaping,
+// probability and progress reports, JSON mode, which is not enforced). The
+// code reads this table, the release notes list the same rows, and there is
+// no second copy of the strings. Default-valued fields are not in it.
+struct RequestFieldRefusal {
+    const char* field;
+    const char* reason;
+    bool        refused;
+};
+const RequestFieldRefusal* request_field_refusals();
+size_t                     request_field_refusal_count();
+// nullptr when the field is not in the table (or is accepted at its default)
+const char* request_field_refusal_reason(const char* field);
+// True for a row that answers 400; false for an accepted-and-ignored row or a
+// field outside the table.
+bool request_field_refused(const char* field);
+
 std::optional<std::string> parse_chat_request(const nlohmann::json& body, ChatRequest& out);
 std::optional<std::string> parse_completion_request(const nlohmann::json& body,
                                                     CompletionRequest& out);
@@ -143,6 +174,10 @@ inline constexpr const char* kMediaMarker = "<__media__>";
 // any other template: a unit that asked for a file does not start without it.
 // What it cannot check is a template that parses but renders wrongly for the
 // model; that needs the GGUF. Enforced by test_template_file.cpp's chat_template_file_* cases.
+// A GGUF's embedded template pointer may be null (a "runs" model with no template); the text
+// a model carries is then the empty string, which builds the template object safely.
+std::string chat_template_text(const char* embedded);
+
 std::optional<std::string> load_chat_template_file(const std::string& path, std::string& text);
 
 // The names a chat_template_kwargs key must not take, because the vendored

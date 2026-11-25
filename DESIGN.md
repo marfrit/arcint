@@ -106,14 +106,27 @@ own red cases, KL as served and the three services
 All served Qwen models are hybrid GatedDeltaNet / attention transformers:
 most layers carry a fixed-size recurrent state (conv + delta-rule state), a
 minority are attention layers with a KV cache. The engine admits a GGUF by
-its own `general.architecture`: `qwen35`, `qwen35moe`, `qwen4exp`, and
-`llama` at two geometries only, Mistral Small 24B and Llama 2 7B (the model of
-the community llama-bench GPU tables, `tools/llama_scoreboard.py`), `gemma4` at
-the E4B geometry, `granite` at the 8B geometry and `dory` at the 1.0-4B geometry only (`code`: the decision is
-the pure function in `src/core/admission.cpp`, unit-tested with no model in
-`tests/test_admission.cpp`; the backend reads the numbers from the loaded
-model); anything else is refused at load, and an untested size of an admitted
-architecture is refused the same way, the message naming the admitted sizes.
+its own `general.architecture`, in three tiers (`code`: the pure decision is
+`src/core/admission.cpp`, unit-tested with no model in `tests/test_admission.cpp`;
+the backend reads the numbers from the loaded model):
+
+- **optimized for** — arcint's own kernels or fast path, release gates passed:
+  Inkling 2 Mini, the Qwen3.8 27B agent, Flash-Next.
+- **verified** — the generic path with KL, acceptance and a served check passed:
+  the coder, Dory1.0-4B, Llama 2 7B, Qwen3-TTS under `--tts`, Qwen2.5-VL-7B.
+- **runs** — anything libllama loads that passes the spill guard: no promise, a
+  start warning. Gemma 4 E4B, Granite 8B, Mistral Small 24B, every unmeasured
+  size of `qwen35` / `qwen35moe` / `qwen4exp` / `qwen2vl`, and every architecture
+  not in the table. A table-named runs model keeps its known dialect; every
+  other runs model gets the neutral one. Renderer material and token mode are
+  off, `--tool-grammar` is refused at the start and per request, and a chat
+  route without a template answers 400 `no chat template: use
+  /v1/completions` (no ChatML guess).
+
+The hard refusal is gone: an unknown architecture or an untested size is not
+refused at load, it is a "runs" start that the memory guard must pass. Qwen3-TTS
+without `--tts` is refused: it is an audio-generation backbone, not a language
+model.
 
 Two models admitted 2026-11-06 (operator's order: admit now, optimise later;
 card-free work only). The geometry and dialect claims below are what the files
@@ -560,6 +573,14 @@ thinking turn's follow-up or an edited message resumes instead of
 re-prefilling: 38.75 -> 0.61 s on a 24.3k-token conversation (dense 27B,
 B60, MTP 5, `measured-here`). There is no prefix cache shared between lanes
 (`decision`, operator, 2026-10-15) and none kept across a restart (§8).
+
+`--llama-swa-window` sizes the sliding-window layers to the model's window
+(`swa_full = false`) instead of the whole context; those cells are the part a
+trim cannot roll back, so the checkpoint carries the SWA window too. A cut is
+taken only when the attention cache's retained history reaches the next
+query's window (patch 0153 exposes that position); otherwise the lane resumes
+from the newest checkpoint, or clears and re-prefills. The rule is
+`src/core/swa_window.h`, off by default (§7.1, `measured-here` CPU).
 
 **The correctness rule** (`decision`, operator, 2026-10-01; this replaced an
 earlier byte-identity invariant; precedent, `paper`: Strata's expert cache
@@ -1079,6 +1100,30 @@ outside the answer-level bar, a shortfall the operator accepted (A2,
 The other quants are options (§7.2). The dense agent's q8_0:q4_0 KV: KL 0.005652 /
 97.30 % against the CPU reference; the coder's searched quant: 0.02367 /
 95.43 % against Q8_0 (`measured-here`, `docs/llama-engine.md`).
+
+**A window-sized SWA cache** (`--llama-swa-window`, 1.8.1; opt-in,
+`measured-here` CPU, 2026-11-22, the recipe host's 8-core build with
+`-DGGML_OPENCL=OFF`, patch 0153): the KV the load logs, true vs false, at
+f16 — Inkling 2 Mini (8 global + 40 SWA cache layers) 8k 1,536 -> 496 MiB,
+32k 6,144 -> 1,264, 131k 24,576 -> 4,336 (5.7x; q8_0:q4_0 9,984 -> 1,762);
+Dory1.0-4B `per_loop` (24 + 72) 8k 3,072 -> 1,200, 32k 12,288 -> 3,504,
+131k 49,152 -> 12,720 (the last by arithmetic; q8_0:q4_0 at 131k 19,968 ->
+5,168); Gemma 4 E4B (4 + 20) 8k 448 -> 168, 32k 1,792 -> 552, 131k 7,168 ->
+2,088. A full-window checkpoint: Inkling 163.7 MiB at f16 (40 layers), Dory
+`per_loop` 288.0, Dory `last_loop` 108.0, Gemma 20.0; the part is the window,
+not the base cache. Prefix reuse on the probe (`tools/swa_ckpt_probe.cpp`):
+Inkling append-only 0 / edited 0.001496 same top; Dory `per_loop` 0 / 0.011592
+same top; Gemma 0 / 0.022537 same top; the trim-only arm leaves a window hole —
+Inkling not reachable (its recurrent refusal has `n_rs_seq` 0), Dory 5.887903,
+Gemma 22.814130, top token differs there. Dory `last_loop` is refused with the
+flag: its prefill depends on chunk boundaries (floor 0.026827 on the same
+prompt in another batch shape); `per_loop` takes the switch. Off by default: at
+the library's full-size SWA cache prefix reuse is exact without the window rule.
+At 16,384 depth on the same CPU, llama-bench one repetition each (`measured-here`):
+Gemma 4 E4B pp16384 48.33 -> 61.56 t/s and tg64 8.67 -> 12.56 with the window (+27 %,
++45 %: its SWA layers over 16k masked keys); Inkling pp16384 18.79 -> 19.87 and tg16
+7.34 -> 7.94, no separable effect in a 16-token weight-bound CPU decode (the card has
+it: 30.4/31.9 at depth 16,384 against 20.5 q8_0 / 24.3 f16 served full-size).
 
 ### 7.2 Flash-Next quant options
 

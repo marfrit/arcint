@@ -19,6 +19,7 @@
 #include "api/responses_state.h"
 #include "build_info.h"
 #include "core/stop.h"
+#include "core/admission.h"
 #include "core/reasoning.h"
 #include "core/toolcall.h"
 #include "util/log.h"
@@ -34,6 +35,7 @@ double decode_other_seconds(const GenerationStats& stats) {
 }
 
 bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect) {
+    if (dialect.neutral()) return false;   // the neutral dialect has no text tags
     // Built on think_tag_pairs(), the one table the split and the sampler's mask
     // read, so no marker is written out here. An opener that already ends in a
     // newline (Gemma 4's) is the prompt's end as it stands.
@@ -44,6 +46,7 @@ bool prompt_ends_inside_think_block(std::string_view prompt, ChatDialect dialect
 }
 
 bool prompt_ends_after_think_block(std::string_view prompt, ChatDialect dialect) {
+    if (dialect.neutral()) return false;   // ids only, and the rendered prompt carries no text tag
     // Inkling ends every message block, the last user turn included, with the
     // same closer; a prompt that ends there did not end after a think block.
     if (dialect.inkling()) return false;
@@ -499,6 +502,11 @@ json props(const Context& ctx) {
 
     json p = json{
         {"model", std::move(model)},
+        // 1.8.1: the admission decision, "optimized for" / "verified" / "runs" (null on the stub)
+        {"admission_tier", st.admission_tier.empty() ? json(nullptr) : json(st.admission_tier)},
+        // 1.8.1: whether this start keeps context checkpoints, and why not (null on the stub)
+        {"checkpoints", st.checkpoints.empty() ? json(nullptr) : json(st.checkpoints)},
+        {"chat_template", {{"present", st.has_chat_template}}},
         {"chat_template_caps", ctx.backend->template_caps()},
         // feyntalk W6a (docs/campaigns/feyntalk.md, D4; review findings 1/3):
         // the capability, not the material. "ready" means token mode serves and
@@ -514,7 +522,11 @@ json props(const Context& ctx) {
         // backend fills from --llama-kv (config.h's llama_kv_dtype); the stub
         // leaves it empty on purpose, which is what lets this print null
         // instead of guessing.
-        {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)}}},
+        // cache_prompt (llama.cpp server's switch) is served on both completion
+        // routes: false evaluates a request's prompt in full, reusing no prefix
+        // and resuming no checkpoint. Named here so a client can see it supported.
+        {"cache", {{"kv_dtype", st.kv_precision.empty() ? json(nullptr) : json(st.kv_precision)},
+                   {"cache_prompt", "supported (default true; false evaluates the prompt in full)"}}},
         // The KV stream (0119-0122, docs/campaigns/kv-streaming-design.md): what was asked
         // and what the card's start probe answered. `requested` false is off; `paged_fa`
         // false with requested true can only be seen under the red switch, because the
@@ -652,6 +664,46 @@ json props(const Context& ctx) {
         {"slots",
          {{"total", slots_total(ctx)},
           {"queue_timeout_s", cfg.queue_timeout_s}}},
+        // 1.8.1: libllama's accounting of what this process placed (bytes), against the card's
+        // memory, and the spill guard's verdict beside it. `card` is the figure allocations come
+        // out of: the driver's xe region total ("driver") or OpenCL's global size ("opencl", a
+        // logged fallback). Host-resident bytes by design are listed, never the reason for a refusal.
+        {"device_memory",
+         {{"weights", st.mem_device_weights},
+          {"context", st.mem_device_context},
+          {"compute", st.mem_device_compute},
+          {"host", st.mem_host},
+          {"host_banks", st.mem_host_banks},
+          {"expert_cache", st.mem_cache_device},
+          {"draft", st.mem_draft_device},
+          {"process_unlisted", st.mem_unlisted},
+          {"card", st.mem_card},
+          {"card_source", st.mem_card_from_driver ? "driver" : "opencl"},
+          {"driver_used", st.mem_used_known ? json(st.mem_driver_used) : json(nullptr)},
+          {"process_vram0", st.mem_process_vram0},
+          {"other_clients", st.mem_other_clients},
+          {"growth_margin", st.mem_growth_margin},
+          {"verdict",
+           {{"state", st.mem_spill_verdict},
+            {"fits", st.mem_spill_fits},
+            {"refused", st.mem_spill_refused},
+            {"fit_n_ctx", st.mem_fit_n_ctx},
+            {"fit_cache_mib", st.mem_fit_cache_flag_mib},
+            {"fit_cache_bytes", st.mem_fit_cache},
+            {"worst_card", st.mem_worst_card}}},
+          {"cards", [&] {
+               json arr = json::array();
+               for (const auto& c : st.mem_cards) {
+                   arr.push_back(json{{"total", c.total}, {"weights", c.weights}, {"context", c.context},
+                                      {"compute", c.compute}, {"cache", c.cache}, {"draft", c.draft},
+                                      {"other", c.other}, {"unlisted", c.unlisted},
+                                      {"card_source", c.driver ? "driver" : "opencl"},
+                                      {"fits", c.fits}, {"fit_n_ctx", c.fit_n_ctx},
+                                      {"fit_cache_mib", c.fit_cache_flag_mib},
+                                      {"fit_cache_bytes", c.fit_cache}, {"state", c.verdict}});
+               }
+               return arr;
+           }()}}},
         {"build",
          {{"version", ARCINT_VERSION},
           {"git", ARCINT_GIT_SHA},
@@ -878,6 +930,11 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
         return HttpResult{400, invalid_request("this unit serves speech (--tts): POST /v1/audio/speech; "
                                                "chat completions are not served here")};
     }
+    // The "runs" tier without a template: no ChatML guess. /v1/completions serves; the chat
+    // route names the cause, never a rendered prompt the model was not trained on.
+    if (!st.has_chat_template) {
+        return HttpResult{400, invalid_request(runs_no_chat_template_refusal())};
+    }
     // A template with its own effort map (Inkling's) raises on a level it does
     // not know: answer that with a 400 naming the allowed set, before the render.
     {
@@ -943,7 +1000,11 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
 
     // §3.7: only parse tool-call syntax when the request actually declared
     // tools. Otherwise the raw text goes back untouched.
-    prep.parse_tool_calls = !prep.req.tools.empty() && prep.req.tool_choice != "none";
+    // The "runs" tier's neutral dialect parses no tool calls: the raw text is the answer and
+    // the start warning says so. A Qwen-dialect "runs" model (its template carries the form)
+    // keeps the existing parse.
+    prep.parse_tool_calls = !prep.req.tools.empty() && prep.req.tool_choice != "none" &&
+                           !st.dialect.neutral();
     if (prep.parse_tool_calls) prep.schemas = tool_schemas(prep.req.tools);
 
     for (const ToolSpec& t : prep.req.tools) prep.input.tool_names.push_back(t.name);
@@ -1065,6 +1126,10 @@ std::optional<HttpResult> prepare_from_chat(const Context& ctx, ChatRequest req,
     // thinking turn whose block never opened is the sampler's own guard. Set
     // after finish_prepare, which owns input.sampler.
     prep.input.sampler.thinking_turn = prep.req.enable_thinking;
+    // llama.cpp server's cache_prompt: false evaluates this request's prompt
+    // in full and resumes no checkpoint; the lane's KV still stays for a later
+    // request that allows reuse.
+    prep.input.cache_prompt = prep.req.cache_prompt;
     // the media, in marker order across the whole request (the renderer put one
     // marker per part into the prompt)
     for (const ChatMessage& m : prep.req.messages)
@@ -1100,6 +1165,10 @@ std::optional<HttpResult> prepare_completion(const Context& ctx, const json& bod
                            /*nothink=*/false, prep.req.prompt_ids)) {
         return err;
     }
+
+    // llama.cpp server's cache_prompt: false evaluates this request's prompt
+    // in full and resumes no checkpoint (set before the prompt's start state).
+    prep.input.cache_prompt = prep.req.cache_prompt;
 
     // The same start state the chat path gives the mask and the loop guard: a
     // raw prompt that ends inside an open block starts the turn there, so the
@@ -1341,6 +1410,8 @@ HttpResult run_completion(const Context& ctx, const PreparedCompletion& prep, in
                  {"usage", usage_json(stats)}};
     if (loop_guard_moved(stats)) body["loop_guard"] = loop_guard_json(stats);
     if (dory_named(stats)) body["dory"] = dory_json(stats);
+    // arcint.timings, as on the chat route: the same object, the same flag.
+    if (prep.req.timings) body["timings"] = timings_json(stats);
     return HttpResult{200, std::move(body)};
 }
 
@@ -1711,6 +1782,11 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     json final_extra = json::object();
     if (loop_guard_moved(stats)) final_extra["loop_guard"] = loop_guard_json(stats);
     if (dory_named(stats)) final_extra["dory"] = dory_json(stats);
+    // arcint.timings: with usage opted in, the object rides the usage chunk as
+    // on the chat route; without usage there is no such chunk, so it rides the
+    // finish chunk.
+    if (prep.req.timings && !prep.req.stream_include_usage)
+        final_extra["timings"] = timings_json(stats);
     if (!sse_send(write, chunk(json::array({{{"index", 0},
                                              {"text", ""},
                                              {"logprobs", nullptr},
@@ -1719,7 +1795,9 @@ void stream_completion(const Context& ctx, const PreparedCompletion& prep, int s
     }
 
     if (prep.req.stream_include_usage) {
-        if (!sse_send(write, chunk(json::array(), json{{"usage", usage_json(stats)}}))) return;
+        json usage_extra = {{"usage", usage_json(stats)}};
+        if (prep.req.timings) usage_extra["timings"] = timings_json(stats);
+        if (!sse_send(write, chunk(json::array(), usage_extra))) return;
     }
     write("data: [DONE]\n\n");
 }

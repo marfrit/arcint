@@ -1,0 +1,44 @@
+0165: a frozen check for the qwen4exp MoE path on the CPU
+
+diff --git a/tools/qwen4exp-moe-frozen-check.sh b/tools/qwen4exp-moe-frozen-check.sh
+new file mode 100755
+index 0000000..0096dac
+--- /dev/null
++++ b/tools/qwen4exp-moe-frozen-check.sh
+@@ -0,0 +1,36 @@
++#!/bin/bash
++# The qwen4exp MoE path must stay bit-identical. Saves a synthetic qwen4exp MoE
++# model with the new build, writes the base build's logits, then compares the new
++# build's logits against them. Gate: mean KLD 0 and same top p 100 %.
++#   BASE_BIN_DIR  directory with the pre-change llama-perplexity/test-llama-archs
++#   NEW_BIN_DIR   directory with the changed binaries (default: build/bin)
++set -euo pipefail
++here=$(cd "$(dirname "$0")" && pwd)
++base=${BASE_BIN_DIR:?set BASE_BIN_DIR to the pre-change build bin directory}
++new=${NEW_BIN_DIR:-"$here/../build/bin"}
++work=${WORK:-$(mktemp -d)}
++trap 'rm -rf "$work"' EXIT INT TERM  2>/dev/null || true
++mkdir -p "$work"
++
++python3 - "$work/text.txt" <<'PY'
++import sys
++open(sys.argv[1], "w").write("aaaa bbbb cccc dddd " * 100)
++PY
++
++mkdir -p "$work/model"
++# a fixed seed: the saved model must be the same GGUF for both arms
++"$new/test-llama-archs" -a qwen4exp -s 20261123 -o "$work/model" >"$work/save.log" 2>&1
++gguf="$work/model/qwen4exp-moe.gguf"
++
++"$base/llama-perplexity" -m "$gguf" -f "$work/text.txt" -c 128 -b 16 -t 2 \
++    --save-all-logits "$work/base.logits" >"$work/base.log" 2>&1
++"$new/llama-perplexity" -m "$gguf" -f "$work/text.txt" -c 128 -b 16 -t 2 \
++    --kl-divergence --kl-divergence-base "$work/base.logits" >"$work/new.log" 2>&1
++
++kld=$(sed -n 's/^Mean    KLD: *\([-0-9.]*\).*/\1/p' "$work/new.log" | tail -1)
++top=$(sed -n 's/^Same top p: *\([-0-9.]*\).*/\1/p' "$work/new.log" | tail -1)
++if [ "$kld" != "0.000000" ] && [ "$kld" != "-0.000000" ]; then
++    echo "FAIL: the MoE path's mean KLD is $kld, expected 0"; exit 1
++fi
++case "$top" in 100*) ;; *) echo "FAIL: same top p is $top, expected 100"; exit 1 ;; esac
++echo "FROZEN: qwen4exp MoE path KLD $kld, same top p $top"

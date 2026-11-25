@@ -11,12 +11,11 @@ repository; what is here is everything needed to build the same thing.
 The top-level `CHANGELOG.md` is the human record per release; the Debian
 changelog here is the package record.
 
-Kept in step by hand: every tagged release updates `arcint/build-deb.sh`,
-`arcint-imggen/build-deb.sh` and
-`arcint-stt/build-deb.sh`
+Kept in step by hand: every tagged release updates `arcint/build-deb.sh`
 (PKGVER, PKGREL, the release tarball's sha256; the llama.cpp commit and its
 tarball's sha256 when the pin moves) and the changelog here in the same
-breath. A stale recipe is a broken instruction, which is the one thing this
+breath. `arcint-imggen/build-deb.sh` and `arcint-stt/build-deb.sh` carry their
+own versions and move when their own builds change, not with every arcint tag. A stale recipe is a broken instruction, which is the one thing this
 directory exists to prevent.
 
 ## What is in here

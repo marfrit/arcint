@@ -1,0 +1,60 @@
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 723dd0f..af25abd 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -5,6 +5,7 @@
+ #include <string>
+ #include "../llama-memory-hybrid-iswa.h"
+ 
++#include <cstdio>
+ #include <cstdlib>
+ #include <map>
+ #include <string>
+@@ -225,6 +226,26 @@ static ggml_tensor * inkling2_mix_column(ggml_context * ctx, ggml_tensor * mixed
+     return ggml_cont(ctx, view);
+ }
+ 
++// TEST ONLY, never in the series (see mix())
++struct inkling2_noise { float amp; unsigned long long seed; unsigned long long call; };
++static void inkling2_noise_fn(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
++    (void) nth;
++    if (ith != 0) {
++        return;
++    }
++    const inkling2_noise * ud = (const inkling2_noise *) userdata;
++    const float * x = (const float *) a->data;
++    float * y = (float *) dst->data;
++    const int64_t n = ggml_nelements(a);
++    unsigned long long h0 = ud->seed*0x9E3779B97F4A7C15ull + ud->call*0xD1B54A32D192ED03ull;
++    for (int64_t i = 0; i < n; ++i) {
++        unsigned long long z = h0 + (unsigned long long) i*0x9E3779B97F4A7C15ull;
++        z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27))*0x94D049BB133111EBull; z ^= z >> 31;
++        // one ulp up or down: the smallest change a float has (relative 6e-8 .. 1.2e-7)
++        y[i] = nextafterf(x[i], (z & 1) ? INFINITY : -INFINITY);
++    }
++}
++
+ // one DOWNGRADE line a key: the reason the arm did not take this call's shapes
+ static void inkling2_depth_mix_refused(const char * why) {
+     static std::map<std::string, int> told;
+@@ -286,7 +307,19 @@ ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *>
+     ggml_tensor * scores = ggml_mul_mat(ctx0, states, queries);
+     scores = ggml_soft_max_ext(ctx0, scores, nullptr, 1.0f/sqrtf(n_embd), 0.0f);
+ 
+-    return ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
++    ggml_tensor * mixed = ggml_mul_mat(ctx0, ggml_cont(ctx0, ggml_transpose(ctx0, states)), scores);
++    // TEST ONLY, never in the series: a noise control for the chain. ARCINT_TEST_MIX_NOISE=<amp>:<seed>
++    // moves every element of the chain's result one ulp up or down at random (amp is unused), at every site the
++    // depth-mix arm would replace (T > 1, at least one block row).
++    if (const char * e = getenv("ARCINT_TEST_MIX_NOISE"); e != nullptr && n_tokens > 1 && n_block >= 1) {
++        static int call = 0;
++        inkling2_noise * ud = new inkling2_noise;   // leaked: a test run
++        ud->amp = 0.0f; ud->seed = 0;
++        sscanf(e, "%f:%llu", &ud->amp, &ud->seed);
++        ud->call = (unsigned long long) call++;
++        mixed = ggml_map_custom1(ctx0, mixed, inkling2_noise_fn, 1, ud);
++    }
++    return mixed;
+ }
+ 
+ // causal short convolution with a residual; dynamic adds input-dependent taps per head
