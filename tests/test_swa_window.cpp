@@ -15,7 +15,7 @@ using namespace lgc;
 
 TEST(swa_window_a_q8_q4_sliding_window_checkpoint_is_refused_on_opencl_only) {
     // 1.8.1: OpenCL + a sliding window + q8_0 / q4_0 K or V: no checkpoint (the restore would
-    // write no bytes). Red: the predicate returning false lets the first two through.
+    // write no bytes). Red: the predicate returning false lets the first three through.
     // The last argument false: a llama.cpp tree without 0209 (1.8.1's and 1.8.2's).
     CHECK(swa_ckpt_restore_refused(1024, true, true, true, false));     // Inkling's units: q8_0 K/V
     CHECK(swa_ckpt_restore_refused(1024, true, false, true, false));    // f16 K, q4_0 V

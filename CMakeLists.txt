@@ -240,6 +240,9 @@ if(ARCINT_LLAMA)
   # (core/swa_window.h, 1.8.1's refusal): such a restore would write positions and no bytes.
   file(STRINGS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp" ARCINT_LLAMA_0209
        REGEX "ggml_cl_warn_view_write_dropped" LIMIT_COUNT 1)
+  # the scan is a configure step: a tree that changes under an existing build directory (0209
+  # reverted, another branch) must re-run it, or the define outlives the patch
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
   if(ARCINT_LLAMA_0209)
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_KV_VIEW_WRITES=1)
     message(STATUS "contrib/llama.cpp 0209 present: q8_0 / q4_0 sliding-window checkpoints are restored")

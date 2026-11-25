@@ -1383,8 +1383,9 @@ public:
         status_.dialect = dialect_;
         status_.admission_tier = admission_tier_name(tier_);
         status_.checkpoints    = ckpt_on_    ? "on"
-                                 : ckpt_stale_ ? "off: a q8_0 / q4_0 sliding-window cache cannot be restored on OpenCL "
-                                                 "in this release; a changed earlier turn re-reads the prompt"
+                                 : ckpt_stale_ ? "off: a q8_0 / q4_0 sliding-window cache cannot be restored on OpenCL by "
+                                                 "this build (its llama.cpp lacks patch 0209); a changed earlier turn "
+                                                 "re-reads the prompt"
                                                : "off";
         SamplerDefaults d;
         d.temperature        = 0.7f;

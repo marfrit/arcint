@@ -27,7 +27,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   build against a tree without it keeps 1.8.1's refusal and says so at load, so it never restores wrong cells. The
   recipe applies the whole series, so a release always restores. A follow-up that changes earlier text resumes from
   the newest checkpoint below the change instead of re-reading the prompt; the resume line names the restore's wall
-  time. `ARCINT_ASSUME_KV_VIEW_WRITES=ON` is a red-case build option (restores without 0209), never for serving.
+  time. `ARCINT_ASSUME_KV_VIEW_WRITES=ON` is a red-case build option (restores without 0209), never for serving: such a
+  build names it in `/props` `build.red_case` (empty otherwise) and the packaging refuses it. The configure re-runs
+  when the tree's `ggml-opencl.cpp` changes, so an existing build directory cannot keep the lift after 0209 left.
   Evidence: the decision's unit cases, red on the 1.8.1 rule, and a check that the build finds 0209 when the series
   has it (`code`); 0209's op test and the probe's exact arms (contrib/llama.cpp/README.md); the served card gate at
   the Inkling unit's settings is owed.
