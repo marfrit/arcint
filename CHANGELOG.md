@@ -18,62 +18,292 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased (branch `development`)
+## 1.8.1 — 2026-11-?? **[owed: date]**
 
-Card-proven, not yet through a release gate. Each item names its card evidence (`measured-here`, B60 / B70 at 165 / 220 W caps).
+Release gate against 1.8.0 **[owed: the whole paragraph — the window, the RC sha = the release code, the cards and
+caps; the agent's 27B KL at ub 1 against the CPU Q8_0 reference and its A/B on the unit flags; Flash-Next's knob-off
+logits against 1.8.0 and its A/B on the B70 unit flags; Dory against 1.8.0; Inkling 2 Mini on its unit flags (q8_0 KV,
+262,144 cells, `--llama-swa-window`) with the knobs it will serve with: KL, needle, acceptance task, the served
+prefill/decode rows; the op suites the series touches (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, CPY/CONT, NORM_CLIP,
+DEPTH_MIX, TOP_K MoE); downgrade keys; the xe kernel log's wedge / CAT error / job-timeout counts]**.
 
-- **Inkling 2 Mini prompt attention after trellis-serve's `fa::Kern` (opt-in, `GGML_OPENCL_FA_PORT=1`; patches 0193,
-  0194, 0198, 0199).** One sub-group a (head, 8-row) tile over 32-key blocks, K/V read in place by 2D block reads, the
-  relative bias read as a run of 16 bins, the sink as the initial softmax state, and the keys a tile visits bounded a
-  block from the positions. For a prompt batch (more than 8 rows, causal, the standard window) on a layer whose backend
-  declares the port's sources; a decode step and every graph with the knob unset are today's. `measured-here`, the card
-  host, B60 at 165 W: the op at 746 / 2,092 / 2,926 us a call (q512 x kv1536, q2048 x kv2048, q2048 x kv3072) against
-  2,263 / 9,577 / 12,645 for the kernel it replaces; Inkling pp4096, port off / on, 769.2 / 909.8 t/s at ub 512, 816.0 /
-  973.9 at ub 1024, 763.9 / 980.8 at ub 2048, 749.5 / 975.7 at ub 4096 (+18.3, +19.4, +28.4, +30.2 %); mean KL at ub 1024
-  against the CPU base 0.001917 -> 0.001965, top p 98.40 -> 98.47 %; the op suite complete with the knob on and off;
-  with the knob unset three models match the development build. **Every tensor grows by 64 bytes**: `GGML_MAX_SRC`
-  14 -> 20 (the positions, group classes and per-query sinks at src 14-18) and `GGML_MAX_OP_PARAMS` 64 -> 80 (the
-  window), whatever the knob. The record, the reference kernel and the design of the next step are in
-  `contrib/refkernels/trellis-fa/README.md`; the reference is listed in `THIRD_PARTY.md`.
-  Every number above is at f16 KV (`measured-here`). The build before patches 0199q1 / 0199q2 refused a q8_0 KV cache,
-  which the Inkling units serve (the knob changed nothing there), and arcint's load-time spill guard refuses f16 KV at
-  the units' 262,144 context; the q8_0 read path and its card figures are the paragraph below. A partial offload of Inkling faulted at `-ngl 12` (`measured-here`); the cause by code reading, not
-  reproduced, is its depth-mix stacks written through views across devices, the same code without the port. Serve
-  Inkling fully offloaded.
-  Patches 0199q1 / 0199q2 add a q8_0 read path to the port (the kernel reads ggml's q8_0 blocks in place, nothing
-  staged; same knob). On the card (`measured-here`, B60 at 165 W): Inkling pp4096 ub 1,024 at q8_0 KV 817.2 -> 945.8 t/s
-  (+15.7 %; predicted 953), the five q8_0 op cases at nmse 2e-6 against a bound of 1e-5, mean KL 0.002464 -> 0.002545
-  and top p 98.240 -> 98.273 % (inside the bar). Paired against the off arm's own logits on the card the port moves
-  the answer by 0.002083 nats where one-ulp noise moves it by 0.002069 (four seeds, sd 0.000062): inside the noise.
-  With the depth mix as well (the combined test tree, `measured-here`): 816.6 t/s off, 980.5 depth mix, 945.7 port,
-  **1,171.4 both** at q8_0 KV; both moves the answer by 0.002125 nats against the card's own off arm, inside the same
-  noise. The op itself is 1.6 to 1.8 x the f16 port where 1.27 x was predicted:
-  a miss, recorded. Not run at the units' own flags (262,144 context, `--llama-swa-window`). Record:
-  `contrib/refkernels/trellis-fa/README.md` §q8 and §q8-card.
-- **Inkling 2 Mini's depth mix as one op: the current entry** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`;
-  the three entries after this one are its history and are superseded by it; `measured-here`, B60, f16 KV,
-  int8 expert tile + wide + 0187 on, the FA port off). pp4096: ub 512 771.1 -> 908.1 t/s (+17.8 %), ub 1024 818.6 ->
-  982.1 (+20.0 %), ub 2048 770.0 -> 917.4 (+19.1 %); at the unit's ub 1024, q8_0 KV 816.4 -> 979.2. The kernel is 99.1
-  ms a pp4096 pass (960 launches, 103 us each) where the chain's four probed parts were 765 ms and the reference's own
-  mix kernel 399 ms; the pass's kernel time falls 5,229 -> 4,431 ms. The prediction (145-290 ms) missed low. Op level:
-  45 cases and 36 replayed export lines under an nmse bound of 1e-10, three reds failing what each must. Answer level
-  against the CPU base made from the card's own file (3 chunks): chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp
-  noise 0.0019-0.0021 / 98.3 %; on 6 chunks (about 6,100 tokens) chain 0.002256 / 98.27 %, the arm 0.002261 / 98.34 %,
-  noise 0.002346 and 0.002270. With development's FA port also on (f16 KV, ub 1024): chain 815.9, the arm 978.5, the
-  port 973.6, both **1,215.7 t/s**; the two savings add (831.6 + 813.2 ms against 1,648.2 together). At the unit's q8_0
-  KV on a combined tree: chain 816.6, the arm 980.5, the port 945.7, both **1,171.4 t/s**. The task battery at q8_0 KV
-  (the capital, an arithmetic chain, a JSON extraction from 4,394 tokens, a binary search after 4,095 tokens run on 300
-  random cases): 8 of 8 right, the arm off and on. Details: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
-  State of the arm: the output norm is folded where the chain norms one mixed column (`=nofold` keeps the norms nodes);
-  its five buffers are bounds-checked before every launch, not only under `GGML_OPENCL_BOUNDS=1`; unset, the graph and
-  the dispatch are the chain's, node for node. Provenance: every card number here ran the published GGUF; the CPU
-  numbers quoted in the history entries below (the knob-on KL 0.0015, 381 tokens) ran a re-quantized variant with a
-  Q6_K output tensor on the recipe host and compare arms of that one file only.
+**Fixed — read first:** on the OpenCL backend a checkpoint resume with a q8_0 or q4_0 K/V cache restored the cells'
+positions but not their bytes: `set_tensor` returned without writing for a view of a q8_0 / q4_0 tensor, and the
+cache restore writes through views. On Inkling 2 Mini (whose sliding-window cells every checkpoint carries, with or
+without `--llama-swa-window`) the sliding-window layers attended stale keys and values for up to 1,024 positions after
+a resume, with no error. **[owed: the affected range as the code shows it (1.8.0 included?), patch 0209, its op red /
+green and the served resume-against-re-prefill arm on the card]** f16 K/V and models without a sliding-window cache
+(the 27B agent) were not affected. The write for such a view now lands; a view write that still cannot be performed
+(into a split tensor) logs once.
+
+**Read first — what changes with no switch set:**
+- **A start that does not fit the card is refused** (the spill guard, below). `--llama-allow-spill` restores 1.8.0's
+  start-and-spill. The guard bounds by the xe driver's card figure; where that figure is missing (an i915 host, the
+  default driver for A-series cards, or a build without `drm/xe_drm.h`) it falls back to OpenCL's smaller global size,
+  under which a start that 1.8.0 served can be refused (the 27B agent at 262,144 cells on a B60 is one): use
+  `--llama-allow-spill` there. The refusal names the figure it used.
+- **No architecture is refused at load any more; three admitted families lose their full surface.** Gemma 4 E4B,
+  Granite 4.2 8B and Mistral Small 3.2 24B (the writer's Cydonia) are now tier "runs": no token mode, no renderer
+  material, `--tool-grammar` refused.
+- **Request fields 1.8.0 ignored silently.** At a non-default value, 15 are refused with HTTP 400, because a silently
+  ignored value would change the answer the client expects: `min_tokens`, `cache_salt`, `prompt_logprobs`,
+  `logit_bias`, `grammar`, `json_schema`, `best_of`, `use_beam_search`, `bad_words`, `allowed_token_ids`,
+  `truncate_prompt_tokens`, `n_predict` 0, `include_stop_str_in_output`, `skip_special_tokens` false, `chat_format`.
+  The other 19 are accepted and ignored, with one warning per field per process naming it: `response_format`
+  (JSON mode is not enforced; the answer is the model's own text), `logprobs`, `top_logprobs`, `n_probs`,
+  `min_keep`, `samplers`, `return_tokens`, `return_progress`, `timings_per_token`, `response_fields`, `typical_p`,
+  `mirostat`, `dynatemp_range`, `dynatemp_exponent`, `xtc_probability`, `tfs_z`, `top_n_sigma`, `dry_multiplier`,
+  `spaces_between_special_tokens` (llama.cpp's own web UI sends several of these on every request).
+  `cache_prompt: false` is honoured. The Responses surface is unchanged.
+- **Default-on kernel paths:** the Q8_0 `MUL_MAT_ID` prompt tile (`GGML_OPENCL_Q8_MM_ID`, and with it the int8 expert
+  program is compiled at start on every sub-group-16 device), the F32 tiny-K and small-M arms
+  (`GGML_OPENCL_F32_SMALLK`, `GGML_OPENCL_F32_SMALL_M`), the sigmoid router (`GGML_OPENCL_FUSE_TOPK_MOE`), and 0156,
+  0157, 0158 with no switch (0157 reaches the 27B, the coder and Flash-Next's MTP head).
+- **Every ggml tensor is 64 bytes larger** (`GGML_MAX_SRC` 14 -> 20, `GGML_MAX_OP_PARAMS` 64 -> 80, patch 0193):
+  rebuild anything compiled against this tree's ggml headers (the llama.cpp tools, sd.cpp, whisper.cpp) from the same
+  tree. The RPC backend's wire struct grows with it: RPC servers and clients must be rebuilt together.
+- Opt-in, off unless set: `--llama-swa-window`, `GGML_OPENCL_KQ_MM_ID_I8_WIDE`, `GGML_OPENCL_CPY_TRANSPOSE`,
+  `GGML_OPENCL_FA_PORT`, `GGML_OPENCL_DEPTH_MIX` (and `GGML_OPENCL_KQ_MM_ID_I8`, unchanged from 1.8.0).
+
+Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B70 at 220 W).
+
+- **Inkling 2 Mini prompt attention after trellis-serve's `fa::Kern` (opt-in, `GGML_OPENCL_FA_PORT=1`, unset = off;
+  patches 0193, 0194, 0198, 0199, and 0199q1 / 0199q2 for a q8_0 cache).** One sub-group a (head, 8-row) tile over
+  32-key blocks, K/V read in place by 2D block reads, the relative bias read as a run of 16 bins, the sink as the
+  initial softmax state, and the keys a tile visits bounded a block from the positions. For a prompt batch (more than
+  8 rows, causal, the standard window, one KV stream) on a layer whose backend declares the port's sources; a decode
+  step and every graph with the knob unset are 1.8.0's. The op at 746 / 2,092 / 2,926 us a call (q512 x kv1536,
+  q2048 x kv2048, q2048 x kv3072) against 2,263 / 9,577 / 12,645 for the kernel it replaces; Inkling pp4096 at f16 KV,
+  port off / on, 769.2 / 909.8 t/s at ub 512, 816.0 / 973.9 at ub 1024, 763.9 / 980.8 at ub 2048, 749.5 / 975.7 at
+  ub 4096 (+18.3, +19.4, +28.4, +30.2 %); mean KL at ub 1024 against the CPU base 0.001917 -> 0.001965, top p 98.40 ->
+  98.47 %; the op suite complete with the knob on and off; with the knob unset three models match the development
+  build. **Every tensor grows by 64 bytes**: `GGML_MAX_SRC` 14 -> 20 (the positions, group classes and per-query sinks
+  at src 14-18) and `GGML_MAX_OP_PARAMS` 64 -> 80 (the window), whatever the knob. The record, the reference kernel
+  and the design of the next step are in `contrib/refkernels/trellis-fa/README.md`; the reference is listed in
+  `THIRD_PARTY.md`.
+  *A q8_0 K/V cache (0199q1 / 0199q2, the same knob).* The kernel reads ggml's q8_0 blocks in place, nothing staged.
+  Inkling pp4096 ub 1,024 at q8_0 KV 817.2 -> 945.8 t/s (+15.7 %; predicted 953), the five q8_0 op cases at nmse 2e-6
+  against a bound of 1e-5, mean KL 0.002464 -> 0.002545 and top p 98.240 -> 98.273 % (inside the bar). Paired against
+  the off arm's own logits on the card the port moves the answer by 0.002083 nats where one-ulp noise moves it by
+  0.002069 (four seeds, sd 0.000062): inside the noise. The op itself is 1.6 to 1.8 x the f16 port where 1.27 x was
+  predicted: a miss, recorded. (Before 0199q1 / 0199q2 the port refused a q8_0 cache, which the Inkling units serve,
+  and arcint's spill guard refuses f16 KV at the units' 262,144 context.)
+  *Limits.* Not run at the units' own flags (262,144 context, `--llama-swa-window`) and not on the B70. A partial
+  offload of Inkling faulted at `-ngl 12`; the cause by code reading, not reproduced, is its depth-mix stacks written
+  through views across devices — 1.8.0's code (patch 0148), not the port's: serve Inkling fully offloaded.
+  `GGML_OPENCL_FA_PORT_PROBE=nobias` is a timing probe with wrong answers; the other `GGML_OPENCL_FA_PORT_*` variables
+  are tuning and red-case hooks. Record: `contrib/refkernels/trellis-fa/README.md` §q8 and §q8-card.
+- **Inkling 2 Mini's depth mix as one op** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`; unset = off, and
+  **any value other than `0` or `off` turns it on**; `GGML_OPENCL_DEPTH_MIX=nofold` keeps the output norms as nodes).
+  The prefill's depth attention ran as 8-12 nodes a mix call; `GGML_OP_DEPTH_MIX` is the reference's `_mix_kernel` form
+  in this tree's OpenCL, a token a work-group. B60, f16 KV, int8 expert tile + wide + 0187 on, the FA port off:
+  pp4096 ub 512 771.1 -> 908.1 t/s (+17.8 %), ub 1024 818.6 -> 982.1 (+20.0 %), ub 2048 770.0 -> 917.4 (+19.1 %); at
+  the unit's ub 1024, q8_0 KV 816.4 -> 979.2. The kernel is 99.1 ms a pp4096 pass (960 launches, 103 us each) where
+  the chain's four probed parts were 765 ms and the reference's own mix kernel 399 ms; the pass's kernel time falls
+  5,229 -> 4,431 ms. The prediction (145-290 ms) missed low. Op level: 45 cases and 36 replayed export lines under an
+  nmse bound of 1e-10, three reds failing what each must. Answer level against the CPU base made from the card's own
+  file (3 chunks): chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp noise
+  0.0019-0.0021 / 98.3 %; on 6 chunks (about 6,100 tokens) chain 0.002256 / 98.27 %, the arm 0.002261 / 98.34 %,
+  noise 0.002346 and 0.002270. With the FA port also on (f16 KV, ub 1024): chain 815.9, the arm 978.5, the port 973.6,
+  both **1,215.7 t/s**; the two savings add (831.6 + 813.2 ms against 1,648.2 together). At q8_0 KV on the release
+  series (applied tree a52a4c2a): chain 816.6, the arm 980.5, the port 945.7, both **1,171.4 t/s**, and both together
+  move the answer by 0.002125 nats against the card's own off arm, inside the one-ulp noise. The task battery at q8_0
+  KV (the capital, an arithmetic chain, a JSON extraction from 4,394 tokens, a binary search after 4,095 tokens run on
+  300 random cases): 8 of 8 right, the arm off and on. Details: `contrib/llama.cpp/README.md`, 0204-0207, card result
+  3. State of the arm: the output norm is folded where the chain norms one mixed column; its five buffers are
+  bounds-checked before every launch, not only under `GGML_OPENCL_BOUNDS=1`; unset, the graph and the dispatch are the
+  chain's, node for node (the dispatch still counts the graph's depth-mix nodes once, no launch). Provenance: every
+  card number here ran the published GGUF; the CPU numbers in the history below (the knob-on KL 0.0015, 381 tokens) ran
+  a re-quantized variant with a Q6_K output tensor and compare arms of that one file only. Not run at the units' flags
+  or on the B70. The open list (two wrong comments in 0205, `GGML_OPENCL_DEPTH_MIX_OPTS` as a test hook in the
+  production dispatch, the reference readings without their tree) is at the end of the patch section.
+  - *History of this arm (superseded, kept as the record; what each entry says about the state describes that
+    revision only):* see the three entries at the end of this release's list.
+- **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158; **on, no switch**). 0156: Q8_0 `MUL_MAT_ID` on the int8
+  dot for a decode batch (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32
+  and flat q8_0). 0158: the three norm clips as one op (`GGML_OP_NORM_CLIP`). Inkling on the B60, three interleaved
+  rounds: decode 36.59 -> 38.93 t/s (+6.4 %) at depth 0, 33.72 -> 35.69 (+5.8 %) at 4k, prefill +0.6 %. KL to the CPU
+  reference inside the bar on every production model, also at micro-batch 1: the agent 27B 0.01039 -> 0.01035,
+  Inkling 0.00201 -> 0.00208 (ub 1), the coder 0.005796 -> 0.005664 (toward the CPU: 0157 takes its 1-D shared-expert
+  gate), Dory and Flash-Next bit-identical; a served Flash-Next greedy A/B with MTP gives 6 of 6 identical texts.
+  0157's two card-only defects were found and fixed before this: a kernel-argument count, and an f32 slice start in
+  floats on float4 pointers (the 27B's KL had gone to 0.54). test-backend-ops carries the production shapes the split-K
+  reaches (the 27B's ssm_alpha/beta, the coder's routers, Flash-Next's MTP injects); the red builds fail them on the
+  card.
+- **`--llama-swa-window`: a window-sized sliding-window KV cache (opt-in, default off).** The library's default sizes
+  every SWA layer to the whole context (`swa_full`); the flag sets `swa_full = false`, so the SWA layers keep
+  `n_swa + n_ubatch` cells (padded to 256). CPU: Inkling 2 Mini f16 8k 1,536 -> 496 MiB, 32k 6,144 -> 1,264, 131k
+  24,576 -> 4,336 (q8_0:q4_0 131k 9,984 -> 1,762; 262,144 at q8_0:q4_0 19,968 -> 3,426); Dory1.0-4B `per_loop` 8k
+  3,072 -> 1,200, 32k 12,288 -> 3,504, 131k 49,152 -> 12,720; Gemma 4 E4B 8k 448 -> 168, 32k 1,792 -> 552, 131k 7,168
+  -> 2,088. A SWA cache cannot be trimmed to an arbitrary prefix; the context checkpoints already carry its cells under
+  `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (163.7 MiB a full Inkling window at f16), and patch 0153
+  (`llama_memory_attn_seq_pos_min`) exposes the attention part's oldest retained position — a hybrid's `seq_pos_min`
+  is the max over its parts and the recurrent cell masks it. `src/core/swa_window.h` resumes from the newest checkpoint
+  when the retained history starts above the next query's window. Red first: `tests/test_swa_window.cpp` (old
+  always-true rule, red 4 of 7) and `tools/swa_ckpt_probe.cpp` (trim-only arm: Dory 5.887903 nats, Gemma 22.814130,
+  top token differs; the resume arms same top, mean KL 0.001496 / 0.011592 / 0.022537, inside the answer bar). Dory's
+  `last_loop` is refused with the flag: its prefill is chunk-boundary dependent (0.026827 nats floor on the same
+  prompt in another batch shape), so a resume cannot be held to the same logits; `per_loop` serves with it. Off by
+  default: at the full-size SWA cache prefix reuse is exact without the rule. A build without patch 0153 fails at
+  configure. Card (B60, q8_0 KV): 49,152 cells VRAM 21,334 -> 17,382 MiB; decode after a 15,790-token prompt 20.6 ->
+  30.5 t/s (+48 %), prefill 333 -> 370; 131,072 and 262,144 cells decode 30.4, needles at 120k and 250k right (262k:
+  20,918 MiB after load, 22,031 after the needle); an edited follow-up resumes from its checkpoint (10,836 of 11,351
+  tokens reused, 1.6 s instead of 30.3 s); the agent's checkpoint resume unchanged. CPU depth cost at 16,384
+  (llama-bench, one repetition each, f16): Gemma 4 E4B pp 48.33 -> 61.56 t/s, tg64 8.67 -> 12.56 with the window
+  (+27 %, +45 %); Inkling pp 18.79 -> 19.87, tg16 7.34 -> 7.94 (its 16-token CPU decode is weight-bound, no separable
+  effect; the card's 30.4/31.9 at depth 16,384 against 20.5 q8_0 / 24.3 f16 served full-size is the device evidence).
+  Dory and Gemma have no card row with the flag.
+- **Inkling 2 Mini's SIGMOID MoE router as one launch** (patch 0159; **on**, `GGML_OPENCL_FUSE_TOPK_MOE=0` turns it
+  off together with the softmax arm): 0064's fused top-k kernel gains a sigmoid arm (with the selection bias and the
+  renormalised weights); softmax routers keep their kernel. The op test reaches the fused arm (counted) and its red
+  build fails 24 cases; Inkling KL to the CPU reference 0.001950 (default batch) and 0.001988 (micro-batch 1), against
+  0158's 0.001999 / 0.002078; decode at 4k +0.6 to +1.2 %, prefill unchanged. The residual against the unfused chain
+  (KL 0.0005-0.0007) is the sigmoid's exp evaluated in another program.
+- **Dense Qwen4 27B plumbing in the llama engine** (patches 0161-0165, **on**: every `qwen4exp` load takes the new
+  per-layer rule), ahead of the checkpoint. `qwen4exp` decides MoE or dense per layer from metadata
+  (`mlp_only_layers`, `decoder_sparse_step`), loads dense FFN tensors, runs a full-attention layer without QSA indexer
+  tensors as dense attention, and requires the GDN/QSA schedule instead of assuming 3:1; the converter writes the
+  per-layer metadata, accepts a checkpoint without MTP and reads the GDN geometry from `text_config`. A numpy fixture
+  (no transformers model classes, no remote code) stands in for the weights. Evidence: the converter on a torch host
+  (CPU only) matches the fixture's GGUF in every tensor and key, with and without an MTP block; on the card (B60) the
+  shape suite at the published 27B shapes passes (HC 4 x 5120 rank 640, QSA 24/4 heads at 256 over 2048 cells, GDN
+  16/48 at 128, the dense FFN at 14336 and 17408) and the fixture's OpenCL logits match the CPU's (mean KLD 0.000137,
+  0.000001 without QSA, also at micro-batch 1); Flash-Next's MoE path keeps its logits (mean KLD 0, same top p 100 %,
+  on a synthetic qwen4exp MoE model) **[owed: the real Flash-Next file's arm — the release gate's Flash-Next logits
+  against 1.8.0 close it]**. The real checkpoint decides the layer count, the schedule and the MTP layout.
+- **Q8_0 expert prompt batches on the int8 DPAS tile** (patches 0167-0169; **on**, `GGML_OPENCL_Q8_MM_ID=0` or `off`
+  turns it off): Inkling 2 Mini's four Q8_0 coda layers took a prompt batch on the flat float matvec (23.2 % of a
+  pp4096 profile); they now take the tile the IQ4_NL experts use, with the experts routed into 32-pair tiles and the
+  activations quantized per column. Because it shares the int8 expert program, that program is now built at start on
+  every sub-group-16 card whether or not `GGML_OPENCL_KQ_MM_ID_I8` is set. Evidence (Inkling IQ4_NL, two rounds):
+  pp4096 at ub 512 410.6 -> 522.4 t/s (+27.2 %); the arm's profile share 23.2 % -> 2.1 %; KL to the CPU reference
+  0.001952 (same top p 98.50 %) against 0.001950 (98.34 %), and identical at micro-batch 1; the op cases pass and the
+  red build (scale dropped) fails 47 of them.
+- **The spill guard and the admission tiers** (patches 0160, 0173; **on**, `--llama-allow-spill` opts out of the
+  refusal). At start the guard bounds the device demand against the driver's card figure (xe's region total: the B60
+  24,480 MiB, the B70 32,656; OpenCL's global size reads 23,256 on the B60 and the agent runs above it, so without the
+  xe figure the guard warns and bounds by the smaller number). The demand is libllama's breakdown (weights, context,
+  compute), the expert cache's on-card slots and banks from its own accounting, a draft model or in-model MTP context
+  from its own breakdown, the process's other device bytes, the other clients, and a 422 MiB growth margin (the worst
+  measured growth beyond that prediction, 294 MiB at the agent's 255k needle, plus 128). Host memory placed on purpose
+  (a pinned expert bank) is logged and never counted. A start that does not fit is refused with every part named and
+  the `--n-ctx` (or expert cache, projected through the cache's own accounting, 0173) that would fit;
+  `--llama-allow-spill` keeps the old behaviour with a warning. `/props` carries the accounting (`device_memory`) and
+  the verdict. Admission is by tier (`admission_tier` in `/props`): "optimized for" (Inkling 2 Mini, the Qwen3.8 27B
+  agent, Flash-Next), "verified" (the coder, Dory1.0-4B, Llama 2 7B for completions, Qwen3-TTS, Qwen2.5-VL-7B) and
+  "runs" (any other model libllama loads that passes the guard — **Gemma 4 E4B, Granite 4.2 8B and Mistral Small 3.2
+  24B included, which 1.8.0 admitted with the full surface** —: no token mode, `--tool-grammar` refused at start and
+  per request, chat routes refused without a template, a start warning with the downgrade count; a model the table
+  names keeps its known dialect, any other gets a neutral one). A template-less runs model serves `/v1/completions`
+  and answers chat with 400. Before 1.8.1 an architecture or size outside the table was refused at load. Card
+  evidence: every production unit starts on its own flags and the prediction lands within 106-172 MiB of the VRAM
+  after the first request (agent 23,902 / 24,027, Flash-Next 26,122 / 26,294); Inkling at 65,536 cells with the full
+  SWA cache fits (23,459 / 23,585, and a 60k needle answered with GTT at 308 MiB); Inkling at 131,072 full SWA
+  (30,834) and Flash-Next with a 40,000 MiB expert cache (53,627) are refused; the latter suggests
+  `--llama-expert-cache 19107`, and the restart with it starts and measures 32,402 of the B70's 32,656 MiB after the
+  first request (32,192 predicted). A "runs" model on a card: not yet on record **[owed or say so]**.
+- **Request fields and the multi-GPU warning.** `cache_prompt: false` is honoured (it was ignored: two identical
+  requests reused 4,092 of 4,096 prompt tokens); `n_predict` is an alias of `max_tokens` (-1 = unset; 0 is refused);
+  `arcint: {timings: true}` returns timings on `/v1/completions`. **Fields that would change the result and that
+  arcint cannot honour are refused with HTTP 400 naming the field and a reason, instead of being dropped silently**
+  (one table, `kRequestFieldRefusals` in `src/core/chat.cpp`; README "Running" lists them); their default values stay
+  accepted (an OpenAI SDK's `response_format: text`, `logprobs: false`, `n: 1`, `top_logprobs: null` or `0`, also on
+  `/v1/responses`). A load warning names the visible GPUs when there is more than one and no `--device` (and no
+  `ZE_AFFINITY_MASK`) was given, and says the model loads on GPU.0 (arcint has loaded on one card since 1.8.0; the
+  layer split over several cards is llama.cpp's own tools'; GitHub issue #9). Card evidence (B60, Inkling):
+  `cache_prompt` true/true/false/true gives `cache_n` 0/1,397/0/1,397 (prefill 3,024/144/2,926/143 ms), the chat
+  route the same; the warning lists both cards without `--device` and is absent with it.
+- **Docs: the runtime the numbers need** (GitHub issue #8). README and `docs/docker.md` state the compute runtime,
+  kernel and xe module behind the measurements, and the image against native with the same `llama-bench` command on a
+  B70 (0.5-2 % slower decode in the image); README says arcint loads on one card and how llama.cpp's tools are pinned
+  to one.
+- **Inkling 2 Mini's depth mix off the generic F32 GEMM** (patches 0170-0172, 0175-0180). The depth-mix products (a
+  tiny-K product batched over the tokens on an 8-slot view, and a 2x4 product per token) ran on the generic and the
+  tiled F32 GEMM at about 1-2 ms a call; they now take a batched tiny-K kernel (0171, 0175-0177, 0179) and 0157's
+  split-K GEMV in a batched dispatch (0178), **on by default** (0180; `GGML_OPENCL_F32_SMALLK=0` / `GGML_OPENCL_F32_SMALL_M=0`
+  turn them off); 0170's wide-N GEMM stays off (`GGML_OPENCL_F32_WIDE_N=1`; no measured gain). The tiny-K and small-M
+  dispatches carry a host-side bounds check (`GGML_OPENCL_BOUNDS=1` aborts before a launch that would read or write
+  past its backend buffer). Evidence (Inkling IQ4_NL, two rounds): pp4096 at ub 512 522.5 -> 628.2 t/s (+20.2 %; 676.6
+  with the int8 expert tile `GGML_OPENCL_KQ_MM_ID_I8=1`), ub 1024 552.0 -> 712.2 with both; decode at 4k 36.0 -> 36.4;
+  KL to the CPU reference 0.001979 against 0.001952 (same top p 98.50 %), 0.001949 at micro-batch 1; the op cases pass
+  with the bounds check on and the red builds fail them; the agent 27B and Flash-Next (its experts on the CPU, so this
+  covers the F32 arms only) give identical logits with the arms on and off; with Flash-Next's layers 28-47 keeping
+  their experts on the card (`-ncmoe 28`, 512-token ubatches, the defaults: `GGML_OPENCL_Q8_MM_ID` and the F32 arms on,
+  `GGML_OPENCL_KQ_MM_ID_I8` unset) neither 0167-0169's Q8_0 expert tile nor 0171-0179's F32 arms is reached: their red
+  builds give the same logits as the green ones.
+- **The wide int8 expert tile (opt-in, `GGML_OPENCL_KQ_MM_ID_I8_WIDE=1` or `on`; unset = off)** (patches 0190-0192).
+  It runs the int8 expert tile (`GGML_OPENCL_KQ_MM_ID_I8`, IQ4_NL, and 0167-0169's Q8_0 prompt arm, which is on by
+  default, so `_WIDE` alone widens that arm) at one work-group a 512-column band instead of 128, so a route tile's
+  activations are staged 5 times for a 2,304-row expert instead of 18. Unset compiles nothing new. Evidence (Inkling
+  IQ4_NL, I8 on in every arm):
+  - Kernel ms a visit (narrow -> wide; the reference stack's per visit beside it):
+    - ub 512: gate/up 31.32 -> 26.46 (reference 25.4), down 16.87 -> 13.56 (reference 9.8; trellis-serve @8f8e2fcc on
+      the same card, a PTI profile);
+    - ub 2048: gate/up 26.12 -> 21.21 (20.3), down 15.26 -> 11.03 (7.5).
+  - llama-bench pp4096: ub 512 676.5 -> 722.2 t/s, ub 1024 712.1 -> 765.7, ub 2048 672.4 -> 723.4.
+  - Served on the planned unit flags at ub 1024: prefill 671.4 -> 718.4 t/s; decode unchanged (35.17 at 4k, 38.94 at 0).
+  - Logits knob on = off: Inkling at ub 512 (direct, mean KLD 0); at ub 1024 / 2048 the same KL and top p against the
+    CPU reference. Flash-Next on the B70 (220 W), with its layers 28-47 experts on the card and no expert cache:
+    reached (its red gives 0.96). The 27B: no MUL_MAT_ID.
+  - With the expert cache on Flash-Next's unit flags: the same greedy texts on and off (bounds on, no abort). Reach on
+    that route is not shown.
+  - Op cases with bounds on, on the series itself (apply-series.sh on the pin, the applied tree `git write-tree`
+    a5610fc1): Inkling's 16 distinct real-shape MUL_MAT_ID cases (0192's 10 IQ4_NL and 0169's six Q8_0) pass 16/16
+    with the knob on and off; 0192's two Q8_0 cases that take the Q8_0 prompt arm's fallback (520 rows, not a multiple
+    of 16; 520 experts, more than 512) pass 2/2; the run logs the generic path once for their shared key
+    (`DOWNGRADE src=opencl op=MUL_MAT_ID type=q8_0 k=256 path=generic reason=no-fast-path`, logged once a key), so a
+    per-case path is not shown; the MUL_MAT_ID suite gives 554 of 628 with the knob on (the 74 failures are the known
+    mxfp4 set); the red build fails all 16 with the knob on; KL to the CPU reference (`-c 2048 --chunks 3`) is the
+    same with the knob off and on at ub 512 (0.001932, same top p 98.208 %) and ub 1024 (0.001917, 98.403 %); no
+    bounds abort.
+  - The rows above the op cases (kernel times, llama-bench, served, logits, expert cache) ran on a development worktree,
+    not the applied series, and were not re-measured on it. That worktree differed from the series in two refusal
+    conditions of 0168 (which pass for every shape it ran), in patches 0161-0165 and in a comment.
+  - The bounds check follows the weight arguments the kernel is given (the SoA planes or an expert cache's gathered
+    stage).
+- **The transposing copies as a tiled transpose (opt-in, `GGML_OPENCL_CPY_TRANSPOSE=1`; unset = off)**
+  (patch 0187). Inkling's relative-bias table (`ggml_cont(ggml_permute(table, 1, 0, 2, 3))`) and the depth mix's
+  `cont(transpose(states))` swap dims 0 and 1, and the pack kernel gathered one side at a 4,100-B stride (74-76 GB/s).
+  `kernel_cpy_f32_f32_t01` moves 16 x 16 tiles through local memory. The eligibility is a pure function with a unit
+  test fed the graph's real strides (`tests/test_opencl_cpy_t01.cpp`; the first predicate was false for every real
+  source and the path never ran — found on the card, red on the CPU since). B60: op 1,334 -> 415 us at
+  `[1025, 24, 512]`, 5,306 -> 1,660 at `[1025, 24, 2048]`, 441 -> 356 at `[2304, 4, 512]` (the prediction missed on
+  all three); Inkling pp4096 (I8 + WIDE on) 720.6 -> 769.7 t/s at ub 512 (+6.8 %), 763.6 -> 816.1 at ub 1024
+  (+6.9 %), 718.5 -> 764.3 at ub 2048 (+6.4 %), three interleaved rounds; at q8_0 KV ub 1024 763.5 -> 816.3. Logits
+  knob off against on: mean KLD 0, top p 100 % on Inkling, the 27B and Dory at ub 512 / 1024 / 1; CONT suite off and
+  on; the red fails 5 cases. Reach: 0 eligible copies in the exports of Flash-Next, the 27B and Dory; Inkling only.
+  Decode: eligible at T = 1 by the export, not measured. `GGML_OPENCL_CPY_TRANSPOSE_DEBUG=1` names the failing term.
+  Record: `contrib/llama.cpp/README.md`, 0187.
+- **Test only:** patch 0208 adds Inkling's expert DOWN against the fused GATE_UP to test-backend-ops' perf
+  list; nothing in a served path changes.
+
+**Known limits** (see the README's "Known limits"):
+- Inkling 2 Mini needs every layer on the card: a partial offload faulted at `-ngl 12` (the depth mix's state store is
+  a graph leaf that CPU layers write through views; 1.8.0's code, patch 0148).
+- The opt-in Inkling prefill switches are measured on the B60 only. Served once at an Inkling unit's own flags
+  (262,144 cells, `--llama-swa-window`, q8_0 KV, ub 1,024, the 400a7dd1 fixture): prefill 764.3 t/s with the switches
+  off, 1,067.5 with `GGML_OPENCL_DEPTH_MIX=1` and `GGML_OPENCL_FA_PORT=1`, decode level, the answer right.
+- `GGML_OPENCL_DEPTH_MIX` takes `0` or `1` (and `nofold`); any other value currently turns it on.
+  `GGML_OPENCL_FA_PORT_PROBE`, `GGML_OPENCL_FA_PORT_RED`, `GGML_OPENCL_CPY_TRANSPOSE_RED` and
+  `GGML_OPENCL_DEPTH_MIX_OPTS` are debug arms (the probe and the reds give wrong answers by design); none acts unless
+  its feature's switch is on. Do not set them on a serving unit.
+- `set_tensor`'s q8_0 / q4_0 conversion to the split layout is keyed on a whole-tensor write, not on weights: a
+  whole-tensor write into a non-weights q8_0 tensor would convert it. No served path does that today (a cache restore
+  writes views and at most the window's cells); a weights-only rule is owed for 1.8.2.
+- The CPU-miss staging buffers of the expert cache are allocated once; a layer registered later would launch without
+  them (code reading; not shown to happen).
+- With more than one KV stream (unnamed lanes, `kv_unified` off) an f16 restore into a stream other than the first
+  could land in the first stream's rows **[owed: closed by 0209 or open]**.
+- A Qwen4exp GGUF that carries neither `attention.recurrent_layers` nor `full_attention_interval` now fails to load
+  (1.8.0 assumed an interval of 4).
+- 1.8.0's S3 (the bias dispatcher's GQA decode variant has no fallback if it fails to build) is still open; the 1.8.0
+  known slow paths in `tests/acceptance/expected-downgrades.json` are unchanged.
+
+History of the depth-mix arm (superseded by the current entry above; kept as the record; what each says about the
+state — "no speed row is claimed", "the model no longer folds the norm", "bounded under `GGML_OPENCL_BOUNDS=1`", "no
+card run of this revision", "the card arm decides" — describes that revision only):
 
 - **Inkling 2 Mini's depth mix as one op** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`). The prefill's depth
-  *Superseded by the current entry above; kept as the record. What it says about the state ("no speed row is claimed",
-  "the model no longer folds the norm", "bounded under `GGML_OPENCL_BOUNDS=1`", "no card run of this revision", "the card
-  arm decides") describes that revision only.*
   attention (`src/models/inkling2.cpp:191`) ran as 8-12 nodes a mix call: a copy of the k+1 states as a transposed view
   (341 ms of a pp4096 pass), the first product on 0178's split-K GEMV (309), the weighted sum on 0171's tiny-K kernel
   (82) and the query repeat (33) — 765 ms, 12.7 % of the 6,042 ms pass (`measured-here`, B60, ub 512, before this
@@ -101,9 +331,6 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   reason, one fixed `TAKEN` line marks the first taken call, `GGML_OPENCL_DEPTH_MIX_STATS=1` counts the graph's calls, and
   every launch is bounded under `GGML_OPENCL_BOUNDS=1`.
 - **The depth mix's two card failures, named and fixed** (patches 0204-0207, still opt-in `GGML_OPENCL_DEPTH_MIX=1`;
-  *Superseded by the current entry above; kept as the record. What it says about the state ("no speed row is claimed",
-  "the model no longer folds the norm", "bounded under `GGML_OPENCL_BOUNDS=1`", "no card run of this revision", "the card
-  arm decides") describes that revision only.*
   `code`, and `measured-here` on the recipe host for the replays - no card run of this revision yet). *The page fault*
   was not in the arm's kernel: Inkling 2 Mini is the loop model, its cross-pass `messages` are a mix result (the bank
   store, k 1, four query columns), the arm took that call, and `build_layer`'s `message()` read the arm's
@@ -122,9 +349,6 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   call, 145-290 ms a pass against the chain's 765 and the reference's 399 (`inference`); card commands in
   `contrib/llama.cpp/README.md`.
 - **The depth mix mixed raw states** (patches 0204, 0205, 0207; found by an independent code read, `code` and
-  *Superseded by the current entry above; kept as the record. What it says about the state ("no speed row is claimed",
-  "the model no longer folds the norm", "bounded under `GGML_OPENCL_BOUNDS=1`", "no card run of this revision", "the card
-  arm decides") describes that revision only.*
   `measured-here` on the recipe host). The chain and the reference mix the NORMALIZED states (the chain's `rms_norm`
   output feeds the score product and the weighted sum; the reference's `pw = p / sum(p) * inv`); the kernel and the CPU
   op weighted the raw rows by `p` alone - a per-state reweighting a following norm does not undo, and one the op cases
@@ -135,145 +359,6 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   (knob off twice: 0, 100 %) - the KL well inside the bar, the folded arm's top p at its 1-point edge on too few tokens
   to decide; the card arm decides. `-DDEPTH_MIX_RED` now doubles one state's weight (every case must fail; the old red
   was cancelled by the folded norm on 12 cases), `-DDEPTH_MIX_RED_RAW` is the red of this defect.
-
-- **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
-  (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
-  three norm clips as one op (`GGML_OP_NORM_CLIP`). Inkling on the B60, three interleaved rounds: decode 36.59 -> 38.93 t/s
-  (+6.4 %) at depth 0, 33.72 -> 35.69 (+5.8 %) at 4k, prefill +0.6 %. KL to the CPU reference inside the bar on every
-  production model, also at micro-batch 1: the agent 27B 0.01039 -> 0.01035, Inkling 0.00201 -> 0.00208 (ub 1), the coder
-  0.005796 -> 0.005664 (toward the CPU: 0157 takes its 1-D shared-expert gate), Dory and Flash-Next bit-identical; a served
-  Flash-Next greedy A/B with MTP gives 6 of 6 identical texts. 0157's two card-only defects were found and fixed before
-  this: a kernel-argument count, and an f32 slice start in floats on float4 pointers (the 27B's KL had gone to 0.54).
-  test-backend-ops carries the production shapes the split-K reaches (the 27B's ssm_alpha/beta, the coder's routers,
-  Flash-Next's MTP injects); the red builds fail them on the card.
-
-- **`--llama-swa-window`: a window-sized sliding-window KV cache (opt-in).** The library's default
-  sizes every SWA layer to the whole context (`swa_full`); the flag sets `swa_full = false`, so the
-  SWA layers keep `n_swa + n_ubatch` cells (padded to 256). `measured-here` CPU: Inkling 2 Mini f16
-  8k 1,536 -> 496 MiB, 32k 6,144 -> 1,264, 131k 24,576 -> 4,336 (q8_0:q4_0 131k 9,984 -> 1,762;
-  262,144 at q8_0:q4_0 19,968 -> 3,426); Dory1.0-4B `per_loop` 8k 3,072 -> 1,200, 32k 12,288 ->
-  3,504, 131k 49,152 -> 12,720; Gemma 4 E4B 8k 448 -> 168, 32k 1,792 -> 552, 131k 7,168 -> 2,088.
-  A SWA cache cannot be trimmed to an arbitrary prefix; the context checkpoints already carry its
-  cells under `LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY` (163.7 MiB a full Inkling window at f16), and
-  patch 0153 (`llama_memory_attn_seq_pos_min`) exposes the attention part's oldest retained position
-  — a hybrid's `seq_pos_min` is the max over its parts and the recurrent cell masks it.
-  `src/core/swa_window.h` resumes from the newest checkpoint when the retained history starts above
-  the next query's window. Red first: `tests/test_swa_window.cpp` (old always-true rule, red 4 of 7)
-  and `tools/swa_ckpt_probe.cpp` (trim-only arm: Dory 5.887903 nats, Gemma 22.814130, top token
-  differs; the resume arms same top, mean KL 0.001496 / 0.011592 / 0.022537, inside the answer bar).
-  Dory's `last_loop` is refused with the flag: its prefill is chunk-boundary dependent (0.026827
-  nats floor on the same prompt in another batch shape), so a resume cannot be held to the same
-  logits; `per_loop` serves with it. Off by default: at the full-size SWA cache prefix reuse is
-  exact without the rule. Card (B60, q8_0 KV, measured-here): 49,152 cells VRAM 21,334 -> 17,382 MiB; decode after a 15,790-token
-  prompt 20.6 -> 30.5 t/s (+48 %), prefill 333 -> 370; 131,072 and 262,144 cells decode 30.4, needles at 120k
-  and 250k right (262k: 20,918 MiB after load, 22,031 after the needle); an edited follow-up resumes from its
-  checkpoint (10,836 of 11,351 tokens reused, 1.6 s instead of 30.3 s); the agent's checkpoint resume unchanged. CPU depth cost at 16,384 (llama-bench, one repetition each, f16):
-  Gemma 4 E4B pp 48.33 -> 61.56 t/s, tg64 8.67 -> 12.56 with the window (+27 %, +45 %);
-  Inkling pp 18.79 -> 19.87, tg16 7.34 -> 7.94 (its 16-token CPU decode is weight-bound,
-  no separable effect; the card's 30.4/31.9 at depth 16,384 against 20.5 q8_0 / 24.3 f16
-  served full-size is the device evidence).
-
-- **Inkling 2 Mini's SIGMOID MoE router as one launch** (patch 0159): 0064's fused top-k kernel gains a sigmoid arm
-  (with the selection bias and the renormalised weights); softmax routers keep their kernel. Card evidence (`measured-here`,
-  B60): the op test reaches the fused arm (counted) and its red build fails 24 cases; Inkling KL to the CPU reference
-  0.001950 (default batch) and 0.001988 (micro-batch 1), against 0158's 0.001999 / 0.002078; decode at 4k +0.6 to +1.2 %,
-  prefill unchanged. The residual against the unfused chain (KL 0.0005-0.0007) is the sigmoid's exp evaluated in another
-  program.
-
-- **Dense Qwen4 27B plumbing in the llama engine** (patches 0161-0165), ahead of the checkpoint. `qwen4exp` decides MoE or
-  dense per layer from metadata (`mlp_only_layers`, `decoder_sparse_step`), loads dense FFN tensors, runs a full-attention
-  layer without QSA indexer tensors as dense attention, and requires the GDN/QSA schedule instead of assuming 3:1; the
-  converter writes the per-layer metadata, accepts a checkpoint without MTP and reads the GDN geometry from `text_config`.
-  A numpy fixture (no transformers model classes, no remote code) stands in for the weights. Evidence (`measured-here`):
-  the converter on a torch host (CPU only) matches the fixture's GGUF in every tensor and key, with and without an MTP
-  block; on the card (B60) the shape suite at the published 27B shapes passes (HC 4 x 5120 rank 640, QSA 24/4 heads at
-  256 over 2048 cells, GDN 16/48 at 128, the dense FFN at 14336 and 17408) and the fixture's OpenCL logits match the
-  CPU's (mean KLD 0.000137, 0.000001 without QSA, also at micro-batch 1); Flash-Next's MoE path keeps its logits (mean
-  KLD 0, same top p 100 %, on a synthetic qwen4exp MoE model; the real file's CPU arm is owed). The real checkpoint decides the layer count, the schedule and the MTP layout.
-
-- **Q8_0 expert prompt batches on the int8 DPAS tile** (patches 0167-0169): Inkling 2 Mini's four Q8_0 coda layers took a
-  prompt batch on the flat float matvec (23.2 % of a pp4096 profile); they now take the tile the IQ4_NL experts use, with
-  the experts routed into 32-pair tiles and the activations quantized per column. `GGML_OPENCL_Q8_MM_ID=0` turns it off.
-  Evidence (`measured-here`, B60, Inkling IQ4_NL, two rounds): pp4096 at ub 512 410.6 -> 522.4 t/s (+27.2 %); the arm's
-  profile share 23.2 % -> 2.1 %; KL to the CPU reference 0.001952 (same top p 98.50 %) against 0.001950 (98.34 %), and
-  identical at micro-batch 1; the op cases pass and the red build (scale dropped) fails 47 of them.
-
-- **The spill guard and the admission tiers** (patches 0160, 0173). At start the guard bounds the device demand against the
-  driver's card figure (xe's region total: the B60 24,480 MiB, the B70 32,656; OpenCL's global size reads 23,256 on the
-  B60 and the agent runs above it). The demand is libllama's breakdown (weights, context, compute), the expert cache's
-  on-card slots and banks from its own accounting, a draft model or in-model MTP context from its own breakdown, the
-  process's other device bytes, the other clients, and a 422 MiB growth margin (the worst measured growth beyond that
-  prediction, 294 MiB at the agent's 255k needle, plus 128). Host memory placed on purpose (a pinned expert bank) is
-  logged and never counted. A start that does not fit is refused with every part named and the `--n-ctx` (or expert
-  cache, projected through the cache's own accounting, 0173) that would fit; `--llama-allow-spill` keeps the old behaviour with a warning. `/props` carries the accounting
-  and the verdict. Admission is by tier: "optimized for" (Inkling 2 Mini, the Qwen3.8 27B agent, Flash-Next),
-  "verified" (the coder, Dory1.0-4B, Llama 2 7B for completions, Qwen3-TTS, Qwen2.5-VL-7B) and "runs" (any other model
-  libllama loads that passes the guard: no token mode, `--tool-grammar` refused at start and per request, chat
-  routes refused without a template, a start warning with the downgrade count; a model the table names keeps its known
-  dialect, any other gets a neutral one). A template-less runs model serves `/v1/completions` and answers chat with 400. Card evidence (`measured-here`): every production unit starts on its own
-  flags and the prediction lands within 106-172 MiB of the VRAM after the first request (agent 23,902 / 24,027,
-  Flash-Next 26,122 / 26,294); Inkling at 65,536 cells with the full SWA cache fits (23,459 / 23,585, and a 60k needle
-  answered with GTT at 308 MiB); Inkling at 131,072 full SWA (30,834) and Flash-Next with a 40,000 MiB expert cache
-  (53,627) are refused; the latter suggests `--llama-expert-cache 19107`, and the restart with it starts and
-  measures 32,402 of the B70's 32,656 MiB after the first request (32,192 predicted).
-- **Request fields and the multi-GPU warning.** `cache_prompt: false` is honoured (it was ignored: two
-  identical requests reused 4,092 of 4,096 prompt tokens); `n_predict` is an alias of `max_tokens`; `arcint:
-  {timings: true}` returns timings on `/v1/completions`. Fields that would change the result and that arcint cannot
-  honour are refused with HTTP 400 naming the field and a reason, instead of being dropped silently (one table in
-  `src/core/chat.cpp`; README "Running" lists them); their default values stay accepted (an OpenAI SDK's
-  `response_format: text`, `logprobs: false`, `n: 1`, `top_logprobs: null` or `0`, also on `/v1/responses`). A load
-  warning names the visible GPUs when there is more than one and no `--device` was given, and says the model loads
-  on GPU.0 (arcint has loaded on one card since 1.8.0; the layer split over several cards is llama.cpp's own tools'). Card evidence (`measured-here`, B60,
-  Inkling): `cache_prompt` true/true/false/true gives `cache_n` 0/1,397/0/1,397 (prefill 3,024/144/2,926/143 ms), the
-  chat route the same; the warning lists both cards without `--device` and is absent
-  with it.
-- **Docs: the runtime the numbers need.** README and `docs/docker.md` state the compute runtime, kernel and xe module
-  behind the measurements, and the image against native with the same `llama-bench` command on a B70 (0.5-2 % slower
-  decode in the image); README says arcint loads on one card and how llama.cpp's tools are pinned to one.
-- **Inkling 2 Mini's depth mix off the generic F32 GEMM** (patches 0170-0172, 0175-0180). The depth-mix products
-  (a tiny-K product batched over the tokens on an 8-slot view, and a 2x4 product per token) ran on the generic and
-  the tiled F32 GEMM at about 1-2 ms a call; they now take a batched tiny-K kernel (0171, 0175-0177, 0179) and 0157's
-  split-K GEMV in a batched dispatch (0178), on by default (0180; `GGML_OPENCL_F32_SMALLK=0` / `_SMALL_M=0` turn
-  them off); 0170's wide-N GEMM stays off (no measured gain). The tiny-K and small-M dispatches carry a host-side bounds check
-  (`GGML_OPENCL_BOUNDS=1` aborts before a launch that would read or write past its backend buffer). Evidence (`measured-here`,
-  B60, Inkling IQ4_NL, two rounds): pp4096 at ub 512 522.5 -> 628.2 t/s (+20.2 %; 676.6 with the int8 expert tile
-  `GGML_OPENCL_KQ_MM_ID_I8=1`), ub 1024 552.0 -> 712.2 with both; decode at 4k 36.0 -> 36.4; KL to the CPU reference
-  0.001979 against 0.001952 (same top p 98.50 %), 0.001949 at micro-batch 1; the op cases pass with the bounds check
-  on and the red builds fail them; the agent 27B and Flash-Next (its experts on the CPU, so this covers the F32 arms
-  only) give identical logits with the arms on and off; with Flash-Next's layers 28-47 keeping their experts on the card
-  (`-ncmoe 28`, 512-token ubatches, the defaults: `GGML_OPENCL_Q8_MM_ID` and the F32 arms on, `GGML_OPENCL_KQ_MM_ID_I8` unset)
-  neither 0167-0169's Q8_0 expert tile nor 0171-0179's F32 arms is reached: their red builds give the same logits as the
-  green ones.
-
-- **The wide int8 expert tile (opt-in)** (patches 0190-0192). `GGML_OPENCL_KQ_MM_ID_I8_WIDE=1` runs the int8 expert tile
-  (`GGML_OPENCL_KQ_MM_ID_I8`, IQ4_NL, and 0167-0169's Q8_0 prompt arm) at one work-group a 512-column band instead of 128, so a
-  route tile's activations are staged 5 times for a 2,304-row expert instead of 18. Unset compiles nothing new. Evidence
-  (`measured-here`, the B60 at 165 W unless named, Inkling IQ4_NL, I8 on in every arm):
-  - Kernel ms a visit (narrow -> wide; the reference stack's per visit beside it):
-    - ub 512: gate/up 31.32 -> 26.46 (reference 25.4), down 16.87 -> 13.56 (reference 9.8; trellis-serve @8f8e2fcc on the
-      same card, a PTI profile);
-    - ub 2048: gate/up 26.12 -> 21.21 (20.3), down 15.26 -> 11.03 (7.5).
-  - llama-bench pp4096: ub 512 676.5 -> 722.2 t/s, ub 1024 712.1 -> 765.7, ub 2048 672.4 -> 723.4.
-  - Served on the planned unit flags at ub 1024: prefill 671.4 -> 718.4 t/s; decode unchanged (35.17 at 4k, 38.94 at 0).
-  - Logits knob on = off: Inkling at ub 512 (direct, mean KLD 0); at ub 1024 / 2048 the same KL and top p against the CPU
-    reference. Flash-Next on the B70 (220 W), with its layers 28-47 experts on the card and no expert cache: reached (its
-    red gives 0.96). The 27B: no MUL_MAT_ID.
-  - With the expert cache on Flash-Next's unit flags: the same greedy texts on and off (bounds on, no abort). Reach on that
-    route is not shown.
-  - Op cases with bounds on, run on this revision built from the series itself (apply-series.sh on the pin, the applied tree
-    `git write-tree` a5610fc1; B60 at 165 W):
-    - Inkling's 16 distinct real-shape MUL_MAT_ID cases (0192's 10 IQ4_NL and 0169's six Q8_0) pass 16/16 with the knob on
-      and with it off; 0192's two Q8_0 cases that take the Q8_0 prompt arm's fallback (520 rows, not a multiple of 16; 520
-      experts, more than 512) pass 2/2; the run logs the generic path once for their shared key (`DOWNGRADE src=opencl op=MUL_MAT_ID type=q8_0 k=256
-      path=generic reason=no-fast-path`, logged once a key), so a per-case path is not shown;
-    - the MUL_MAT_ID suite gives 554 of 628 with the knob on (the 74 failures are the known mxfp4 set);
-    - the red build fails all 16 with the knob on; KL to the CPU reference (`-c 2048 --chunks 3`) is the same with the
-      knob off and on at ub 512 (0.001932, same top p 98.208 %) and ub 1024 (0.001917, 98.403 %); no bounds abort.
-    The rows above this one (the kernel times, llama-bench, the served numbers, the logit and expert-cache rows) ran on a
-    development worktree, not the applied series, and were not re-measured on it. That worktree differed from the series
-    in two refusal conditions of 0168 (which pass for every shape it ran), in patches 0161-0165 (the Qwen4 converter and
-    model files and their test cases) and in a comment.
-  - The bounds check follows the weight arguments the kernel is given (the SoA planes or an expert cache's gathered stage).
 
 ## 1.8.0 — 2026-11-22
 
