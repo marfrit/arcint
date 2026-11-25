@@ -40,6 +40,70 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   context. A partial offload of Inkling faulted at `-ngl 12` (`measured-here`); the cause by code reading, not
   reproduced, is its depth-mix stacks written through views across devices, the same code without the port. Serve
   Inkling fully offloaded.
+- **Inkling 2 Mini's depth mix as one op** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`). The prefill's depth
+  attention (`src/models/inkling2.cpp:191`) ran as 8-12 nodes a mix call: a copy of the k+1 states as a transposed view
+  (341 ms of a pp4096 pass), the first product on 0178's split-K GEMV (309), the weighted sum on 0171's tiny-K kernel
+  (82) and the query repeat (33) — 765 ms, 12.7 % of the 6,042 ms pass (`measured-here`, B60, ub 512, before this
+  series). `GGML_OP_DEPTH_MIX` is the reference's `_mix_kernel` form in this tree's OpenCL: a token a work-group, fp32,
+  the states read once into registers, the softmax and weighted sum on that copy, an output RMSNorm folded where the
+  chain norms one mixed column with one weight (an SWA layer without messages, the ffn, the output); the store's last-row
+  cpy, the repeat and the per-column cont go with it. The first card run (`measured-here`, B60) showed the path
+  never running - every op case "not supported [OpenCL]", no TAKEN line, no DOWNGRADE line: `supports_op` had also
+  required each tensor's device storage, which is null there by design, so the node went to the CPU silently. The
+  decision is now types, shapes and strides only (the shared rule), device storage is the dispatch's assert, every
+  refusal logs a DOWNGRADE line and a graph that takes fewer nodes than it was handed says so at WARN; the device-free
+  test now reads that `supports_op` case as text and fails on a `->extra` or a missing refusal line, and its stride
+  literals are the exported graph's (store `[2304, 5, tokens]`, row step 9216, slab step 46080, k 1..4). The second card
+  run (`measured-here`, B60) executed the suite: 16/19 OK, the red 19/19 failing, and the 3 failures were exactly the
+  folded-norm cases (ERR ~2), while the model run page-faulted (446 read faults at a [2304,512]-slab spacing, ~57 slabs
+  - the folded calls' count). Two defects are named: the folded-norm path's local slots aliased the first reduction's
+  results (a sub-group race, fixed: the norm's quantities sit past them and the reduce takes a base offset), and a norm
+  weight through a `reshape_2d` view is storage this tree cannot verify on the host (now refused, `nw-view`). **The model
+  no longer folds the norm** - the norms stay the chain's nodes, and the op suite carries no `with_norm` case until that
+  path has its own card evidence - so the arm's taken path is the one the card proved 16/16, and the arm's bounds are
+  always on, aborting with the buffer's name instead of faulting. **No speed row is claimed for these patches yet**: the
+  plan, the predicted numbers against both of 0187's baselines and the card command list are
+  `contrib/llama.cpp/README.md`'s 0204-0207 section. Unset, the
+  graph is today's node for node, decode and every other model untouched; `DEPTH_MIX` leaves a `DOWNGRADE` line with its
+  reason, one fixed `TAKEN` line marks the first taken call, `GGML_OPENCL_DEPTH_MIX_STATS=1` counts the graph's calls, and
+  every launch is bounded under `GGML_OPENCL_BOUNDS=1`.
+- **The depth mix's two card failures, named and fixed** (patches 0204-0207, still opt-in `GGML_OPENCL_DEPTH_MIX=1`;
+  `code`, and `measured-here` on the recipe host for the replays - no card run of this revision yet). *The page fault*
+  was not in the arm's kernel: Inkling 2 Mini is the loop model, its cross-pass `messages` are a mix result (the bank
+  store, k 1, four query columns), the arm took that call, and `build_layer`'s `message()` read the arm's
+  `[n_embd, n_tokens, 4]` dst with the chain's `[n_embd, 4, n_tokens]` strides - a row step of 4,718,592 bytes at ub 512,
+  one row at the start of each `[2304, 512]` slab, in a tensor four slabs long; the copy behind it read past the buffer.
+  Every reader of a mix result's columns now goes through one function that knows both layouts and asserts the view
+  stays inside its source (`ggml_view_within_src`, new). *The three folded-norm op failures* were one missing line:
+  `depth_mix.cl` never added the norm weight's offset. The entry above's second "named defect" (a norm weight through a
+  view) and its reading of the fault are **retracted**; the fold is back (`=nofold` keeps the norms nodes, for a card
+  bisect), the `nw-view` refusal is gone. New device-free test `depth-mix` in the recipe's unit set: the rule on 69
+  lines of the exported graph (39 prefill calls accepted, the decode lines and ten variants refused, red first against
+  the handed-over rule and an accept-all rule), the launch plan the dispatch binds from, `depth_mix.cl`'s own text run
+  on host threads against the CPU op (nmse <= 2e-14; the red build without the offset > 100), and the fault's read
+  (flagged before, clean after; `fault-before` crashes with a READ in the copy under ASan). The op cases are the
+  exported shapes only (45), with the bank's four columns and their readers. The prediction is revised to 150-300 us a
+  call, 145-290 ms a pass against the chain's 765 and the reference's 399 (`inference`); card commands in
+  `contrib/llama.cpp/README.md`.
+- **The depth mix mixed raw states** (patches 0204, 0205, 0207; found by an independent code read, `code` and
+  `measured-here` on the recipe host). The chain and the reference mix the NORMALIZED states (the chain's `rms_norm`
+  output feeds the score product and the weighted sum; the reference's `pw = p / sum(p) * inv`); the kernel and the CPU
+  op weighted the raw rows by `p` alone - a per-state reweighting a following norm does not undo, and one the op cases
+  and the replay could not see, since both compared the op with its own CPU twin. The unit test now builds the model's
+  chain node for node on the exported shapes and compares the op with it, the states at different scales: the previous
+  revision fails 16 of 16 calls (nmse 0.0091 .. 0.64), the fix agrees to 2e-13. Knob on against knob off on the CPU
+  (llama-perplexity, 381 tokens): mean KL 0.0015 nats, same top p 98.95 % folded and 99.21 % with `=nofold`
+  (knob off twice: 0, 100 %) - the KL well inside the bar, the folded arm's top p at its 1-point edge on too few tokens
+  to decide; the card arm decides. `-DDEPTH_MIX_RED` now doubles one state's weight (every case must fail; the old red
+  was cancelled by the folded norm on 12 cases), `-DDEPTH_MIX_RED_RAW` is the red of this defect.
+- **The depth mix on the card** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`; `measured-here`, B60, f16 KV,
+  int8 expert tile + wide + 0187 on, the FA port off). pp4096: ub 512 771.1 -> 908.1 t/s (+17.8 %), ub 1024 818.6 ->
+  982.1 (+20.0 %), ub 2048 770.0 -> 917.4 (+19.1 %); at the unit's ub 1024, q8_0 KV 816.4 -> 979.2. The kernel is 99.1
+  ms a pp4096 pass (960 launches, 103 us each) where the chain's four probed parts were 765 ms and the reference's own
+  mix kernel 399 ms; the pass's kernel time falls 5,229 -> 4,431 ms. The prediction (145-290 ms) missed low. Op level:
+  45 cases and 36 replayed export lines under an nmse bound of 1e-10, three reds failing what each must. Answer level
+  against the CPU base: chain 0.001932 nats / 98.21 % same top p, the arm 0.001982 / 98.44 %, the chain with one-ulp
+  noise 0.0019-0.0021 / 98.3 %. Details and what is still owed: `contrib/llama.cpp/README.md`, 0204-0207, card result 3.
 
 - **Inkling 2 Mini decode kernels** (patches 0156, 0157, 0158). 0156: Q8_0 `MUL_MAT_ID` on the int8 dot for a decode batch
   (the four coda layers' experts). 0157: split-K for one-column matvecs of few output rows (f32 and flat q8_0). 0158: the
