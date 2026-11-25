@@ -10,6 +10,7 @@
 #include "config.h"
 #include "core/swa_window.h"
 #include "harness.h"
+#include <string>
 
 using namespace lgc;
 
@@ -22,6 +23,28 @@ TEST(swa_window_a_q8_q4_sliding_window_checkpoint_is_refused_on_opencl_only) {
     CHECK(!swa_ckpt_restore_refused(1024, true, false, false));  // f16 K/V: the generic write
     CHECK(!swa_ckpt_restore_refused(1024, false, true, true));   // not on OpenCL (the CPU's memcpy)
     CHECK(!swa_ckpt_restore_refused(0, true, true, true));       // no sliding window: the 27B agent at q8_0:q4_0
+}
+
+TEST(swa_window_the_props_checkpoints_string_names_the_refusal_only_where_it_took_them) {
+    // 1.8.1 reported "off: <reason>" whenever the refusal was set, also for a model that
+    // would not have kept checkpoints (Dory without --llama-swa-window: a sliding window,
+    // no snapshotting memory). Red: the 1.8.2 rule (stale -> the reason) fails the third
+    // and fourth cases. Arguments: --llama-checkpoints, can_snapshot, the refusal.
+    const std::string reason = checkpoints_status(32, true, true);
+    CHECK(reason.rfind("off: ", 0) == 0);                          // Inkling at q8_0 K/V: taken away
+    CHECK(std::string(checkpoints_status(32, true, false)) == "on");   // Inkling at f16 K/V
+    CHECK(std::string(checkpoints_status(32, false, true)) == "off");  // Dory at q8_0, not hybrid
+    CHECK(std::string(checkpoints_status(0, true, true)) == "off");    // --llama-checkpoints 0
+    CHECK(std::string(checkpoints_status(0, false, false)) == "off");
+    CHECK(std::string(checkpoints_status(32, false, false)) == "off"); // the 27B agent: attention trims
+    // red, on every run: 1.8.2's rule (ckpt_on ? "on" : stale ? the reason : "off", with ckpt_on
+    // = ckpt_max > 0 && can_snapshot && !stale) names the reason for the Dory and the 0 cases
+    const auto rule_182 = [](int max, bool snap, bool stale) -> std::string {
+        const bool on = max > 0 && snap && !stale;
+        return on ? "on" : stale ? "off: <reason>" : "off";
+    };
+    CHECK(rule_182(32, false, true) != checkpoints_status(32, false, true));
+    CHECK(rule_182(0, true, true) != checkpoints_status(0, true, true));
 }
 
 TEST(swa_window_a_trim_inside_the_retained_history_is_exact) {

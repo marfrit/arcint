@@ -24,6 +24,10 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   token-a-group` was printed at ggml's INFO level, which arcint logs only under `-v`, so a unit with
   `GGML_OPENCL_DEPTH_MIX=1` showed the FA port's TAKEN line and not the mix's. It is now at the port's level (WARN),
   once a process, text unchanged. Device-free test red on the 1.8.2 series.
+- **`/props` `checkpoints` names the q8_0 / q4_0 refusal only where it took checkpoints away.** 1.8.1 and 1.8.2
+  reported `off: <reason>` for every start with a sliding window at q8_0 / q4_0 K/V on OpenCL, also for a model
+  that keeps no checkpoints anyway (Dory without `--llama-swa-window`: no hybrid or recurrent memory). Now
+  `off: <reason>` only when `--llama-checkpoints` > 0 and the memory can snapshot, else `off`. Behaviour unchanged.
 
 ## 1.8.2 — 2026-11-25
 
