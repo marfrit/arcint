@@ -10691,3 +10691,17 @@ least 5,000 scored tokens (a 6-chunk CPU base), and the task battery (the capita
 chain, a JSON extraction, the binary-search completion) with the arm off and on.
 
 The README is not part of the applied tree: these paragraphs leave `13ab33b8` as it is.
+
+**Provenance of the numbers in this section.** The card rows (card result 3) ran the published
+Inkling 2 Mini IQ4_NL file (`output.weight` and `token_embd.weight` Q8_0). The recipe host's CPU
+arms above (the first knob-on / knob-off KL, the per-node dump, the noise control) ran a
+re-quantized variant of the same model whose output tensor is Q6_K: they compare arms of one
+file with each other and are not comparable with the card's KL against its CPU base. The CPU
+base for the card's 6-chunk KL is made from the published file (2,456,010,284 bytes, 6 chunks of
+2,048 on the gate text, knob off, tree `13ab33b8`).
+
+**With the FA port** (`GGML_OPENCL_FA_PORT=1`, another patch set's opt-in; f16 KV, because the
+port refuses a q8_0 KV cache; `measured-here`, the operator's window): the arm and the port
+together reach **1,215 t/s** at pp4096. The ubatch size of that row and the port-alone row
+beside it are not in the reports this section was written from; they belong in the port's
+section.
