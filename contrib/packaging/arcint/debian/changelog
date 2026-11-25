@@ -19,7 +19,7 @@ arcint (1.8.1-1) trixie; urgency=medium
   * Every ggml tensor is 64 bytes larger (0193): rebuild tools built
     against this tree's headers, RPC servers and clients together.
 
- -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 25 Nov 2026 12:00:00 +0100
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 25 Nov 2026 11:55:00 +0100
 
 arcint (1.8.0-1) trixie; urgency=medium
 

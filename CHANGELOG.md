@@ -18,7 +18,7 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## 1.8.1 — 2026-11-?? **[owed: date]**
+## 1.8.1 — 2026-11-25
 
 Release gate against 1.8.0 (`measured-here`, 2026-11-25, one window: the B60 at 165 W, then the B70 at 220 W; the
 release candidate 233bfa2a, applied llama tree a52a4c2a; 1.8.0's tools from its applied tree 0053c9da; knobs unset
