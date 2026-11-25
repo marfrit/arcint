@@ -22,9 +22,9 @@ PKGREL=1
 # and carries operator-local notes; the published tree is the same code without
 # them, so the package is built from what anyone can check.
 SRC_URL="https://github.com/marfrit/arcint/archive/refs/tags/${UPSTREAM_TAG}.tar.gz"
-# sha256 of the release tag's tarball, taken after the tag was pushed (recorded in the follow-up commit, as
-# for every tag). Until then this is v1.8.0's (aba103dd...); pass ARCINT_TARBALL_SHA256 for an rc build.
-ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-aba103dd086c33cfad50cb28d03faebfa5262ea2224358cb74860672f8be3491}
+# sha256 of https://github.com/marfrit/arcint/archive/refs/tags/v1.8.1.tar.gz,
+# taken after the tag was pushed (recorded in the follow-up commit, as for every tag).
+ARCINT_TARBALL_SHA256=${ARCINT_TARBALL_SHA256:-b2c491205584bc38fa5ee4fbbd8742e3d91a7298a3f7320d1d51d0f6acd8d4c2}
 # The libllama engine (--engine llama) builds against llama.cpp at this pin
 # with contrib/llama.cpp/patches applied (contrib/llama.cpp/README.md): the
 # GitHub tarball of the commit, checked by sha256.
