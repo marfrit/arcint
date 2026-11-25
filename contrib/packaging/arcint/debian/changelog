@@ -1,3 +1,15 @@
+arcint (1.8.2-1) trixie; urgency=medium
+
+  * FIX: Inkling 2 Mini's tokenizer takes a whole-word vocabulary entry
+    whole (ignore_merges for the inkling2 pre, patch 0210): 337 words were
+    split, so a served conversation re-read its prompt and such prompts
+    were tokenized differently from training.
+  * FIX: tool call ids are unique across the turns of a conversation (they
+    restarted at call_0 every response; Inkling's template then rewrote
+    earlier text and the prompt was re-read).
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Wed, 25 Nov 2026 15:40:00 +0100
+
 arcint (1.8.1-1) trixie; urgency=medium
 
   * FIX: a checkpoint resume with a q8_0 or q4_0 K/V cache on the OpenCL
