@@ -10617,3 +10617,12 @@ conflicted; 0208 applies on top of 0207 unchanged). The FA port's knob
 (`GGML_OPENCL_FA_PORT`) is off by default and the arm's card window runs with it off unless
 stated otherwise.
 Applied tree `4c5f2df145477470efc0f8f4e7294c2d59db4060` (`measured-here`, the recipe host).
+
+**The bound covers the replays, and every depth-mix row prints its error** (0207, test only;
+found by the delta review, `code`). The `--test-file` replays run as the tool's generic case,
+whose tolerance was the default 1e-7, and the tool printed an error only for a failing
+comparison. Two changes in `tests/test-backend-ops.cpp`, nothing else: the generic case's
+tolerance switch has `GGML_OP_DEPTH_MIX` at 1e-10, and the comparison prints
+`[DEPTH_MIX] nmse = <value> (bound <bound>)` for every depth-mix output, pass or fail. So the
+45 cases and the 36 replayed lines all sit under 1e-10 and each row carries the number it
+passed with. Applied tree `13ab33b8232fac4b4fddd2cf6ed414e8328f1868`.

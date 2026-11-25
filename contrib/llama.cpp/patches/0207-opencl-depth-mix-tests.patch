@@ -1,8 +1,20 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 4bb4448..15df7ed 100644
+index 4bb4448..179978b 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6888,6 +6888,124 @@ struct test_norm_clip : public test_case {
+@@ -1563,6 +1563,11 @@ struct test_case {
+             }
+ 
+             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
++            if (t1->op == GGML_OP_DEPTH_MIX) {
++                // 0207: the depth mix's error is printed for every case, pass or fail - its bound is
++                // stated before the card run, and a passing line must carry the number it passed with
++                printf("[%s] nmse = %.3g (bound %.3g) ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
++            }
+             if (err > ud->tc->max_err(ud->backend1)) {
+                 printf("[%s] ERR = %.9f > %.9f ", ggml_op_desc(t1), err, ud->tc->max_err(ud->backend1));
+                 //for (int i = 0; i < (int) f1.size(); i++) {
+@@ -6888,6 +6893,124 @@ struct test_norm_clip : public test_case {
      }
  };
  
@@ -127,7 +139,18 @@ index 4bb4448..15df7ed 100644
  // GGML_OP_FLOOR
  struct test_floor : public test_case {
      const ggml_type type;
-@@ -13253,6 +13371,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -10730,6 +10853,10 @@ struct test_generic_op : public test_case {
+             const int64_t kv = sources[1].ne[1];
+             return 5e-4 * std::max(1.0, kv / 20000.0);
+         }
++        case GGML_OP_DEPTH_MIX:
++            // 0207: a DEPTH_MIX line replayed from a graph export (--test-file) takes the bound
++            // the depth mix's own cases have (test_depth_mix), not the tool's 1e-7
++            return 1e-10;
+         default:
+             return 1e-7;
+         }
+@@ -13253,6 +13380,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_norm_clip({13, 3, 5, 1}, true));
      test_cases.emplace_back(new test_norm_clip({7, 5, 2, 2}, false, 8.0f));
  
@@ -149,7 +172,7 @@ index 4bb4448..15df7ed 100644
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
-@@ -14473,6 +14606,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14473,6 +14615,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  
