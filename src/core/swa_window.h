@@ -28,17 +28,21 @@ inline bool swa_window_trim_complete(int n_swa, long long pos_min, size_t common
     return pos_min <= need_from;
 }
 
-// 1.8.1: whether this start must not save or restore checkpoints. A checkpoint
+// Whether this start must not save or restore checkpoints. A checkpoint
 // (PARTIAL_ONLY) carries a sliding-window cache's cells (every swa type but none),
-// and the restore writes them through views of the K / V tensors. On the OpenCL
-// backend of this release a view write into a q8_0 or q4_0 tensor returns
+// and the restore writes them through views of the K / V tensors. On the pinned
+// llama.cpp's OpenCL backend a view write into a q8_0 or q4_0 tensor returns
 // without writing, so a restore would bring back the cells' positions and not
-// their bytes: the window would attend stale keys and values. Until the write is
-// fixed (1.8.2) such a start keeps no checkpoints, and a follow-up that changes
-// earlier text re-reads the prompt. `on_opencl`: the model runs on an OpenCL
-// device; `k_q4q8` / `v_q4q8`: the K / V cache type is q8_0 or q4_0.
-inline bool swa_ckpt_restore_refused(int n_swa, bool on_opencl, bool k_q4q8, bool v_q4q8) {
-    return n_swa > 0 && on_opencl && (k_q4q8 || v_q4q8);
+// their bytes: the window would attend stale keys and values. 1.8.1 and 1.8.2
+// refused every such start. contrib/llama.cpp 0209 performs the write (1.8.3), so
+// the refusal now stands only where the binary's llama.cpp lacks it.
+// `on_opencl`: the model runs on an OpenCL device; `k_q4q8` / `v_q4q8`: the K / V
+// cache type is q8_0 or q4_0; `view_writes`: the llama.cpp tree the binary was
+// built against carries 0209 (found at configure, ARCINT_LLAMA_KV_VIEW_WRITES;
+// the recipe builds the whole series, so a release always does). A build against
+// a tree without it keeps 1.8.1's refusal instead of restoring wrong cells.
+inline bool swa_ckpt_restore_refused(int n_swa, bool on_opencl, bool k_q4q8, bool v_q4q8, bool view_writes) {
+    return n_swa > 0 && on_opencl && (k_q4q8 || v_q4q8) && !view_writes;
 }
 
 }  // namespace lgc

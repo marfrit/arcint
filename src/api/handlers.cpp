@@ -708,7 +708,17 @@ json props(const Context& ctx) {
          {{"version", ARCINT_VERSION},
           {"git", ARCINT_GIT_SHA},
           {"type", ARCINT_BUILD_TYPE},
-          {"compiler", ARCINT_COMPILER}}},
+          {"compiler", ARCINT_COMPILER},
+          // a red-case build option compiled in (CMakeLists.txt): empty in a served build; the
+          // packaging refuses a binary that carries one (contrib/packaging/arcint/build-deb.sh)
+          {"red_case", [] {
+               json a = json::array();
+#ifdef ARCINT_ASSUME_KV_VIEW_WRITES
+               a.push_back("ARCINT_ASSUME_KV_VIEW_WRITES: RED-CASE BUILD, q8_0 / q4_0 sliding-window checkpoints "
+                           "restored without patch 0209; not for serving");
+#endif
+               return a;
+           }()}}},
         // The multimodal/audio presence: the backbone, the projector and its
         // own halves (libmtmd's cap), the served TTS flag and the enrolled-voice
         // count (names not required on /props by D5; GET /v1/audio/voices

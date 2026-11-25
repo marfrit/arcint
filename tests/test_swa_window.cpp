@@ -15,13 +15,14 @@ using namespace lgc;
 
 TEST(swa_window_a_q8_q4_sliding_window_checkpoint_is_refused_on_opencl_only) {
     // 1.8.1: OpenCL + a sliding window + q8_0 / q4_0 K or V: no checkpoint (the restore would
-    // write no bytes). Red: the predicate returning false lets the first two through.
-    CHECK(swa_ckpt_restore_refused(1024, true, true, true));     // Inkling's units: q8_0 K/V
-    CHECK(swa_ckpt_restore_refused(1024, true, false, true));    // f16 K, q4_0 V
-    CHECK(swa_ckpt_restore_refused(1024, true, true, false));
-    CHECK(!swa_ckpt_restore_refused(1024, true, false, false));  // f16 K/V: the generic write
-    CHECK(!swa_ckpt_restore_refused(1024, false, true, true));   // not on OpenCL (the CPU's memcpy)
-    CHECK(!swa_ckpt_restore_refused(0, true, true, true));       // no sliding window: the 27B agent at q8_0:q4_0
+    // write no bytes). Red: the predicate returning false lets the first three through.
+    // The last argument false: a llama.cpp tree without 0209 (1.8.1's and 1.8.2's).
+    CHECK(swa_ckpt_restore_refused(1024, true, true, true, false));     // Inkling's units: q8_0 K/V
+    CHECK(swa_ckpt_restore_refused(1024, true, false, true, false));    // f16 K, q4_0 V
+    CHECK(swa_ckpt_restore_refused(1024, true, true, false, false));
+    CHECK(!swa_ckpt_restore_refused(1024, true, false, false, false));  // f16 K/V: the generic write
+    CHECK(!swa_ckpt_restore_refused(1024, false, true, true, false));   // not on OpenCL (the CPU's memcpy)
+    CHECK(!swa_ckpt_restore_refused(0, true, true, true, false));       // no sliding window: the 27B agent at q8_0:q4_0
 }
 
 TEST(swa_window_a_trim_inside_the_retained_history_is_exact) {
@@ -85,4 +86,38 @@ TEST(swa_window_the_flag_is_off_by_default_and_opt_in) {
 TEST(swa_window_the_help_names_the_flag) {
     const std::string help = usage_text();
     CHECK(help.find("--llama-swa-window") != std::string::npos);
+}
+
+TEST(swa_window_with_0209_q8_q4_sliding_window_checkpoints_are_restored) {
+    // 1.8.3: contrib/llama.cpp 0209 writes through a q8_0 / q4_0 view, so a binary built
+    // against a tree with it restores these checkpoints. Red, on every run: 1.8.1's rule (no
+    // view_writes argument, the refusal for every OpenCL q8_0 / q4_0 sliding window) refuses
+    // each of the first three cases, which this test requires to be restored.
+    const auto rule_181 = [](int n_swa, bool cl, bool k, bool v) { return n_swa > 0 && cl && (k || v); };
+    CHECK(!swa_ckpt_restore_refused(1024, true, true, true, true));     // Inkling's units: q8_0 K/V
+    CHECK(!swa_ckpt_restore_refused(1024, true, false, true, true));    // f16 K, q4_0 V
+    CHECK(!swa_ckpt_restore_refused(1024, true, true, false, true));
+    CHECK(rule_181(1024, true, true, true) != swa_ckpt_restore_refused(1024, true, true, true, true));
+    CHECK(rule_181(1024, true, false, true) != swa_ckpt_restore_refused(1024, true, false, true, true));
+    CHECK(rule_181(1024, true, true, false) != swa_ckpt_restore_refused(1024, true, true, false, true));
+    // the cases 1.8.1 allowed stay allowed
+    CHECK(!swa_ckpt_restore_refused(1024, true, false, false, true));
+    CHECK(!swa_ckpt_restore_refused(1024, false, true, true, true));
+    CHECK(!swa_ckpt_restore_refused(0, true, true, true, true));
+}
+
+TEST(swa_window_the_build_finds_0209_in_its_llama_tree) {
+    // The source's series carries 0209 (ARCINT_SERIES_HAS_0209), so a build against the
+    // tree the recipe applies must find it (ARCINT_LLAMA_KV_VIEW_WRITES, CMakeLists.txt's
+    // marker): a marker that stopped matching would turn the q8_0 / q4_0 checkpoints off
+    // with every other test green. A build against another tree (a red or an older one)
+    // fails here by design and says so.
+#if defined(ARCINT_LLAMA) && defined(ARCINT_SERIES_HAS_0209)
+#if !defined(ARCINT_LLAMA_KV_VIEW_WRITES)
+    t::fail(__FILE__, __LINE__, "the series has 0209 but ARCINT_LLAMA_DIR does not: q8_0 / q4_0 sliding-window "
+                                "checkpoints are off in this build");
+#endif
+#else
+    t::skip("not a libllama build against this source's series");
+#endif
 }

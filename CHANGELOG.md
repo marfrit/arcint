@@ -18,6 +18,22 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+- **Context checkpoints again at q8_0 / q4_0 K/V for a sliding-window cache on OpenCL** (Inkling 2 Mini at its unit's
+  q8_0, Dory1.0-4B with `--llama-swa-window`). 1.8.1 and 1.8.2 kept none there, because the restore's writes through
+  views of the K / V tensors were dropped (positions restored, bytes not); patch 0209 performs them. The refusal now
+  depends on the build: arcint's configure looks for 0209 in its llama.cpp tree (`ARCINT_LLAMA_KV_VIEW_WRITES`), and a
+  build against a tree without it keeps 1.8.1's refusal and says so at load, so it never restores wrong cells. The
+  recipe applies the whole series, so a release always restores. A follow-up that changes earlier text resumes from
+  the newest checkpoint below the change instead of re-reading the prompt; the resume line names the restore's wall
+  time. `ARCINT_ASSUME_KV_VIEW_WRITES=ON` is a red-case build option (restores without 0209), never for serving: such a
+  build names it in `/props` `build.red_case` (empty otherwise) and the packaging refuses it. The configure re-runs
+  when the tree's `ggml-opencl.cpp` changes, so an existing build directory cannot keep the lift after 0209 left.
+  Evidence: the decision's unit cases, red on the 1.8.1 rule, and a check that the build finds 0209 when the series
+  has it (`code`); 0209's op test and the probe's exact arms (contrib/llama.cpp/README.md); the served card gate at
+  the Inkling unit's settings is owed.
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn

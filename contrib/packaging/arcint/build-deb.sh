@@ -128,6 +128,12 @@ cmake -S "$SRC" -B build \
 # built native on its host: Flash-Next with the CPU misses decoded 45.6 against 49.4 t/s (measured-here,
 # 2026-10-15). Asked for explicitly, and checked.
 grep -q '^GGML_NATIVE:BOOL=ON$' build/CMakeCache.txt || { echo "GGML_NATIVE is not ON (ggml-cpu without -march=native)" >&2; exit 1; }
+# A red-case or gate build is never packaged (CMakeLists.txt: ARCINT_ASSUME_KV_VIEW_WRITES restores q8_0 / q4_0
+# sliding-window checkpoints without patch 0209; ARCINT_GATE_TAP and ARCINT_DFLASH_RED are test builds).
+if grep -qE '^(ARCINT_ASSUME_KV_VIEW_WRITES|ARCINT_GATE_TAP):BOOL=ON$|^ARCINT_DFLASH_RED:STRING=[^0]' build/CMakeCache.txt; then
+    echo "a red-case / gate build option is ON in the cache: $(grep -E '^(ARCINT_ASSUME_KV_VIEW_WRITES|ARCINT_GATE_TAP|ARCINT_DFLASH_RED)' build/CMakeCache.txt | tr '\n' ' ')" >&2
+    exit 1
+fi
 cmake --build build -j"$(nproc)"
 # the package is public: no build path (with the build user's home in it) in the binary, and two builds
 # from one tarball differ no more for it
@@ -156,6 +162,10 @@ STRAY=$(cd "$ROOT" && find . -path ./usr/include -prune -print -o \( -name '*.a'
 # The binary carries the engine (its OpenCL kernels are embedded).
 # No pipe: `strings | grep -q` takes SIGPIPE under pipefail (see the ldd
 # probe below).
+# the binary itself: a red-case or gate build says so in a string (/props build.red_case, the load lines)
+if grep -qaE 'RED-CASE BUILD|GATE TAP BUILD' "$ROOT/usr/bin/arcint"; then
+    echo "the binary is a red-case / gate build (RED-CASE BUILD / GATE TAP BUILD string): not packaged" >&2; exit 1
+fi
 grep -qa kernel_mul_mm_kq2d_q4_K_i8 "$ROOT/usr/bin/arcint" || {
     echo "the libllama engine is missing from the binary (ARCINT_LLAMA?)" >&2; exit 1; }
 # The result of GGML_NATIVE=ON, not only the ask: this host is the target host, so a ggml-cpu dot product

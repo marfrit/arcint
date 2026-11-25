@@ -234,6 +234,37 @@ if(ARCINT_LLAMA)
   else()
     message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0153 (llama_memory_attn_seq_pos_min): apply the series")
   endif()
+  # contrib/llama.cpp 0209: the OpenCL backend writes through a view of a q8_0 / q4_0 tensor
+  # (a checkpoint restore's K / V cells). 0209 adds no API, so the marker is its function in
+  # ggml-opencl.cpp. Without it a q8_0 / q4_0 sliding-window cache keeps no checkpoints
+  # (core/swa_window.h, 1.8.1's refusal): such a restore would write positions and no bytes.
+  file(STRINGS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp" ARCINT_LLAMA_0209
+       REGEX "ggml_cl_warn_view_write_dropped" LIMIT_COUNT 1)
+  # the scan is a configure step: a tree that changes under an existing build directory (0209
+  # reverted, another branch) must re-run it, or the define outlives the patch
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl.cpp")
+  if(ARCINT_LLAMA_0209)
+    target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_KV_VIEW_WRITES=1)
+    message(STATUS "contrib/llama.cpp 0209 present: q8_0 / q4_0 sliding-window checkpoints are restored")
+  else()
+    message(WARNING "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0209: a q8_0 / q4_0 sliding-window cache "
+                    "keeps no context checkpoints on OpenCL")
+  endif()
+  # the series this source carries has 0209: the unit suite checks the tree agrees (a
+  # renamed marker would otherwise turn the checkpoints off with every test green)
+  file(GLOB ARCINT_SERIES_0209 "${CMAKE_CURRENT_SOURCE_DIR}/contrib/llama.cpp/patches/0209-*.patch")
+  if(ARCINT_SERIES_0209)
+    target_compile_definitions(arcint_core PUBLIC ARCINT_SERIES_HAS_0209=1)
+  endif()
+  # A red-case build: restore q8_0 / q4_0 sliding-window checkpoints although the tree lacks
+  # 0209, to show the stale restore the refusal prevents (the served gate's red arm). Never
+  # for serving.
+  option(ARCINT_ASSUME_KV_VIEW_WRITES "red case: restore q8_0/q4_0 SWA checkpoints without 0209 (a test build only)" OFF)
+  if(ARCINT_ASSUME_KV_VIEW_WRITES)
+    target_compile_definitions(arcint_core PUBLIC ARCINT_ASSUME_KV_VIEW_WRITES=1)
+    message(WARNING "ARCINT_ASSUME_KV_VIEW_WRITES=ON: a red-case build that restores q8_0 / q4_0 sliding-window "
+                    "checkpoints whether or not the tree has 0209; not for serving")
+  endif()
   if(ARCINT_LLAMA_H MATCHES "expert_cache_bytes")
     target_compile_definitions(arcint_core PUBLIC ARCINT_LLAMA_EXPERT_CACHE=1)
     # 0024: an expert cache per card under the layer split

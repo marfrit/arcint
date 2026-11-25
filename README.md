@@ -381,9 +381,10 @@ with the port, 1,067.5 with both; decode 35.3-35.4 in every arm; the answer righ
 Inkling (tested on the B60 and the B70; other Xe2 cards untested): all five. `GGML_OPENCL_DEPTH_MIX` takes `0` or `1`;
 serve Inkling fully offloaded (see "Known limits").
 
-At q8_0 or q4_0 K/V on OpenCL, 1.8.1 keeps no context checkpoints for Inkling (a restore would not write the
-sliding-window cells back): a follow-up that changes earlier text re-reads its prompt (about 1,067 t/s at the unit's
-settings). f16 K/V (`--llama-kv f16`) keeps checkpoints. The fix is planned for 1.8.3.
+At q8_0 or q4_0 K/V on OpenCL, 1.8.1 and 1.8.2 kept no context checkpoints for Inkling (a restore did not write the
+sliding-window cells back): a follow-up that changed earlier text re-read its prompt (about 1,067 t/s at the unit's
+settings). Patch 0209 writes them, and a build whose llama.cpp tree carries it keeps checkpoints at every K/V type; a
+build against a tree without 0209 keeps the refusal and says so at load.
 
 The B70 gives the same answers (mean KL against the CPU reference identical to the B60's, the
 acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 23-30 % on generation,
@@ -716,10 +717,11 @@ service's production flags, Flash-Next's expert cache included
   not evict the referenced stored response — it is a lookup, so it refreshes
   that entry's LRU rank like any other read.
 
-## Known limits (1.8.1)
+## Known limits (1.8.3)
 
-- **No context checkpoints for a sliding-window cache at q8_0 / q4_0 K/V on OpenCL** (Inkling 2 Mini at its units'
-  q8_0): a follow-up that changes earlier text re-reads its prompt. f16 K/V keeps them; the fix is planned for 1.8.3.
+- **A build against a llama.cpp tree without patch 0209 keeps no context checkpoints for a sliding-window cache at
+  q8_0 / q4_0 K/V on OpenCL** (1.8.1's refusal; a release applies the whole series and is not affected): a follow-up
+  that changes earlier text re-reads its prompt there. The load log and `/props` `checkpoints` say so.
 - **Inkling 2 Mini needs every layer on the card.** A partial offload (`-ngl` below the layer count) faulted in a
   test at `-ngl 12`: the depth-mix state store is written from every layer, and a CPU layer's copy into the card's
   buffer fails (measured on the development tree; by code also in 1.8.0). arcint's units load every layer.

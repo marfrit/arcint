@@ -676,3 +676,18 @@ TEST(props_carries_the_admission_tier_and_the_spill_verdict) {
     CHECK_EQ(j2.at("device_memory").at("cards").at(1).at("state").get<std::string>(), std::string("allowed-spill"));
 }
 
+TEST(props_build_names_no_red_case_option_in_a_served_build) {
+    // CMakeLists.txt's red-case options mark /props build.red_case; the packaging refuses
+    // a binary that carries one. The unit suite is built without them: the array is empty.
+    FakeBackend backend;
+    Config     cfg;
+    SlotPool   slots(1);
+    Context    ctx{&cfg, &backend, &slots};
+    const auto rc = lgc::api::props(ctx).at("build").at("red_case");
+    CHECK(rc.is_array());
+#ifdef ARCINT_ASSUME_KV_VIEW_WRITES
+    CHECK_EQ(rc.size(), size_t{1});
+#else
+    CHECK_EQ(rc.size(), size_t{0});
+#endif
+}
