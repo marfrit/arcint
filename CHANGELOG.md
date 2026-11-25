@@ -35,9 +35,9 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   14 -> 20 (the positions, group classes and per-query sinks at src 14-18) and `GGML_MAX_OP_PARAMS` 64 -> 80 (the
   window), whatever the knob. The record, the reference kernel and the design of the next step are in
   `contrib/refkernels/trellis-fa/README.md`; the reference is listed in `THIRD_PARTY.md`.
-  Every number is at f16 KV (`measured-here`): the port refuses a q8_0 KV cache, which the Inkling units serve (at q8_0
-  `GGML_OPENCL_FA_PORT` changes nothing), and arcint's load-time spill guard refuses f16 KV at the units' 262,144
-  context. A partial offload of Inkling faulted at `-ngl 12` (`measured-here`); the cause by code reading, not
+  Every number above is at f16 KV (`measured-here`). The build before patches 0199q1 / 0199q2 refused a q8_0 KV cache,
+  which the Inkling units serve (the knob changed nothing there), and arcint's load-time spill guard refuses f16 KV at
+  the units' 262,144 context; the q8_0 read path and its card figures are the paragraph below. A partial offload of Inkling faulted at `-ngl 12` (`measured-here`); the cause by code reading, not
   reproduced, is its depth-mix stacks written through views across devices, the same code without the port. Serve
   Inkling fully offloaded.
   Patches 0199q1 / 0199q2 add a q8_0 read path to the port (the kernel reads ggml's q8_0 blocks in place, nothing
