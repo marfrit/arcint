@@ -293,7 +293,8 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
 
 **Known limits** (see the README's "Known limits"):
 - Inkling 2 Mini needs every layer on the card: a partial offload faulted at `-ngl 12` (the depth mix's state store is
-  a graph leaf that CPU layers write through views; 1.8.0's code, patch 0148).
+  a graph leaf that CPU layers write through views; measured on the development tree, by code also in 1.8.0, patch
+  0148).
 - The opt-in Inkling prefill switches are measured on the B60 only. Served once at an Inkling unit's own flags
   (262,144 cells, `--llama-swa-window`, q8_0 KV, ub 1,024, the 400a7dd1 fixture): prefill 764.3 t/s with the switches
   off, 1,067.5 with `GGML_OPENCL_DEPTH_MIX=1` and `GGML_OPENCL_FA_PORT=1`, decode level, the answer right.

@@ -373,7 +373,7 @@ on the B60 (llama-bench pp4096, each row on top of the previous where stated):
 | `GGML_OPENCL_DEPTH_MIX=1` | the depth mix as one op | q8_0 KV, ub 1024: 816.4 -> 979.2 |
 | `FA_PORT` and `DEPTH_MIX` together | the two savings add | q8_0 KV, ub 1024: 816.6 -> **1,171.4**; f16 KV 815.9 -> 1,215.7 |
 
-They keep the answers: KL against the CPU reference within 0.0001 nats of the arm without them, the paired FA-port
+They keep the answers: KL against the CPU reference within about 0.0001 nats of the arm without them (0.00011 at most, both switches: 0.002571 against 0.002464; inside the one-ulp noise arms), the paired FA-port
 measure at q8_0 inside one-ulp noise (0.002083 against 0.002069 nats), the task battery 8/8 with the depth mix on and
 off. Served once at an Inkling unit's own flags (262,144 cells, `--llama-swa-window`, q8_0 KV, ub 1,024, the
 400a7dd1 fixture, I8 + WIDE + CPY_TRANSPOSE on): prefill 764.3 t/s without the two, 908.0 with the depth mix, 874.5
@@ -722,7 +722,7 @@ service's production flags, Flash-Next's expert cache included
   q8_0): a follow-up that changes earlier text re-reads its prompt. f16 K/V keeps them; the fix is planned for 1.8.2.
 - **Inkling 2 Mini needs every layer on the card.** A partial offload (`-ngl` below the layer count) faulted in a
   test at `-ngl 12`: the depth-mix state store is written from every layer, and a CPU layer's copy into the card's
-  buffer fails. Already so in 1.8.0. arcint's units load every layer.
+  buffer fails (measured on the development tree; by code also in 1.8.0). arcint's units load every layer.
 - The opt-in Inkling prefill switches are measured on the B60 only.
 - `GGML_OPENCL_FA_PORT_PROBE`, `GGML_OPENCL_FA_PORT_RED`, `GGML_OPENCL_CPY_TRANSPOSE_RED` and
   `GGML_OPENCL_DEPTH_MIX_OPTS` are debug arms (the probe and the reds give wrong answers by design); none acts
