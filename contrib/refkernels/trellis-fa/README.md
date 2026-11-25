@@ -2246,8 +2246,9 @@ Refusals: `DOWNGRADE src=opencl op=FLASH_ATTN port=declined reason=<why>`, with
   and the launch agree on each. `_REFUSED`, `_SETTLE`: a q8_0 cache keeps the
   port's sources, a q4_0 cache and 8 rows lose them.
 - `port_abi_check.py`: 42 / 42 (one argument list for both builds).
-- The recipe on the code commit: 50 of 50 unit tests, the package builds. The applied tree
-  (a fresh pin + `apply-series.sh`, 153 patches): write-tree `e4d76c347d70c59d69231e3f4a5f01179aa2e4a2`.
+- The recipe: 50 of 50 unit tests, the package builds. The applied tree (a fresh pin +
+  `apply-series.sh`, 153 patches): write-tree `59732cfe995e736755dba41342f56e2cf681b56f` since the
+  harness fix of §window1 (`e4d76c34…` before it; the kernel and the backend are the same bytes).
 - The f16 build is untouched: its ISA is the same text before and after the patch.
 
 ## The offline gate on this kernel {#gate-q8}
@@ -2306,6 +2307,28 @@ down at most 1 point.
 3. **The extension's limits are checked for the q8_0 build's reads only.** The f16
    build's reads are not modelled; a separate audit of the extension's text found them
    inside every limit.
+
+## The first card window stopped in the test harness, not in the kernel {#window1}
+
+`measured-here`, the card host, B60: step 1 (one q8_0 port case) aborted before any
+launch with `CL_INVALID_MEM_OBJECT` at `clCreateSubBuffer` in this backend's
+`set_tensor`, its Q8_0 branch. No device fault. The cause (`code`): the port's test
+fill wrote the q8_0 K / V base twice - the harness's uniform init of every unnamed
+tensor, then `fill_view` through the view. The OpenCL backend repacks a q8_0 tensor
+into planes at `set_tensor` and replaces the tensor's extra; a second `set_tensor`
+reads that extra as the plain one, takes the codes' sub-buffer for the tensor's
+buffer and asks for a sub-buffer of it. An f16 base takes a second write, which is
+why the f16 cases ran. `GGML_OPENCL_BOUNDS` allocates nothing and is not involved;
+the model's cache is written by the graph and never reaches `set_tensor`. Earlier
+suite logs of this card show 680 dense q8_0 `FLASH_ATTN_EXT` cases OK: one write each.
+
+The fix is in `0199q2` only (kernel and backend byte-identical): `init_port_tensor`
+leaves a quantized base to `fill_view`, which asserts that it writes the base from
+offset 0 over its full byte size; `initialize_tensors` asserts that no skipped base
+is left unfilled. **No CPU test can show this red**: the CPU backend takes a second
+write. The red / green is the card's step 1 - it aborted on the applied tree
+`e4d76c34…` and must pass on `59732cfe…`. A second `set_tensor` of a q8_0 tensor is
+a limit of this backend that the patch does not change.
 
 ## The card commands, in order {#commands-q8}
 

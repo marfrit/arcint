@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 4bb4448..b5482bf 100644
+index 4bb4448..2e4e2cb 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -1246,6 +1246,11 @@ struct test_case {
@@ -65,7 +65,17 @@ index 4bb4448..b5482bf 100644
              // the port's inputs; the mask and the bins are built from these positions
              // in initialize_tensors, so the CPU's indexed-bias path is the same attention
              ggml_tensor * pk = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kv);
-@@ -9702,6 +9729,29 @@ struct test_flash_attn_ext : public test_case {
+@@ -9676,6 +9703,9 @@ struct test_flash_attn_ext : public test_case {
+         return (float) (x >> 40) * (1.0f / 16777216.0f);
+     }
+ 
++    // 0199q2: the quantized K / V bases whose uniform init was skipped and whose fill is still owed
++    std::vector<const ggml_tensor *> port_q_bases;
++
+     // 0199: every tensor of a port case (port 1) or of its twin (port 2)
+     void init_port_tensor(ggml_tensor * t) {
+         GGML_ASSERT(nr23[1] == 1);
+@@ -9702,6 +9732,33 @@ struct test_flash_attn_ext : public test_case {
              ggml_tensor * base = tv->view_src ? tv->view_src : tv;
              const size_t off = tv->view_src ? tv->view_offs : 0;
              std::vector<uint8_t> buf(ggml_nbytes(base), 0);
@@ -89,13 +99,46 @@ index 4bb4448..b5482bf 100644
 +                    ggml_quantize_chunk(GGML_TYPE_Q8_0, row.data(), buf.data() + off + i1*tv->nb[1] + i2*tv->nb[2], 0, 1, tv->ne[0], nullptr);
 +                    GGML_ASSERT(off + i1*tv->nb[1] + i2*tv->nb[2] + rb <= buf.size());
 +                }
-+                ggml_backend_tensor_set(base, buf.data(), 0, buf.size());
++                // the base's only write, and all of it: offset 0, its full byte size (zero where
++                // the view has no row); only then may the base go without its uniform init
++                GGML_ASSERT(buf.size() == ggml_nbytes(base));
++                ggml_backend_tensor_set(base, buf.data(), 0, ggml_nbytes(base));
++                port_q_bases.erase(std::remove(port_q_bases.begin(), port_q_bases.end(), (const ggml_tensor *) base), port_q_bases.end());
 +                return;
 +            }
              GGML_ASSERT(tv->ne[3] == 1 && (tv->type == GGML_TYPE_F32 || tv->type == GGML_TYPE_F16));
              for (int64_t i2 = 0; i2 < tv->ne[2]; ++i2) for (int64_t i1 = 0; i1 < tv->ne[1]; ++i1) for (int64_t i0 = 0; i0 < tv->ne[0]; ++i0) {
                  const float x = -1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0));
-@@ -14134,6 +14184,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -9779,6 +9836,14 @@ struct test_flash_attn_ext : public test_case {
+             // the per-head sink: zero. The port reads src[18]; the twin's sink is in its table
+             std::vector<float> z(ggml_nelements(t), 0.0f);
+             ggml_backend_tensor_set(t, z.data(), 0, z.size() * sizeof(float));
++        } else if (t->view_src == nullptr && ggml_is_quantized(t->type)) {
++            // 0199q2: the base of a q8_0 K / V view. It gets ONE write: fill_view's, through the
++            // view that comes after it, which sets every byte of the base. A backend that
++            // repacks a quantized tensor at set_tensor (OpenCL: planes, and the tensor's extra
++            // replaced) cannot take a second set_tensor of the same tensor - the card stopped
++            // there with CL_INVALID_MEM_OBJECT, a sub-buffer of the first write's sub-buffer.
++            // The base is noted, and initialize_tensors asserts that a fill_view wrote it whole
++            port_q_bases.push_back(t);
+         } else if (t->view_src == nullptr) {
+             // anything else: the base of a view above (overwritten through the view, which
+             // comes after it), the output, or the harness's sentinels, which it compares
+@@ -9787,9 +9852,13 @@ struct test_flash_attn_ext : public test_case {
+     }
+ 
+     void initialize_tensors(ggml_context * ctx) override {
++        port_q_bases.clear();
+         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+             if (port) {
+                 init_port_tensor(t);
++                // 0199q2: after the last tensor, no quantized base may be left without its fill
++                GGML_ASSERT((ggml_get_next_tensor(ctx, t) != NULL || port_q_bases.empty()) &&
++                            "a quantized K / V base was skipped by the uniform init and never filled");
+                 continue;
+             }
+             if (strcmp(t->name, "s") == 0) {
+@@ -14134,6 +14203,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
              GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
              1, (int32_t) c[2], (int32_t) c[3], c[4]));
      }
@@ -121,7 +164,7 @@ index 4bb4448..b5482bf 100644
      // 0199: a table whose pad bin is not zero, with keys far past the extent (2,200 keys, no
      // window): the port must read the bin (GGML_OPENCL_FA_PORT_RED=4 assumes zero and must
      // FAIL this case), and its twin gives today's kernels the same table
-@@ -14521,6 +14590,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -14521,6 +14609,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
              GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
              port, 0, 0, 2560));
      }
@@ -140,7 +183,7 @@ index 4bb4448..b5482bf 100644
  
      // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
      // 27B's geometry (head size 256, 24 query heads on 4)
-@@ -15368,6 +15449,12 @@ static const int FA_PORT_EVAL_PORT1     = 11;
+@@ -15368,6 +15468,12 @@ static const int FA_PORT_EVAL_PORT1     = 11;
  static const int FA_PORT_EVAL_PORT1_PAD = 1;
  static const int FA_PORT_EVAL_PORT2     = 5;       // 4 with pad_bias=0 and the pad's twin
  static const int FA_PORT_EVAL_PORT2_PAD = 1;
@@ -153,7 +196,7 @@ index 4bb4448..b5482bf 100644
  
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
  
-@@ -15380,17 +15467,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+@@ -15380,17 +15486,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
  static bool test_fa_port_decisions() {
      const bool red = getenv("GGML_TEST_FA_PORT_ROUTE_RED") != nullptr;
      auto cases = make_test_cases_eval();
@@ -175,7 +218,7 @@ index 4bb4448..b5482bf 100644
          ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
          ggml_context * ctx = ggml_init(params);
          ggml_tensor * op = fa->build_graph(ctx);
-@@ -15402,16 +15491,17 @@ static bool test_fa_port_decisions() {
+@@ -15402,16 +15510,17 @@ static bool test_fa_port_decisions() {
              lau[gqa_wide] = fa_port_gate_at_launch(op, red ? 0 : 1, gqa_wide, 1, 4096, 256, 1, &wl[gqa_wide]);
              ok = ok && sup != 0 && lau[gqa_wide] == sup;
          }
@@ -197,7 +240,7 @@ index 4bb4448..b5482bf 100644
             counts ? "as the table says" : "FAIL, the table above is stale");
      printf("  port decisions%s: %s\n", red ? " (the old dispatch order)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
      return n_fail == 0 && counts;
-@@ -15457,7 +15547,8 @@ static bool test_fa_port_guard() {
+@@ -15457,7 +15566,8 @@ static bool test_fa_port_guard() {
  
  // 0199: GGML_TEST_FA_PORT_REFUSED=1 (no device needed): an op the port's gate refuses does
  // not keep the port's sources. For each shape - the port's eval cases (accepted), and
@@ -207,7 +250,7 @@ index 4bb4448..b5482bf 100644
  // the op is built with the port's sources, the gate is asked (fa_port_gate_op, the function
  // supports_op calls), and what the graph builder does with the answer is done: a refusal
  // drops the sources and gives the op today's table (ggml_flash_attn_ext_drop_port_sources).
-@@ -15474,7 +15565,9 @@ static bool test_fa_port_refused() {
+@@ -15474,7 +15584,9 @@ static bool test_fa_port_refused() {
          { "9 rows",                           160,   9, GGML_TYPE_F16,  1, true  },
          { "8 rows (a verify step)",           160,   8, GGML_TYPE_F16,  1, false },
          { "1 row (a decode step)",            160,   1, GGML_TYPE_F16,  1, false },
@@ -218,7 +261,7 @@ index 4bb4448..b5482bf 100644
      };
      int n_fail = 0;
      for (const shape & sh : shapes) {
-@@ -15512,7 +15605,8 @@ static bool test_fa_port_refused() {
+@@ -15512,7 +15624,8 @@ static bool test_fa_port_refused() {
  // (fa_port_settle, what build_attn_mha calls after it attached the port's sources) with a
  // mock backend that declares the port's sources and answers supports_op with the port's
  // gate - so it refuses what the real backend refuses. Rows: an accepted shape on the layer's
@@ -228,7 +271,7 @@ index 4bb4448..b5482bf 100644
  // accepted shape whose layer has no scheduler backend (the op would run on the CPU fallback)
  // loses them. A dropped op has no port source, window 0 and today's table.
  // GGML_TEST_FA_PORT_SETTLE_RED=1 skips the step (the builder before it): the refused and the
-@@ -15540,7 +15634,8 @@ static bool test_fa_port_settle() {
+@@ -15540,7 +15653,8 @@ static bool test_fa_port_settle() {
          { "512 rows, the layer's backend",            1536, 512, GGML_TYPE_F16,  1, true  },
          { "9 rows, the layer's backend",               160,   9, GGML_TYPE_F16,  1, true  },
          { "8 rows, the layer's backend",               160,   8, GGML_TYPE_F16,  1, false },
@@ -238,7 +281,7 @@ index 4bb4448..b5482bf 100644
          { "512 rows, no scheduler backend for layer", 1536, 512, GGML_TYPE_F16,  0, false },
      };
      int n_fail = 0;
-@@ -15596,15 +15691,19 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+@@ -15596,15 +15710,19 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
          ggml_free(ctx);
      };
      int n_fail = 0;
@@ -263,7 +306,7 @@ index 4bb4448..b5482bf 100644
                                     model_layout ? std::array<int32_t, 4>{0, 2, 1, 3} : std::array<int32_t, 4>{0, 1, 2, 3},
                                     !model_layout, false, 0, true, 1025, false,
                                     i == 0 ? 1 : 2, (int32_t) c[2], (int32_t) c[3], c[4], c[0] == 2200 ? 2.5f : 0.0f);
-@@ -15621,8 +15720,8 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+@@ -15621,8 +15739,8 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
              // the same attention up to rounding: the twin's bins carry bias - sink (magnitude
              // ~10 against the port's ~4), and the CPU kernel rounds scores through f16
              const bool ok = same_mask && out[i].size() == out[0].size() && nmse < 1e-5;
@@ -274,7 +317,7 @@ index 4bb4448..b5482bf 100644
                     i == 1 ? "model layout" : "contiguous, kv view", same_mask ? "identical" : "DIFFERS", nmse, ok ? "OK" : "FAIL");
              n_fail += !ok;
          }
-@@ -15631,11 +15730,312 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+@@ -15631,11 +15749,312 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
      return n_fail == 0;
  }
  
