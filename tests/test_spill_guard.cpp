@@ -68,6 +68,26 @@ TEST(spill_guard_inkling_131072_full_swa_is_truly_over_the_card) {
     CHECK_EQ(static_cast<size_t>(d.accounted), (30372 + 422) * MiB);
 }
 
+TEST(spill_guard_a_refusal_on_the_opencl_fallback_says_so) {
+    // 1.8.1: the agent at 262,144 cells fits the B60 by the driver's 24,480 MiB but not by OpenCL's
+    // 23,256; a refusal on the fallback names it (red: the text without the sentence).
+    SpillFacts f = facts(23902 * MiB, 0, 262144);
+    f.card_total = 23256 * MiB;
+    f.card_from_driver = false;
+    const SpillDecision d = spill_guard(f);
+    CHECK(d.refuse);
+    CHECK(d.text.find("OpenCL's global memory size") != std::string::npos);
+    CHECK(d.text.find("i915") != std::string::npos);
+    SpillFacts g = facts(23902 * MiB, 0, 262144);   // the same demand against the driver's figure fits
+    const SpillDecision e = spill_guard(g);
+    CHECK(!e.refuse);
+    CHECK(e.text.find("OpenCL's global memory size") == std::string::npos);
+    SpillFacts h = facts(24480 * MiB, 0, 262144);    // a refusal on the driver's figure does not blame the fallback
+    const SpillDecision r = spill_guard(h);
+    CHECK(r.refuse);
+    CHECK(r.text.find("OpenCL's global memory size") == std::string::npos);
+}
+
 TEST(spill_guard_the_allow_spill_flag_warns_but_starts) {
     SpillFacts f = facts(30372 * MiB, 0, 131072);
     f.allow_spill = true;

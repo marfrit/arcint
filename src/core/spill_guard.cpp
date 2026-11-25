@@ -141,6 +141,12 @@ SpillDecision spill_guard(const SpillFacts& f) {
         d.text = head + "; start does NOT fit, allowed by --llama-allow-spill (it may spill to GTT)";
     } else {
         d.text = head + "; start refused (pass --llama-allow-spill to run it anyway)";
+        // Without the xe driver's figure the budget is OpenCL's global memory size, which can be
+        // below the card (the B60: 23,256 against 24,480 MiB) and refuse a start that fits the card.
+        if (!f.card_from_driver)
+            d.text += "; the card figure is OpenCL's global memory size because the xe driver's was not available "
+                      "(an i915 host, a build without drm/xe_drm.h, or several xe clients without a PCI bus id): "
+                      "it can be below the card's real size, so this refusal may be the fallback's, not the card's";
     }
     return d;
 }
