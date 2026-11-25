@@ -1,4 +1,4 @@
-0220: dense Q8_0 x F32 products of 16 or more columns on the 2D-block GEMM of mul_mm_kq_2d.cl behind GGML_OPENCL_Q8_2D (0 off, the default: nothing is built and the 0058 tile takes Q8_0 as before; 1 fp16, kernel_mul_mm_kq2d_q8_0; 2 int8, kernel_mul_mm_kq2d_q8_0_i8, the Q4_0 int8 kernel with the decode removed: Q8_0's codes are the DPAS operand). A program of its own from the same text (Q8_2D_ONLY: the K-quants' program is unchanged), the work-group sized to the rows, a pure gate (ggml-opencl-q8-2d.h: Q8_0 SoA, F32, K % 256, contiguous, no view, at most 8,192 rows, the 2D limits) with a DOWNGRADE line on refusal and one TAKEN line a process, the int8 activations in GGML_OPENCL_Q8_2D_SLOTS slots (default 4), bounds under GGML_OPENCL_BOUNDS, three reds through GGML_OPENCL_KQ_2D_OPTS (-DQ8_2D_RED=1 / 2 / 3: a block's codes, the block scales' row, the activation scales' token), an inline-vISA decode for the fp16 arm behind GGML_OPENCL_Q8_2D_VISA=1 (the C form the fallback), and the served shapes as op and perf cases, with op cases on a fill that tells the scales apart (test_mul_mat_spread: the uniform fill cannot see red 3).
+0220: dense Q8_0 x F32 products of 16 or more columns on the 2D-block GEMM of mul_mm_kq_2d.cl behind GGML_OPENCL_Q8_2D (0 off, the default: nothing is built and the 0058 tile takes Q8_0 as before; 1 fp16, kernel_mul_mm_kq2d_q8_0; 2 int8, kernel_mul_mm_kq2d_q8_0_i8, the Q4_0 int8 kernel with the decode removed: Q8_0's codes are the DPAS operand). A program of its own from the same text (Q8_2D_ONLY: the K-quants' program is unchanged), the work-group sized to the rows, a pure gate (ggml-opencl-q8-2d.h: Q8_0 SoA, F32, K % 256, contiguous, no view, at most 8,192 rows, the 2D limits) with a DOWNGRADE line on refusal and one TAKEN line a process, the int8 activations in GGML_OPENCL_Q8_2D_SLOTS slots (default 4), bounds under GGML_OPENCL_BOUNDS, three reds through GGML_OPENCL_KQ_2D_OPTS (-DQ8_2D_RED=1 / 2 / 3: a block's codes, the block scales' row, the activation scales' token), an inline-vISA decode for the fp16 arm behind GGML_OPENCL_Q8_2D_VISA=1 (the C form the fallback), and the served shapes as op and perf cases, with op cases on a fill that tells the scales apart (test_mul_mat_spread: the uniform fill cannot see red 3); every Q8_0 x F32 MUL_MAT case prints its NMSE, pass or fail.
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h b/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h
 new file mode 100644
@@ -745,10 +745,23 @@ index 7f138d6..c699ec1 100644
 +}
 +#endif // Q8_2D_KERNELS
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c3ff1b1..2e51200 100644
+index c3ff1b1..ef8dee6 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -5954,6 +5954,45 @@ struct test_mul_mat : public test_case {
+@@ -5836,6 +5836,12 @@ struct test_mul_mat : public test_case {
+         return 5e-4;
+     }
+ 
++    // 0220: a Q8_0 case prints its error pass or fail, so a red's margin (and a red the fill cannot see)
++    // is a number in the log, not only a verdict
++    const char * err_tag() override {
++        return type_a == GGML_TYPE_Q8_0 && type_b == GGML_TYPE_F32 ? "MUL_MAT q8_0" : nullptr;
++    }
++
+     double max_nmse_err(ggml_backend_t backend) override {
+         // for blackwell we quantize activations to mxfp4 instead of q8_1 so we add higher tolerance
+         if ((type_a == GGML_TYPE_MXFP4 || type_a == GGML_TYPE_NVFP4) &&
+@@ -5954,6 +5960,45 @@ struct test_mul_mat : public test_case {
      }
  };
  
@@ -794,7 +807,7 @@ index c3ff1b1..2e51200 100644
  // ARC-LAB 0116: a 2-D view of a quantized weight that is not a whole slice of it: [K, N, E] reshaped to
  // [K, N E] (the elements of the parent, not its slices), or (rows > 0) the first `rows` rows of a [K, N]
  // weight at offset 0. OpenCL keeps the low-bit types and Q3_K in planes per slice of the parent, so a
-@@ -13324,6 +13363,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13324,6 +13369,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, true, 520, 512, 256));
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 520, 8, true, 512, 512, 256));
  
@@ -832,7 +845,7 @@ index c3ff1b1..2e51200 100644
      // multiple blocks per row: exercises the block-stride loop and the
      // per-expert base offset, which k == 256 alone leaves untested
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
-@@ -15151,6 +15221,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -15151,6 +15227,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_mul_mat_id_routed(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, bs, 2304));
      }
  

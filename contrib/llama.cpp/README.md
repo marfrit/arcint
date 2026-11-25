@@ -10943,7 +10943,9 @@ port's per-row int8 route.
   its activation token t, 256-block s by 2^((t + s) % 8 - 4); 3,072 x 2,304 at 1,024 tokens, 24 rows at
   1,025, 257 rows at 512, 1,024 x 256 at 512, and the first two again with `big=1` (every token t % 61 == 7
   times 2^15, past the f16 conversion's 16,384, so the fp16 arm's column scale moves). The uniform cases
-  stay.
+  stay. Every Q8_0 x F32 `MUL_MAT` case prints its NMSE (`[MUL_MAT q8_0] nmse = ... (bound
+  5e-4)`, once a compared node; the output's is the largest), pass or fail, so a red's margin and a red
+  the fill cannot see are numbers in the log.
 - The gate's limit includes K x columns < 2^31: the activations are keyed and sized by an `int` of K x
   columns (as Q4_0's int8 arm), which K 8,192 at 262,144 columns would overflow.
 
@@ -10991,7 +10993,7 @@ unit test asserts mode 0 refuses every export line as `off`.
   by their parameters (Q8_0 x F32, 16+ columns, plain layout, K % 256, at most 8,192 rows).
 
 **Card rows (owed).** The B60, by PCI id; the build from the applied series on the pin (development
-`f81d6175` + 0220: write-tree `472fb863e412603dda7205eb0649727e669e0c8e`); `-b GPUOpenCL`, every suite
+`f81d6175` + 0220: write-tree `a6ed9f554cfeb8ad1daa0f43ae1a690947e36f12`); `-b GPUOpenCL`, every suite
 run's summary line and per-class counts asserted, not an OK count; the B60's board power cap named with
 every number. `UENV` is the Inkling unit's prompt switches (`GGML_OPENCL_KQ_MM_ID_I8=1
 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 GGML_OPENCL_CPY_TRANSPOSE=1 GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_FA_PORT=1`);
