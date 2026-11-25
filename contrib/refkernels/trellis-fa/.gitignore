@@ -1,0 +1,7 @@
+out/
+*.spv
+*.spvasm
+*.bc
+*.bin
+*.zebin
+fa_ref_host

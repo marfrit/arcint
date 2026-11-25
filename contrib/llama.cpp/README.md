@@ -9867,3 +9867,80 @@ GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`):
   ones (the model's other copies, e.g. `ne=[3,1024,1,1]` failing `same_shape` and `nb01==4`). With `-lv 4`
   it printed the taken line, in the Inkling ub 512 identity run too. A per-call counter would still
   give the count; it belongs to the follow-up on the narrow destination.
+
+## 0193-flash-attn-port-op-sources.patch / 0194-flash-attn-port-sink-positions.patch / 0198-opencl-flash-attn-port-kernel.patch / 0199-flash-attn-port-tests.patch
+
+Inkling 2 Mini's prompt attention after trellis-serve's `fa::Kern<128>` (MIT; `THIRD_PARTY.md`), as an opt-in arm of the
+OpenCL backend: `GGML_OPENCL_FA_PORT=1`. Unset, the dispatch and the model's graph are what they were. The full record -
+the reference kernel, the plan, each card run, the reviews and the design of the next step - is
+`contrib/refkernels/trellis-fa/README.md`.
+
+- **0193** (`ggml.h`, `ggml-impl.h`, `ggml.c`): the op's new sources and their setters - `kpos` / `qpos` (I32), one class a
+  16-key group and one flag a 8-row group (I8), the per-query sink logits (F32 `[n_head, rows]`, src 18) and the window
+  (op param 16). `GGML_MAX_SRC` 14 -> 20 and `GGML_MAX_OP_PARAMS` 64 -> 80: **64 bytes more a tensor, with the knob or
+  without**. The indexed-bias setter accepts the table as `[n_bins, n_head, rows]` too.
+- **0194** (`ops.cpp`, `llama-graph.*`, `llama-kv-cache.*`, `inkling2.cpp`): for a prompt batch (flash attention, causal,
+  the standard window, more than 8 rows, one stream) on a layer whose backend declares the port's sources, the sink is
+  not folded into the table (the table is the bias only, bin-fastest as the MUL_MAT emits it) and rides as src 18; the
+  kv-cache walk fills the positions and classes; the sources are on the op before the backend's `supports_op` is asked.
+  The CPU's kernel reads both table layouts and the per-query sink. Any other graph is today's.
+- **0198** (`fa_port_gate.h`, `ggml-opencl.cpp`, `kernels/flash_attn_port.cl`): the gate as pure functions (the strides the
+  kernel indexes, the 2D block read's alignment, the work-group, the paged forms refused), one decision for `supports_op`
+  and the launch, the port taken first in the dispatch, a bounds check of every buffer under `GGML_OPENCL_BOUNDS=1`, a
+  DOWNGRADE line a refusal, one TAKEN line a process. The kernel: one sub-group a (head, 8-row) tile over 32-key blocks,
+  K/V by 2D block reads, a class a key group and a skip a block, the bias run as one block read and a shuffle, the pad
+  bin read once a tile, the online softmax with the sink as its initial state, Q held in registers at 256 GRF.
+- **0199** (`test-backend-ops.cpp`): the port's cases in the model's layout (the graph export's prompt lines), their twins
+  for the indexed-bias kernels of today on the same data, the pad case, the perf rows, and three device-free checks
+  (`GGML_TEST_FA_PORT_TWINS`, `_DECISIONS`, `_GUARD`), each with a red.
+
+Knobs: `GGML_OPENCL_FA_PORT` (the arm), `_GRF=128|256` (256), `_QHOIST`, `_QF32`, `_SKIP`, `_UNIFORM`, `_QTW`,
+`_RED=1|2|4` (each must fail), `_PROBE=nobias` (a timing probe with wrong answers).
+
+`measured-here`, the card host, B60 at 165 W. The op, us a call, window 1,024, 24 heads on 8, head 128, 1,025 bins:
+
+| shape | the port, 256 GRF | the kernel it replaces (the twin) |
+|---|---|---|
+| q512 x kv1536 | 746 | 2,263 |
+| q2048 x kv2048 | 2,092 | 9,577 |
+| q2048 x kv3072 | 2,926 | 12,645 |
+
+Inkling pp4096, t/s, the port off / on: 769.2 / 909.8 (ub 512), 816.0 / 973.9 (ub 1024), 763.9 / 980.8 (ub 2048), 749.5 /
+975.7 (ub 4096). Mean KL at ub 1024 against the CPU base 0.001917 -> 0.001965, top p 98.40 -> 98.47 %. The op suite is
+complete with the knob on (3,190 cases) and off (3,179); the reds fail every case they run; with the knob unset three
+models match the development build. Not through a release gate.
+
+Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
+(`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
+
+## 0208-test-backend-ops-inkling-expert-projection-perf.patch
+
+The expert DOWN projection next to the fused GATE_UP as perf cases, so one card run compares them, plus
+one correctness case each so the CPU reference runs both. The shapes, strides and ids layout are the
+Inkling 2 Mini graph export's MUL_MAT_ID lines, named in the ub 512 / 1024 / 2048 exports:
+`ffn_moe_down-0` (IQ4_NL weights `[1152, 2304, 128]`, nb 18 / 648 / 1,492,992; a token's F32
+activations `[1152, 8, n]`, nb 4 / 4,608 / 36,864) and `ffn_moe_gate_up-0` (`[2304, 2304, 128]`,
+nb 18 / 1,296 / 2,985,984; gate and up fused, so b is one broadcast column, `[2304, 1, n]`, nb
+4 / 9,216 / 9,216). The ids are the constructor's own view: a token's 128-wide I32 row with the
+8 used columns, nb1 512. 128 experts, top-8, F32 activations, at 512, 1,024 and 2,048 tokens; 2,304
+rows both ways, K 1,152 for down and K 2,304 for gate/up. The routing is fixed (seed 20261124), each
+token's eight slots eight distinct experts over the 128, not the base case's random re-draw: per-expert
+pair counts 20..51 (mean 32) at 512, 46..91 (64) at 1,024, 100..166 (128) at 2,048, no expert empty.
+`test_mul_mat_id_routed` keeps the routing between perf iterations, so the two arms time the same work.
+
+Prediction before the card (inference): at 512 tokens the wide-tile per-visit figures of 0190 (26.46 ms
+gate/up, 13.56 ms down over 8 ub chunks) are 3,310 and 1,700 us a call; the narrow tile gives 3,915 and
+2,110. Down's narrow-to-wide difference is 0.41 ms a call, which is the 0.43 ms a call the 2026-11-24
+pass reading gives over 384 calls (165 ms); the int8 floor is about 0.11 ms a call. At 1,024 and 2,048
+the weights are re-read once a 512-column band, 2 and 4 times, so about 3.3 / 6.6 ms a call for down and
+6.5 / 12.9 for gate/up, before the empty-tile floor.
+
+Card commands, perf mode:
+```
+GGML_OPENCL_KQ_MM_ID_I8=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
+GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
+```
+
+CPU gate: `test-backend-ops -b CPU -o MUL_MAT_ID -p 'routed=1'` gives 2/2 OK (the two new correctness
+cases). The whole `-o MUL_MAT_ID` family did not finish here within a 30-minute cap (163 OK, 0 fail before
+the cap; the suite's large 512-expert cases dominate), so the full-family CPU row is open.

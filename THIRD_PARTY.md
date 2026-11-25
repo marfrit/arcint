@@ -8,6 +8,12 @@ Vendored, single-header, licenses unchanged:
 | nlohmann/json | 3.11.3 | MIT | `third_party/nlohmann/json.hpp` |
 | minja (chat templating) | vendored | MIT | via `minja/chat-template.hpp` |
 
+Reference material, not compiled into arcint or its package:
+
+| component | version | license | file |
+|---|---|---|---|
+| trellis-serve, `fa::Kern<128>` (the prefill attention kernel) | commit `8f8e2fcc`, `xpu/csrc/inkling2_ops.sycl` lines 509-654 | MIT, Copyright (c) 2026 0xSero | `contrib/refkernels/trellis-fa/fa_kern.sycl` (the block verbatim, with its notice); `contrib/llama.cpp/patches/0198-opencl-flash-attn-port-kernel.patch` adds `flash_attn_port.cl`, an OpenCL kernel written after its structure |
+
 `third_party/httplib.h` is cpp-httplib **0.18.3** with two small local
 changes. The exact diff against a fresh upstream v0.18.3 `httplib.h` is
 `third_party/httplib-arcint.patch` (4 hunks; `--- a/httplib.h`).

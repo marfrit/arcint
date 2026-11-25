@@ -1,0 +1,1091 @@
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index a1c914b..63a481f 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -272,6 +272,7 @@ set(GGML_OPENCL_KERNELS
+     gated_delta_net_intel
+     flash_attn_dpas
+     flash_attn_dpas2
++    flash_attn_port
+     flash_attn_gqa_dpas
+     sub
+     sum_rows
+diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
+new file mode 100644
+index 0000000..4fc068b
+--- /dev/null
++++ b/ggml/src/ggml-opencl/fa_port_gate.h
+@@ -0,0 +1,237 @@
++// fa_port_gate.h - the port arm's eligibility, as one pure function (no OpenCL call, no
++// backend state), so a CPU test can feed it a graph export's own lines.
++//
++// Each rule exists because of what flash_attn_port.cl indexes:
++//   q:     kernel_flash_attn_port_q16 (the prepass) reads 8 floats at
++//          head*nb[2] + row*nb[1] + 32*c; any row and head stride, D contiguous (nb[0] 4);
++//   k/v:   the 2D block reads, surface (D*2-1, n_kv-1, nb[1]-1) at base + kvh*nb[2]: f16,
++//          the head's base 64-byte aligned, the row pitch a multiple of 16 bytes and
++//          at least 64 and D*2, below 2^24 (the rules flash_attn_dpas2.cl's reads have);
++//   mask:  f16, row*nb[1]/2 + key;
++//   table: f32 [n_bins, n_head, rows], ((row*n_head + head)*n_bins + bin), a run of 16 bins;
++//   sink:  f32 [n_head, rows], row*n_head + head;
++//   positions and flags: element i;
++//   dst:   f32 [D, n_head, rows], head*nb[1] + row*nb[2] + 4*col.
++// 0198's first form asked for ggml_is_contiguous(q/k/v) and declined every call of the
++// model on the card (reason=layout): its FLASH_ATTN_EXT inputs are permuted views, q
++// [128, Lq, 24] nb [4, 12288, 512] and K/V [128, n_kv, 8] nb [2, 2048, 256]. That rule is
++// kept under FA_PORT_GATE_RED for the unit test's red run (port_gate_test.cpp) only.
++#ifndef FA_PORT_GATE_H
++#define FA_PORT_GATE_H
++
++#include <ggml.h>
++#include <ggml-backend.h>
++#include <stdint.h>
++#include <string.h>
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++// 1 accept, 0 refuse with *why set. Pure: the tensors' type/ne/nb/view_offs and scalars.
++// buf_align is the backend's buffer alignment: a tensor's placed offset is its buffer's
++// (a multiple of buf_align, by the allocator) plus its view offset, so "the K/V base is
++// 64-byte aligned" is decided here, from the view and the alignment, before any tensor is
++// placed - the launch only asserts it. wg_max is the work-group the device grants a
++// kernel: one sub-group (16 lanes) a head of a kv head's group must fit it.
++static inline int fa_port_gate_why(
++        const struct ggml_tensor * q, const struct ggml_tensor * k, const struct ggml_tensor * v,
++        const struct ggml_tensor * mask, const struct ggml_tensor * dst,
++        const struct ggml_tensor * table, const struct ggml_tensor * indices,
++        const struct ggml_tensor * sinks_q,
++        const struct ggml_tensor * kpos, const struct ggml_tensor * qpos,
++        const struct ggml_tensor * cflag, const struct ggml_tensor * rflag,
++        size_t buf_align, size_t wg_max, int is_intel, int paged, int has_bias,
++        float max_bias, float logit_softcap, int32_t window,
++        const char ** why_out) {
++#define REFUSE(r) do { *why_out = (r); return 0; } while (0)
++    if (!has_bias || table == NULL || indices == NULL) REFUSE("no-bias");
++    if (!is_intel) REFUSE("device");
++    if (paged) REFUSE("paged");
++    if (kpos == NULL || qpos == NULL || cflag == NULL || rflag == NULL) REFUSE("no-positions");
++    if (sinks_q == NULL) REFUSE("no-sinks");
++    if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) REFUSE("streams");
++    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) REFUSE("kv-type");
++    if (q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) REFUSE("head");
++    if (q->ne[1] < 9) REFUSE("decode");          // n_q <= 8: the model keeps today's graph and kernels
++    if (mask == NULL || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) REFUSE("mask");
++    if (max_bias != 0.0f) REFUSE("alibi");
++    if (logit_softcap != 0.0f) REFUSE("softcap");
++    if (window < 0) REFUSE("window");
++
++    const int64_t D = 128, rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_head_kv = k->ne[2];
++    if (n_kv < 1 || n_kv >= (1 << 24) || n_head_kv < 1 || n_head % n_head_kv != 0 ||
++        v->ne[1] != n_kv || v->ne[2] != n_head_kv) REFUSE("shape");
++    if ((size_t) (16 * (n_head / n_head_kv)) > wg_max) REFUSE("work-group");
++    if (mask->ne[0] < n_kv || mask->ne[1] < rows || mask->nb[0] != 2 || mask->nb[1] % 2 != 0 ||
++        mask->nb[1] < (size_t) (n_kv * 2)) REFUSE("mask");
++    if (dst == NULL || dst->type != GGML_TYPE_F32 || dst->ne[0] != D || dst->ne[1] != n_head ||
++        dst->ne[2] < rows || dst->nb[0] != 4 || dst->nb[1] != (size_t) (D * 4) ||
++        dst->nb[2] != (size_t) (n_head * D * 4)) REFUSE("dst");
++
++#ifdef FA_PORT_GATE_RED
++    // 0198's original rule, a contiguous order: refuses the model's permuted views
++    if (q->nb[1] != q->ne[0]*q->nb[0] || q->nb[2] != q->ne[1]*q->nb[1] ||
++        k->nb[1] != k->ne[0]*k->nb[0] || k->nb[2] != k->ne[1]*k->nb[1] ||
++        v->nb[1] != v->ne[0]*v->nb[0] || v->nb[2] != v->ne[1]*v->nb[1]) REFUSE("layout");
++#else
++    // q: the prepass's vload8 at head*nb[2] + row*nb[1]: D contiguous floats, float-aligned strides
++    if (q->nb[0] != 4 || q->nb[1] < 4 || q->nb[2] < 4 || q->nb[1] % 4 != 0 || q->nb[2] % 4 != 0 ||
++        q->view_offs % 4 != 0) REFUSE("layout-q");
++    // k/v: the 2D block reads' surface
++    if (buf_align % 64 != 0) REFUSE("layout-align");
++    if (k->nb[0] != 2 || k->nb[1] % 16 != 0 || k->nb[1] < 64 || k->nb[1] < (size_t) (D * 2) ||
++        k->nb[1] >= ((size_t) 1 << 24) || k->nb[2] % 64 != 0 || k->view_offs % 64 != 0) REFUSE("layout-k");
++    if (v->nb[0] != 2 || v->nb[1] % 16 != 0 || v->nb[1] < 64 || v->nb[1] < (size_t) (D * 2) ||
++        v->nb[1] >= ((size_t) 1 << 24) || v->nb[2] % 64 != 0 || v->view_offs % 64 != 0) REFUSE("layout-v");
++#endif
++
++    if (sinks_q->type != GGML_TYPE_F32 || sinks_q->ne[0] != n_head || sinks_q->ne[1] < rows ||
++        sinks_q->ne[2] != 1 || sinks_q->nb[0] != 4 || sinks_q->nb[1] != (size_t) (n_head * 4)) REFUSE("sinks");
++    // the table: [n_bins, n_head, rows], bin fastest; a run read takes 16 bins
++    if (table->type != GGML_TYPE_F32 || table->ne[0] < 17 || table->ne[1] != n_head ||
++        table->ne[2] < rows || table->ne[3] != 1) REFUSE("bias-table");
++    if (table->nb[0] != 4 || table->nb[1] != (size_t) (table->ne[0] * 4) ||
++        table->nb[2] != (size_t) (n_head * table->ne[0] * 4)) REFUSE("bias-table-layout");
++    if (indices->type != GGML_TYPE_I32 || indices->ne[0] < n_kv || indices->ne[1] < rows) REFUSE("bias-indices");
++    if (kpos->type != GGML_TYPE_I32 || qpos->type != GGML_TYPE_I32 || kpos->nb[0] != 4 || qpos->nb[0] != 4 ||
++        kpos->ne[0] < n_kv || qpos->ne[0] < rows) REFUSE("positions");
++    if (cflag->type != GGML_TYPE_I8 || rflag->type != GGML_TYPE_I8 || cflag->nb[0] != 1 || rflag->nb[0] != 1 ||
++        cflag->ne[0] < (n_kv + 15) / 16 || rflag->ne[0] < (rows + 7) / 8) REFUSE("flags");
++#undef REFUSE
++    return 1;
++}
++
++// ---- the op-level forms: everything below reads the op itself, so supports_op, the launch
++// ---- and a CPU test ask the same question of the same tensor ----
++
++// the op's slots and params the port reads (ggml-impl.h's GGML_FA_SRC_* / GGML_FA_PARAM_*;
++// repeated here so this header needs ggml.h only, and checked against them where both are seen)
++enum {
++    FA_PORT_SRC_PAGES = 5, FA_PORT_SRC_RING_K = 6, FA_PORT_SRC_RING_V = 7, FA_PORT_SRC_TAG = 8,
++    FA_PORT_SRC_HOST_K = 9, FA_PORT_SRC_HOST_V = 10, FA_PORT_SRC_PLAN = 11,
++    FA_PORT_SRC_TABLE = 12, FA_PORT_SRC_IDX = 13, FA_PORT_SRC_KPOS = 14, FA_PORT_SRC_QPOS = 15,
++    FA_PORT_SRC_CFLAG = 16, FA_PORT_SRC_RFLAG = 17, FA_PORT_SRC_SINK_Q = 18,
++    FA_PORT_PARAM_BIAS_FLAG = 15, FA_PORT_PARAM_WINDOW = 16,
++};
++#ifdef GGML_FA_SRC_SINK_Q
++#if GGML_FA_SRC_PAGES != 5 || GGML_FA_SRC_RING_K != 6 || GGML_FA_SRC_RING_V != 7 || GGML_FA_SRC_TAG != 8 || \
++    GGML_FA_SRC_HOST_K != 9 || GGML_FA_SRC_HOST_V != 10 || GGML_FA_SRC_PLAN != 11 || GGML_FA_SRC_BIAS_TABLE != 12 || \
++    GGML_FA_SRC_BIAS_IDX != 13 || GGML_FA_SRC_KPOS != 14 || GGML_FA_SRC_QPOS != 15 || GGML_FA_SRC_CFLAG != 16 || \
++    GGML_FA_SRC_RFLAG != 17 || GGML_FA_SRC_SINK_Q != 18 || GGML_FA_PARAM_BIAS_FLAG != 15 || GGML_FA_PARAM_WINDOW != 16
++#error "fa_port_gate.h's slots are not ggml-impl.h's"
++#endif
++#endif
++
++// any source of the paged K/V forms: the page table, its plan and tag, and the ring and
++// host stores they read from. The port reads K/V in place from src[1] / src[2] only, so an
++// op that names any of them is not the port's. (FA_PORT_GATE_RED_PAGED: the first form,
++// which looked at three of the seven slots - the unit test's red run.)
++static inline int fa_port_op_paged(const struct ggml_tensor * op) {
++#ifdef FA_PORT_GATE_RED_PAGED
++    return op->src[FA_PORT_SRC_PAGES] != NULL || op->src[FA_PORT_SRC_PLAN] != NULL || op->src[FA_PORT_SRC_TAG] != NULL;
++#else
++    for (int i = FA_PORT_SRC_PAGES; i <= FA_PORT_SRC_PLAN; ++i) {
++        if (op->src[i] != NULL) return 1;
++    }
++    return 0;
++#endif
++}
++
++// a call carries the port's sources: an indexed bias and the per-query sinks. Such a call is
++// the port's or nobody's - no other kernel reads its table or its sink.
++static inline int fa_port_carries(const struct ggml_tensor * op) {
++    int32_t flag;
++    memcpy(&flag, (const char *) op->op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
++    return flag != 0 && op->src[FA_PORT_SRC_SINK_Q] != NULL;
++}
++
++// THE gate, on the op: supports_op and the launch both call this and nothing else of their own
++static inline int fa_port_gate_op(const struct ggml_tensor * op, size_t buf_align, size_t wg_max, int is_intel,
++                                  const char ** why_out) {
++    int32_t flag, window;
++    float max_bias, softcap;
++    memcpy(&flag,     (const char *) op->op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
++    memcpy(&window,   (const char *) op->op_params + FA_PORT_PARAM_WINDOW * sizeof(int32_t), sizeof window);
++    memcpy(&max_bias, (const char *) op->op_params + 1 * sizeof(float), sizeof max_bias);
++    memcpy(&softcap,  (const char *) op->op_params + 2 * sizeof(float), sizeof softcap);
++    return fa_port_gate_why(op->src[0], op->src[1], op->src[2], op->src[3], op,
++                            op->src[FA_PORT_SRC_TABLE], op->src[FA_PORT_SRC_IDX], op->src[FA_PORT_SRC_SINK_Q],
++                            op->src[FA_PORT_SRC_KPOS], op->src[FA_PORT_SRC_QPOS],
++                            op->src[FA_PORT_SRC_CFLAG], op->src[FA_PORT_SRC_RFLAG],
++                            buf_align, wg_max, is_intel, fa_port_op_paged(op), flag != 0,
++                            max_bias, softcap, window, why_out);
++}
++
++// Which layer gets the port's graph. An op with the port's sources has a table of another
++// layout ([n_bins, n_head, rows], the bias only) and its sink at src[18]; a backend that
++// knows the indexed bias but not these sources would answer supports_op "yes" and read the
++// table its own way - asking supports_op cannot tell that backend from one that serves the
++// port, because the unaware "yes" is the hazard. So a backend DECLARES that it reads the
++// port's sources, by answering this name through its registry's get_proc_address (any
++// non-null pointer); supports_op then decides each op as before. No backend is named here,
++// and absent means refused: a backend without the name (another GPU backend, a remote one,
++// an older build of this one), a layer on the CPU, a layer with no device - each gets
++// today's graph. So a CPU-only run with the knob set builds the graph it builds without it.
++// guard = 0 is the form before this rule (every layer gets the sources): the tests' red.
++#define FA_PORT_CAPABILITY_PROC "ggml_backend_flash_attn_port_sources"
++static inline int fa_port_layer_attaches(ggml_backend_dev_t dev, int guard) {
++    if (!guard) return 1;
++    if (dev == NULL) return 0;
++    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
++    return reg != NULL && ggml_backend_reg_get_proc_address(reg, FA_PORT_CAPABILITY_PROC) != NULL;
++}
++
++// What a graph builder does with an op it has just given the port's sources: the op keeps
++// them only if `backend` is the layer's own backend (backend_is_layers: the scheduler has a
++// backend for the layer's device - otherwise the op would run somewhere else) and that
++// backend's supports_op accepts exactly this op. Else they come off and the op is today's,
++// with `table_today` ([n_head, n_bins, rows], the form ggml_flash_attn_ext_add_indexed_bias
++// takes). Returns 1 when the op keeps the port's sources. The one place this is decided:
++// the model's build_attn_mha calls it, and the unit test calls it with a mock backend.
++static inline int fa_port_settle(struct ggml_tensor * op, ggml_backend_t backend, int backend_is_layers,
++                                 struct ggml_tensor * table_today, struct ggml_tensor * indices) {
++    if (backend != NULL && backend_is_layers && ggml_backend_supports_op(backend, op)) {
++        return 1;
++    }
++    ggml_flash_attn_ext_drop_port_sources(op, table_today, indices);
++    return 0;
++}
++
++// The dispatch's block split of a 9 to 64-row call (rows are independent for the kernels it
++// feeds: it re-enters the dispatch with stack copies of the op, 8 rows each). The predicate
++// is here so that the dispatch and the routing test below share it.
++static inline int fa_row_blocks_split(int64_t n_q, int64_t n_batch, int is_intel, int q_is_f32, int mask_ok,
++                                      int paged, int gqa_wide, int rb_on) {
++    return rb_on && !paged && !gqa_wide && is_intel && n_q > 8 && n_q <= 64 && n_batch == 1 && q_is_f32 && mask_ok;
++}
++
++// The query rows of the op the port's launch is handed. port_first = the dispatch takes a
++// call that carries the port's sources before any other branch (what it does). port_first
++// = 0 is the order it had before: the block split ran first, and a 9 to 64-row port call
++// reached the port as blocks of at most 8 rows that still carried its sources - the launch's
++// gate then said "decode" for a call supports_op had accepted, and aborted (the card: the
++// 1088 x 64 case; 20 and 12 rows the same way).
++static inline int64_t fa_port_launch_rows(const struct ggml_tensor * op, int port_first, int is_intel, int gqa_wide, int rb_on) {
++    const struct ggml_tensor * q = op->src[0], * mask = op->src[3];
++    const int64_t n_q = q->ne[1];
++    if (port_first) return n_q;
++    return fa_row_blocks_split(n_q, q->ne[3], is_intel, q->type == GGML_TYPE_F32, mask != NULL && mask->ne[2] == 1,
++                               fa_port_op_paged(op), gqa_wide, rb_on) ? (n_q < 8 ? n_q : 8) : n_q;
++}
++
++// The launch-time decision for an op supports_op was asked about: the same gate, on the op as
++// the launch receives it. With port_first it is the op itself, so the two cannot differ.
++static inline int fa_port_gate_at_launch(const struct ggml_tensor * op, int port_first, int gqa_wide, int rb_on,
++                                         size_t buf_align, size_t wg_max, int is_intel, const char ** why_out) {
++    const int64_t rows = fa_port_launch_rows(op, port_first, is_intel, gqa_wide, rb_on);
++    if (rows == op->src[0]->ne[1]) return fa_port_gate_op(op, buf_align, wg_max, is_intel, why_out);
++    struct ggml_tensor qv = *op->src[0], dv = *op;      // a block, as the split builds it
++    qv.ne[1] = rows; dv.ne[2] = rows; dv.src[0] = &qv;
++    return fa_port_gate_op(&dv, buf_align, wg_max, is_intel, why_out);
++}
++
++#if defined(__cplusplus)
++}
++#endif
++#endif
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index df2ec85..239983e 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -8,6 +8,7 @@
+ #endif
+ 
+ #include "ggml-opencl.h"
++#include "fa_port_gate.h"   // 0198: the port arm's eligibility, a pure function (CPU-testable)
+ #include "ggml-opencl-planes.h"   // 0022 / 0116: the planar layout, device-free
+ #include "ggml-backend.h"
+ #include "ggml-impl.h"
+@@ -723,6 +724,7 @@ struct ggml_cl_kq_act {
+ static std::mutex g_cl_downgrade_mu;
+ static std::map<std::string, uint64_t> g_cl_downgrades;
+ 
++static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);   // 0198: defined below, used by the port arm
+ static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
+ static void ggml_cl_downgrade(const char * fmt, ...) {
+     char buf[256];
+@@ -1499,6 +1501,12 @@ struct ggml_backend_opencl_context {
+     // flash_attn_dpas2.cl (Xe2): K/V by 2D block reads, Q as f16 re-read a tile
+     cl_kernel kernel_fa_dpas2_dk[3] = {}, kernel_fa_dpas2_carry_dk[3] = {}, kernel_fa_q_to_f16_dk[3] = {};
+     cl_kernel kernel_fa_mask_cls = nullptr;       // the mask by 8 x 32 blocks (flash_attn_dpas2.cl)
++    // 0198: the port arm (flash_attn_port.cl, after trellis-serve's fa::Kern), GGML_OPENCL_FA_PORT=1
++    cl_kernel kernel_fa_port = nullptr, kernel_fa_port_q16 = nullptr;
++    cl_program program_fa_port = nullptr;
++    bool fa_port_tried = false;
++    int  fa_port_grf = 0, fa_port_qhoist = 0, fa_port_qf32 = 0, fa_port_skip = 1, fa_port_uniform = 1, fa_port_nobias = 0;
++    size_t fa_port_wg = 0;   // the port kernel's work-group limit, asked once when it is built
+     int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
+     // 0106: the build options of the head-256 prompt kernels, so that the
+     // head-512 builds made on first use match them (sub-group, sub-groups a
+@@ -13094,6 +13102,160 @@ static bool ggml_opencl_fa512_intel_supported(ggml_backend_opencl_context * back
+     return true;
+ }
+ 
++// 0198: the port arm after trellis-serve's fa::Kern<128>. The kernel is
++// flash_attn_port.cl; the plan and the reference are in the arcint tree
++// (contrib/refkernels/trellis-fa/). GGML_OPENCL_FA_PORT=1 turns it on; unset,
++// every path below is exactly the dispatch it was (0191/0192's).
++static bool ggml_cl_port_on() {
++    static const bool on = [] {
++        const char * e = getenv("GGML_OPENCL_FA_PORT");
++        return e != nullptr && atoi(e) != 0;
++    }();
++    return on;
++}
++
++// The port serves the calls that carry its sources (the per-query sinks at src[18]: the
++// model attaches them to a prompt batch only) and that its gate covers; anything else
++// carrying them is declined with a reason, never served by a kernel that would read it
++// another way. The rules are fa_port_gate.h's pure function; this is only its argument list.
++static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx);
++
++// THE decision whether the port serves an op that carries its sources. supports_op and the
++// launch both call this, and neither has a rule of its own: the pure gate on the op
++// (fa_port_gate.h), then the two facts only the device has - the kernel is built, and one
++// tile's work-group fits it.
++// Those two are not pure, and are the same answer every time: the kernel is built at most
++// once a device (ggml_cl_port_kernel remembers a failure as well as a success), from one
++// source with options read once a process, and its work-group limit is asked at that build
++// and kept. The first call pays the compile; every later call, at supports_op or at the
++// launch, reads the two fields. A device's first answer is its answer for the process.
++static bool ggml_cl_port_decide(ggml_backend_opencl_context * backend_ctx, const struct ggml_tensor * op, const char ** why) {
++    if (!fa_port_gate_op(op, (size_t) backend_ctx->alignment, backend_ctx->max_workgroup_size,
++                         backend_ctx->gpu_family == INTEL, why)) {
++        return false;
++    }
++    if (ggml_cl_port_kernel(backend_ctx) == nullptr || backend_ctx->kernel_fa_port_q16 == nullptr) {
++        *why = "not-built";
++        return false;
++    }
++    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) > backend_ctx->fa_port_wg) {
++        *why = "no-fit";
++        return false;
++    }
++    return true;
++}
++
++// built once a device, on the first call the gate lets through
++static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx) {
++    if (backend_ctx->kernel_fa_port != nullptr) return backend_ctx->kernel_fa_port;
++    if (backend_ctx->fa_port_tried) return nullptr;
++    backend_ctx->fa_port_tried = true;
++    if (backend_ctx->kernel_compile_opts.empty()) return nullptr;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++    const std::string src {
++        #include "flash_attn_port.cl.h"
++    };
++#else
++    const std::string src = read_file("flash_attn_port.cl");
++#endif
++    if (src.empty()) {
++        ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s", "source-missing");
++        return nullptr;
++    }
++    std::string opts = backend_ctx->kernel_compile_opts + " -DDKQ=128 -DBK=32";
++    // 0198: the register mode, GGML_OPENCL_FA_PORT_GRF=128|256 (unset: 256). The
++    // offline gate (ocloc, bmg-g21) on this kernel: 256 GRF has no scratch, 128 GRF
++    // spills. The reference fa::Kern is the same from its own SPIR-V (a spill at 128,
++    // none at 256) and its 256 build is the faster one on the B60, although 256 halves
++    // the threads a core. Both modes build, so a window can time both; the 256 build
++    // also holds a tile's Q in registers (PORT_QHOIST, as fa::Kern holds Qc) and takes it
++    // straight from the op's f32 Q (PORT_QF32: no prepass launch); the 128 build re-reads
++    // the f16 scratch a key block. GGML_OPENCL_FA_PORT_QHOIST=0|1 and
++    // GGML_OPENCL_FA_PORT_QF32=0|1 override that (QF32 needs QHOIST).
++    int grf = 256;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_GRF")) {
++        const int g = atoi(e);
++        if (g == 128 || g == 256) {
++            grf = g;
++        } else {
++            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_FA_PORT_GRF=%s is neither 128 nor 256; 256 is used\n", e);
++        }
++    }
++    int qhoist = grf == 256 ? 1 : 0;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_QHOIST")) {
++        qhoist = atoi(e) != 0 ? 1 : 0;
++    }
++    if (grf == 256) {
++        opts += " -cl-intel-256-GRF-per-thread";
++    }
++    int qf32 = qhoist;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_QF32")) {
++        qf32 = atoi(e) != 0 && qhoist ? 1 : 0;
++    }
++    opts += qhoist ? " -DPORT_QHOIST=1" : " -DPORT_QHOIST=0";
++    opts += qf32 ? " -DPORT_QF32=1" : " -DPORT_QF32=0";
++    // GGML_OPENCL_FA_PORT_SKIP=0: every key block is walked (the A/B arm of the block skip)
++    int skip = 1;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_SKIP")) {
++        skip = atoi(e) != 0 ? 1 : 0;
++    }
++    if (!skip) {
++        opts += " -DGB_NO_SKIP";
++    }
++    // GGML_OPENCL_FA_PORT_UNIFORM=0: the tile's ids as lane-varying values (the A/B of the
++    // broadcast that makes the kernel's indices and branches scalar)
++    int uniform = 1;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_UNIFORM")) {
++        uniform = atoi(e) != 0 ? 1 : 0;
++    }
++    opts += uniform ? " -DPORT_UNIFORM=1" : " -DPORT_UNIFORM=0";
++    // GGML_OPENCL_FA_PORT_PROBE=nobias: a timing probe with WRONG answers - the kernel
++    // never reads the bias table. Its time against the full kernel's is what the
++    // table's bytes cost a call. The TAKEN line names it.
++    int nobias = 0;
++    if (const char * e = getenv("GGML_OPENCL_FA_PORT_PROBE")) {
++        nobias = strcmp(e, "nobias") == 0 ? 1 : 0;
++    }
++    if (nobias) {
++        opts += " -DGB_NO_BIAS";
++    }
++    // the red cases: GGML_OPENCL_FA_PORT_RED=1 shifts every K/V read one key row up,
++    // =2 drops the sink's term; both must FAIL the port's test cases
++    if (const char * red = getenv("GGML_OPENCL_FA_PORT_RED")) {
++        const int r = atoi(red);
++        if (r == 1) opts += " -DGB_PAD_KEYS_OFF=1";
++        if (r == 2) opts += " -DGB_SKIP_SINK";
++        if (r == 4) opts += " -DGB_PAD_ZERO";     // the pad bin assumed zero, not read
++    }
++    cl_program p = build_program_from_source_optional(backend_ctx, src.c_str(), opts);
++    if (p == nullptr) {
++        ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s", "compile");
++        return nullptr;
++    }
++    cl_int err = CL_SUCCESS;
++    cl_kernel k = clCreateKernel(p, "kernel_flash_attn_port", &err);
++    cl_kernel k16 = err == CL_SUCCESS ? clCreateKernel(p, "kernel_flash_attn_port_q16", &err) : nullptr;
++    if (err != CL_SUCCESS) {
++        if (k != nullptr) CL_CHECK(clReleaseKernel(k));
++        CL_CHECK(clReleaseProgram(p));
++        ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s what=%s", "kernel", "kernel_flash_attn_port");
++        return nullptr;
++    }
++    size_t wg = 0;
++    CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
++    backend_ctx->fa_port_wg = wg;
++    backend_ctx->program_fa_port = p;
++    backend_ctx->kernel_fa_port = k;
++    backend_ctx->kernel_fa_port_q16 = k16;
++    backend_ctx->fa_port_grf = grf;
++    backend_ctx->fa_port_qhoist = qhoist;
++    backend_ctx->fa_port_qf32 = qf32;
++    backend_ctx->fa_port_skip = skip;
++    backend_ctx->fa_port_uniform = uniform;
++    backend_ctx->fa_port_nobias = nobias;
++    return k;
++}
++
+ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
+     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
+@@ -13641,6 +13803,26 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             // 0143: an indexed bias (table and bins at src 12/13) runs on the intel
+             // split decode kernels, compiled on demand with -DFA_BIAS_TABLE=<n_bins>;
+             // the prompt kernels have no bias yet, so those shapes go to ggml
++            if (ggml_cl_port_on() && fa_port_carries(op)) {
++                // 0198: the port arm serves the calls that carry its sources (the model's
++                // prompt batches under the knob) and only what ggml_cl_port_decide accepts -
++                // the same function the launch asserts. A call without them (a decode step,
++                // any other graph) and every call with the knob unset take 0143/0144's
++                // dispatch below, untouched.
++                const char * why = nullptr;
++                if (!ggml_cl_port_decide(backend_ctx, op, &why)) {
++                    ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", why);
++                    return false;
++                }
++                return true;
++            }
++            if (ggml_flash_attn_ext_has_indexed_bias(op) && op->src[GGML_FA_SRC_SINK_Q] != nullptr) {
++                // 0198: the port's sources without its knob. The table is then the port's
++                // [n_bins, n_head, rows] and the sink a logit a query, which the indexed-bias
++                // kernels below would read as their own layout: not served here.
++                ggml_cl_downgrade("op=FLASH_ATTN port=declined reason=%s", "knob-off");
++                return false;
++            }
+             if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+                 const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
+                 const ggml_tensor * mask = op->src[3];
+@@ -18778,6 +18960,12 @@ static void ggml_backend_opencl_reserve_gather(ggml_backend_dev_t dev, size_t q,
+ }
+ 
+ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
++    if (strcmp(name, FA_PORT_CAPABILITY_PROC) == 0) {
++        // 0198: this backend reads the port arm's sources (fa_port_gate.h); the pointer is a
++        // declaration, not something to call
++        static const int declares = 1;
++        return (void *) &declares;
++    }
+     if (strcmp(name, "ggml_backend_opencl_topk_moe_sigmoid_fused_count") == 0) {
+         return (void *) ggml_backend_opencl_topk_moe_sigmoid_fused_count;
+     }
+@@ -26014,6 +26202,194 @@ static void ggml_cl_fa_kv_stream_pages(ggml_backend_opencl_context * backend_ctx
+     // the clReleaseMemObject -38 abort of window 280 (the 2-layer case's SoA host store)
+ }
+ 
++// 0198: the port arm's launch, after trellis-serve's fa::Kern. The dispatch calls it first
++// for a call that carries the port's sources, before any other branch: every earlier branch
++// (the block split of a 9 to 64-row call, above all) would hand it another op than the one
++// supports_op was asked about. It decides nothing: ggml_cl_port_decide accepted this op.
++static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
++    {
++        // first, before any tensor is read: the decision supports_op made, asserted
++        const char * why = nullptr;
++        if (!ggml_cl_port_decide(backend_ctx, dst, &why)) {
++            // the op as the launch has it, so a disagreement can be read off the log
++            auto shape = [](const char * name, const ggml_tensor * t) {
++                if (t == nullptr) { GGML_LOG_ERROR("  %s: (null)\n", name); return; }
++                GGML_LOG_ERROR("  %s: %s ne [%lld, %lld, %lld, %lld] nb [%zu, %zu, %zu, %zu] view_offs %zu\n", name, ggml_type_name(t->type),
++                               (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
++                               t->nb[0], t->nb[1], t->nb[2], t->nb[3], t->view_offs);
++            };
++            GGML_LOG_ERROR("op=FLASH_ATTN port: supports_op and the launch disagree (reason=%s)\n", why ? why : "?");
++            shape("q", q); shape("k", k); shape("v", v); shape("mask", mask); shape("dst", dst);
++            shape("table", dst->src[GGML_FA_SRC_BIAS_TABLE]); shape("sinks_q", dst->src[GGML_FA_SRC_SINK_Q]);
++            shape("kpos", dst->src[GGML_FA_SRC_KPOS]); shape("qpos", dst->src[GGML_FA_SRC_QPOS]);
++            GGML_ABORT("op=FLASH_ATTN port: the launch was handed an op supports_op did not accept");
++        }
++    }
++    const int n_q = (int) q->ne[1], n_kv = (int) k->ne[1], d_head_q = (int) q->ne[0];
++    const int n_head = (int) q->ne[2], n_head_kv = (int) k->ne[2];
++    const cl_ulong mask_nb1 = mask->nb[1];
++    const float scale = ((const float *) dst->op_params)[0];
++    {
++        cl_kernel kp = backend_ctx->kernel_fa_port;
++        cl_kernel kq16 = backend_ctx->kernel_fa_port_q16;
++        const int G = n_head / n_head_kv;
++        // GGML_OPENCL_FA_PORT_QTW: adjacent query tiles a work-group (the reference's server
++        // runs 4), clamped to what the device's work-group holds; one tile always fits
++        const size_t wg_limit = backend_ctx->fa_port_wg;   // asked once, when the kernel was built
++        static const char * qtw_env = getenv("GGML_OPENCL_FA_PORT_QTW");
++        int qtw = qtw_env != nullptr ? std::max(1, atoi(qtw_env)) : 1;
++        if ((size_t) 16 * G * qtw > wg_limit) {
++            const int fit = std::max(1, (int) (wg_limit / ((size_t) 16 * G)));
++            ggml_cl_downgrade("op=FLASH_ATTN port=qtw-clamped reason=%s from=%d to=%d", "work-group", qtw, fit);
++            qtw = fit;
++        }
++        const int ntiles = CEIL_DIV(n_q, 8), ngroups = CEIL_DIV(ntiles, qtw);
++        const int window = ggml_get_op_params_i32(dst, GGML_FA_PARAM_WINDOW);
++        // the key blocks a tile visits are decided in the kernel, a block at a time, from
++        // the positions and the group classes (fa::Kern's [lo, hi) a tile): the launch
++        // hands it the whole kv axis
++        const int kv_lo = 0, kv_hi = n_kv;
++        const int rows = (int) q->ne[1];
++
++        auto argbuf = [](const ggml_tensor * t, cl_mem * m, cl_ulong * off) {
++            ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) t->extra;
++            *m = e->data_device;
++            *off = e->offset + t->view_offs;
++        };
++        cl_mem bq = nullptr, bk = nullptr, bv = nullptr, bo = nullptr, bm = nullptr, bs = nullptr, bt = nullptr,
++               bkp = nullptr, bqp = nullptr, bcf = nullptr, brf = nullptr;
++        cl_ulong oq = 0, ok = 0, ov = 0, oo = 0, om = 0, os = 0, ot = 0, okp = 0, oqp = 0, ocf = 0, orf = 0;
++        argbuf(q, &bq, &oq); argbuf(k, &bk, &ok); argbuf(v, &bv, &ov); argbuf(dst, &bo, &oo);
++        argbuf(mask, &bm, &om);
++        argbuf(dst->src[GGML_FA_SRC_SINK_Q], &bs, &os);
++        argbuf(dst->src[GGML_FA_SRC_BIAS_TABLE], &bt, &ot);
++        argbuf(dst->src[GGML_FA_SRC_KPOS], &bkp, &okp);
++        argbuf(dst->src[GGML_FA_SRC_QPOS], &bqp, &oqp);
++        argbuf(dst->src[GGML_FA_SRC_CFLAG], &bcf, &ocf);
++        argbuf(dst->src[GGML_FA_SRC_RFLAG], &brf, &orf);
++        const int   n_bins = (int) dst->src[GGML_FA_SRC_BIAS_TABLE]->ne[0];
++        const cl_ulong q_nb1p = q->nb[1], q_nb2p = q->nb[2];   // the op's Q: a query row's stride, a head's stride
++        const cl_ulong o_nb2p = dst->nb[2];                    // the output's query-row stride
++        const cl_ulong k_nb1p = k->nb[1], v_nb1p = v->nb[1];
++        const cl_ulong k_nb2p = k->nb[2], v_nb2p = v->nb[2];   // a kv head's stride
++        // the 2D block reads want each head's base 64-byte aligned. The gate decided it from
++        // the view offset and the backend's alignment; a placed offset is the buffer's (a
++        // multiple of that alignment) plus the view's, so this cannot fail for a tensor this
++        // backend placed - an assertion of that, not a refusal
++        GGML_ASSERT(ok % 64 == 0 && ov % 64 == 0 && "op=FLASH_ATTN port: a K/V base off the backend's alignment");
++
++        // Q. The 256-GRF build reads the op's f32 Q itself (PORT_QF32). Otherwise Q goes to
++        // f16 once a call, [head][row][D] contiguous, unscaled (the kernel applies scale_log2
++        // itself): the port's own prepass, built with the kernel, reading the op's Q by its
++        // row and head strides; the kernel's Q surface then has row pitch D*2 and head
++        // stride n_q*D*2.
++        const bool qf32 = backend_ctx->fa_port_qf32 != 0;
++        const size_t q16_size = (size_t) rows * n_head * d_head_q * sizeof(cl_half);
++        cl_mem   qsrc = bq;
++        cl_ulong qsrc_off = oq, qsrc_nb1 = q_nb1p, qsrc_nb2 = q_nb2p;
++        if (!qf32) {
++            ggml_cl_buffer & q16buf = backend_ctx->scratch_buffer("fa_port_q16");
++            q16buf.allocate(backend_ctx->context, q16_size);
++            qsrc = q16buf.buffer;
++            qsrc_off = 0;
++            qsrc_nb1 = (cl_ulong) d_head_q * sizeof(cl_half);
++            qsrc_nb2 = qsrc_nb1 * rows;
++        }
++
++        // every buffer the two launches touch, against its allocation, before any enqueue
++        ggml_cl_bounds("op=FLASH_ATTN port", "q",  bq,  oq  + (size_t)(n_head - 1) * q_nb2p + (size_t)(rows - 1) * q_nb1p + (size_t) d_head_q * sizeof(float));
++        if (!qf32) {
++            ggml_cl_bounds("op=FLASH_ATTN port", "q16", qsrc, q16_size);
++        }
++        ggml_cl_bounds("op=FLASH_ATTN port", "k",  bk,  ok  + (size_t)(n_head_kv - 1) * k_nb2p + (size_t)(n_kv - 1) * k_nb1p + (size_t) d_head_q * sizeof(cl_half));
++        ggml_cl_bounds("op=FLASH_ATTN port", "v",  bv,  ov  + (size_t)(n_head_kv - 1) * v_nb2p + (size_t)(n_kv - 1) * v_nb1p + (size_t) d_head_q * sizeof(cl_half));
++        ggml_cl_bounds("op=FLASH_ATTN port", "o",  bo,  oo  + (size_t)(n_head - 1) * dst->nb[1] + (size_t)(rows - 1) * o_nb2p + (size_t) d_head_q * sizeof(float));
++        ggml_cl_bounds("op=FLASH_ATTN port", "mask", bm, om + (size_t)(rows - 1) * mask_nb1 + (size_t)n_kv * sizeof(cl_half));
++        ggml_cl_bounds("op=FLASH_ATTN port", "sink", bs, os + (size_t)rows * n_head * sizeof(float));
++        ggml_cl_bounds("op=FLASH_ATTN port", "table", bt, ot + (size_t)rows * n_head * n_bins * sizeof(float));
++        ggml_cl_bounds("op=FLASH_ATTN port", "kpos", bkp, okp + (size_t)n_kv * sizeof(int32_t));
++        ggml_cl_bounds("op=FLASH_ATTN port", "qpos", bqp, oqp + (size_t)rows * sizeof(int32_t));
++        ggml_cl_bounds("op=FLASH_ATTN port", "cflag", bcf, ocf + (size_t)((n_kv + 15) / 16));
++        ggml_cl_bounds("op=FLASH_ATTN port", "rflag", brf, orf + (size_t)((rows + 7) / 8));
++
++        GGML_ASSERT((size_t) 16 * G <= wg_limit && "op=FLASH_ATTN port: supports_op accepted a tile the kernel cannot hold");
++
++        {
++            static std::once_flag taken;
++            std::call_once(taken, [&] {
++                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=%d qhoist=%d qf32=%d skip=%d uniform=%d qtw=%d%s\n",
++                              backend_ctx->fa_port_grf, backend_ctx->fa_port_qhoist, backend_ctx->fa_port_qf32,
++                              backend_ctx->fa_port_skip, backend_ctx->fa_port_uniform, qtw,
++                              backend_ctx->fa_port_nobias ? " probe=nobias-WRONG-ANSWERS" : "");
++            });
++        }
++
++        if (!qf32) {
++            int a = 0;
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_mem),   &bq));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_ulong), &oq));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_ulong), &q_nb1p));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_ulong), &q_nb2p));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(int),      &n_q));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(int),      &n_head));
++            CL_CHECK(clSetKernelArg(kq16, a++, sizeof(cl_mem),   &qsrc));
++            size_t lws16[3] = { (size_t) d_head_q / 8, 4, 1 };
++            size_t gws16[3] = { (size_t) d_head_q / 8, (size_t) CEIL_DIV(n_q, 4) * 4, (size_t) n_head };
++            backend_ctx->enqueue_ndrange_kernel(kq16, 3, gws16, lws16, dst);
++        }
++
++        float scale_log2 = 1.4426950408889634f * scale;
++        int a = 0;
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &qsrc));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &qsrc_off));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &qsrc_nb1));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &qsrc_nb2));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bk));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ok));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &k_nb1p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &k_nb2p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bv));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ov));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v_nb1p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &v_nb2p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bo));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oo));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &dst->nb[1]));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &o_nb2p));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bm));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &om));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &mask_nb1));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bs));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &os));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bt));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ot));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_bins));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bkp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &okp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bqp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &oqp));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &bcf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &ocf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem),   &brf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_ulong), &orf));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_q));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_kv));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_head));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &n_head_kv));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &qtw));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &ngroups));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &kv_lo));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &kv_hi));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &window));
++        CL_CHECK(clSetKernelArg(kp, a++, sizeof(float),    &scale_log2));
++        size_t lws[3] = { 16, (size_t) G, (size_t) qtw };
++        size_t gws[3] = { 16, (size_t) G, (size_t) n_head_kv * ngroups * qtw };
++        backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
++    }
++}
++
+ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
+     const ggml_tensor * v = dst->src[2];
+     const ggml_tensor * mask = dst->src[3];
+@@ -26033,6 +26409,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+ 
+     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
++    // 0198: a call that carries the port's sources is the port's, first and whole
++    // (fa_port_gate.h: fa_port_launch_rows says what an earlier branch would make of it)
++    if (ggml_cl_port_on() && fa_port_carries(dst)) {
++        ggml_cl_flash_attn_port(backend, dst);
++        return;
++    }
++
+     // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
+ 
+     const int n_q = q->ne[1];
+@@ -26277,6 +26660,12 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+     {
+         static const char * rb_env = getenv("GGML_OPENCL_FA_ROW_BLOCKS");
+         static const bool   rb_on  = rb_env == nullptr || atoi(rb_env) != 0;
++        // 0198: the same predicate as fa_port_gate.h's fa_row_blocks_split, which the port's
++        // routing test models the dispatch with: the two are asserted equal on every call
++        GGML_ASSERT((rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
++                     q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) ==
++                    (fa_row_blocks_split(n_q, n_batch, backend_ctx->gpu_family == INTEL, q->type == GGML_TYPE_F32,
++                                         mask != nullptr && mask->ne[2] == 1, kv_pages != nullptr, gqa_wide, rb_on) != 0));
+         if (rb_on && kv_pages == nullptr && !gqa_wide && backend_ctx->gpu_family == INTEL && n_q > 8 && n_q <= 64 && n_batch == 1 &&
+             q->type == GGML_TYPE_F32 && mask != nullptr && mask->ne[2] == 1) {
+             for (int r0 = 0; r0 < n_q; r0 += 8) {
+@@ -26482,6 +26871,7 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         max_bias == 0.0f && logit_softcap == 0.0f &&
+         q->nb[0] == sizeof(float) && k->nb[0] == ggml_type_size(k->type) && v->nb[0] == ggml_type_size(v->type) &&
+         (mask == nullptr || (mask->type == GGML_TYPE_F16 && mask->ne[0] >= n_kv && mask->ne[1] >= n_q));
++
+     if (backend_ctx->gpu_family == INTEL && n_q > 8 && !fa_dpas_ok && !gqa_wide) {
+         ggml_cl_downgrade("op=FLASH_ATTN head=%d kv=%s n_q=9+ path=f32_f16 reason=%s", (int) d_head_q, ggml_type_name(k->type),
+                           kd_sel == nullptr && !fa_v2_512 ? "no-dpas-kernel" : "shape");
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+new file mode 100644
+index 0000000..66c415e
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+@@ -0,0 +1,366 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
++
++// Flash attention for a prompt after trellis-serve's fa::Kern<128> (the vendored
++// kernel and the port's plan are in the arcint tree:
++// contrib/refkernels/trellis-fa/). One sub-group (16 lanes) owns an (head,
++// 8-query-row) tile and walks 32-key blocks (QR 8, KT 16, KBT 2, NC D/16); the
++// work-group is G heads x QTW adjacent query tiles of one kv head, sharing keys.
++// What OpenCL forces (opencl-plan.md): a DPAS needs 16 lanes, so the 8 rows are
++// one sub-group's collaboration, not one work-item's private state.
++//
++// Q: with PORT_QHOIST (the 256-GRF build) a tile's 8 x 128 Q values are read once
++// and held in registers, as fa::Kern holds Qc. With PORT_QF32 as well they come
++// straight from the op's f32 Q (D contiguous, any row and head stride), 16 floats a
++// sub-group block read, converted to f16 in registers: no prepass launch, no
++// scratch. Otherwise Q is the f16 scratch [head][row][D] that
++// kernel_flash_attn_port_q16 below writes once a call, read by 2D block reads -
++// once a tile with PORT_QHOIST, once a key block without it (128 GRF).
++//
++// Positions, not bins: qpos[n_q] and kpos[n_kv] (the host walks the cells and
++// emits them: patch 0194), the window as a scalar, and one class a 16-key group
++// (cflag: 1 = keys at consecutive positions, all of the query's sequence, no
++// empty cell; 2 = every cell empty; 0 = anything else) and one flag a 8-row
++// group (rflag: 1 = consecutive rows of that sequence). dist = qpos - kpos;
++// future and window cells are compares, so a linear group under a linear row
++// group reads no mask. Any other pair takes the general path: the mask decides
++// what is visible, and the bias is a clamped table read a key.
++//
++// The keys a tile visits: fa::Kern computes [lo, hi) a tile from qpos0/kpos0. Here
++// the positions are arrays (a ring cache has a seam, a cache has empty cells), so
++// the bounds are a test a 32-key block: a block is skipped when each of its two
++// groups is empty (class 2), past n_kv, or linear under linear rows with every
++// key in the future of the tile's last row or behind the window of its first.
++// A skipped block costs two flag reads and two position reads. -DGB_NO_SKIP
++// walks every block (the A/B arm; the answers are the same).
++//
++// The table is f32 [row][head][bin], bin-fastest and in the model's order (bin =
++// distance, the last bin the pad). A linear group's 16 keys are 16 descending
++// distances d0 .. d0-15: one intel_sub_group_block_read at bin d0-15, and lane j
++// takes lane 15-j's value (a shuffle).
++//
++// The softmax is fa::Kern's online form: m starts at the sink logit, a block's
++// row maximum updates it, alpha = exp2(m - m_new) rescales l and O, and
++// p = exp2(s - m_new) <= 1 is what goes to f16 for P V. l is a lane's partial
++// sum; the sink's own term (1 at the start, rescaled by every alpha) lives in
++// lane 0, and one reduction a row at the end gives the denominator.
++//
++// The red cases the build offers (GGML_OPENCL_FA_PORT_RED): GB_PAD_KEYS_OFF=1
++// shifts every K/V read one key row up, so the scores are another token's and
++// the answers differ (the 2D block read clamps at the surface height, so a
++// shifted row is an answer difference, not a fault); GB_SKIP_SINK drops the
++// sink's term from the denominator. GB_NO_BIAS (GGML_OPENCL_FA_PORT_PROBE=nobias)
++// is a timing probe, not a red case: the table is never read, so the difference
++// to the full kernel is what the table's bytes cost.
++// GB_PAD_ZERO (RED=4) takes the pad bin as zero instead of reading it: a table whose
++// pad bin is not zero must then FAIL.
++
++#ifndef QR
++#define QR 8
++#endif
++#ifndef BK
++#define BK 32
++#endif
++#define NKB (BK / 16)   // two 16-key groups a block
++#ifndef DKQ
++#define DKQ 128
++#endif
++#define NC (DKQ / 16)   // eight D chunks
++#define M_INIT (-3.0e38f)
++#define LOG2E 1.4426950408889634f
++#ifndef PORT_QHOIST
++#define PORT_QHOIST 0
++#endif
++#ifndef PORT_QF32
++#define PORT_QF32 0
++#endif
++#ifndef PORT_UNIFORM
++#define PORT_UNIFORM 1
++#endif
++#if PORT_QF32 && !PORT_QHOIST
++#error "PORT_QF32 needs PORT_QHOIST: the f32 rows are converted once a tile"
++#endif
++#ifndef GB_PAD_KEYS_OFF
++#define GB_PAD_KEYS_OFF 0    // the red case: every key read one row up
++#endif
++#ifdef GB_SKIP_SINK
++#define SINK_L 0.f           // the red case: the sink's term dropped
++#else
++#define SINK_L 1.f
++#endif
++
++#define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++#define QREAD(c, y) as_short8(__builtin_IB_subgroup_block_read_flat_u16_m8k16v1((long) qb, DKQ * 2 - 1, n_q - 1, qp - 1, (int2)(16 * (c), (y))))
++#define KREAD(c, y) as_int8(__builtin_IB_subgroup_block_read_flat_transpose_u32_k8((long) kb, DKQ * 2 - 1, n_kv - 1, kp - 1, (int2)(8 * (c), (y) + GB_PAD_KEYS_OFF)))
++#define VREAD(c, y) as_int8(__builtin_IB_subgroup_block_read_flat_transform_u16_k16((long) vb, DKQ * 2 - 1, n_kv - 1, vp - 1, (int2)(16 * (c), (y) + GB_PAD_KEYS_OFF)))
++
++// the reads flash_attn_dpas2.cl declares; the table's run read is
++// cl_intel_subgroups' intel_sub_group_block_read (one uint a lane), a builtin
++ushort8 __builtin_IB_subgroup_block_read_flat_u16_m8k16v1(long base, int w, int h, int p, int2 c);
++uint8   __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(long base, int w, int h, int p, int2 c);
++uint8   __builtin_IB_subgroup_block_read_flat_transform_u16_k16(long base, int w, int h, int p, int2 c);
++
++// Q to f16, unscaled, [head][row][DKQ]: a work-item per 8 values. q_nb1 is the op's
++// query-row stride and q_nb2 its head stride, whatever the view (the model's Q is a
++// permuted [D, Lq, Hq] with nb1 = Hq*D*4, nb2 = D*4).
++kernel void kernel_flash_attn_port_q16(global const char * q, ulong q_offset, ulong q_nb1, ulong q_nb2,
++                                       int n_q, int n_head, global half * dst) {
++    const int c8 = get_global_id(0), row = get_global_id(1), head = get_global_id(2);
++    if (c8 >= DKQ / 8 || row >= n_q || head >= n_head) return;
++    const float8 x = vload8(c8, (global const float *)(q + q_offset + (ulong) head * q_nb2 + (ulong) row * q_nb1));
++    vstore8(convert_half8(x), 0, dst + ((ulong) head * n_q + row) * DKQ + 8 * c8);
++}
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_flash_attn_port(
++        global const char * q, ulong q_offset, ulong q_nb1, ulong q_nb2,
++        global const char * k, ulong k_offset, ulong k_nb1, ulong k_nb2,
++        global const char * v, ulong v_offset, ulong v_nb1, ulong v_nb2,
++        global char * dst, ulong o_offset, ulong o_nb1, ulong o_nb2,
++        global const void * mask_void, ulong mask_offset, ulong mask_nb1,
++        global const float * sink, ulong sink_offset,
++        global const float * table, ulong table_offset, int n_bins,
++        global const int * kpos, ulong kpos_offset,
++        global const int * qpos, ulong qpos_offset,
++        global const char * cflag, ulong cflag_offset,
++        global const char * rflag, ulong rflag_offset,
++        int n_q, int n_kv, int n_head, int hkv, int qtw, int ngroups,
++        int kv_lo, int kv_hi, int window, float scale_log2)
++{
++    const int lane = get_sub_group_local_id();
++    // z and g are the same in all 16 lanes of a sub-group, but an id read from the lane
++    // payload is a varying value to the compiler: every index, branch and loop below would
++    // then be SIMD-16 control flow, every scalar load a 16-lane gather of one address.
++    // The broadcast of lane 0 makes them uniform (PORT_UNIFORM=0: the varying form, the A/B).
++#if PORT_UNIFORM
++    const int z    = sub_group_broadcast((int) get_global_id(2), 0u);
++    const int g    = sub_group_broadcast((int) get_local_id(1), 0u);
++#else
++    const int z    = get_global_id(2);
++    const int g    = get_local_id(1);
++#endif
++    const int qti  = z % qtw, unit = z / qtw;
++    const int kvh  = unit / ngroups, grp = unit % ngroups;
++    const int qt   = grp * qtw + qti;
++    const int q0   = qt * QR;
++    if (q0 >= n_q) return;
++    const int head = kvh * (n_head / hkv) + g;
++
++    // Q is the op's f32 Q (PORT_QF32) or the f16 scratch [head][row][D]; either way q_nb1 is
++    // a row's stride and q_nb2 a head's. K/V are [D, Lk, Hk] with D fastest (nb1 a key row,
++    // nb2 a kv head); the head slice is the base offset.
++    const long qb = (long) (q + q_offset) + (long) head * (long) q_nb2;
++    const long kb = (long) (k + k_offset) + (long) kvh * (long) k_nb2;
++    const long vb = (long) (v + v_offset) + (long) kvh * (long) v_nb2;
++    const global int * kps = (global const int *)((global const char *) kpos + kpos_offset);
++    const global int * qps = (global const int *)((global const char *) qpos + qpos_offset);
++    const global char * cfl = (global const char *)(cflag + cflag_offset);
++    const global char * rfl = (global const char *)(rflag + rflag_offset);
++    const global half * mb = (global const half *)((global const char *) mask_void + mask_offset);
++    const global float * tb = (global const float *)((global const char *) table + table_offset);
++    const global float * sk = (global const float *)((global const char *) sink + sink_offset);
++
++    const int qp = (int) q_nb1, kp = (int) k_nb1, vp = (int) v_nb1;   // row pitches (bytes)
++    const bool rg_lin = rfl[q0 / QR] != 0;
++    const int nrow = min(QR, n_q - q0);
++
++    // the tile's rows: position, table row and mask row (a row past n_q repeats the last one
++    // and is never live), and the online softmax state with the sink as the initial (m, l)
++    int    qpr[QR];
++    size_t trow[QR], mrow[QR];
++    float  m[QR], l[QR], padv[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++        const bool live = r < nrow;
++        const int  row  = min(q0 + r, n_q - 1);
++        qpr[r]  = qps[row];
++        trow[r] = ((size_t) row * n_head + head) * n_bins;       // where the row has its bins
++        mrow[r] = (size_t) row * (mask_nb1 / sizeof(half));     // where the row has its mask
++#ifdef GB_PAD_ZERO
++        padv[r] = 0.f;                                           // the red case: the pad bin assumed zero
++#else
++        padv[r] = tb[trow[r] + n_bins - 1];                      // the row's pad bin: the bias of a key at or past the extent
++#endif
++        const float s2 = LOG2E * sk[(size_t) row * n_head + head];
++        m[r] = live ? s2 : M_INIT;
++        l[r] = (live && lane == 0) ? SINK_L : 0.f;
++    }
++    const int qmin = qpr[0], qmax = qpr[0] + nrow - 1;   // the tile's span when rg_lin
++
++    float8 o[NC];
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) o[c] = (float8)(0.f);
++
++#if PORT_QHOIST
++    short8 qa[NC];
++#if PORT_QF32
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) {
++        // lane = dim 16 c + lane, component = row: the a operand, as QREAD returns it
++        float qv[QR];
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            const global char * qrow = q + q_offset + (ulong) head * q_nb2 + (ulong) min(q0 + r, n_q - 1) * q_nb1;
++            qv[r] = as_float(intel_sub_group_block_read((global const uint *) qrow + 16 * c));
++        }
++        qa[c] = as_short8(convert_half8((float8)(qv[0], qv[1], qv[2], qv[3], qv[4], qv[5], qv[6], qv[7])));
++    }
++#else
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) qa[c] = QREAD(c, q0);
++#endif
++#define QA(c) qa[c]
++#else
++#define QA(c) QREAD(c, q0)
++#endif
++
++    for (int t0 = kv_lo; t0 < kv_hi; t0 += BK) {
++        // ---- the block's two key groups: class, first position, dead or not ----
++        bool glin[NKB], gdead[NKB];
++        int  gk0[NKB];
++        bool skip = true;
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            const int  kg  = t0 + gb * 16;
++            const bool in  = kg < n_kv;
++            const int  kgc = min(kg, n_kv - 1);
++            const int  cf  = in ? (int) cfl[kgc >> 4] : 2;
++            const int  k0  = kps[kgc];
++            const int  cnt = min(16, n_kv - kg);
++            bool dead = cf == 2;
++            if (cf == 1 && rg_lin) {
++                // every key in the future of the last row, or behind the window of the first
++                dead = k0 > qmax || (window > 0 && qmin - (k0 + cnt - 1) >= window);
++            }
++            glin[gb]  = cf == 1 && rg_lin;
++            gdead[gb] = dead;
++            gk0[gb]   = k0;
++            skip = skip && dead;
++        }
++#ifndef GB_NO_SKIP
++        if (skip) continue;
++#endif
++
++        // ---- S = Q K^T: lane = key, component = row ----
++        float8 s[NKB];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) s[gb] = (float8)(0.f);
++        _Pragma("unroll")
++        for (int c = 0; c < NC; ++c) {
++            const short8 a = QA(c);
++            s[0] = DPAS(a, KREAD(c, t0), s[0]);
++            s[1] = DPAS(a, KREAD(c, t0 + 16), s[1]);
++        }
++
++        // ---- score -> per-row components: validity, mask, bias, in one pass ----
++        float sc[NKB][QR];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            const int  kg   = t0 + gb * 16;
++            const int  kk   = min(kg + lane, n_kv - 1);
++            const bool live = kg + lane < n_kv && !gdead[gb];
++            const int  kpl  = kps[kk];
++            const float sv8[QR] = { s[gb].s0, s[gb].s1, s[gb].s2, s[gb].s3, s[gb].s4, s[gb].s5, s[gb].s6, s[gb].s7 };
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) {
++                const int  d   = qpr[r] - kpl;
++                bool  vis;
++                float mv = 0.f;
++                if (glin[gb]) {
++                    vis = r < nrow && live && d >= 0 && (window == 0 || d < window);
++                } else {
++                    // the general path: the mask decides (empty cells, other sequences, a seam).
++                    // -inf (by its bits: the build is finite-math) and the f16 lowest hide a cell,
++                    // any other value is added to the score (natural-log units, like the bias)
++                    const ushort mu = as_ushort(mb[mrow[r] + kk]);
++                    const bool hidden = (mu & 0x7C00) == 0x7C00 || mu == 0xFBFF;
++                    mv  = hidden ? 0.f : (float) as_half(mu);
++                    vis = r < nrow && live && !hidden;
++                }
++                float bv = 0.f;
++#ifndef GB_NO_BIAS    // the timing probe: no table read at all (the answers are wrong)
++                if (glin[gb]) {
++                    // the run: this row's distance to the group's first key is d0 (lane-uniform),
++                    // lane j's is d0 - j. With d0 in [15, n_bins-1] the 16 bins d0-15 .. d0 are one
++                    // block read and lane j takes lane 15-j's value; a group wholly at or past the
++                    // pad bin takes the row's pad value, read once a tile (zero in the model's
++                    // unfolded table, but the kernel does not assume it); otherwise a clamped read a key.
++                    const int d0 = qpr[r] - gk0[gb];
++                    if (d0 - 15 < n_bins - 1) {
++                        if (d0 >= 15 && d0 <= n_bins - 1) {
++                            const float tv = as_float(intel_sub_group_block_read(
++                                (global const uint *) (tb + trow[r] + (d0 - 15))));
++                            bv = intel_sub_group_shuffle(tv, (uint) (15 - lane));
++                        } else {
++                            const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);
++                            bv = tb[trow[r] + bin];
++                        }
++                    } else {
++                        bv = padv[r];      // the whole group at or past the extent: the pad bin's value
++                    }
++                } else {
++                    const int bin = d < 0 ? n_bins - 1 : (d < n_bins - 1 ? d : n_bins - 1);
++                    bv = tb[trow[r] + bin];
++                }
++#endif
++                sc[gb][r] = vis ? sv8[r] * scale_log2 + LOG2E * (mv + bv) : M_INIT;
++            }
++        }
++
++        // ---- the online softmax: the rows' block maxima, alpha, l ----
++        float alpha[QR];
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            const float mx = sub_group_reduce_max(fmax(sc[0][r], sc[1][r]));
++            const float mn = fmax(m[r], mx);
++            alpha[r] = native_exp2(m[r] - mn);
++            m[r] = mn;
++            l[r] *= alpha[r];
++        }
++
++        // ---- p = exp2(s - m) <= 1, f16 a lane, l the lane's partial sum ----
++        short8 pa[NKB];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            half ph[QR];
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) {
++                ph[r] = (half)(sc[gb][r] > 0.5f * M_INIT ? native_exp2(sc[gb][r] - m[r]) : 0.f);
++                l[r] += (float) ph[r];
++            }
++            pa[gb] = as_short8((half8)(ph[0], ph[1], ph[2], ph[3], ph[4], ph[5], ph[6], ph[7]));
++        }
++
++        // ---- O = O alpha + P V, lane = dim, components = rows ----
++        const float8 av = (float8)(alpha[0], alpha[1], alpha[2], alpha[3], alpha[4], alpha[5], alpha[6], alpha[7]);
++        _Pragma("unroll")
++        for (int c = 0; c < NC; ++c) {
++            float8 acc = o[c] * av;
++            _Pragma("unroll")
++            for (int gb = 0; gb < NKB; ++gb) acc = DPAS(pa[gb], VREAD(c, t0 + gb * 16), acc);
++            o[c] = acc;
++        }
++    }
++
++    // ---- the reduction once, the store ----
++    float inv[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++        const float lv = sub_group_reduce_add(l[r]);
++        inv[r] = lv > 0.f ? 1.f / lv : 0.f;
++    }
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) {
++        const float ov[QR] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            if (r >= nrow) continue;
++            // the op's dst is [D, n_head, n_q]: o_nb1 is a head's stride, o_nb2 a query row's
++            global float * orow = (global float *)(dst + o_offset + (size_t)head * o_nb1 + (size_t)(q0 + r) * o_nb2);
++            orow[c * 16 + lane] = ov[r] * inv[r];
++        }
++    }
++}
