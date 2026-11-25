@@ -10922,9 +10922,10 @@ port's per-row int8 route.
   destination against its buffer, aborting on a violation.
 - The reds, compiled in through `GGML_OPENCL_KQ_2D_OPTS`: `-DQ8_2D_RED=1` drops the codes of the 8th block
   of every super-block (the read still issues; one K term in eight), `-DQ8_2D_RED=2` gives every lane the
-  scales of its sub-group's first row. The build line `ggml_opencl: the Q8_0 2D GEMM built: ...` names
-  `GGML_OPENCL_KQ_2D_OPTS` when it is set, so a run's log shows its artefact carries the mutant. Both reds
-  apply to both arms.
+  scales of its sub-group's first row, `-DQ8_2D_RED=3` (the int8 kernel only) gives every token of a
+  32-token tile the activation scale of the tile's first token. The build line `ggml_opencl: the Q8_0 2D
+  GEMM built: ...` names `GGML_OPENCL_KQ_2D_OPTS` when it is set, so a run's log shows its artefact carries
+  the mutant. Reds 1 and 2 apply to both arms; red 3 leaves the fp16 arm as it is (a control).
 - `GGML_OPENCL_Q8_2D_VISA=1` (default off): the fp16 arm's decode as inline vISA, with the C form as the
   fallback. The ISA dump showed IGC's planar SIMD16 form of the C (a byte extract, a byte-to-word move, a
   word-to-float move, a multiply and a float-to-half move for every 16 codes of a lane); the vISA form is
@@ -10935,6 +10936,16 @@ port's per-row int8 route.
 - test-backend-ops: the served shapes (the seven above, and the 6,552-row attention bundle) at 512, 1,024
   and 2,048 tokens as op and perf cases; tails at 17, 1,023 and 1,025 tokens (the int8 arm pads tokens to
   32, the fp16 one to 64) on 3,072 and 24 rows, 255 and 257 rows, K 256, and K 64 (refused: the tile).
+  And `test_mul_mat_spread` (`spread=1` in the case name), the reds' fill: the suite's uniform [-1, 1]
+  fill makes every block scale and every activation scale nearly the same number, so a kernel reading the
+  wrong one passes (an activation scale of the wrong token or 256-block stays near 5e-5 NMSE, a review's
+  numpy model and the unit model below). Its weight row r, 32-block b is scaled by 2^((r + b) % 8 - 4),
+  its activation token t, 256-block s by 2^((t + s) % 8 - 4); 3,072 x 2,304 at 1,024 tokens, 24 rows at
+  1,025, 257 rows at 512, 1,024 x 256 at 512, and the first two again with `big=1` (every token t % 61 == 7
+  times 2^15, past the f16 conversion's 16,384, so the fp16 arm's column scale moves). The uniform cases
+  stay.
+- The gate's limit includes K x columns < 2^31: the activations are keyed and sized by an `int` of K x
+  columns (as Q4_0's int8 arm), which K 8,192 at 262,144 columns would overflow.
 
 **Unset, nothing changes** (`code`): the dispatch block and the program build sit behind
 `ggml_cl_q8_2d_mode() != 0`; the slot loop in `ggml_cl_kq_forget` runs over an empty list; the graph's
@@ -10949,50 +10960,83 @@ unit test asserts mode 0 refuses every export line as `off`.
   lines of Inkling 2 Mini's graph export at ub 512 / 1,024 / 2,048 (`tests/q8_2d_export_lines.inc`,
   verbatim; the export's model variant has a Q6_K head, the published file a Q8_0 one, so the head's row
   cap is also checked on a synthetic 201,024-row Q8_0 product): the 18 prompt products taken at modes 1
-  and 2, nothing at mode 0, the one-column lines and the head left alone, and 17 constructed variants
-  (K 64, K 2,880, 1 and 15 columns, 201,024 and 8,193 rows, a view, not flattened, a 32-byte alignment,
+  and 2, nothing at mode 0, the one-column lines and the head left alone, and 19 constructed variants
+  (K 64, K 2,880, 1 and 15 columns, K x columns at 2^31 and just under, 201,024 and 8,193 rows, a view, not flattened, a 32-byte alignment,
   a batched weight, strided columns, a strided destination, F16 columns, mode 3, and the taken edges
   8,192 rows, K 256 at 16 columns, 6,552 rows) each with its verdict. Red first, every run: K % 32 for
-  % 256 fails 2 checks, no row cap 2, accept-every-Q8_0 92, refuse-everything 141. The launch shape on
+  % 256 fails 2 checks, no row cap 2, accept-every-Q8_0 93, refuse-everything 143. The launch shape on
   every row count to 20,000 (all rows covered, no idle work-group, at most one sub-group of padding a
   work-group) and the seven named shapes; its red (16 sub-groups always, the `WG` macro's shape) fails 4.
 - The same test models the arithmetic against the CPU backend's product (activations as Q8_0 per 32,
   what test-backend-ops compares to) on the suite's uniform fill, 32 tokens, at K 2,304 / 3,072 / 256:
   NMSE int8 2.4-2.7e-5, fp16 1.4-1.5e-5, against the MUL_MAT bound of 5e-4; red 1 0.12-0.13; red 2
   1.5-2.1e-3 (3-4x the bound only: on the uniform fill every row's scales are nearly alike), and 0.977 on
-  rows of eight magnitudes. So red 2 is expected to fail on the card by a small margin; a case it passes
-  is that margin, not a pass of the red.
+  rows of eight magnitudes; red 3 5.4-6.7e-5 at K 2,304 / 3,072 and 2.95e-4 at K 256: under the bound, so
+  the uniform cases cannot see an activation-scale error (asserted, so the model stays honest). On
+  `test_mul_mat_spread`'s fill at its four shapes (64 rows at most, 32 tokens): int8 2.1-2.6e-5, fp16
+  1.3-1.4e-5, red 1 0.12-0.13, red 2 1.11-1.28, red 3 0.98-1.21. So on the card red 2 fails the uniform
+  cases by a small margin (a case it passes there is that margin) and red 2 and red 3 fail the spread cases
+  at ~1.
 - ocloc (`tools/ocloc_q8_2d.sh`, `bmg-g21` and `bmg-g31`, the backend's options): both kernels and the
   quantizer at 256 GRF, no scratch, one dump a kernel (no `_1_` recompile), at the default build, with
-  `-DQ8_2D_VISA`, `-DQ8_2D_RED=1`, `-DQ8_2D_RED=2` (each red's ISA differs from the green's). The int8
+  `-DQ8_2D_VISA`, `-DQ8_2D_RED=1`, `-DQ8_2D_RED=2`, `-DQ8_2D_RED=3` (each red's ISA differs from the
+  green's). The int8
   kernel: 32 DPAS and 16 2D block loads a super-block (8 weight, 8 activation) plus 2 before the loop, the
   only other loads the block scales and the activation scales; 1,270 ALU instructions. The fp16 kernel: 128
   DPAS, 40 2D block loads (8 weight, 32 activation). The check's own red: `-DTMM=128` spills, recompiles and
   FAILs.
-- test-backend-ops on the CPU backend, the 31 new correctness cases: 31/31, and the whole `-o MUL_MAT -p
-  type_a=q8_0` filter 289/289 (they construct and run; the CPU against itself proves nothing more).
+- test-backend-ops on the CPU backend, the 31 new correctness cases: 31/31, the whole `-o MUL_MAT -p
+  type_a=q8_0` filter 289/289 before the spread cases, the 6 spread cases 6/6 (they construct and run; the
+  CPU against itself proves nothing more). With them the filter holds 295 cases, 65 of which the gate takes
+  by their parameters (Q8_0 x F32, 16+ columns, plain layout, K % 256, at most 8,192 rows).
 
-**Card rows (owed; the B60, by PCI id; the build from the applied series on the pin, its write-tree hash
-named; `-b GPUOpenCL`, and every suite run's summary line and per-class counts asserted, not an OK count).**
-`UENV` is the Inkling unit's prompt switches (`GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1
-GGML_OPENCL_CPY_TRANSPOSE=1 GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_FA_PORT=1`); `A` is the arm,
-`GGML_OPENCL_Q8_2D=0|1|2`.
+**Card rows (owed).** The B60, by PCI id; the build from the applied series on the pin (development
+`f81d6175` + 0220: write-tree `472fb863e412603dda7205eb0649727e669e0c8e`); `-b GPUOpenCL`, every suite
+run's summary line and per-class counts asserted, not an OK count; the B60's board power cap named with
+every number. `UENV` is the Inkling unit's prompt switches (`GGML_OPENCL_KQ_MM_ID_I8=1
+GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 GGML_OPENCL_CPY_TRANSPOSE=1 GGML_OPENCL_DEPTH_MIX=1 GGML_OPENCL_FA_PORT=1`);
+`A` is the arm, `GGML_OPENCL_Q8_2D=0|1|2`. `Q8` is the suite filter `-o MUL_MAT -p 'type_a=q8_0'` (295
+cases, 65 taken by the gate, 6 of them `spread=1`).
+
+**Order of the body: the reds first, each with its expected result and its write-up line written into the
+report before it runs**, so a window that stops early still says what it proved. The body writes the
+lines of the table below into its report as `EXPECT` lines at its start; each step then appends its
+`RESULT` line under its `EXPECT`. A red's line names what it proves and the number that proves it.
+
+| # | red (arm, options) | expected | what it proves, the number in the line | min |
+|---|---|---|---|---|
+| R1 | arm 2, `GGML_OPENCL_KQ_2D_OPTS=-DQ8_2D_RED=1`, `$Q8` | the build line names `-DQ8_2D_RED=1`; FAIL on the 65 taken cases at NMSE ~0.12-0.13, the other 230 pass | the int8 kernel ran on every taken case and every one of its blocks counts: the count of FAILs = 65 and their NMSE | 3 |
+| R1' | arm 1, the same | the same 65 FAIL, ~0.12 | the same for the fp16 kernel | 3 |
+| R2 | arm 2, `-DQ8_2D_RED=2` | the 6 spread cases FAIL at ~1.1-1.3; the uniform taken cases FAIL at ~1.5-2.1e-3 or pass by a hair | the block-scale row addressing is seen on the spread fill: the spread NMSE; the uniform margin as a number (a uniform pass is that margin) | 3 |
+| R3 | arm 2, `-DQ8_2D_RED=3` | the 6 spread cases FAIL at ~1.0-1.2; every uniform case passes (5-7e-5, 3e-4 at K 256) | the activation-scale token addressing is seen only by the spread fill: the spread NMSE, and the uniform cases' pass on the record (their blindness) | 3 |
+| R3' | arm 1, `-DQ8_2D_RED=3` | 295/295 pass | red 3 is int8-only: a control that the mutant does not reach the fp16 kernel | 2 |
+| R0 | arm 0, `-DQ8_2D_RED=1` | 295/295 pass, no build line for the Q8_0 program | the red options reach nothing at the knob off: arm 0 is today's dispatch | 2 |
+
+Then the green rows:
 
 | # | step | command shape | expected | min |
 |---|---|---|---|---|
-| 1 | op suite, arms 0 / 1 / 2, arm 1 with the vISA decode too, arm 2 with `GGML_OPENCL_BOUNDS=1` | `$A test-backend-ops test -b GPUOpenCL -o MUL_MAT -p 'type_a=q8_0'` | 289/289 on every arm (the filter's count on the CPU backend); TAKEN `2d-f16` on arm 1, `2d-i8` on arm 2, none on arm 0; DOWNGRADE keys only `q8-2d-k` and `q8-2d-layout` (24 and 18 of the cases by their parameters) | 12 |
-| 2 | the reds on arms 2 and 1 | `GGML_OPENCL_KQ_2D_OPTS=-DQ8_2D_RED=1` (then `=2`) with `$A`, the same suite | the build line names the define; red 1 FAILs the 59 cases the gate takes (by their parameters: Q8_0 x F32, 16+ columns, plain layout, K % 256, <= 8,192 rows) at NMSE ~0.12, the other 230 pass; red 2 FAILs them at ~1.5-2.1e-3 (a pass is its margin, reported); the same binary and options at arm 0 pass | 8 |
-| 3 | op perf, the served shapes x 512 / 1,024 / 2,048 tokens, arms 0 / 1 / 1+vISA / 2 | `$A test-backend-ops perf -b GPUOpenCL -o MUL_MAT -p 'type_a=q8_0,type_b=f32,m=(3072\|2304\|1024\|384\|24\|32\|6552),n=(512\|1024\|2048),k=(2304\|3072),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0'`, median of repeats | 3,072 x 2,304 at 1,024: ~425 us (arm 0) -> <= 240 (arm 2), <= 330 (arm 1); 24 rows <= 30 us on arm 2; 6,552 x 2,304 arm 2 >= 60 TFLOP/s (the tile 21 at 512 and 35 at 2,048 tokens) | 8 |
-| 4 | the pass at the unit's settings, arms 0 / 1 / 2, three interleaved rounds, a fresh process each | `env $UENV $A llama-batched-bench -m <the published IQ4_NL file> -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -c 262144 -b 1024 -ub 1024 -npl 1 -ntg 0 -npp 4096` | arm 0 at the unit's ~1,068 t/s; arm 2 +3.8-5.5 % (the 4-chunk pass saving 140-200 ms of ~350), outside the run-to-run spread; arm 1 +1.5-3 % | 22 |
-| 5 | the profile at depth 4,096, arms 0 and 2, `GGML_OPENCL_Q8_2D_STATS=1` | the profiling build's chunk step with `$A` added to its environment | `kernel_mul_mm_q8_0_f16` gone (0 of 351 launches), `kernel_mul_mm_kq2d_q8_0_i8` 351 launches and 35-55 ms (was 88.3); the stats line `calls=351` a chunk graph with at most 4 quantizer launches a visit (`quants` <= 192) | 6 |
-| 6 | the answer-level bar | `env $UENV $A llama-perplexity -lv 4 -m <file> -f <gate text> -c 2048 --chunks 6 -fa on -ctk q8_0 -ctv q8_0 -b 1024 -ub 1024 --kl-divergence --kl-divergence-base <the published file's CPU base>`, arms 0 / 1 / 2; arm 2 again at `-ub 32` | the TAKEN line in each arm-1/2 log; arm 1 = arm 0 (the same rounding a weight: a tripwire, not a gate); arm 2 within 0.03 nats and 1 point of arm 0 (Llama 2's Q4_0 int8 cost was +0.0006 nats, README 0099) | 14 |
+| 1 | op suite, arms 0 / 1 / 1+vISA / 2, arm 2 with `GGML_OPENCL_BOUNDS=1` | `$A test-backend-ops test -b GPUOpenCL $Q8` | 295/295 on every arm, the 6 spread cases green on arms 1 and 2; TAKEN `2d-f16` on arm 1, `2d-i8` on arm 2, none on arm 0; DOWNGRADE keys only `q8-2d-k` and `q8-2d-layout` (24 and 18 cases by their parameters) | 12 |
+| 3 | op perf, the served shapes x 512 / 1,024 / 2,048 tokens, arms 0 / 1 / 1+vISA / 2 | `$A test-backend-ops perf -b GPUOpenCL -o MUL_MAT -p 'type_a=q8_0,type_b=f32,m=(3072\|2304\|1024\|384\|24\|32\|6552),n=(512\|1024\|2048),k=(2304\|3072),bs=\[1,1\],nr=\[1,1\],per=\[0,1,2,3\],k_v=0'`, median of repeats | 3,072 x 2,304 at 1,024: ~425 us (arm 0) -> <= 240 (arm 2), <= 330 (arm 1); 24 rows <= 30 us on arm 2; 6,552 x 2,304 arm 2 >= 60 TFLOP/s (the tile 21 at 512 and 35 at 2,048 tokens): diagnostics, not the acceptance | 8 |
+| 4 | the pass at the unit's settings, arms 0 / 1 / 2, three interleaved rounds, a fresh process each; one screening run of arm 2 at `GGML_OPENCL_Q8_2D_SLOTS=0` | `env $UENV $A llama-batched-bench -m <the published IQ4_NL file> -ngl 99 -fa on -ctk q8_0 -ctv q8_0 -c 262144 -b 1024 -ub 1024 -npl 1 -ntg 0 -npp 4096` | arm 2 above arm 0 outside the run-to-run spread. +3.8-5.5 % is an upper band (140-200 ms of the tile's ~350 a pass, before the quantizer's cost against the f16 conversion's, ~30 ms a pass): +2-3 % would not indicate a defect. Arm 1 +1.5-3 %. The SLOTS=0 run prices the slots (expected within the spread at ub 1,024) | 25 |
+| 5 | the profile at depth 4,096, arms 0 and 2, `GGML_OPENCL_Q8_2D_STATS=1` | the profiling build's chunk step with `$A` added to its environment | `kernel_mul_mm_q8_0_f16` 0 launches on arm 2 (351 on arm 0), `kernel_mul_mm_kq2d_q8_0_i8` 351 launches, 35-55 ms (was 88.3); per arm the time and launches of `kernel_quant_i8` and `kernel_cvt_f32_f16` next to the GEMMs, so the net is read from the profile; the stats line `calls=351` a chunk graph with `hits > 0` and at most 4 quantizer launches a visit (`quants` <= 192) | 6 |
+| 6 | the answer-level bar | `env $UENV $A llama-perplexity -lv 4 -m <file> -f <gate text> -c 2048 --chunks 6 -fa on -ctk q8_0 -ctv q8_0 -b 1024 -ub 1024 --kl-divergence --kl-divergence-base <the published file's CPU base>`, arms 0 / 1 / 2; arm 2 again at `-ub 32`; and arm 2 with `GGML_OPENCL_Q8_2D_SLOTS=0`, and arm 2 with `GGML_OPENCL_KQ_DEDUP=0`, each against default arm 2 | TAKEN in each arm-1/2 log; arm 1 = arm 0 (the same rounding a weight: a tripwire, not a gate); arm 2 within 0.03 nats and 1 point of arm 0 (Llama 2's Q4_0 int8 cost +0.0006 nats, README 0099); the SLOTS=0 and DEDUP=0 arms within the bar of default arm 2, the stats line `hits > 0` on the default arm and `hits=0` on DEDUP=0 (the slot cache's one served check); `reason=q8-2d-rows` expected here (the published file's Q8_0 head, 201,024 rows, at every scored token) | 22 |
 | 7 | the task battery, arm 2 | `contrib/llama.cpp/replay/mix_task_battery.sh` with `$A` and `UENV` | 8 of 8 right | 8 |
 
-About 80 minutes, then the fixture answers on the dev unit with arm 2. If arm 2 fails the answer-level bar,
-arm 1 becomes the candidate and rows 4, 6 and 7 are re-run with it (+25 min). A B70 row only if a B70 unit
-gets the knob (Inkling does not run there): the offline check covers `bmg-g31`.
+In rows 4-7 no DOWNGRADE key `q8-2d-view`, `-layout`, `-not-soa`, `-align` or `-not-built` (the gate's
+code-read inputs, closed by row 5's `calls=351`); `q8-2d-rows` is the one expected key. Acceptance for arm
+2: row 4 outside the spread, rows 6 and 7; the TOPS lines of row 3 are diagnostics.
 
-**Open.** No card number exists for any of this. `GGML_OPENCL_Q8_2D_SLOTS` against 0 is not priced
-(row 5's stats line counts it). The fp16 arm's tile-identity (arm 1 = arm 0) is expected from the
-rounding, not proven: DPAS's internal summation order is the hardware's. 0201 (the attention bundle) is
-not part of this patch.
+About 105 minutes, the reds' 16 first, then the fixture answers on the dev unit with arm 2. If arm 2 fails
+the answer-level bar, arm 1 becomes the candidate and rows 4, 6 and 7 are re-run with it (+25 min). A B70
+row only if a B70 unit gets the knob (Inkling does not run there): the offline check covers `bmg-g31`.
+
+**Integration.** 0220 is diffed against development's series. 0209-0213 and 0219 on the other 1.8.3
+branches touch `ggml-opencl.cpp`: when they meet, the series needs an apply check and the knob-off ISA
+comparison of the K-quant program once more.
+
+**Open.** No card number exists for any of this. The fp16 arm's tile-identity (arm 1 = arm 0) is expected
+from the rounding, not proven: DPAS's internal summation order is the hardware's. The vISA decode is
+checked only on fills whose half products never round to subnormals; before it is proposed for a unit it
+needs a small-magnitude fill case and its own KL row. No op case hits a slot (one product a graph): the
+slot logic's coverage is rows 5 and 6. 0201 (the attention bundle) is not part of this patch.

@@ -7,7 +7,7 @@
 //     3072, wk / wv 1024 x 2304, attn_rel 384 x 2304, attn_sink_proj 24 x 2304, the k/v conv
 //     projections 32 x 2304) at modes 1 and 2, take nothing at mode 0, and leave the one-column
 //     lines and the head (Q6_K) alone; and it must refuse the out-of-scope variants built from
-//     a real line: K 64 and K 2880, one and 15 columns, a view, a weight not in the flat
+//     a real line: K 64 and K 2880, one and 15 columns, K x columns at 2^31, a view, a weight not in the flat
 //     planes, the head's 201,024 rows as Q8_0, a batched weight, strided columns, a strided
 //     destination, a 32-byte base alignment. Red first, on every run: the same checks against
 //     wrong rules (K % 32 in place of % 256, no row cap, accept-all, refuse-all) must FAIL.
@@ -24,11 +24,14 @@
 //     scale), the comparison test-backend-ops makes, on its uniform [-1, 1] fill. The bound is
 //     the suite's NMSE for MUL_MAT, 5e-4. The two red builds of the kernel (Q8_2D_RED 1, the
 //     8th block's codes dropped; 2, every lane the scales of its sub-group's first row) are
-//     modelled too, so the card's reds have a predicted size: red 1 must be far above the
-//     bound; red 2 above it on the uniform fill (every row's scales are then nearly alike,
-//     so its margin there is small) and far above it on rows of eight magnitudes. This is a
-//     model of the arithmetic, not of the kernel's text: the kernel is checked by the op
-//     cases on the card.
+//     modelled too, and 3 (the int8 kernel: every token of a 32-token tile the activation
+//     scale of the tile's first token), so the card's reds have a predicted size. On the
+//     uniform fill every scale is nearly alike: red 1 is far above the bound, red 2 only
+//     3-4x above it, and red 3 under it (asserted: the suite's uniform cases cannot see an
+//     activation-scale error). On test_mul_mat_spread's fill (weights per (row, 32-block),
+//     activations per (token, 256-block), eight magnitudes) all three must be far above it
+//     and both green arms under it. This is a model of the arithmetic, not of the kernel's
+//     text: the kernel is checked by the op cases on the card.
 #include "ggml-opencl-q8-2d.h"
 
 #include <cmath>
@@ -197,6 +200,8 @@ static int check_rule(const std::vector<export_line> & ex, rule_fn rule, bool qu
     negs.push_back({ "15 columns", make_input(2, 2304, 3072, 15), GGML_CL_Q8_2D_NOT_MINE });
     negs.push_back({ "the head's 201,024 rows as Q8_0", make_input(2, 2304, 201024, 1024), GGML_CL_Q8_2D_ROWS });
     negs.push_back({ "8,193 rows", make_input(2, 2304, 8193, 1024), GGML_CL_Q8_2D_ROWS });
+    negs.push_back({ "K 8,192 x 262,144 columns (2^31 values)", make_input(2, 8192, 1024, 262144), GGML_CL_Q8_2D_LIMIT });
+    negs.push_back({ "K 8,192 x 262,143 columns", make_input(2, 8192, 1024, 262143), GGML_CL_Q8_2D_TAKE });
     { ggml_cl_q8_2d_in a = make_input(2, 2304, 3072, 1024); a.view0 = true;     negs.push_back({ "a view", a, GGML_CL_Q8_2D_VIEW }); }
     { ggml_cl_q8_2d_in a = make_input(2, 2304, 3072, 1024); a.soa0 = false;     negs.push_back({ "not in the flat planes", a, GGML_CL_Q8_2D_SOA }); }
     { ggml_cl_q8_2d_in a = make_input(2, 2304, 3072, 1024); a.alignment = 32;  negs.push_back({ "32-byte base alignment", a, GGML_CL_Q8_2D_ALIGN }); }
@@ -307,18 +312,20 @@ static void quant_q8_0(const float * x, int k, int8_t * q, float * d) {
     }
 }
 
-struct model_out { double nmse_i8, nmse_f16, nmse_red1, nmse_red2; };
+struct model_out { double nmse_i8, nmse_f16, nmse_red1, nmse_red2, nmse_red3; };
 
-// the products of one shape: m rows x k, n tokens; rows_spread scales row r by 2^(r % 8 - 4)
-static model_out model(int64_t m, int64_t k, int64_t n, bool rows_spread, uint32_t seed) {
+// the products of one shape: m rows x k, n tokens. spread: test_mul_mat_spread's fill, weight row r,
+// 32-block b scaled by 2^((r + b) % 8 - 4), activation token t, 256-block s by 2^((t + s) % 8 - 4)
+static model_out model(int64_t m, int64_t k, int64_t n, bool spread, uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_real_distribution<float> u(-1.f, 1.f);
     std::vector<float> w(m * k), x(n * k);
     for (int64_t r = 0; r < m; ++r) {
-        const float s = rows_spread ? std::ldexp(1.f, (int) (r % 8) - 4) : 1.f;
-        for (int64_t i = 0; i < k; ++i) w[r * k + i] = u(rng) * s;
+        for (int64_t i = 0; i < k; ++i) w[r * k + i] = u(rng) * (spread ? std::ldexp(1.f, (int) ((r + i / 32) % 8) - 4) : 1.f);
     }
-    for (float & v : x) v = u(rng);
+    for (int64_t t = 0; t < n; ++t) {
+        for (int64_t i = 0; i < k; ++i) x[t * k + i] = u(rng) * (spread ? std::ldexp(1.f, (int) ((t + i / 256) % 8) - 4) : 1.f);
+    }
     const int64_t nb32 = k / 32, nb256 = k / 256;
     std::vector<int8_t> wq(m * k);
     std::vector<float>  wd(m * nb32);
@@ -339,7 +346,7 @@ static model_out model(int64_t m, int64_t k, int64_t n, bool rows_spread, uint32
             for (int j = 0; j < 256; ++j) aq[t * k + 256 * b + j] = (int8_t) std::nearbyint(x[t * k + 256 * b + j] * iq);
         }
     }
-    double e_i8 = 0, e_f16 = 0, e_r1 = 0, e_r2 = 0, s_ref = 0;
+    double e_i8 = 0, e_f16 = 0, e_r1 = 0, e_r2 = 0, e_r3 = 0, s_ref = 0;
     for (int64_t r = 0; r < m; ++r) {
         const int64_t r_first = r - r % 16;   // red 2: the sub-group's first row
         for (int64_t t = 0; t < n; ++t) {
@@ -351,7 +358,8 @@ static model_out model(int64_t m, int64_t k, int64_t n, bool rows_spread, uint32
             }
             // the int8 arm: a block's integer sum times the block's scale, summed over the
             // super-block in f32, times the activation scale
-            float acc = 0.f, acc1 = 0.f, acc2 = 0.f;
+            float acc = 0.f, acc1 = 0.f, acc2 = 0.f, acc3 = 0.f;
+            const int64_t t_first = t - t % 32;   // red 3: the 32-token tile's first token
             for (int64_t sb = 0; sb < nb256; ++sb) {
                 float af = 0.f, af1 = 0.f, af2 = 0.f;
                 for (int bl = 0; bl < 8; ++bl) {
@@ -365,6 +373,7 @@ static model_out model(int64_t m, int64_t k, int64_t n, bool rows_spread, uint32
                 acc  = std::fma(af,  ad[t * nb256 + sb], acc);
                 acc1 = std::fma(af1, ad[t * nb256 + sb], acc1);
                 acc2 = std::fma(af2, ad[t * nb256 + sb], acc2);
+                acc3 = std::fma(af,  ad[t_first * nb256 + sb], acc3);
             }
             // the fp16 arm: half(code x scale) times half(x), f32 sums
             float f16 = 0.f;
@@ -374,9 +383,10 @@ static model_out model(int64_t m, int64_t k, int64_t n, bool rows_spread, uint32
             e_f16 += (f16 - ref) * (f16 - ref);
             e_r1  += (acc1 - ref) * (acc1 - ref);
             e_r2  += (acc2 - ref) * (acc2 - ref);
+            e_r3  += (acc3 - ref) * (acc3 - ref);
         }
     }
-    return { e_i8 / s_ref, e_f16 / s_ref, e_r1 / s_ref, e_r2 / s_ref };
+    return { e_i8 / s_ref, e_f16 / s_ref, e_r1 / s_ref, e_r2 / s_ref, e_r3 / s_ref };
 }
 
 int main() {
@@ -428,19 +438,26 @@ int main() {
         // not on how many rows and tokens there are
         const int64_t mm = s.m < 64 ? s.m : 64;
         const model_out o = model(mm, s.k, 32, false, 20261125u + (uint32_t) s.k);
-        printf("model %lld x %lld (%lld rows, 32 tokens), uniform fill: NMSE int8 %.2e, fp16 %.2e, red 1 %.3f, red 2 %.2e\n",
-               (long long) s.m, (long long) s.k, (long long) mm, o.nmse_i8, o.nmse_f16, o.nmse_red1, o.nmse_red2);
+        printf("model %lld x %lld (%lld rows, 32 tokens), uniform fill: NMSE int8 %.2e, fp16 %.2e, red 1 %.3f, red 2 %.2e, red 3 %.2e\n",
+               (long long) s.m, (long long) s.k, (long long) mm, o.nmse_i8, o.nmse_f16, o.nmse_red1, o.nmse_red2, o.nmse_red3);
         CHECK(o.nmse_i8 < bound, "%lld x %lld: the int8 arm's NMSE %.2e is not under %.0e", (long long) s.m, (long long) s.k, o.nmse_i8, bound);
         CHECK(o.nmse_f16 < bound, "%lld x %lld: the fp16 arm's NMSE %.2e is not under %.0e", (long long) s.m, (long long) s.k, o.nmse_f16, bound);
         CHECK(o.nmse_red1 > 100 * bound, "%lld x %lld: red 1's NMSE %.2e is not far above the bound", (long long) s.m, (long long) s.k, o.nmse_red1);
         CHECK(o.nmse_red2 > bound, "%lld x %lld: red 2's NMSE %.2e is under the bound", (long long) s.m, (long long) s.k, o.nmse_red2);
+        // red 3 is invisible on the uniform fill: on the record, and a reason for the spread cases
+        CHECK(o.nmse_red3 < bound, "%lld x %lld: red 3 is visible on the uniform fill (%.2e): the model changed", (long long) s.m, (long long) s.k, o.nmse_red3);
     }
-    {
-        const model_out o = model(64, 2304, 32, true, 7u);
-        printf("model 64 x 2304, rows of 8 magnitudes: NMSE int8 %.2e, fp16 %.2e, red 1 %.3f, red 2 %.3f\n",
-               o.nmse_i8, o.nmse_f16, o.nmse_red1, o.nmse_red2);
-        CHECK(o.nmse_i8 < bound && o.nmse_f16 < bound, "the spread rows' green arms are not under the bound");
-        CHECK(o.nmse_red2 > 100 * bound, "red 2 on rows of 8 magnitudes: NMSE %.2e is not far above the bound", o.nmse_red2);
+    // test_mul_mat_spread's shapes, rows capped at 64, 32 tokens
+    const struct { int64_t m, k; } spread_shapes[] = { { 3072, 2304 }, { 24, 2304 }, { 257, 2304 }, { 1024, 256 } };
+    for (const auto & s : spread_shapes) {
+        const int64_t mm = s.m < 64 ? s.m : 64;
+        const model_out o = model(mm, s.k, 32, true, 7u + (uint32_t) s.m);
+        printf("model %lld x %lld (%lld rows, 32 tokens), spread fill: NMSE int8 %.2e, fp16 %.2e, red 1 %.3f, red 2 %.3f, red 3 %.3f\n",
+               (long long) s.m, (long long) s.k, (long long) mm, o.nmse_i8, o.nmse_f16, o.nmse_red1, o.nmse_red2, o.nmse_red3);
+        CHECK(o.nmse_i8 < bound && o.nmse_f16 < bound, "%lld x %lld: the spread fill's green arms are not under the bound", (long long) s.m, (long long) s.k);
+        CHECK(o.nmse_red1 > 100 * bound, "%lld x %lld spread: red 1's NMSE %.2e is not far above the bound", (long long) s.m, (long long) s.k, o.nmse_red1);
+        CHECK(o.nmse_red2 > 100 * bound, "%lld x %lld spread: red 2's NMSE %.2e is not far above the bound", (long long) s.m, (long long) s.k, o.nmse_red2);
+        CHECK(o.nmse_red3 > 100 * bound, "%lld x %lld spread: red 3's NMSE %.2e is not far above the bound", (long long) s.m, (long long) s.k, o.nmse_red3);
     }
 
     if (g_failures) {

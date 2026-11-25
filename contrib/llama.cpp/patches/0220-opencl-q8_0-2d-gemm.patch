@@ -1,11 +1,11 @@
-0220: dense Q8_0 x F32 products of 16 or more columns on the 2D-block GEMM of mul_mm_kq_2d.cl behind GGML_OPENCL_Q8_2D (0 off, the default: nothing is built and the 0058 tile takes Q8_0 as before; 1 fp16, kernel_mul_mm_kq2d_q8_0; 2 int8, kernel_mul_mm_kq2d_q8_0_i8, the Q4_0 int8 kernel with the decode removed: Q8_0's codes are the DPAS operand). A program of its own from the same text (Q8_2D_ONLY: the K-quants' program is unchanged), the work-group sized to the rows, a pure gate (ggml-opencl-q8-2d.h: Q8_0 SoA, F32, K % 256, contiguous, no view, at most 8,192 rows, the 2D limits) with a DOWNGRADE line on refusal and one TAKEN line a process, the int8 activations in GGML_OPENCL_Q8_2D_SLOTS slots (default 4), bounds under GGML_OPENCL_BOUNDS, two reds through GGML_OPENCL_KQ_2D_OPTS (-DQ8_2D_RED=1 / 2), an inline-vISA decode for the fp16 arm behind GGML_OPENCL_Q8_2D_VISA=1 (the C form the fallback), and the served shapes as op and perf cases.
+0220: dense Q8_0 x F32 products of 16 or more columns on the 2D-block GEMM of mul_mm_kq_2d.cl behind GGML_OPENCL_Q8_2D (0 off, the default: nothing is built and the 0058 tile takes Q8_0 as before; 1 fp16, kernel_mul_mm_kq2d_q8_0; 2 int8, kernel_mul_mm_kq2d_q8_0_i8, the Q4_0 int8 kernel with the decode removed: Q8_0's codes are the DPAS operand). A program of its own from the same text (Q8_2D_ONLY: the K-quants' program is unchanged), the work-group sized to the rows, a pure gate (ggml-opencl-q8-2d.h: Q8_0 SoA, F32, K % 256, contiguous, no view, at most 8,192 rows, the 2D limits) with a DOWNGRADE line on refusal and one TAKEN line a process, the int8 activations in GGML_OPENCL_Q8_2D_SLOTS slots (default 4), bounds under GGML_OPENCL_BOUNDS, three reds through GGML_OPENCL_KQ_2D_OPTS (-DQ8_2D_RED=1 / 2 / 3: a block's codes, the block scales' row, the activation scales' token), an inline-vISA decode for the fp16 arm behind GGML_OPENCL_Q8_2D_VISA=1 (the C form the fallback), and the served shapes as op and perf cases, with op cases on a fill that tells the scales apart (test_mul_mat_spread: the uniform fill cannot see red 3).
 
 diff --git a/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h b/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h
 new file mode 100644
-index 0000000..2e34409
+index 0000000..d7a8c89
 --- /dev/null
 +++ b/ggml/src/ggml-opencl/ggml-opencl-q8-2d.h
-@@ -0,0 +1,137 @@
+@@ -0,0 +1,139 @@
 +// 0220: the gate and the launch shape of the dense Q8_0 2D-block GEMM (mul_mm_kq_2d.cl,
 +// kernel_mul_mm_kq2d_q8_0_i8 and kernel_mul_mm_kq2d_q8_0, GGML_OPENCL_Q8_2D). Pure: no cl_
 +// calls and no device, so a unit test feeds them a graph export's real types, shapes and
@@ -22,7 +22,8 @@ index 0000000..2e34409
 +//   - K a multiple of 256 (a super-block of eight 32-blocks: the int8 activations carry
 +//     one scale per 256);
 +//   - the 2D block limits: a surface at most 2^24 bytes wide and 2^24 rows high (the
-+//     fp16 activations are 2 * K bytes a row);
++//     fp16 activations are 2 * K bytes a row), and K x columns under 2^31 (the host keys
++//     and sizes the activations by that int);
 +//   - at most `max_rows` rows (8,192 from the host): the big output head stays where it
 +//     is.
 +// The verdict names the first refusal; GGML_CL_Q8_2D_TAKE (0) is the only take. A
@@ -50,7 +51,7 @@ index 0000000..2e34409
 +    GGML_CL_Q8_2D_SOA,        // not in the flat planes
 +    GGML_CL_Q8_2D_K,          // K not a multiple of 256
 +    GGML_CL_Q8_2D_ROWS,       // above the row cap
-+    GGML_CL_Q8_2D_LIMIT,      // past a 2D block surface's 2^24
++    GGML_CL_Q8_2D_LIMIT,      // past a 2D block surface's 2^24, or K x columns past an int
 +    GGML_CL_Q8_2D_ALIGN,      // the device's base alignment not a multiple of 64 bytes
 +};
 +
@@ -118,7 +119,8 @@ index 0000000..2e34409
 +    if (m < 1 || m > a.max_rows) {
 +        return GGML_CL_Q8_2D_ROWS;
 +    }
-+    if (2 * k >= ((int64_t) 1 << 24) || m >= ((int64_t) 1 << 24) || n >= ((int64_t) 1 << 24)) {
++    if (2 * k >= ((int64_t) 1 << 24) || m >= ((int64_t) 1 << 24) || n >= ((int64_t) 1 << 24) ||
++        k * n >= ((int64_t) 1 << 31)) {
 +        return GGML_CL_Q8_2D_LIMIT;
 +    }
 +    if (a.alignment == 0 || a.alignment % 64 != 0) {
@@ -502,7 +504,7 @@ index 7b04b86..13dd0cc 100644
      // durable image form; 0058 q8_0 XMX GEMM). Only a flattened (SoA) Q8_0
      // tensor carries the code/scale split; a view reads its view_src's.
 diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
-index 7f138d6..1a5bc80 100644
+index 7f138d6..c699ec1 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_2d.cl
 @@ -190,6 +190,7 @@ kernel void kernel_cvt_f32_f16_p4(global const char * src, ulong offs, global ha
@@ -529,7 +531,7 @@ index 7f138d6..1a5bc80 100644
  __attribute__((intel_reqd_sub_group_size(16)))
  kernel void kernel_mul_mm_kq2d_q4_K_i8(global const uchar * q, global const uchar * s, global const half * d,
                                         global const half * dm, global const char * xq, global const float * xd,
-@@ -815,3 +818,205 @@ kernel void kernel_mul_mm_kq2d_q4_0_i8(global const uchar * q, global const half
+@@ -815,3 +818,212 @@ kernel void kernel_mul_mm_kq2d_q4_0_i8(global const uchar * q, global const half
          }
      }
  }
@@ -551,7 +553,10 @@ index 7f138d6..1a5bc80 100644
 +//
 +// Q8_2D_RED (the red cases, through GGML_OPENCL_KQ_2D_OPTS): 1 drops the codes of
 +// the 8th block of every super-block (one K term in eight, NMSE ~0.125); 2 gives
-+// every lane the scales of its sub-group's first row.
++// every lane the scales of its sub-group's first row; 3 (the int8 kernel only) gives
++// every token of a 32-token tile the activation scale of the tile's first token.
++// Reds 2 and 3 are visible on a fill whose scales differ (test_mul_mat_spread); on
++// the uniform fill red 3 passes.
 +#ifndef Q8_2D_RED
 +#define Q8_2D_RED 0
 +#endif
@@ -590,7 +595,11 @@ index 7f138d6..1a5bc80 100644
 +        float8 xv[NGM], af[NGM];
 +        _Pragma("unroll")
 +        for (int g = 0; g < NGM; ++g) {
++#if Q8_2D_RED == 3
++            xv[g] = (float8)(xd[(ulong)kb * tp + t0]);
++#else
 +            xv[g] = vload8(0, xd + (ulong)kb * tp + t0 + 8 * g);
++#endif
 +            af[g] = (float8)(0.f);
 +        }
 +        const int kn = min(kb + 1, nb - 1);
@@ -736,10 +745,56 @@ index 7f138d6..1a5bc80 100644
 +}
 +#endif // Q8_2D_KERNELS
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c3ff1b1..c0d4a9d 100644
+index c3ff1b1..2e51200 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -13324,6 +13324,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -5954,6 +5954,45 @@ struct test_mul_mat : public test_case {
+     }
+ };
+ 
++// 0220: MUL_MAT with a fill that tells the scales apart. On the uniform fill every Q8_0 block scale and
++// every activation scale per 256 is nearly the same number, so a kernel that reads the wrong one passes
++// (an activation scale of the wrong token or 256-block stays near 5e-5 NMSE). Here weight row r, 32-block
++// b is scaled by 2^((r + b) % 8 - 4) and activation token t, 256-block s by 2^((t + s) % 8 - 4); with
++// big = 1 every token t % 61 == 7 is also scaled by 2^15, past the f16 conversion's 16,384 (its column
++// scale then moves). The weights are quantized from that fill as init_tensor_uniform quantizes.
++struct test_mul_mat_spread : public test_mul_mat {
++    const int big;
++    test_mul_mat_spread(ggml_type type_a, int64_t m, int64_t n, int64_t k, int big = 0)
++        : test_mul_mat(type_a, GGML_TYPE_F32, m, n, k, { 1, 1 }, { 1, 1 }), big(big) {}
++    std::string vars() override { return test_mul_mat::vars() + ",spread=1,big=" + std::to_string(big); }
++    void initialize_tensors(ggml_context * ctx) override {
++        std::mt19937 rng(20261125u);
++        std::uniform_real_distribution<float> u(-1.0f, 1.0f);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
++            const bool is_a = strcmp(t->name, "a") == 0, is_b = strcmp(t->name, "b") == 0;
++            if (!is_a && !is_b) {
++                init_tensor_uniform(t);   // the sentinels and the rest, as the base case fills them
++                continue;
++            }
++            const int64_t ne0 = t->ne[0], nr = ggml_nrows(t), blk = is_a ? 32 : 256;
++            std::vector<float> data(ne0 * nr);
++            for (int64_t r = 0; r < nr; ++r) {
++                const float extra = (!is_a && big && r % 61 == 7) ? 32768.0f : 1.0f;
++                for (int64_t i = 0; i < ne0; ++i) {
++                    data[r * ne0 + i] = u(rng) * std::ldexp(1.0f, (int) ((r + i / blk) % 8) - 4) * extra;
++                }
++            }
++            if (t->type == GGML_TYPE_F32) {
++                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
++            } else {
++                std::vector<uint8_t> q(ggml_row_size(t->type, ne0) * nr);
++                ggml_quantize_chunk(t->type, data.data(), q.data(), 0, nr, ne0, nullptr);
++                ggml_backend_tensor_set(t, q.data(), 0, q.size());
++            }
++        }
++    }
++};
++
+ // ARC-LAB 0116: a 2-D view of a quantized weight that is not a whole slice of it: [K, N, E] reshaped to
+ // [K, N E] (the elements of the parent, not its slices), or (rows > 0) the first `rows` rows of a [K, N]
+ // weight at offset 0. OpenCL keeps the low-bit types and Q3_K in planes per slice of the parent, so a
+@@ -13324,6 +13363,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, true, 520, 512, 256));
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 520, 8, true, 512, 512, 256));
  
@@ -764,11 +819,20 @@ index c3ff1b1..c0d4a9d 100644
 +    }
 +    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 1024, 512, 256, { 1, 1 }, { 1, 1 }));
 +    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2304, 512, 64, { 1, 1 }, { 1, 1 }));
++    // the same products on a fill that tells the block and activation scales apart (the reds' fill):
++    // 3072 x 2304 at 1,024 tokens, 24 rows at 1,025, 257 rows at 512, one super-block of K; and two with
++    // tokens past the f16 conversion's 16,384
++    for (auto [m, n, k] : std::vector<std::array<int64_t, 3>>{ { 3072, 1024, 2304 }, { 24, 1025, 2304 }, { 257, 512, 2304 },
++                                                               { 1024, 512, 256 } }) {
++        test_cases.emplace_back(new test_mul_mat_spread(GGML_TYPE_Q8_0, m, n, k));
++    }
++    test_cases.emplace_back(new test_mul_mat_spread(GGML_TYPE_Q8_0, 3072, 1024, 2304, 1));
++    test_cases.emplace_back(new test_mul_mat_spread(GGML_TYPE_Q8_0, 24, 1025, 2304, 1));
 +
      // multiple blocks per row: exercises the block-stride loop and the
      // per-expert base offset, which k == 256 alone leaves untested
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
-@@ -15151,6 +15173,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -15151,6 +15221,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
          test_cases.emplace_back(new test_mul_mat_id_routed(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, bs, 2304));
      }
  
