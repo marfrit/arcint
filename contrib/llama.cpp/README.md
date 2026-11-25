@@ -10847,7 +10847,9 @@ drops to the first freed cell and the restored window lands on cells holding oth
 (hybrid, standard SWA) takes checkpoints for every hybrid and restores them partial (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`,
 which carries the SWA cells), so it had the defect at q8_0 / q8_0:q4_0 K/V on OpenCL whenever the checkpoint sat above
 `n_swa`, with the full-size SWA cache (1.8.0) and the window-sized one (`--llama-swa-window`); Dory too with the window
-flag. 1.8.1 and 1.8.2 refuse the restore at those K/V types instead. The missing `view_offs` in the generic and bf16
+flag. 1.8.1 and 1.8.2 refuse the restore at those K/V types instead; 1.8.3 restores them where arcint's configure
+finds this patch in its llama.cpp tree (`ARCINT_LLAMA_KV_VIEW_WRITES`, `src/core/swa_window.h`), and a build against a
+tree without it keeps the refusal. The missing `view_offs` in the generic and bf16
 writes put a stream s > 0's rows at stream 0's (unnamed lanes over a non-unified cache at f16 / f32 / bf16).
 
 **The trees** (`measured-here`, `git write-tree` of the pin with the series applied by `apply-series.sh`, LC_ALL=C):

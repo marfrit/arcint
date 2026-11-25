@@ -258,6 +258,17 @@ ggml_type kv_type(const std::string& t) {
     return t == "q8_0" ? GGML_TYPE_Q8_0 : t == "q4_0" ? GGML_TYPE_Q4_0 : GGML_TYPE_F16;   // q4_0: V only
 }
 
+// contrib/llama.cpp 0209 (the OpenCL q8_0 / q4_0 write through a view) in the llama
+// tree this binary was built against, found at configure; core/swa_window.h keeps
+// the q8_0 / q4_0 sliding-window checkpoints off without it.
+// ARCINT_ASSUME_KV_VIEW_WRITES is a red-case build's (a tree without 0209 that
+// restores anyway, to show what the refusal prevents), never a served one
+#if defined(ARCINT_LLAMA_KV_VIEW_WRITES) || defined(ARCINT_ASSUME_KV_VIEW_WRITES)
+constexpr bool kKvViewWrites = true;
+#else
+constexpr bool kKvViewWrites = false;
+#endif
+
 using clock_type = std::chrono::steady_clock;
 
 double seconds_since(clock_type::time_point t0) {
@@ -1213,22 +1224,29 @@ public:
         if (const std::string no = checkpoints_refusal(cfg.llama_checkpoints_asked, can_snapshot, a); !no.empty())
             throw std::runtime_error(no);
         ckpt_on_   = ckpt_max_ > 0 && can_snapshot;
-        // 1.8.1: a q8_0 / q4_0 K/V restore of sliding-window cells writes no bytes on
-        // OpenCL (core/swa_window.h); such a start keeps no checkpoints and re-reads
-        // the prompt where it would have resumed. The llama engine runs on the
+        // a q8_0 / q4_0 K/V restore of sliding-window cells writes no bytes on OpenCL
+        // without contrib/llama.cpp 0209 (core/swa_window.h); a binary built against a
+        // llama.cpp tree without it keeps 1.8.1's refusal: no checkpoints, and the
+        // prompt is re-read where it would have resumed. The llama engine runs on the
         // OpenCL device it picked (devs_, the build's one GPU backend)
         {
             const auto q4q8 = [](ggml_type t) { return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0; };
             ckpt_stale_ = swa_ckpt_restore_refused(n_swa_, !devs_.empty() && devs_[0] != nullptr,
-                                                   q4q8(cp.type_k), q4q8(cp.type_v));
+                                                   q4q8(cp.type_k), q4q8(cp.type_v), kKvViewWrites);
             if (ckpt_stale_ && ckpt_on_) {
                 ckpt_on_ = false;
                 log::warn("load", "context checkpoints: off for this start. A sliding-window cache at %s K / %s V "
-                                  "cannot be restored on OpenCL in this release (the cells' bytes would not be "
-                                  "written back); a follow-up that changes earlier text re-reads the whole prompt. "
-                                  "f16 K/V keeps checkpoints",
+                                  "cannot be restored on OpenCL by this build: its llama.cpp lacks contrib/llama.cpp "
+                                  "patch 0209 (the cells' bytes would not be written back); a follow-up that changes "
+                                  "earlier text re-reads the whole prompt. f16 K/V keeps checkpoints",
                           ggml_type_name(cp.type_k), ggml_type_name(cp.type_v));
             }
+#if defined(ARCINT_ASSUME_KV_VIEW_WRITES) && !defined(ARCINT_LLAMA_KV_VIEW_WRITES)
+            if (ckpt_on_ && n_swa_ > 0 && (q4q8(cp.type_k) || q4q8(cp.type_v)))
+                log::warn("load", "RED-CASE BUILD (ARCINT_ASSUME_KV_VIEW_WRITES): q8_0 / q4_0 sliding-window "
+                                  "checkpoints are restored although this llama.cpp lacks patch 0209; a restore "
+                                  "brings back positions and not bytes. Not for serving");
+#endif
         }
         if (ckpt_max_ > 0 && !can_snapshot)
             log::info("load", "context checkpoints: none, a '%s' model has no recurrent memory; its attention cache trims", a.c_str());
@@ -3026,7 +3044,7 @@ private:
     // the oldest. One already at n_tokens is kept (the lane's tokens below it
     // are unchanged, so is its state). Caller holds mu_.
     void save_ckpt_locked(int seq, size_t n_tokens) {
-        if (ckpt_stale_) return;   // 1.8.1: never restorable (core/swa_window.h)
+        if (ckpt_stale_) return;   // never restorable without 0209 (core/swa_window.h)
         auto& list = ckpts_[static_cast<size_t>(seq)];
         while (!list.empty() && list.back().n_tokens > n_tokens) list.pop_back();
         if (!list.empty() && list.back().n_tokens == n_tokens) {
@@ -3077,21 +3095,23 @@ private:
     // when there is none or loading failed (the state is then undefined and
     // the caller clears the sequence). Caller holds mu_.
     const Checkpoint* restore_ckpt_locked(int seq, size_t limit) {
-        if (ckpt_stale_) {   // 1.8.1, core/swa_window.h: refused before any cell is touched
+        if (ckpt_stale_) {   // core/swa_window.h: without 0209, refused before any cell is touched
             log::info("slot", "lane %d: nothing restored (a q8_0 / q4_0 sliding-window cache cannot be restored on "
-                              "OpenCL in this release): full re-prefill", seq);
+                              "OpenCL by this build, whose llama.cpp lacks patch 0209): full re-prefill", seq);
             return nullptr;
         }
         const auto& list = ckpts_[static_cast<size_t>(seq)];
         for (auto it = list.rbegin(); it != list.rend(); ++it) {
             if (it->n_tokens > limit) continue;
+            const auto t_restore = clock_type::now();
             if (llama_state_seq_set_data_ext(ctx_, it->state.data(), it->state.size(), seq,
                                              LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != it->state.size()) {
                 log::warn("slot", "lane %d: loading the checkpoint at %zu tokens failed", seq, it->n_tokens);
                 return nullptr;
             }
-            log::info("slot", "lane %d resumes from its checkpoint at %zu tokens (%.1f MiB)", seq, it->n_tokens,
-                      static_cast<double>(it->state.size()) / (1u << 20));
+            log::info("slot", "lane %d resumes from its checkpoint at %zu tokens (%.1f MiB, restored in %.1f ms)", seq,
+                      it->n_tokens, static_cast<double>(it->state.size()) / (1u << 20),
+                      seconds_since(t_restore) * 1000.0);
             return &*it;
         }
         return nullptr;
@@ -3601,7 +3621,7 @@ private:
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;
     bool                                  ckpt_on_   = false;   // a hybrid or recurrent model, or a window-sized SWA cache, N > 0
-    bool                                  ckpt_stale_ = false;   // 1.8.1: q8_0/q4_0 SWA cells on OpenCL, no checkpoints (swa_window.h)
+    bool                                  ckpt_stale_ = false;   // q8_0/q4_0 SWA cells on OpenCL without 0209: no checkpoints (swa_window.h)
     bool                                  swa_window_ = false;   // --llama-swa-window: the SWA cache holds n_swa + ubatch
     int                                   n_swa_      = 0;       // llama_model_n_swa of the loaded model
     size_t                                ckpt_empty_bytes_ = 0;   // a checkpoint's partial state of an empty lane: no SWA cells
