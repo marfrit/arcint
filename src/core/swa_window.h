@@ -28,4 +28,17 @@ inline bool swa_window_trim_complete(int n_swa, long long pos_min, size_t common
     return pos_min <= need_from;
 }
 
+// 1.8.1: whether this start must not save or restore checkpoints. A checkpoint
+// (PARTIAL_ONLY) carries a sliding-window cache's cells (every swa type but none),
+// and the restore writes them through views of the K / V tensors. On the OpenCL
+// backend of this release a view write into a q8_0 or q4_0 tensor returns
+// without writing, so a restore would bring back the cells' positions and not
+// their bytes: the window would attend stale keys and values. Until the write is
+// fixed (1.8.2) such a start keeps no checkpoints, and a follow-up that changes
+// earlier text re-reads the prompt. `on_opencl`: the model runs on an OpenCL
+// device; `k_q4q8` / `v_q4q8`: the K / V cache type is q8_0 or q4_0.
+inline bool swa_ckpt_restore_refused(int n_swa, bool on_opencl, bool k_q4q8, bool v_q4q8) {
+    return n_swa > 0 && on_opencl && (k_q4q8 || v_q4q8);
+}
+
 }  // namespace lgc

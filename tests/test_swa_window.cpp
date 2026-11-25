@@ -13,6 +13,17 @@
 
 using namespace lgc;
 
+TEST(swa_window_a_q8_q4_sliding_window_checkpoint_is_refused_on_opencl_only) {
+    // 1.8.1: OpenCL + a sliding window + q8_0 / q4_0 K or V: no checkpoint (the restore would
+    // write no bytes). Red: the predicate returning false lets the first two through.
+    CHECK(swa_ckpt_restore_refused(1024, true, true, true));     // Inkling's units: q8_0 K/V
+    CHECK(swa_ckpt_restore_refused(1024, true, false, true));    // f16 K, q4_0 V
+    CHECK(swa_ckpt_restore_refused(1024, true, true, false));
+    CHECK(!swa_ckpt_restore_refused(1024, true, false, false));  // f16 K/V: the generic write
+    CHECK(!swa_ckpt_restore_refused(1024, false, true, true));   // not on OpenCL (the CPU's memcpy)
+    CHECK(!swa_ckpt_restore_refused(0, true, true, true));       // no sliding window: the 27B agent at q8_0:q4_0
+}
+
 TEST(swa_window_a_trim_inside_the_retained_history_is_exact) {
     // the lane holds [1,536, 3,071]; the cut is at 2,599, the next query at
     // 2,599 needs keys from 2,599 - 1,024 + 1 = 1,576: inside what it holds

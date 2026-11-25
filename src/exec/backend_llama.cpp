@@ -1213,6 +1213,23 @@ public:
         if (const std::string no = checkpoints_refusal(cfg.llama_checkpoints_asked, can_snapshot, a); !no.empty())
             throw std::runtime_error(no);
         ckpt_on_   = ckpt_max_ > 0 && can_snapshot;
+        // 1.8.1: a q8_0 / q4_0 K/V restore of sliding-window cells writes no bytes on
+        // OpenCL (core/swa_window.h); such a start keeps no checkpoints and re-reads
+        // the prompt where it would have resumed. The llama engine runs on the
+        // OpenCL device it picked (devs_, the build's one GPU backend)
+        {
+            const auto q4q8 = [](ggml_type t) { return t == GGML_TYPE_Q8_0 || t == GGML_TYPE_Q4_0; };
+            ckpt_stale_ = swa_ckpt_restore_refused(n_swa_, !devs_.empty() && devs_[0] != nullptr,
+                                                   q4q8(cp.type_k), q4q8(cp.type_v));
+            if (ckpt_stale_ && ckpt_on_) {
+                ckpt_on_ = false;
+                log::warn("load", "context checkpoints: off for this start. A sliding-window cache at %s K / %s V "
+                                  "cannot be restored on OpenCL in this release (the cells' bytes would not be "
+                                  "written back); a follow-up that changes earlier text re-reads the whole prompt. "
+                                  "f16 K/V keeps checkpoints",
+                          ggml_type_name(cp.type_k), ggml_type_name(cp.type_v));
+            }
+        }
         if (ckpt_max_ > 0 && !can_snapshot)
             log::info("load", "context checkpoints: none, a '%s' model has no recurrent memory; its attention cache trims", a.c_str());
         // the baseline the save's guard compares against: the partial state of an
@@ -3005,6 +3022,7 @@ private:
     // the oldest. One already at n_tokens is kept (the lane's tokens below it
     // are unchanged, so is its state). Caller holds mu_.
     void save_ckpt_locked(int seq, size_t n_tokens) {
+        if (ckpt_stale_) return;   // 1.8.1: never restorable (core/swa_window.h)
         auto& list = ckpts_[static_cast<size_t>(seq)];
         while (!list.empty() && list.back().n_tokens > n_tokens) list.pop_back();
         if (!list.empty() && list.back().n_tokens == n_tokens) {
@@ -3055,6 +3073,11 @@ private:
     // when there is none or loading failed (the state is then undefined and
     // the caller clears the sequence). Caller holds mu_.
     const Checkpoint* restore_ckpt_locked(int seq, size_t limit) {
+        if (ckpt_stale_) {   // 1.8.1, core/swa_window.h: refused before any cell is touched
+            log::info("slot", "lane %d: nothing restored (a q8_0 / q4_0 sliding-window cache cannot be restored on "
+                              "OpenCL in this release): full re-prefill", seq);
+            return nullptr;
+        }
         const auto& list = ckpts_[static_cast<size_t>(seq)];
         for (auto it = list.rbegin(); it != list.rend(); ++it) {
             if (it->n_tokens > limit) continue;
@@ -3574,6 +3597,7 @@ private:
     // lane's tokens still match, oldest first
     std::vector<std::vector<Checkpoint>>  ckpts_;
     bool                                  ckpt_on_   = false;   // a hybrid or recurrent model, or a window-sized SWA cache, N > 0
+    bool                                  ckpt_stale_ = false;   // 1.8.1: q8_0/q4_0 SWA cells on OpenCL, no checkpoints (swa_window.h)
     bool                                  swa_window_ = false;   // --llama-swa-window: the SWA cache holds n_swa + ubatch
     int                                   n_swa_      = 0;       // llama_model_n_swa of the loaded model
     size_t                                ckpt_empty_bytes_ = 0;   // a checkpoint's partial state of an empty lane: no SWA cells
