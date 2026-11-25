@@ -10828,6 +10828,71 @@ touched for it now, because that would move the card-proven tree `13ab33b8`):
 - `GGML_OPENCL_DEPTH_MIX_OPTS` (the reds' route: extra compiler options for `depth_mix.cl`) is a
   test hook that lives in the production dispatch.
 
+## 0209-opencl-q8-q4-view-writes.patch
+
+**Status: not yet run on a card.** The code is reviewed (`code`); the op test and the probe below are built on both
+trees and their card gate is written and rehearsed, not run. This section gets the card rows when the gate has run.
+
+**What.** `ggml_backend_opencl_buffer_set_tensor` writes through a VIEW of a non-weights q8_0 / q4_0 tensor: 0123zzzzz2's
+plain copy (a q8_0 / q4_0 tensor that is not a weight and was never split into scales and quants) now also takes a view
+or a partial range, and writes at `extra->offset + view_offs + offset` through the same staged / blocking write
+`get_tensor` reads from. A view of a split base, or a weights view, keeps the pin's return, which now logs a
+`GGML_LOG_WARN` once a process per type naming the tensor and its base. The generic write (f16 / f32) and the bf16 write
+add `view_offs` as `get_tensor` does. Weights and the whole-tensor split are untouched.
+
+**Why** (`code`). `llama_kv_cache::state_read_data` writes K / V through `ggml_view_2d` stream views. At the pin the
+OpenCL Q8_0 and Q4_0 branches return for any view before writing (pin code, not this series'), so a checkpoint resume
+at q8_0 / q4_0 K/V restored the cells' metadata and none of their bytes: `state_read_meta` clears the lane, the head
+drops to the first freed cell and the restored window lands on cells holding other positions' K/V. Inkling 2 Mini
+(hybrid, standard SWA) takes checkpoints for every hybrid and restores them partial (`LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY`,
+which carries the SWA cells), so it had the defect at q8_0 / q8_0:q4_0 K/V on OpenCL whenever the checkpoint sat above
+`n_swa`, with the full-size SWA cache (1.8.0) and the window-sized one (`--llama-swa-window`); Dory too with the window
+flag. 1.8.1 and 1.8.2 refuse the restore at those K/V types instead. The missing `view_offs` in the generic and bf16
+writes put a stream s > 0's rows at stream 0's (unnamed lanes over a non-unified cache at f16 / f32 / bf16).
+
+**The trees** (`measured-here`, `git write-tree` of the pin with the series applied by `apply-series.sh`, LC_ALL=C):
+- green, the full series (159 patches): `4fcdadd84d3643eddf07a4f5e6579bb3887b25d2`;
+- red base, the series without 0209 (158 patches): `5610f3f55d95bb4cffdd65b2c3289b5d18294cdd`;
+- red, that base plus 0209's `tests/` part only (`git apply --include='tests/*'`, the op test against the unfixed
+  backend): `b2555eff7baf6542559ba230dee128fa8adf6e60`. Red and green differ in `ggml/src/ggml-opencl/ggml-opencl.cpp`
+  alone. These trees carry 0187's comment as of 1.8.3 (the first card run named instead of a window label; comment
+  only, the line count unchanged); the commit that added this patch named the trees of an older base.
+
+**The op test** (`tests/test-opencl-kv-view-write.cpp`, built under `GGML_OPENCL` without `add_test`; the recipe builds
+llama with tests off, so it is built outside the recipe: `-DLLAMA_BUILD_TESTS=ON`, target
+`test-opencl-kv-view-write`). 64 cases: per type q8_0, q4_0, f16, bf16, a view below and one above the 4 MiB staging
+bound (7 cases each: the buffer is not a weights buffer, view init, the size, view a written whole, view b, a partial
+write inside view a, the base read whole), and per q8_0 / q4_0 a split base whose view write must not be performed and
+must warn once for two writes (4 cases each). Expected red by reading: 34 of 64 (4 per plain arm x 8: view a, view b,
+the partial write and the base read; plus the two warn-once cases); green: PASS (64 cases) with exactly two
+not-performed warnings.
+- CPU format check (`measured-here`, the CPU backend, the OpenCL ICD hidden, both trees' binaries): 60 of 60 plain cases
+  pass on the reference backend (the test's expectations are right), the 4 split cases fail there as they must (the
+  CPU backend does not split, so its view write is performed and nothing warns): `FAIL (4 of 64 cases failed)` on both.
+  This checks the test, not the fix: the fix is OpenCL code.
+
+**The probe** (`tools/swa_ckpt_probe.cpp`, `--ngl`, `--type-k` / `--type-v`, `--swa-full`; built per tree with
+`-DARCINT_LLAMA_DIR` at that tree, target `arcint-swa-ckpt-probe`, CMake's default generator as the recipe uses.
+Configured with Ninja (CMake 3.31, C++20 from arcint), the llama target compiled its model sources one by one instead
+of in unity batches (`measured-here`, the build log), and the pin's `src/models/clef.cpp` does not compile alone: it
+calls `std::find` without `<algorithm>`). On a card the bar is comparative: arm B (an edited prompt resumed from the
+checkpoint) has the same top token and mean KL <= arm D (the same prompt in another ubatch split, the card's floor) +
+0.03 nats, and the run asserts RESTORE TAKEN.
+
+**The card gate** (B60, not run). In order: the op test red then green (the device line names the card; red rc 1 with
+its failing set compared to the reading's 34, green `PASS (64 cases)`, rc 0, two warnings, one per type);
+`test-backend-ops -b GPUOpenCL` on both trees (the summary line printed in both, the same total, the same failing set);
+the probe on Inkling 2 Mini IQ4_NL at n_ctx 8192, red then green, 3 rounds of four arms (q8_0 / q8_0, the same with
+`--swa-full`, q8_0 / q4_0, and the f16 control), each run asserting the OpenCL device line, every layer offloaded,
+`config: ngl 99 (card)` with the arm's types and RESTORE TAKEN before its B and D lines are read. Expected: the red
+q8_0 / q4_0 arms B FAIL with a KL far above D's, everything else (the red f16 control included) PASS within D + 0.03.
+Estimated about an hour of card time: the two op suites about 16 minutes each, 24 probe runs at about a minute each
+(the load and some 14k tokens of short prefills; an estimate from the parts, not measured), the op tests seconds.
+A trimmed form for a short window: the op tests as above; the op suite on green only, its failing set compared with
+the last recorded B60 full suite (157 failing of 14,016, from an older tree: the difference is logged, not gated);
+the probe's red arms once each, the three q8_0 / q4_0 arms three times on green, the f16 control once a tree (14
+runs). About 30 minutes by the same estimate.
+
 ## 0210-vocab-inkling2-ignore-merges.patch
 
 **What.** Inkling 2 Mini's tokenizer pre (`inkling2`, added by 0133) now sets `ignore_merges = true`, as the model's
