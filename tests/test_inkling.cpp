@@ -168,15 +168,16 @@ nlohmann::ordered_json message_of(const char* role, const char* content) {
 
 // The same three steps the llama backend takes: a request's messages and tools
 // as the template's JSON (chat_json.h), the template's context (template_context),
-// and minja with polyfills off.
-std::string render(const ChatRequest& req) {
+// and minja with polyfills off. `name_tool_results` is chat_messages_json's third
+// argument: the dialect's (render) or false, the render before 1.8.3 (render_unnamed).
+std::string render_with(const ChatRequest& req, bool name_tool_results) {
     std::string      err;
     nlohmann::json   ctx = template_context(req, err, kInklingTemplate);
     CHECK(err.empty());
     minja::chat_template tmpl(kInklingTemplate, "", "");
     minja::chat_template_inputs in;
     const ChatDialect d(ChatDialect::Inkling);
-    in.messages              = chat_messages_json(req, d.replays_arguments_as_object(), d.names_tool_results());
+    in.messages              = chat_messages_json(req, d.replays_arguments_as_object(), name_tool_results);
     in.add_generation_prompt = true;
     const nlohmann::json tools = chat_tools_json(req);
     if (!tools.is_null()) in.tools = nlohmann::ordered_json(tools);
@@ -185,6 +186,12 @@ std::string render(const ChatRequest& req) {
     opts.apply_polyfills = false;
     return tmpl.apply(in, opts);
 }
+
+std::string render(const ChatRequest& req) {
+    return render_with(req, ChatDialect(ChatDialect::Inkling).names_tool_results());
+}
+
+std::string render_unnamed(const ChatRequest& req) { return render_with(req, false); }
 
 ChatRequest conversation(const char* effort, bool numeric = false) {
     ChatRequest req;
@@ -534,6 +541,11 @@ TEST(inkling_render_two_turn_tool_ids_do_not_merge_names) {
     after_one.messages.resize(3);
     const std::string one = render(after_one);
     CHECK(!one.empty() && got.compare(0, one.size(), one) == 0);
+    // with unique ids the named render is byte-identical to 1.8.2's (no names): a
+    // conversation begun on 1.8.2 keeps its cache across the update. The red is the
+    // repeated-id history below, where the same two renders differ.
+    CHECK_EQ(got, render_unnamed(req));
+    CHECK_EQ(one, render_unnamed(after_one));
 }
 
 // The same two turns with every call id `call_0`, as a proxy that rewrites ids per
@@ -584,22 +596,39 @@ TEST(inkling_render_repeated_tool_ids_do_not_merge_names) {
     CHECK(render(named).find("<|message_tool|>reader<|content_text|>ok") != std::string::npos);
 
     // red: without the names the template merges both calls into both headers
-    auto render_unnamed = [](const ChatRequest& r) {
-        std::string    err;
-        nlohmann::json ctx = template_context(r, err, kInklingTemplate);
-        minja::chat_template        tmpl(kInklingTemplate, "", "");
-        minja::chat_template_inputs in;
-        in.messages              = chat_messages_json(r, true, false);
-        in.add_generation_prompt = true;
-        const nlohmann::json tools = chat_tools_json(r);
-        if (!tools.is_null()) in.tools = nlohmann::ordered_json(tools);
-        if (!ctx.empty()) in.extra_context = nlohmann::ordered_json(ctx);
-        minja::chat_template_options opts;
-        opts.apply_polyfills = false;
-        return tmpl.apply(in, opts);
-    };
     const std::string red     = render_unnamed(req);
     const std::string red_one = render_unnamed(after_one);
     CHECK(red.find("<|message_tool|>readbash<|content_text|>ok") != std::string::npos);
     CHECK(red.compare(0, red_one.size(), red_one) != 0);
+    CHECK(red != got);
+}
+
+// Two calls in ONE assistant turn with the same id (a proxy that numbers each turn's
+// calls from call_0 and then rewrites a collision, or one that does not), answered by
+// two results: the k-th result after the turn is the k-th call's (chat_json.h).
+// A rule that gives every result the first call's name fails the second name check.
+TEST(inkling_render_duplicate_ids_in_one_turn_pair_by_position) {
+    ChatRequest req;
+    req.model = "inkling2-mini";
+    req.messages.push_back({"user", "Read it and run it.", {}, {}, {}, {}, {}});
+    req.tools.push_back({"read", "Read a file", nlohmann::json::parse(R"({"type":"object","properties":{}})")});
+    req.tools.push_back({"bash", "Run a command", nlohmann::json::parse(R"({"type":"object","properties":{}})")});
+    ChatMessage assistant;
+    assistant.role       = "assistant";
+    assistant.tool_calls = {{"call_0", "read", "{}"}, {"call_0", "bash", "{}"}};
+    req.messages.push_back(assistant);
+    req.messages.push_back({"tool", "text", {}, "", "call_0", {}, {}});
+    req.messages.push_back({"tool", "done", {}, "", "call_0", {}, {}});
+    const nlohmann::json msgs = chat_messages_json(req, true, true);
+    CHECK_EQ(msgs[2].value("name", std::string()), std::string("read"));
+    CHECK_EQ(msgs[3].value("name", std::string()), std::string("bash"));
+    const std::string got = render(req);
+    CHECK(got.find("<|message_tool|>read<|content_text|>text") != std::string::npos);
+    CHECK(got.find("<|message_tool|>bash<|content_text|>done") != std::string::npos);
+    CHECK(got.find("readbash") == std::string::npos);
+    // a third result past the turn's two calls takes the first call's name
+    req.messages.push_back({"tool", "again", {}, "", "call_0", {}, {}});
+    CHECK_EQ(chat_messages_json(req, true, true)[4].value("name", std::string()), std::string("read"));
+    // red, on every run: unnamed, the template gives both results both names
+    CHECK(render_unnamed(req).find("<|message_tool|>readbash<|content_text|>text") != std::string::npos);
 }

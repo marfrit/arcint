@@ -91,6 +91,9 @@ int main(int argc, char** argv) {
     // "objargs": replay tool-call arguments as an object, as the backend does for
     // a Gemma 4 model (ChatDialect::replays_arguments_as_object)
     const bool force_object = argc > 4 && std::string(argv[4]) == "objargs";
+    // tool results named from their calls where the backend does it (an Inkling template:
+    // ChatDialect::names_tool_results, exec/chat_json.h)
+    const bool name_results = dialect_from_template(src, ChatDialect::Qwen).names_tool_results();
 
     std::unique_ptr<minja::chat_template> tmpl;
     try {
@@ -120,7 +123,8 @@ int main(int argc, char** argv) {
                                           (think == 0 ? " thinking=unset" : think == 1 ? " thinking=true" : " thinking=false");
                 try {
                     minja::chat_template_inputs inputs;
-                    inputs.messages = chat_messages_json(req, tmpl->original_caps().requires_object_arguments || force_object);
+                    inputs.messages = chat_messages_json(req, tmpl->original_caps().requires_object_arguments || force_object,
+                                                         name_results);
                     inputs.tools    = chat_tools_json(req);
                     inputs.add_generation_prompt = true;
                     std::string ctx_error;

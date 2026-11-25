@@ -32,8 +32,10 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   tool result's `tool_call_id` up over all messages and appends every match, so a history whose ids repeat (a client
   or proxy that rewrites them per turn; 1.8.2 made arcint's own ids unique) rendered `readbash` again and re-read the
   prompt. For the Inkling dialect each tool result without a `name` now carries the name of the call it answers (the
-  nearest earlier assistant turn with its id); the template takes a `name` and looks nothing up. A client's `name` is
-  kept; other dialects are unchanged. A `name` on the result gave 4 of 4 cache hits on the served unit.
+  nearest earlier assistant turn with its id; two calls of one turn with the same id pair with their results by
+  position); the template takes a `name` and looks nothing up. A client's `name` is kept; other dialects are
+  unchanged. With unique ids the render is byte-identical to 1.8.2's, so a conversation begun on 1.8.2 keeps its
+  cache. A `name` on the result gave 4 of 4 cache hits on the served unit.
 
 ## 1.8.2 — 2026-11-25
 
