@@ -20,12 +20,22 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## 1.8.1 — 2026-11-?? **[owed: date]**
 
-Release gate against 1.8.0 **[owed: the whole paragraph — the window, the RC sha = the release code, the cards and
-caps; the agent's 27B KL at ub 1 against the CPU Q8_0 reference and its A/B on the unit flags; Flash-Next's knob-off
-logits against 1.8.0 and its A/B on the B70 unit flags; Dory against 1.8.0; Inkling 2 Mini on its unit flags (q8_0 KV,
-262,144 cells, `--llama-swa-window`) with the knobs it will serve with: KL, needle, acceptance task, the served
-prefill/decode rows; the op suites the series touches (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, CPY/CONT, NORM_CLIP,
-DEPTH_MIX, TOP_K MoE); downgrade keys; the xe kernel log's wedge / CAT error / job-timeout counts]**.
+Release gate against 1.8.0 (`measured-here`, 2026-11-25, one window: the B60 at 165 W, then the B70 at 220 W; the
+release candidate 233bfa2a, applied llama tree a52a4c2a; 1.8.0's tools from its applied tree 0053c9da; knobs unset
+unless named). The 27B agent and Dory, llama-bench 1.8.0 / rc / 1.8.0 again: pp512 1023.2 / 1023.6 / 1026.5, pp4096
+1003.6 / 1003.6 / 1006.2, tg128 19.78 / 19.92 / 19.90 t/s (27B); 2007.2 / 2006.7 / 2007.2, 1814.8 / 1814.2 / 1814.1,
+36.78 / 36.77 / 36.78 (Dory). Their logits at the units' K/V types (q8_0 K, q4_0 V) against 1.8.0's, next to 1.8.0
+against itself (the card's floor, 0 on every arm): 2 x 1,024 tokens and 8,192 tokens 0.000000 nats and 100 % same top
+token for both; 1,024 tokens one at a time (the decode path) 0.000251 nats at 100 % for the 27B (the default-on decode
+kernels, 0157), 0.000000 for Dory. Served starts of the release binary at each unit's own flags: the agent (262,144
+cells, q8_0:q4_0, MTP 5) answers right, an 8k-token question (12,057 prompt tokens) included, and its spill guard
+fits by 116 MiB (24,364 of 24,480 MiB); Dory right; Inkling 2 Mini with I8, WIDE, CPY_TRANSPOSE, DEPTH_MIX and
+FA_PORT at q8_0 KV, 262,144 cells and `--llama-swa-window`: the port taken at q8_0, answers right, `/props`
+checkpoints "off: ...", and a turn that edits the first turn answers from the edited text after a full re-read
+("nothing restored", cache 0). Flash-Next on the B70 at its unit's flags, 1.8.0 against the release binary: three
+greedy answers of 110, 267 and 600 tokens identical, decode 37.6 / 42.5 / 52.1 against 39.7 / 44.6 / 53.1 t/s. The
+xe kernel log's wedge / CAT error / job-timeout count unchanged through the window. Inkling's opt-in rows, op suites
+and answer-level arms are the record below, on the same applied tree (a52a4c2a).
 
 **Fixed by refusal — read first:** on the OpenCL backend a checkpoint resume with a q8_0 or q4_0 K or V cache
 restored a sliding-window cache's positions but not its bytes: the restore writes the cells through views of the K / V
@@ -174,8 +184,7 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
   shape suite at the published 27B shapes passes (HC 4 x 5120 rank 640, QSA 24/4 heads at 256 over 2048 cells, GDN
   16/48 at 128, the dense FFN at 14336 and 17408) and the fixture's OpenCL logits match the CPU's (mean KLD 0.000137,
   0.000001 without QSA, also at micro-batch 1); Flash-Next's MoE path keeps its logits (mean KLD 0, same top p 100 %,
-  on a synthetic qwen4exp MoE model) **[owed: the real Flash-Next file's arm — the release gate's Flash-Next logits
-  against 1.8.0 close it]**. The real checkpoint decides the layer count, the schedule and the MTP layout.
+  on a synthetic qwen4exp MoE model) (the real Flash-Next file loads and answers identically to 1.8.0 in the release gate above). The real checkpoint decides the layer count, the schedule and the MTP layout.
 - **Q8_0 expert prompt batches on the int8 DPAS tile** (patches 0167-0169; **on**, `GGML_OPENCL_Q8_MM_ID=0` or `off`
   turns it off): Inkling 2 Mini's four Q8_0 coda layers took a prompt batch on the flat float matvec (23.2 % of a
   pp4096 profile); they now take the tile the IQ4_NL experts use, with the experts routed into 32-pair tiles and the
@@ -206,7 +215,7 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
   SWA cache fits (23,459 / 23,585, and a 60k needle answered with GTT at 308 MiB); Inkling at 131,072 full SWA
   (30,834) and Flash-Next with a 40,000 MiB expert cache (53,627) are refused; the latter suggests
   `--llama-expert-cache 19107`, and the restart with it starts and measures 32,402 of the B70's 32,656 MiB after the
-  first request (32,192 predicted). A "runs" model on a card: not yet on record **[owed or say so]**.
+  first request (32,192 predicted). A "runs" model on a card: not on record.
 - **Request fields and the multi-GPU warning.** `cache_prompt: false` is honoured (it was ignored: two identical
   requests reused 4,092 of 4,096 prompt tokens); `n_predict` is an alias of `max_tokens` (-1 = unset; 0 is refused);
   `arcint: {timings: true}` returns timings on `/v1/completions`. **Fields that would change the result and that
