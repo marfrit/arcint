@@ -18,6 +18,13 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+- **The depth mix's TAKEN line shows in a served unit's log** (patch 0211). `depth_mix: TAKEN opencl f32
+  token-a-group` was printed at ggml's INFO level, which arcint logs only under `-v`, so a unit with
+  `GGML_OPENCL_DEPTH_MIX=1` showed the FA port's TAKEN line and not the mix's. It is now at the port's level (WARN),
+  once a process, text unchanged. Device-free test red on the 1.8.2 series.
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn

@@ -1,0 +1,23 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7b04b8664..e43666627 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -21952,11 +21952,13 @@ static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks
+     size_t global_work_size[] = { (size_t) plan.nt*lsz, 1, 1 };
+     size_t local_work_size[]  = { lsz, 1, 1 };
+ 
+-    static bool taken_told = false;
+-    if (!taken_told) {
+-        taken_told = true;
+-        GGML_LOG_INFO("depth_mix: TAKEN opencl f32 token-a-group\n");
+-    }
++    // 0211: the FA port's level and guard (a WARN line, once a process): at INFO the
++    // server's log routing keeps the line for its verbose level, and a served unit
++    // with GGML_OPENCL_DEPTH_MIX=1 could not show that the mix was on
++    static std::once_flag taken_told;
++    std::call_once(taken_told, [] {
++        GGML_LOG_WARN("depth_mix: TAKEN opencl f32 token-a-group\n");
++    });
+     backend_ctx->depth_mix_calls_graph++;
+ 
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);

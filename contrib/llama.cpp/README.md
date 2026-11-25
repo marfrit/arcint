@@ -10854,3 +10854,20 @@ pre type of the models served here that mainline sets it for (tekken for the wri
 **What it means for recorded Inkling numbers.** Every Inkling KL and perplexity row in this file and the CHANGELOG was
 computed on text tokenized by the old rule, on both sides of each comparison: they stay valid as comparisons between
 arms. The rate of affected words is small (above); the served prefill and decode rows do not depend on it.
+
+## 0211-opencl-depth-mix-taken-line-level.patch
+
+**What.** The depth mix's TAKEN line (`depth_mix: TAKEN opencl f32 token-a-group`, 0205) is printed with
+`GGML_LOG_WARN` inside a `std::call_once`, as the FA port's TAKEN lines are (0198, 0199q1). The text is unchanged.
+
+**Why.** 0205 printed it with `GGML_LOG_INFO`. arcint's log routing (`route_llama_log`, `src/exec/backend_llama.cpp`)
+shows ERROR and WARN and sends every other level to its verbose level (`-v`), so on a served Inkling unit with
+`GGML_OPENCL_DEPTH_MIX=1` the log showed the FA port's TAKEN line and not the depth mix's: production could not see
+that the mix was on. The once-a-process guard was a plain `static bool`, a data race when two backends launch at once;
+`std::call_once` is the port's guard.
+
+**Test** (device-free, `tests/python/test_depth_mix_taken_line.py`, `ctest -L unit` as `depth-mix-taken-line`): the
+line's macro equals the FA port's, that level is one `route_llama_log` shows outside `-v`, the call sits in a
+`std::call_once` on a static `once_flag`, and the text is the one the card commands above grep for. Red on the series
+through 0210 (`measured-here`, CPU, the applied tree): 3 of 4 cases fail (`GGML_LOG_INFO` against `GGML_LOG_WARN`;
+INFO not among the shown levels; no `call_once`).
