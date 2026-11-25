@@ -175,7 +175,8 @@ std::string render(const ChatRequest& req) {
     CHECK(err.empty());
     minja::chat_template tmpl(kInklingTemplate, "", "");
     minja::chat_template_inputs in;
-    in.messages              = chat_messages_json(req, ChatDialect(ChatDialect::Inkling).replays_arguments_as_object());
+    const ChatDialect d(ChatDialect::Inkling);
+    in.messages              = chat_messages_json(req, d.replays_arguments_as_object(), d.names_tool_results());
     in.add_generation_prompt = true;
     const nlohmann::json tools = chat_tools_json(req);
     if (!tools.is_null()) in.tools = nlohmann::ordered_json(tools);
@@ -495,8 +496,9 @@ TEST(inkling_numeric_effort_survives_other_kwargs) {
 // result as "readbash": the earlier prompt text changes between turns and the
 // lane's prefix misses. Each turn here is answered as the routes do: the model
 // output parsed, then numbered after the history (core/toolcall.h).
-// Mutation: next_call_index returning 0 (1.8.1's numbering) and both headers
-// read <|message_tool|>readbash.
+// Mutation: next_call_index returning 0 (1.8.1's numbering) fails the id checks;
+// before 1.8.3 named the results from our side (the test below), both headers
+// also read <|message_tool|>readbash.
 TEST(inkling_render_two_turn_tool_ids_do_not_merge_names) {
     auto model_call = [](const char* name) {
         return std::string(markers::kInkMessageModel) + name + std::string(markers::kInkContentToolJson) +
@@ -532,4 +534,72 @@ TEST(inkling_render_two_turn_tool_ids_do_not_merge_names) {
     after_one.messages.resize(3);
     const std::string one = render(after_one);
     CHECK(!one.empty() && got.compare(0, one.size(), one) == 0);
+}
+
+// The same two turns with every call id `call_0`, as a proxy that rewrites ids per
+// turn sends them (1.8.3). The template appends the name of EVERY call whose id
+// matches a nameless result, over all messages, so the ids alone render the first
+// result as "readbash" and turn two rewrites turn one's text. arcint names each
+// result from the call it answers (the nearest earlier assistant turn with its id,
+// ChatDialect::names_tool_results); the template takes a `name` and looks nothing up.
+// Red, on every run: the same history without the names (the render before 1.8.3,
+// chat_messages_json's third argument false) must merge, or this history tests nothing.
+TEST(inkling_render_repeated_tool_ids_do_not_merge_names) {
+    ChatRequest req;
+    req.model = "inkling2-mini";
+    req.messages.push_back({"user", "Read it, then run it.", {}, {}, {}, {}, {}});
+    req.tools.push_back({"read", "Read a file", nlohmann::json::parse(R"({"type":"object","properties":{}})")});
+    req.tools.push_back({"bash", "Run a command", nlohmann::json::parse(R"({"type":"object","properties":{}})")});
+    for (const char* name : {"read", "bash"}) {
+        ChatMessage assistant;
+        assistant.role       = "assistant";
+        assistant.tool_calls = {{"call_0", name, "{}"}};
+        req.messages.push_back(assistant);
+        req.messages.push_back({"tool", "ok", {}, "", "call_0", {}, {}});
+    }
+    const std::string read_hdr = "<|message_tool|>read<|content_text|>ok";
+    const std::string bash_hdr = "<|message_tool|>bash<|content_text|>ok";
+
+    // the template's input: each result carries its own call's name, other dialects none
+    const nlohmann::json msgs = chat_messages_json(req, true, true);
+    CHECK_EQ(msgs[2].value("name", std::string()), std::string("read"));
+    CHECK_EQ(msgs[4].value("name", std::string()), std::string("bash"));
+    CHECK(!chat_messages_json(req, true, false)[2].contains("name"));
+    CHECK(!ChatDialect(ChatDialect::Qwen).names_tool_results());
+    CHECK(!ChatDialect(ChatDialect::Gemma4).names_tool_results());
+
+    const std::string got = render(req);
+    CHECK(got.find(read_hdr) != std::string::npos);
+    CHECK(got.find(bash_hdr) != std::string::npos);
+    CHECK(got.find("<|message_tool|>readbash") == std::string::npos);
+    ChatRequest after_one = req;
+    after_one.messages.resize(3);
+    const std::string one = render(after_one);
+    CHECK(one.find(read_hdr) != std::string::npos);
+    CHECK(!one.empty() && got.compare(0, one.size(), one) == 0);
+
+    // a client's own name is kept, not replaced by the call's
+    ChatRequest named = req;
+    named.messages[2].name = "reader";
+    CHECK(render(named).find("<|message_tool|>reader<|content_text|>ok") != std::string::npos);
+
+    // red: without the names the template merges both calls into both headers
+    auto render_unnamed = [](const ChatRequest& r) {
+        std::string    err;
+        nlohmann::json ctx = template_context(r, err, kInklingTemplate);
+        minja::chat_template        tmpl(kInklingTemplate, "", "");
+        minja::chat_template_inputs in;
+        in.messages              = chat_messages_json(r, true, false);
+        in.add_generation_prompt = true;
+        const nlohmann::json tools = chat_tools_json(r);
+        if (!tools.is_null()) in.tools = nlohmann::ordered_json(tools);
+        if (!ctx.empty()) in.extra_context = nlohmann::ordered_json(ctx);
+        minja::chat_template_options opts;
+        opts.apply_polyfills = false;
+        return tmpl.apply(in, opts);
+    };
+    const std::string red     = render_unnamed(req);
+    const std::string red_one = render_unnamed(after_one);
+    CHECK(red.find("<|message_tool|>readbash<|content_text|>ok") != std::string::npos);
+    CHECK(red.compare(0, red_one.size(), red_one) != 0);
 }

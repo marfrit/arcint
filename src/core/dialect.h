@@ -50,6 +50,12 @@ struct ChatDialect {
     // which the effort mapping then rendered as none).
     constexpr bool thinks_by_default() const { return kind != Gemma4; }
     constexpr bool replays_arguments_as_object() const { return kind == Gemma4 || kind == Inkling; }
+    // A tool result is rendered with its function's name from our side: Inkling's template
+    // looks a nameless result's tool_call_id up over ALL messages and appends every match
+    // to the header, so a history whose ids repeat (a proxy that rewrites them per turn)
+    // renders "readbash" and changes earlier prompt text between turns. With a `name` on
+    // the result the template takes that name and does no lookup (core/chat_json.h).
+    constexpr bool names_tool_results() const { return kind == Inkling; }
     friend constexpr bool operator==(ChatDialect a, ChatDialect b) { return a.kind == b.kind; }
     friend constexpr bool operator!=(ChatDialect a, ChatDialect b) { return a.kind != b.kind; }
 };

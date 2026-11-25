@@ -28,6 +28,12 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   reported `off: <reason>` for every start with a sliding window at q8_0 / q4_0 K/V on OpenCL, also for a model
   that keeps no checkpoints anyway (Dory without `--llama-swa-window`: no hybrid or recurrent memory). Now
   `off: <reason>` only when `--llama-checkpoints` > 0 and the memory can snapshot, else `off`. Behaviour unchanged.
+- **Inkling 2 Mini: a tool result's function name is resolved by arcint.** The model's template looks a nameless
+  tool result's `tool_call_id` up over all messages and appends every match, so a history whose ids repeat (a client
+  or proxy that rewrites them per turn; 1.8.2 made arcint's own ids unique) rendered `readbash` again and re-read the
+  prompt. For the Inkling dialect each tool result without a `name` now carries the name of the call it answers (the
+  nearest earlier assistant turn with its id); the template takes a `name` and looks nothing up. A client's `name` is
+  kept; other dialects are unchanged. A `name` on the result gave 4 of 4 cache hits on the served unit.
 
 ## 1.8.2 — 2026-11-25
 
