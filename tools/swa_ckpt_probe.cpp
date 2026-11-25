@@ -1,15 +1,32 @@
-// The window-sized SWA cache's checkpoint resume (--llama-swa-window), on the
-// CPU: a partial state (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) must carry the
-// sliding window, and a cut below the retained window must resume from a
-// checkpoint instead of trimming.
+// The SWA cache's checkpoint resume: a partial state
+// (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) must carry the sliding window, and a cut
+// below the retained window must resume from a checkpoint instead of trimming.
+// By default the window-sized cache (--llama-swa-window) on the CPU, as before.
 //
 // Needs a GGUF; not a ctest case (the unit gate is tests/test_swa_window.cpp for
-// the rule and the flag). Build CPU only against the pinned tree:
+// the rule and the flag). Built with arcint (target arcint-swa-ckpt-probe), or
+// CPU only against the pinned tree:
 //
-//   g++ -O2 -std=c++17 -I include -I ggml/include -I src tools/swa_ckpt_probe.cpp
+//   g++ -O2 -std=c++17 -I include -I ggml/include -I src -I <arcint>/src <arcint>/tools/swa_ckpt_probe.cpp
 //       -o swa_ckpt_probe -L build/bin -lllama -Wl,-rpath,$PWD/build/bin
 //
-//   ./swa_ckpt_probe model.gguf [n_ctx]
+//   ./swa_ckpt_probe model.gguf [n_ctx] [per_loop|last_loop] [options]
+//
+// Options (contrib/llama.cpp 0209: the card's q8_0 / q4_0 K/V restore):
+//   --ngl N           offload N layers (0, the default: CPU; 99: all, on one
+//                     device, split mode none; pick the card by the backend's env)
+//   --type-k T        K cache type (f16, the default; q8_0, q4_0, bf16, f32)
+//   --type-v T        V cache type (as --type-k)
+//   --swa-full        the full-size SWA cache (no --llama-swa-window, 1.8.0's
+//                     default) instead of the window-sized one
+// With --ngl > 0 the answer-level bar is comparative (CLAUDE.md): an arm passes
+// at the same top token and a KL at most 0.03 nats above the floor arm D on the
+// same card (the B60's per-forward floor is ~0.14 nats, an absolute bound would
+// fail a right answer). On the CPU the bounds stay as they were.
+// The B arm states whether the checkpoint restore was taken, and fails when it
+// was expected (a hybrid, whose recurrent memory refuses the trim, or a window
+// the trim cannot keep) and not taken: a pass by a fresh prefill proves nothing
+// about the restore.
 //
 // The arms:
 //   A  append-only follow-up, no cut: must match a fresh full prefill
@@ -29,10 +46,30 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace {
+
+struct Config {
+    int       ngl      = 0;
+    ggml_type type_k   = GGML_TYPE_F16;
+    ggml_type type_v   = GGML_TYPE_F16;
+    bool      swa_full = false;   // false: --llama-swa-window
+};
+Config g_cfg;
+
+bool parse_type(const char* s, ggml_type& t) {
+    static const struct { const char* name; ggml_type type; } types[] = {
+        {"f16", GGML_TYPE_F16}, {"bf16", GGML_TYPE_BF16}, {"f32", GGML_TYPE_F32},
+        {"q8_0", GGML_TYPE_Q8_0}, {"q4_0", GGML_TYPE_Q4_0},
+    };
+    for (const auto& e : types) {
+        if (std::strcmp(s, e.name) == 0) { t = e.type; return true; }
+    }
+    return false;
+}
 
 struct Result {
     double kl       = 0.0;
@@ -104,7 +141,9 @@ llama_context* make_ctx(llama_model* m, int n_ctx, uint32_t n_ubatch = 512, uint
     cp.n_threads  = 4;
     cp.n_threads_batch = 4;
     cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
-    cp.swa_full   = false;   // --llama-swa-window
+    cp.swa_full   = g_cfg.swa_full;   // false: --llama-swa-window
+    cp.type_k     = g_cfg.type_k;
+    cp.type_v     = g_cfg.type_v;
     return llama_init_from_model(m, cp);
 }
 
@@ -119,13 +158,41 @@ std::vector<uint8_t> save_partial(llama_context* ctx, int seq) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: %s model.gguf [n_ctx] [per_loop|last_loop]\n", argv[0]); return 2; }
-    const int n_ctx = argc > 2 ? std::atoi(argv[2]) : 8192;
-    const char* dory_kv = argc > 3 ? argv[3] : nullptr;
+    // the positional arguments as before; the options anywhere after the model
+    std::vector<const char*> pos;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--ngl" && i + 1 < argc) {
+            g_cfg.ngl = std::atoi(argv[++i]);
+        } else if ((a == "--type-k" || a == "--type-v") && i + 1 < argc) {
+            if (!parse_type(argv[++i], a == "--type-k" ? g_cfg.type_k : g_cfg.type_v)) {
+                std::fprintf(stderr, "unknown cache type %s\n", argv[i]);
+                return 2;
+            }
+        } else if (a == "--swa-full") {
+            g_cfg.swa_full = true;
+        } else if (a.rfind("--", 0) == 0) {
+            std::fprintf(stderr, "unknown option %s\n", a.c_str());
+            return 2;
+        } else {
+            pos.push_back(argv[i]);
+        }
+    }
+    if (pos.empty()) {
+        std::fprintf(stderr, "usage: %s model.gguf [n_ctx] [per_loop|last_loop] [--ngl N] [--type-k T] [--type-v T] [--swa-full]\n", argv[0]);
+        return 2;
+    }
+    const int n_ctx = pos.size() > 1 ? std::atoi(pos[1]) : 8192;
+    const char* dory_kv = pos.size() > 2 ? pos[2] : nullptr;
+    const bool card = g_cfg.ngl > 0;
 
     llama_backend_init();
     llama_model_params mp = llama_model_default_params();
-    mp.n_gpu_layers = 0;
+    mp.n_gpu_layers = g_cfg.ngl;
+    if (card) {
+        mp.split_mode = LLAMA_SPLIT_MODE_NONE;   // one device: the one the backend's env selects
+        mp.main_gpu   = 0;
+    }
     // Dory's recurrent KV mode is a GGUF override (arcint's --llama-dory-kv);
     // the file's own is per_loop. last_loop aliases the passes' slots, and its
     // prefill is chunk-boundary dependent by design (upstream's own test says
@@ -137,7 +204,7 @@ int main(int argc, char** argv) {
         std::snprintf(overrides[0].val_str, sizeof(overrides[0].val_str), "%s", dory_kv);
         mp.kv_overrides = overrides;   // overrides[1] is the zeroed terminator
     }
-    llama_model* m = llama_model_load_from_file(argv[1], mp);
+    llama_model* m = llama_model_load_from_file(pos[0], mp);
     if (m == nullptr) { std::fprintf(stderr, "load failed\n"); return 2; }
 
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(m));
@@ -146,6 +213,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "model: n_layer %d, n_swa %d, hybrid %d, recurrent %d, n_ctx %d%s%s\n",
                  n_layer, n_swa, (int) llama_model_is_hybrid(m), (int) llama_model_is_recurrent(m), n_ctx,
                  dory_kv ? ", kv " : "", dory_kv ? dory_kv : "");
+    std::fprintf(stderr, "config: ngl %d (%s), K %s, V %s, SWA cache %s\n", g_cfg.ngl, card ? "card" : "CPU",
+                 ggml_type_name(g_cfg.type_k), ggml_type_name(g_cfg.type_v),
+                 g_cfg.swa_full ? "full-size (--swa-full)" : "window-sized (--llama-swa-window)");
     if (n_swa <= 0) {
         std::fprintf(stderr, "SKIP: the model has no sliding window; nothing to verify\n");
         llama_model_free(m);
@@ -198,6 +268,9 @@ int main(int argc, char** argv) {
                  floor_r.kl, floor_r.dmax, floor_r.top_ref, floor_r.top_got,
                  floor_r.same_top ? " same-top" : " TOP-DIFFERS", floor_chunk);
     if (!floor_r.same_top) ++failures;
+    // the bound an arm's KL is held to: on the CPU as before, on a card the
+    // floor plus the answer-level bar's 0.03 nats
+    auto kl_bound = [&](double cpu_bound) { return card ? floor_kl + 0.03 : cpu_bound; };
 
     // Reference: a fresh full prefill of the appended prompt.
     auto* ref_ctx2 = make_ctx(m, n_ctx);
@@ -216,7 +289,7 @@ int main(int argc, char** argv) {
         // another ubatch split than the single full prefill: on a chunk-boundary
         // dependent mode (Dory's last_loop) the floor arm D measures that, and
         // the follow-up must stay inside it; elsewhere it is zero.
-        gate(r.same_top && r.kl <= std::max(floor_kl, 1e-3), "A append-only follow-up matches the fresh prefill", "", r);
+        gate(r.same_top && r.kl <= kl_bound(std::max(floor_kl, 1e-3)), "A append-only follow-up matches the fresh prefill", "", r);
         llama_free(ctx);
     }
 
@@ -280,6 +353,19 @@ int main(int argc, char** argv) {
             }
         }
         std::fprintf(stderr, "B arm: trim-complete %d, resumed from %zu%s\n", (int) complete, from, restore ? " (checkpoint)" : "");
+        // the restore must be what this arm measures: a hybrid's recurrent
+        // memory refuses the trim, and a window the trim cannot keep needs the
+        // checkpoint; a fresh prefill from 0 would pass without testing it
+        const bool want_restore = llama_model_is_hybrid(m) || !complete;
+        if (want_restore) {
+            std::fprintf(stderr, "%s %-58s %s (checkpoint %zu tokens, %.1f MiB)\n", restore ? "PASS" : "FAIL",
+                         "B the checkpoint restore was taken", restore ? "RESTORE TAKEN" : "RESTORE NOT TAKEN",
+                         (size_t) cut, ckpt.size() / 1048576.0);
+            if (!restore) ++failures;
+        } else {
+            std::fprintf(stderr, "B arm: no restore expected (the trim keeps the window); %s\n",
+                         restore ? "RESTORE TAKEN" : "RESTORE NOT TAKEN");
+        }
         if (!decode(lane, std::vector<llama_token>(edited_tokens.begin() + from, edited_tokens.end() - 1), from, false)) { return 2; }
         if (!decode(lane, {edited_tokens.back()}, edited - 1, true)) { return 2; }
         const Result r = compare(ref_edited, logits_of(lane));
@@ -290,7 +376,7 @@ int main(int argc, char** argv) {
         // cells are re-found in the ring's slot order, so the CPU's FA sums them
         // in a different order than the original placement (the floor arm D above
         // holds the batch-shape part of that; measured 1.5e-3 to 2.3e-2)
-        gate(r.same_top && r.kl <= 0.03, "B edited last message, resumed from the checkpoint", "", r);
+        gate(r.same_top && r.kl <= kl_bound(0.03), "B edited last message, resumed from the checkpoint", "", r);
     }
     llama_free(lane);
 
@@ -302,6 +388,9 @@ int main(int argc, char** argv) {
     // reaches the attention cache there and the arm is skipped.
     if (llama_model_is_hybrid(m)) {
         std::fprintf(stderr, "SKIP %-58s a hybrid's recurrent refusal blocks the trim\n",
+                     "C trim-only resume (the pre-change rule) is wrong");
+    } else if (g_cfg.swa_full) {
+        std::fprintf(stderr, "SKIP %-58s a full-size SWA cache trims exactly\n",
                      "C trim-only resume (the pre-change rule) is wrong");
     } else {
         auto* ctx = make_ctx(m, n_ctx);
