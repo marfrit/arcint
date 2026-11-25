@@ -23,7 +23,8 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 - **The relative-bias flash attention falls back instead of aborting when the card cannot build its GQA decode
   variant** (patch 0212; 1.8.0's review item S3, open since 1.8.0). Inkling 2 Mini's 4-8 row decode calls on Xe2
   now run on the split kernel's bias variant, which `supports_op` has already built, with a `DOWNGRADE` line once;
-  the failed build is not retried. `GGML_OPENCL_FA_BIAS_GQA_FAIL=1` is a debug arm that forces the failure. Evidence:
+  the failed build is not retried, and a variant that builds but cannot take the launch (work-group cap, local
+  memory) counts as failed. `GGML_OPENCL_FA_BIAS_GQA_FAIL=1` is a debug arm that forces the failure. Evidence:
   the route function's unit cell, its red twin (the old rule) and a gate over the patched tree (`code`, the recipe's
   suite); the card arm is owed.
 

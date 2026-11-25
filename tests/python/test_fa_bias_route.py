@@ -7,7 +7,8 @@ and asserts the wiring that cell cannot see:
     clears use_fd_gqa (the launch then takes the split kernel's split size, grid and
     arguments) and leaves a DOWNGRADE line; the abort is left only for the NONE route;
   - the GQA bias variant is still memoised with its failure, so a later call does not
-    rebuild it;
+    rebuild it; a variant that builds but cannot take the launch (work-group cap, local
+    memory: the plain build's rule) is released and counts as unbuilt;
   - supports_op still builds the split variant for a decode-row bias call and declines
     the call when that fails (reason no-bias-kernel), so the fallback has a kernel;
   - GGML_OPENCL_FA_BIAS_GQA_FAIL (debug) adds -DFA_BIAS_GQA_FORCE_FAIL to the GQA bias
@@ -98,6 +99,20 @@ class FaBiasRoute(unittest.TestCase):
         self.assertEqual(b.count("FA_BIAS_GQA_FORCE_FAIL"), gqa.count("FA_BIAS_GQA_FORCE_FAIL"),
                          "the forced failure belongs to the GQA variant only")
         self.assertEqual(self.cpp.count("GGML_OPENCL_FA_BIAS_GQA_FAIL\")"), 1, "the switch is read in one place")
+
+    def test_variant_must_fit_the_launch(self):
+        b = self._builder()
+        gqa = _between(b, "if (kind == 0", "} else if (kind == 1")
+        self.assertIsNotNone(gqa, "the GQA branch of the bias builder is absent")
+        create = gqa.find("k = clCreateKernel(prog, name.c_str(), &err);")
+        fits = gqa.find("ggml_cl_fa_gqa_fits(wg, lm, lm_dev, backend_ctx->fa_gqa_sides)")
+        self.assertGreater(create, 0, "the GQA bias kernel is not created")
+        self.assertGreater(fits, create, "the fit rule must run on the created kernel")
+        for q in ("CL_KERNEL_WORK_GROUP_SIZE", "CL_KERNEL_LOCAL_MEM_SIZE", "CL_DEVICE_LOCAL_MEM_SIZE"):
+            self.assertIn(q, gqa[create:fits], "the fit rule's input " + q + " is not queried")
+        refuse = gqa[fits:gqa.find("CL_CHECK(clReleaseProgram(prog));", fits)]
+        self.assertIn("CL_CHECK(clReleaseKernel(k));", refuse, "a refused variant must be released")
+        self.assertIn("k = nullptr;", refuse, "a refused variant must count as unbuilt")
 
     def test_kernel_fails_on_the_define(self):
         m = re.search(r"#ifdef FA_BIAS_GQA_FORCE_FAIL\s*\n\s*#error[^\n]*\n\s*#endif", self.cl)

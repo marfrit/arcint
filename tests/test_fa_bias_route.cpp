@@ -8,8 +8,9 @@
 // forces the failure with GGML_OPENCL_FA_BIAS_GQA_FAIL=1 (an #error in the kernel source);
 // this cell drives the decision with the build's outcome as an input.
 //
-// Red: the same cell compiled with FA_BIAS_ROUTE_RED (the rule before 0212) is registered
-// as fa-bias-route-red with WILL_FAIL: the failed-build cases read NONE, the abort.
+// Red: the same cell compiled with FA_BIAS_ROUTE_RED (the rules before 0212) is registered
+// as fa-bias-route-red with WILL_FAIL: the failed-build case reads NONE, the abort, and the
+// fit refusals read "fits", the launch failure.
 
 #include "ggml-opencl-fa-bias-route.h"
 
@@ -49,6 +50,16 @@ int main() {
     // the dispatcher's abort stays for a call that bypassed supports_op
     CHECK(ggml_cl_fa_bias_route(1, 0, 0) == GGML_CL_FA_BIAS_ROUTE_NONE, "GQA failed and no split: none");
     CHECK(ggml_cl_fa_bias_route(0, 0, 0) == GGML_CL_FA_BIAS_ROUTE_NONE, "no split: none");
+
+    // a variant that built but cannot take the launch (review F1): the plain GQA build's
+    // rule, GQA_SIDES x 8 tiles x 16 lanes and local memory within the device's. Red: the
+    // rule before F1 accepted every built variant, so the three refusals read 1
+    CHECK(ggml_cl_fa_gqa_fits(256, 32768, 131072, 2), "2 sides, cap 256, local memory within: fits");
+    CHECK(ggml_cl_fa_gqa_fits(1024, 131072, 131072, 2), "local memory exactly the device's: fits");
+    CHECK(ggml_cl_fa_gqa_fits(128, 0, 131072, 1), "1 side needs 128: fits");
+    CHECK(!ggml_cl_fa_gqa_fits(128, 32768, 131072, 2), "2 sides on a cap of 128: refused (the launch would fail)");
+    CHECK(!ggml_cl_fa_gqa_fits(512, 131073, 131072, 4), "local memory over the device's: refused");
+    CHECK(!ggml_cl_fa_gqa_fits(256, 0, 131072, 0), "no sides: refused");
 
     // the debug switch: on for a nonzero number only
     CHECK(!ggml_cl_fa_bias_gqa_fail(nullptr), "unset: off");
