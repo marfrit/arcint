@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
-index a1c914b..0311c94 100644
+index 63a481f..1d9faef 100644
 --- a/ggml/src/ggml-opencl/CMakeLists.txt
 +++ b/ggml/src/ggml-opencl/CMakeLists.txt
 @@ -109,6 +109,7 @@ set(GGML_OPENCL_KERNELS
@@ -11,12 +11,12 @@ index a1c914b..0311c94 100644
      cvt
      diag_mask_inf
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index df2ec85..1b02515 100644
+index 239983e..47604d5 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -724,6 +724,13 @@ static std::mutex g_cl_downgrade_mu;
- static std::map<std::string, uint64_t> g_cl_downgrades;
+@@ -726,6 +726,13 @@ static std::map<std::string, uint64_t> g_cl_downgrades;
  
+ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);   // 0198: defined below, used by the port arm
  static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
 +// 0205: the depth-mix arm, defined below; supports_op at the top reaches it
 +static bool ggml_cl_depth_mix_on();
@@ -28,7 +28,7 @@ index df2ec85..1b02515 100644
  static void ggml_cl_downgrade(const char * fmt, ...) {
      char buf[256];
      va_list args;
-@@ -989,6 +996,7 @@ struct ggml_backend_opencl_context {
+@@ -991,6 +998,7 @@ struct ggml_backend_opencl_context {
      cl_program program_moe_add_id_glu;
      cl_program program_clamp;
      cl_program program_norm_clip;
@@ -36,7 +36,7 @@ index df2ec85..1b02515 100644
      cl_program program_cvt;
      cl_program program_diag_mask_inf;
      cl_program program_gelu;
-@@ -1075,6 +1083,12 @@ struct ggml_backend_opencl_context {
+@@ -1077,6 +1085,12 @@ struct ggml_backend_opencl_context {
      cl_kernel kernel_fill_f16 = nullptr;
      cl_kernel kernel_clamp, kernel_clamp_nc;
      cl_kernel kernel_norm_clip_f32;
@@ -49,7 +49,7 @@ index df2ec85..1b02515 100644
      cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
                kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
                kernel_geglu_erf_f16, kernel_geglu_quick_f16, kernel_situ_f32;
-@@ -12389,6 +12403,13 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
+@@ -12397,6 +12411,13 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
@@ -63,7 +63,7 @@ index df2ec85..1b02515 100644
      // 0130d: the previous graph's pre/post pairs: their events are waited here, the frame's
      // first point that is not inside a dispatch
      if (ggml_cl_fa_paged_verify_mode() == 3 && g_fa_paged_verify3_ctx)
-@@ -12701,6 +12722,23 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -12709,6 +12730,23 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
                        backend_ctx->ngpt_fused, cgraph->n_nodes, backend_ctx->ngpt_inplace, backend_ctx->ngpt_refused);
      }
  
@@ -87,7 +87,7 @@ index df2ec85..1b02515 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -13302,6 +13340,32 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+@@ -13464,6 +13502,32 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
              return (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) && ggml_is_contiguous(op);
          case GGML_OP_CLAMP:
              return op->src[0]->type == GGML_TYPE_F32;
@@ -120,7 +120,7 @@ index df2ec85..1b02515 100644
          case GGML_OP_NORM_CLIP:
              return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
                     ggml_is_contiguous_rows(op->src[0]) &&
-@@ -21520,6 +21584,152 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
+@@ -21708,6 +21772,152 @@ static void ggml_cl_norm_clip(ggml_backend_t backend, const ggml_tensor * src0,
      backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
  }
  
@@ -273,7 +273,7 @@ index df2ec85..1b02515 100644
  static void ggml_cl_clamp(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -33870,6 +34080,14 @@ static bool ggml_cl_bounds_on() {
+@@ -34260,6 +34470,14 @@ static bool ggml_cl_bounds_on() {
      }();
      return on;
  }
@@ -288,7 +288,7 @@ index df2ec85..1b02515 100644
  static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto) {
      if (!ggml_cl_bounds_on()) {
          return;
-@@ -42458,6 +42676,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+@@ -42848,6 +43066,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
              }
              func = ggml_cl_norm_clip;
              break;

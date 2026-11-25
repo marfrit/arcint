@@ -1,8 +1,8 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index 95f9623..c716f28 100644
+index 4bb4448..15df7ed 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6881,6 +6881,124 @@ struct test_norm_clip : public test_case {
+@@ -6888,6 +6888,124 @@ struct test_norm_clip : public test_case {
      }
  };
  
@@ -127,7 +127,7 @@ index 95f9623..c716f28 100644
  // GGML_OP_FLOOR
  struct test_floor : public test_case {
      const ggml_type type;
-@@ -13074,6 +13192,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13253,6 +13371,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_norm_clip({13, 3, 5, 1}, true));
      test_cases.emplace_back(new test_norm_clip({7, 5, 2, 2}, false, 8.0f));
  
@@ -149,7 +149,7 @@ index 95f9623..c716f28 100644
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 1}, 5));
      test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 3, 2}, 5));
-@@ -14250,6 +14383,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14473,6 +14606,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
  static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
      std::vector<std::unique_ptr<test_case>> test_cases;
  

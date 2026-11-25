@@ -10592,3 +10592,28 @@ arm and noise seeds 2 and 3 on the same tokens.
 it the chain with the one-ulp noise control on the same tokens, or the card's own run-to-run
 arm. A ~2e-3 KL is what one ulp costs here, so this bar cannot see a defect of that size - which
 is why it is secondary.
+
+**The noise control, all arms** (`measured-here`, the recipe host, CPU, llama-perplexity as
+above, the knob-off logits as the base; mean KL in nats, same top p):
+
+| arm | 381 tokens | 2,032 tokens | max KL (2,032) |
+|---|---|---|---|
+| knob on (fold) | 0.00154 ± 0.00024, 98.95 ± 0.52 % | 0.00234 ± 0.00062, 98.38 ± 0.28 % | 1.229 |
+| knob on (`=nofold`) | 0.00155 ± 0.00022, 99.21 ± 0.45 % | 0.00212 ± 0.00049, 98.13 ± 0.30 % | 0.971 |
+| chain + one-ulp noise, seed 1 | 0.00253 ± 0.00096, 99.21 ± 0.45 % | 0.00213 ± 0.00027, 98.08 ± 0.30 % | 0.357 |
+| chain + one-ulp noise, seed 2 | 0.00191 ± 0.00032, 98.69 ± 0.58 % | 0.00194 ± 0.00018, 98.33 ± 0.29 % | 0.266 |
+| chain + one-ulp noise, seed 3 | 0.00204 ± 0.00034, 98.95 ± 0.52 % | 0.00272 ± 0.00091, 98.33 ± 0.29 % | 1.840 |
+
+On 2,032 tokens the three noise seeds span 0.00194 .. 0.00272 nats and 98.08 .. 98.33 % top p;
+the arm sits inside that span with the fold (0.00234, 98.38 %) and without it (0.00212,
+98.13 %). The fold and the nofold arm do not separate. The single-token maxima are as large
+under noise (1.84) as under the arm (1.23). This closes the CPU question: the knob's
+difference from the chain is what one ulp at these sites costs.
+
+**Rebased onto development with the FA port (2026-11-25).** The series is development's
+through 0199, then 0204-0207, then 0208: 155 patches, applied in byte order from the pin;
+0204-0207 are regenerated against the tree before each (no hunk of the port's patches
+conflicted; 0208 applies on top of 0207 unchanged). The FA port's knob
+(`GGML_OPENCL_FA_PORT`) is off by default and the arm's card window runs with it off unless
+stated otherwise.
+Applied tree `4c5f2df145477470efc0f8f4e7294c2d59db4060` (`measured-here`, the recipe host).

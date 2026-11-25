@@ -1,8 +1,8 @@
 diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
-index 8661cf4..389b04a 100644
+index 2cdaeff..37bb093 100644
 --- a/ggml/include/ggml.h
 +++ b/ggml/include/ggml.h
-@@ -553,6 +553,7 @@ extern "C" {
+@@ -560,6 +560,7 @@ extern "C" {
          GGML_OP_ROPE_BACK,
          GGML_OP_CLAMP,
          GGML_OP_NORM_CLIP,
@@ -10,7 +10,7 @@ index 8661cf4..389b04a 100644
          GGML_OP_CONV_TRANSPOSE_1D,
          GGML_OP_IM2COL,
          GGML_OP_IM2COL_BACK,
-@@ -1826,6 +1827,73 @@ extern "C" {
+@@ -1833,6 +1834,73 @@ extern "C" {
              float                 threshold,
              float                 eps);
  
@@ -111,7 +111,7 @@ index 6f7afd6..5d38340 100644
              {
                  n_tasks = MIN(n_threads, ggml_nrows(node->src[0]));
 diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
-index 517eba9..1931b4d 100644
+index 5b253b0..83aa7f5 100644
 --- a/ggml/src/ggml-cpu/ops.cpp
 +++ b/ggml/src/ggml-cpu/ops.cpp
 @@ -6482,6 +6482,139 @@ void ggml_compute_forward_norm_clip(
@@ -267,7 +267,7 @@ index bfef2a8..1607712 100644
  void ggml_compute_forward_im2col(const struct ggml_compute_params * params, struct ggml_tensor * dst);
  void ggml_compute_forward_im2col_back_f32(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
-index 9a57c18..ce82958 100644
+index 2f36ba4..c7077b4 100644
 --- a/ggml/src/ggml.c
 +++ b/ggml/src/ggml.c
 @@ -1055,6 +1055,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
