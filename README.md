@@ -309,8 +309,13 @@ The engine admits these architectures (`qwen35`, `qwen35moe`, `qwen4exp`,
 `llama` at the Mistral Small 24B and Llama 2 7B geometries, `qwen2vl` for vision, `gemma4` at
 the E4B geometry, `granite` at the 8B geometry, `dory` at the 1.0-4B geometry, `inkling2_loop` at the Inkling 2
 Mini geometry (24 physical blocks x 2304, 24/8 heads), and under `--tts`
-`qwen3tts`) and refuses others
-at load, an untested size of an admitted architecture included. Gemma 4 E4B and Granite 4.2 8B
+`qwen3tts`). Since 1.8.1 it admits a model in three tiers (DESIGN §2, `src/core/admission.cpp`):
+**optimized for** (Inkling 2 Mini, the Qwen3.8 27B agent, Qwen3.8-Flash-Next), **verified** (the Qwen3.6 coder,
+Dory1.0-4B, Llama 2 7B, Qwen3-TTS under `--tts`, Qwen2.5-VL-7B) and **runs**: anything else libllama loads that
+passes the spill guard, Gemma 4 E4B, Granite 4.2 8B and Mistral Small 3.2 24B (the writer) included. A "runs"
+model starts with a warning counting its downgrades; it gets no token mode and no renderer material,
+`--tool-grammar` is refused, and without a chat template its chat routes answer 400. Before 1.8.1 a model outside
+the table was refused at load, and Gemma, Granite and Mistral Small had the full surface. Gemma 4 E4B and Granite 4.2 8B
 were admitted 2026-11-06 from their files' metadata and templates (`code`); Dory1.0-4B (a looped
 nGPT, with `--llama-dory-loops` and `--llama-dory-kv`; since then also the opt-in
 `--llama-dory-max-loops`, a loop count per request) on 2026-11-07; Inkling 2 Mini on 2026-11-22,
@@ -344,7 +349,36 @@ The llama-bench rows run with window-sized sliding-window caches (llama-bench se
 `swa_full = false`); the 1.8.0 server keeps the full-size cache, which lets the sliding-window
 layers attend over every cached key, so its decode at depth is lower: after a 15,790-token
 prompt on the B60, 20.5 t/s with q8_0 KV and 24.3 with f16 (`measured-here`), against the
-bench's 30.4 / 31.9 at 16,384. Window-sized caches with checkpoints for prefix reuse are 1.8.1 work.
+bench's 30.4 / 31.9 at 16,384. Since 1.8.1, `--llama-swa-window` gives the server the window-sized cache, with
+checkpoints for prefix reuse: after the same 15,790-token prompt on the B60 (q8_0 KV) decode is 30.5 t/s instead of
+20.6, and 262,144 cells fit on the one card (needles at 120k and 250k found).
+
+### What 1.8.1 adds for Inkling 2 Mini
+
+On by default (`measured-here`, B60 at 165 W, IQ4_NL): the decode's Q8_0 expert products on the int8 dot, split-K
+for one-column matvecs of few rows, and the three norm clips as one op (0156-0158; tg +6.4 % at depth 0, 36.59 ->
+38.93 t/s, +5.8 % at 4,096); the sigmoid router as one launch (0159); the prefill's Q8_0 experts on the int8 DPAS
+tile (0167-0169; pp4096 at ub 512 410.6 -> 522.4 t/s) and the depth mix's small F32 products on their own kernels
+(0170-0180; 522.5 -> 628.2).
+
+Opt-in, environment switches of the OpenCL backend, prompt batches only (decode is unchanged), Inkling only, measured
+on the B60 (llama-bench pp4096, each row on top of the previous where stated):
+
+| switch | what | measured |
+|---|---|---|
+| `GGML_OPENCL_KQ_MM_ID_I8=1` | the int8 DPAS expert tile for the IQ4_NL experts | ub 512 628.2 -> 676.6 |
+| `GGML_OPENCL_KQ_MM_ID_I8_WIDE=1` | that tile (and the Q8_0 prompt tile) at a 512-column band | ub 1024 712.1 -> 765.7 (I8 on) |
+| `GGML_OPENCL_CPY_TRANSPOSE=1` | the bias table's and the depth-mix stacks' transposing copies as a tiled transpose | ub 1024 763.6 -> 816.1; q8_0 KV 763.5 -> 816.3 |
+| `GGML_OPENCL_FA_PORT=1` | the prompt attention as one kernel after trellis-serve's `fa::Kern` (f16 or q8_0 K/V read in place) | q8_0 KV, ub 1024: 817.2 -> 945.8 |
+| `GGML_OPENCL_DEPTH_MIX=1` | the depth mix as one op | q8_0 KV, ub 1024: 816.4 -> 979.2 |
+| `FA_PORT` and `DEPTH_MIX` together | the two savings add | q8_0 KV, ub 1024: 816.6 -> **1,171.4**; f16 KV 815.9 -> 1,215.7 |
+
+They keep the answers: KL against the CPU reference within 0.0001 nats of the arm without them, the paired FA-port
+measure at q8_0 inside one-ulp noise (0.002083 against 0.002069 nats), the task battery 8/8 with the depth mix on and
+off. Served once at an Inkling unit's own flags (262,144 cells, `--llama-swa-window`, q8_0 KV, ub 1,024, the
+400a7dd1 fixture, I8 + WIDE + CPY_TRANSPOSE on): prefill 764.3 t/s without the two, 908.0 with the depth mix, 874.5
+with the port, 1,067.5 with both; decode 35.3-35.4 in every arm; the answer right. Recommended on Xe2 cards for
+Inkling: all five. `GGML_OPENCL_DEPTH_MIX` takes `0` or `1`; serve Inkling fully offloaded (see "Known limits").
 
 The B70 gives the same answers (mean KL against the CPU reference identical to the B60's, the
 acceptance task 10/10 at effort low) and is 57-66 % faster on the prompt, 23-30 % on generation,
@@ -521,28 +555,45 @@ service's production flags, Flash-Next's expert cache included
   layers over every visible card, a cross-card hop per layer (on two B70s a
   user measured Inkling 2 Mini's decode 5x slower than on one); for those
   tools, `GGML_OPENCL_DEVICE=0` pins one device.
+- **The spill guard (new default in 1.8.1).** At start arcint adds up what the model will hold on the card
+  (libllama's weights, context and compute buffers, the expert cache's slots and banks, a draft head, the
+  process's other device bytes, other clients on the card) plus a 422 MiB growth margin, against the xe driver's
+  figure for the card (B60 24,480 MiB, B70 32,656 MiB). A start that does not fit is refused with every part named
+  and the `--n-ctx` (or `--llama-expert-cache`) that would fit; `--llama-allow-spill` starts anyway with a warning
+  (the 1.8.0 behaviour). `/props` carries the accounting (`device_memory`). Without the xe figure (an i915 host, a
+  build without `drm/xe_drm.h`) the guard falls back to OpenCL's global memory size, which on the B60 (23,256 MiB) is
+  below what a full 24 GB unit uses: start such a unit with `--llama-allow-spill`.
+- **`--llama-swa-window`** (opt-in) gives a model with sliding-window attention a window-sized cache for those layers
+  (`n_swa + n_ubatch` cells) instead of one sized to the whole context: Inkling 2 Mini at 131,072 cells and f16 drops
+  from 24,576 to 4,336 MiB of sliding-window cache. The cache cannot then be cut back to an arbitrary prefix; the
+  context checkpoints carry the window, and a follow-up that changes earlier text resumes from the newest checkpoint
+  below the change (or re-prefills). Each full Inkling window checkpoint is 163.7 MiB of host memory at f16. Dory's
+  `--llama-dory-kv last_loop` is refused with it.
 - **Request fields.** `cache_prompt: false` evaluates that request's prompt
   in full (no prefix reuse, no checkpoint resume); the KV it leaves is kept
   for later requests that allow reuse; the default is `true`, as in
   llama-server. `n_predict` (at least 1; -1, llama.cpp's default, means unset) is an alias of
   `max_tokens`, and
-  `arcint: {timings: true}` returns the timings on `/v1/completions` too. A
-  field that would change the result and that this build cannot honour is
-  refused with HTTP 400 naming the field and the reason, not dropped
-  silently: `min_tokens`, a non-empty `cache_salt`, `logprobs`/`top_logprobs`/
-  `n_probs`/`prompt_logprobs` asking for probabilities, `min_keep` above 0,
-  `logit_bias` (object or array form), a non-empty `grammar`, `json_schema` or
-  `samplers`, `response_format` other than `{type: text}`, `best_of` other than 1, `use_beam_search`, `bad_words`,
-  `allowed_token_ids`, `truncate_prompt_tokens` other than -1, `typical_p`,
-  `mirostat`, `dynatemp_*`, `xtc_probability`, `tfs_z`, `top_n_sigma`,
-  `dry_multiplier` outside their default value, `include_stop_str_in_output:
-  true`, `skip_special_tokens: false`, `spaces_between_special_tokens:
-  false`, `chat_format`, and `return_tokens`, `return_progress`,
-  `timings_per_token`, `response_fields`. Default values of all of these are
-  accepted (`grammar: ""`, `json_schema: {}`, `samplers: []`, `top_n_sigma: -1.0`
-  included), so an OpenAI SDK's `response_format: {type: text}`,
-  `logprobs: false`, `n: 1`, `top_logprobs: null` or `0` pass; the list and its
-  reasons live in one table (`src/core/chat.cpp`, `kRequestFieldRefusals`).
+  `arcint: {timings: true}` returns the timings on `/v1/completions` too.
+  Fields this build does not serve (1.8.0 ignored all of them silently): at a
+  non-default value, those whose silent loss would change the answer the client
+  expects are refused with HTTP 400 naming the field and the reason —
+  `min_tokens`, a non-empty `cache_salt`, `prompt_logprobs`, `logit_bias`
+  (object or array form), a non-empty `grammar` or `json_schema`, `best_of`
+  other than 1, `use_beam_search`, `bad_words`, `allowed_token_ids`,
+  `truncate_prompt_tokens` other than -1, `n_predict: 0`,
+  `include_stop_str_in_output: true`, `skip_special_tokens: false`,
+  `chat_format`. The others are accepted and ignored, with one warning per
+  field per process: `response_format` other than `{type: text}` (JSON mode is
+  not enforced; the answer is the model's own text, and `--tool-grammar`
+  constrains tool calls only), `logprobs`/`top_logprobs`/`n_probs`, `min_keep`,
+  `samplers`, `typical_p`, `mirostat`, `dynatemp_*`, `xtc_probability`, `tfs_z`,
+  `top_n_sigma`, `dry_multiplier`, `return_tokens`, `return_progress`,
+  `timings_per_token`, `response_fields`, `spaces_between_special_tokens`.
+  Default values are accepted silently (`grammar: ""`, `json_schema: {}`,
+  `samplers: []`, `top_n_sigma: -1.0` included). The list, each field's
+  disposition and its reason live in one table (`src/core/chat.cpp`,
+  `kRequestFieldRefusals`).
 - **No authentication by default, permissive CORS, no TLS.** `--api-key`
   (or `--api-key-file PATH`) adds a bearer token on every route but `/health`
   (GET/HEAD only) — `/props`, `/metrics` and `/slots` included, an unknown path too, and
@@ -660,6 +711,25 @@ service's production flags, Flash-Next's expert cache included
   not evict the referenced stored response — it is a lookup, so it refreshes
   that entry's LRU rank like any other read.
 
+## Known limits (1.8.1)
+
+- **Inkling 2 Mini needs every layer on the card.** A partial offload (`-ngl` below the layer count) faulted in a
+  test at `-ngl 12`: the depth-mix state store is written from every layer, and a CPU layer's copy into the card's
+  buffer fails. Already so in 1.8.0. arcint's units load every layer.
+- The opt-in Inkling prefill switches are measured on the B60 only.
+- `GGML_OPENCL_FA_PORT_PROBE`, `GGML_OPENCL_FA_PORT_RED`, `GGML_OPENCL_CPY_TRANSPOSE_RED` and
+  `GGML_OPENCL_DEPTH_MIX_OPTS` are debug arms (the probe and the reds give wrong answers by design); none acts
+  unless its feature's switch is on. Never set them on a serving unit.
+- The relative-bias flash attention aborts if the card fails to build its GQA decode variant (both Battlemage cards
+  build it); a fallback is owed (1.8.0's S3).
+- llama.cpp's own tools from this tree (`llama-bench`, `llama-server`) split a model over every visible card by
+  layer; pin one with `GGML_OPENCL_DEVICE=0`. `-sm row` fails on the OpenCL backend ("does not support split
+  buffers") and `-sm tensor` is not implemented upstream for `inkling2_loop`: run one model per card.
+- Every ggml tensor is 64 bytes larger than in 1.8.0 (`GGML_MAX_SRC` 20, `GGML_MAX_OP_PARAMS` 80): tools and
+  libraries built against this tree's headers must be rebuilt from it, RPC servers and clients together.
+- A Qwen4exp GGUF without `attention.recurrent_layers` and `full_attention_interval` fails to load (1.8.0 assumed
+  an interval of 4).
+
 ## Scope
 
 - **Models**: the table above, in the three admission tiers (DESIGN §2): `optimized for`, `verified`, and `runs` — any architecture or size libllama loads that passes the spill guard, with no promise and a start warning.
@@ -676,7 +746,8 @@ service's production flags, Flash-Next's expert cache included
   FLUX.2 klein, one unit each, one at a time on the card
   ([docs/imggen-service.md](docs/imggen-service.md)).
 - **Not goals**: a web UI or dashboard (console and HTTP JSON only), a model
-  zoo, training or quantization tooling, multimodal input (images in), Windows.
+  zoo, training or quantization tooling, multimodal input beyond the vision service's `image_url` data URIs,
+  Windows.
 
 ## Why not just use …
 
