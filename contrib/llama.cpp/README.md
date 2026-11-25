@@ -10854,3 +10854,35 @@ pre type of the models served here that mainline sets it for (tekken for the wri
 **What it means for recorded Inkling numbers.** Every Inkling KL and perplexity row in this file and the CHANGELOG was
 computed on text tokenized by the old rule, on both sides of each comparison: they stay valid as comparisons between
 arms. The rate of affected words is small (above); the served prefill and decode rows do not depend on it.
+
+## 0212-opencl-fa-bias-gqa-fallback.patch
+
+**What.** An indexed-bias FLASH_ATTN_EXT (0143, Inkling 2 Mini's relative bias) whose decode rows took the GQA
+kernel (`flash_attn_gqa_dpas.cl`, 4-8 rows by default, Xe2) now falls back to the split kernel's bias variant when
+the GQA bias variant fails to build or its kernel cannot be created. Before, the dispatcher aborted ("an
+indexed-bias FLASH_ATTN_EXT reached the dispatcher without a kernel"; 1.8.0's review item S3). The decision is one
+pure function, `ggml_cl_fa_bias_route` in `ggml-opencl-fa-bias-route.h`; the split branch clears `use_fd_gqa`, so
+the launch takes the split kernel's split size, grid and arguments, the same launch the 1-3 row calls take.
+
+**Why the split variant is there.** `supports_op` already builds the split variant (or its quantized pair) for
+every decode-row bias call and declines the call when that fails (`reason=no-bias-kernel`), so a call that reaches
+the dispatcher has it: the fallback is a lookup. The GQA variant is built only at dispatch, which is why its
+failure was not caught earlier. A failed build is memoised (0143's map keeps the null), so it is tried once per
+(head size, KV pair, bins), not on every call.
+
+**Lines.** The failed build logs the compiler's error (`kernel compile error ... building fa gqa bias`), then once a
+key `ggml_opencl: the indexed-bias GQA decode variant did not build (dk=.. dv=.. kvq=.. bins=..); its calls take
+the split kernel`, and the first fallen-back call leaves `DOWNGRADE src=opencl op=FLASH_ATTN indexed-bias
+path=split reason=gqa-variant-unbuilt` (counted in the downgrade table). A call that takes the GQA variant prints
+`TAKEN src=opencl op=FLASH_ATTN indexed-bias form=gqa` once a process.
+
+**Debug switch (red only).** `GGML_OPENCL_FA_BIAS_GQA_FAIL=1` adds `-DFA_BIAS_GQA_FORCE_FAIL` to the GQA bias
+variant's build, and the kernel turns that define into an `#error`: the card takes the real failed-build path.
+Never set it on a serving unit: it moves the 4-8 row bias calls off the GQA kernel.
+
+**Red / green** (`code`, device-free, in arcint's unit suite): `fa-bias-route` drives the function over every case
+(the failed GQA build reads SPLIT); `fa-bias-route-red`, the same cell compiled with `FA_BIAS_ROUTE_RED` (the rule
+before this patch), must fail and does (WILL_FAIL); `fa-bias-route-gate` reads the patched tree (the dispatcher asks
+the function, the fallback clears `use_fd_gqa` and leaves the DOWNGRADE line, the abort is left for the NONE route,
+the switch reaches the GQA build only, the kernel's `#error`) and fails 4 of 6 cells on the series without this
+patch. The card arm (the forced failure answers right with the lines above; unset, the TAKEN line) is owed.

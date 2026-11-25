@@ -727,8 +727,9 @@ service's production flags, Flash-Next's expert cache included
 - `GGML_OPENCL_FA_PORT_PROBE`, `GGML_OPENCL_FA_PORT_RED`, `GGML_OPENCL_CPY_TRANSPOSE_RED` and
   `GGML_OPENCL_DEPTH_MIX_OPTS` are debug arms (the probe and the reds give wrong answers by design); none acts
   unless its feature's switch is on. Never set them on a serving unit.
-- The relative-bias flash attention aborts if the card fails to build its GQA decode variant (both Battlemage cards
-  build it); a fallback is owed (1.8.0's S3).
+- `GGML_OPENCL_FA_BIAS_GQA_FAIL=1` (development branch, patch 0212) is a debug arm too: it makes the relative-bias
+  GQA decode variant's build fail on purpose, to prove the fallback to the split kernel. Never set it on a serving
+  unit.
 - llama.cpp's own tools from this tree (`llama-bench`, `llama-server`) split a model over every visible card by
   layer; pin one with `GGML_OPENCL_DEVICE=0`. `-sm row` fails on the OpenCL backend ("does not support split
   buffers") and `-sm tensor` is not implemented upstream for `inkling2_loop`: run one model per card.
