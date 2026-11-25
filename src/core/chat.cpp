@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <mutex>
+#include <set>
 #include <fstream>
 #include <sstream>
 
@@ -359,6 +361,19 @@ bool float_not_one(const json& v) { return !v.is_number() || v.get<double>() != 
 bool float_not_zero(const json& v) { return !v.is_number() || v.get<double>() != 0.0; }
 bool int_not_zero(const json& v) { return !v.is_number_integer() || v.get<int64_t>() != 0; }
 
+// One warning per accepted-and-ignored field per process, naming the field: a
+// client that sends the field on every request does not fill the log.
+void warn_ignored_field_once(const char* field, const char* why) {
+    static std::mutex mu;
+    static std::set<std::string> seen;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!seen.insert(field).second) return;
+    }
+    log::warn("request", "%s is accepted and ignored: %s (this warning is printed once per process)",
+              field, why != nullptr ? why : "this build does not serve it");
+}
+
 std::optional<std::string> read_result_changing_fields(const json& b) {
     struct Rule {
         const char* field;
@@ -404,6 +419,10 @@ std::optional<std::string> read_result_changing_fields(const json& b) {
         if (!b.contains(r.field) || b[r.field].is_null()) continue;
         if (!r.trips(b[r.field])) continue;
         const char* why = request_field_refusal_reason(r.field);
+        if (!request_field_refused(r.field)) {
+            warn_ignored_field_once(r.field, why);
+            continue;
+        }
         return log::format("%s is not served: %s", r.field,
                            why != nullptr ? why : "this build does not serve it");
     }
@@ -416,46 +435,53 @@ std::optional<std::string> read_result_changing_fields(const json& b) {
 // check take every refusal's reason from here; the same rows are listed in the
 // release notes. A field's value at its own default is accepted.
 const RequestFieldRefusal kRequestFieldRefusals[] = {
-    {"min_tokens", "this build cannot force a minimum length; use max_tokens or stop"},
-    {"cache_salt", "this build has no salted KV cache; an unsalted reuse would cross tenants"},
-    {"n_probs", "this build returns no token probabilities; send 0 or omit it"},
-    {"logprobs", "this build returns no token probabilities; send 0/false or omit it"},
-    {"min_keep", "min_keep is a sampler floor for the candidate list; this build serves one sampler row and cannot honour it"},
-    {"top_logprobs", "this build returns no token probabilities; send 0 or null"},
-    {"prompt_logprobs", "this build returns no prompt logprobs"},
-    {"samplers", "the sampler order is the operator's; send no order or omit it"},
-    {"return_tokens", "this build writes no raw token ids in the response"},
-    {"return_progress", "this build emits no prompt-processing progress events"},
-    {"timings_per_token", "this build reports timings once per request, not per token"},
-    {"response_fields", "this build writes a fixed response body"},
-    {"logit_bias", "logit_bias changes the distribution; it is not applied here"},
-    {"grammar", "request-time grammars are not served; --tool-grammar is the operator's switch"},
-    {"json_schema", "request-time grammars are not served; --tool-grammar is the operator's switch"},
-    {"response_format", "JSON-mode output is not served; the answer is the model's own text"},
-    {"best_of", "one slot serves one sequence; only 1 is accepted"},
-    {"use_beam_search", "beam search is not served; one sequence, one sampler"},
-    {"bad_words", "bad_words would change the distribution; it is not applied here"},
-    {"allowed_token_ids", "allowed_token_ids would change the distribution; it is not applied here"},
-    {"truncate_prompt_tokens", "prompt truncation is not served; only -1 (no truncation) is accepted"},
-    {"n_predict", "n_predict 0 would evaluate the prompt only; only -1 (unset) and >= 1 are accepted; use max_tokens for a token budget"},
-    {"typical_p", "the served sampler has no typical sampling; use top_p"},
-    {"mirostat", "mirostat sampling is not served; the served sampler is one row"},
-    {"dynatemp_range", "dynamic temperature is not served"},
-    {"dynatemp_exponent", "dynamic temperature is not served"},
-    {"xtc_probability", "XTC sampling is not served"},
-    {"tfs_z", "tail-free sampling is not served"},
-    {"top_n_sigma", "sigma-based truncation is not served"},
-    {"dry_multiplier", "DRY repetition breaking is not served (loop_guard is the served one)"},
-    {"include_stop_str_in_output", "the stop string is never echoed into the text"},
-    {"skip_special_tokens", "special tokens are decoded out; false would ask for text this build cannot produce"},
-    {"spaces_between_special_tokens", "special tokens are decoded out, so the spacing switch changes nothing this build writes"},
-    {"chat_format", "the chat template is the model's, chosen by the operator; a request cannot replace it"},
+    {"min_tokens", "this build cannot force a minimum length; use max_tokens or stop", true},
+    {"cache_salt", "this build has no salted KV cache; an unsalted reuse would cross tenants", true},
+    {"n_probs", "this build returns no token probabilities; send 0 or omit it", false},
+    {"logprobs", "this build returns no token probabilities; send 0/false or omit it", false},
+    {"min_keep", "min_keep is a sampler floor for the candidate list; this build serves one sampler row and cannot honour it", false},
+    {"top_logprobs", "this build returns no token probabilities; send 0 or null", false},
+    {"prompt_logprobs", "this build returns no prompt logprobs", true},
+    {"samplers", "the sampler order is the operator's; send no order or omit it", false},
+    {"return_tokens", "this build writes no raw token ids in the response", false},
+    {"return_progress", "this build emits no prompt-processing progress events", false},
+    {"timings_per_token", "this build reports timings once per request, not per token", false},
+    {"response_fields", "this build writes a fixed response body", false},
+    {"logit_bias", "logit_bias changes the distribution; it is not applied here", true},
+    {"grammar", "request-time grammars are not served; --tool-grammar is the operator's switch", true},
+    {"json_schema", "request-time grammars are not served; --tool-grammar is the operator's switch", true},
+    {"response_format", "JSON mode is not enforced; the answer is the model's own text (--tool-grammar constrains tool calls only)", false},
+    {"best_of", "one slot serves one sequence; only 1 is accepted", true},
+    {"use_beam_search", "beam search is not served; one sequence, one sampler", true},
+    {"bad_words", "bad_words would change the distribution; it is not applied here", true},
+    {"allowed_token_ids", "allowed_token_ids would change the distribution; it is not applied here", true},
+    {"truncate_prompt_tokens", "prompt truncation is not served; only -1 (no truncation) is accepted", true},
+    {"n_predict", "n_predict 0 would evaluate the prompt only; only -1 (unset) and >= 1 are accepted; use max_tokens for a token budget", true},
+    {"typical_p", "the served sampler has no typical sampling; use top_p", false},
+    {"mirostat", "mirostat sampling is not served; the served sampler is one row", false},
+    {"dynatemp_range", "dynamic temperature is not served", false},
+    {"dynatemp_exponent", "dynamic temperature is not served", false},
+    {"xtc_probability", "XTC sampling is not served", false},
+    {"tfs_z", "tail-free sampling is not served", false},
+    {"top_n_sigma", "sigma-based truncation is not served", false},
+    {"dry_multiplier", "DRY repetition breaking is not served (loop_guard is the served one)", false},
+    {"include_stop_str_in_output", "the stop string is never echoed into the text", true},
+    {"skip_special_tokens", "special tokens are decoded out; false would ask for text this build cannot produce", true},
+    {"spaces_between_special_tokens", "special tokens are decoded out, so the spacing switch changes nothing this build writes", false},
+    {"chat_format", "the chat template is the model's, chosen by the operator; a request cannot replace it", true},
 };
 
 const RequestFieldRefusal* request_field_refusals() { return kRequestFieldRefusals; }
 
 size_t request_field_refusal_count() {
     return sizeof(kRequestFieldRefusals) / sizeof(kRequestFieldRefusals[0]);
+}
+
+bool request_field_refused(const char* field) {
+    if (field == nullptr) return false;
+    for (const RequestFieldRefusal& r : kRequestFieldRefusals)
+        if (std::string_view(r.field) == field) return r.refused;
+    return false;
 }
 
 const char* request_field_refusal_reason(const char* field) {

@@ -129,17 +129,27 @@ struct SpeechRequest {
 };
 
 // Both return an error message on rejection and leave the output untouched.
-// One refused request field and the reason the server gives. The refusal code
-// reads this table, the release notes list the same rows, and there is no
-// second copy of the strings. Default-valued fields are not in it.
+// One request field that this build does not serve at a non-default value, and
+// what the server does with it. `refused` rows answer HTTP 400 with the reason:
+// a silently ignored value would change the answer the client expects (a
+// grammar, a token ban, a prompt truncation). The other rows are accepted and
+// ignored, with one warning per field per process naming the field and the
+// reason: the answer is the model's own text either way (sampler shaping,
+// probability and progress reports, JSON mode, which is not enforced). The
+// code reads this table, the release notes list the same rows, and there is
+// no second copy of the strings. Default-valued fields are not in it.
 struct RequestFieldRefusal {
     const char* field;
     const char* reason;
+    bool        refused;
 };
 const RequestFieldRefusal* request_field_refusals();
 size_t                     request_field_refusal_count();
-// nullptr when the field is not refused (or is accepted at its default)
+// nullptr when the field is not in the table (or is accepted at its default)
 const char* request_field_refusal_reason(const char* field);
+// True for a row that answers 400; false for an accepted-and-ignored row or a
+// field outside the table.
+bool request_field_refused(const char* field);
 
 std::optional<std::string> parse_chat_request(const nlohmann::json& body, ChatRequest& out);
 std::optional<std::string> parse_completion_request(const nlohmann::json& body,

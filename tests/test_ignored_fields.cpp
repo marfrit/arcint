@@ -36,6 +36,7 @@ json completion_with(const json& extra) {
 
 // The refusal is on both routes and names the field.
 void refuses_on_both(const char* field, const json& value) {
+    CHECK(request_field_refused(field));
     ChatRequest chat;
     const auto chat_err = parse_chat_request(chat_with({{field, value}}), chat);
     CHECK(chat_err.has_value());
@@ -45,6 +46,17 @@ void refuses_on_both(const char* field, const json& value) {
     const auto comp_err = parse_completion_request(completion_with({{field, value}}), comp);
     CHECK(comp_err.has_value());
     if (comp_err) CHECK(comp_err->find(field) != std::string::npos);
+}
+
+// 1.8.1: accepted and ignored (one warning per field per process); the request
+// parses as if the field were absent.
+void ignores_on_both(const char* field, const json& value) {
+    CHECK(!request_field_refused(field));
+    CHECK(request_field_refusal_reason(field) != nullptr);
+    ChatRequest chat;
+    CHECK(!parse_chat_request(chat_with({{field, value}}), chat).has_value());
+    CompletionRequest comp;
+    CHECK(!parse_completion_request(completion_with({{field, value}}), comp).has_value());
 }
 
 void accepts_on_both(const char* field, const json& value) {
@@ -78,30 +90,30 @@ TEST(ignored_fields_cache_salt_is_refused) {
     accepts_on_both("cache_salt", "");
 }
 
-TEST(ignored_fields_n_probs_and_logprobs_are_refused_when_they_ask_for_probabilities) {
-    refuses_on_both("n_probs", 5);
-    refuses_on_both("logprobs", 3);
+TEST(ignored_fields_n_probs_and_logprobs_are_ignored_when_they_ask_for_probabilities) {
+    ignores_on_both("n_probs", 5);
+    ignores_on_both("logprobs", 3);
     accepts_on_both("n_probs", 0);
     accepts_on_both("logprobs", 0);
     accepts_on_both("logprobs", nullptr);
 }
 
-TEST(ignored_fields_samplers_order_is_refused) {
-    refuses_on_both("samplers", json::array({"top_k", "top_p", "temperature"}));
-    refuses_on_both("samplers", "kpp");
+TEST(ignored_fields_samplers_order_is_ignored) {
+    ignores_on_both("samplers", json::array({"top_k", "top_p", "temperature"}));
+    ignores_on_both("samplers", "kpp");
 }
 
-TEST(ignored_fields_return_tokens_refused_when_true) {
+TEST(ignored_fields_return_tokens_ignored_when_true) {
     // true asks for raw ids in a field this build never writes.
-    refuses_on_both("return_tokens", true);
+    ignores_on_both("return_tokens", true);
     accepts_on_both("return_tokens", false);
 }
 
-TEST(ignored_fields_llama_completion_switches_are_refused_when_they_change_the_response) {
-    refuses_on_both("timings_per_token", true);
-    refuses_on_both("return_progress", true);
-    refuses_on_both("response_fields", json::array({"tokens"}));
-    refuses_on_both("min_keep", 4);
+TEST(ignored_fields_llama_completion_switches_are_ignored) {
+    ignores_on_both("timings_per_token", true);
+    ignores_on_both("return_progress", true);
+    ignores_on_both("response_fields", json::array({"tokens"}));
+    ignores_on_both("min_keep", 4);
 }
 
 TEST(ignored_fields_grammar_and_logit_bias_are_refused) {
@@ -125,14 +137,15 @@ TEST(ignored_fields_empty_forms_are_the_default_and_accepted) {
     accepts_on_both("n_predict", -1);
 }
 
-TEST(ignored_fields_response_format_other_than_text_is_refused) {
-    // The chat and completions surfaces accept exactly the SDK default.
+TEST(ignored_fields_response_format_other_than_text_is_ignored_not_enforced) {
+    // The chat and completions surfaces serve only text; JSON mode is accepted and
+    // not enforced (1.8.0 ignored it silently; 1.8.1 warns once per process).
     accepts_on_both("response_format", json{{"type", "text"}});
-    refuses_on_both("response_format", "text");
-    refuses_on_both("response_format", json{{"type", "json_object"}});
-    refuses_on_both("response_format", json{{"type", "json_schema"}});
-    refuses_on_both("response_format", json{{"type", "made_up"}});
-    refuses_on_both("response_format", json::object());
+    ignores_on_both("response_format", "text");
+    ignores_on_both("response_format", json{{"type", "json_object"}});
+    ignores_on_both("response_format", json{{"type", "json_schema"}});
+    ignores_on_both("response_format", json{{"type", "made_up"}});
+    ignores_on_both("response_format", json::object());
 }
 
 TEST(ignored_fields_vllm_completion_switches_are_refused) {
@@ -144,17 +157,17 @@ TEST(ignored_fields_vllm_completion_switches_are_refused) {
     refuses_on_both("truncate_prompt_tokens", 128);
 }
 
-TEST(ignored_fields_llama_sampler_shaping_is_refused_outside_its_default) {
+TEST(ignored_fields_llama_sampler_shaping_is_ignored_outside_its_default) {
     // The rest of llama.cpp server's sampler fields: each accepted at its own
-    // default (where it changes nothing) and refused otherwise.
-    refuses_on_both("typical_p", 0.9);
-    refuses_on_both("mirostat", 2);
-    refuses_on_both("dynatemp_range", 0.2);
-    refuses_on_both("dynatemp_exponent", 2.0);
-    refuses_on_both("xtc_probability", 0.5);
-    refuses_on_both("tfs_z", 0.9);
-    refuses_on_both("top_n_sigma", 3);
-    refuses_on_both("dry_multiplier", 0.8);
+    // default (where it changes nothing) and ignored with a warning otherwise.
+    ignores_on_both("typical_p", 0.9);
+    ignores_on_both("mirostat", 2);
+    ignores_on_both("dynatemp_range", 0.2);
+    ignores_on_both("dynatemp_exponent", 2.0);
+    ignores_on_both("xtc_probability", 0.5);
+    ignores_on_both("tfs_z", 0.9);
+    ignores_on_both("top_n_sigma", 3);
+    ignores_on_both("dry_multiplier", 0.8);
     accepts_on_both("typical_p", 1.0);
     accepts_on_both("mirostat", 0);
     accepts_on_both("dynatemp_range", 0.0);
@@ -170,7 +183,7 @@ TEST(ignored_fields_other_result_shaping_is_refused) {
     accepts_on_both("include_stop_str_in_output", false);
     refuses_on_both("skip_special_tokens", false);
     accepts_on_both("skip_special_tokens", true);
-    refuses_on_both("spaces_between_special_tokens", false);
+    ignores_on_both("spaces_between_special_tokens", false);
     accepts_on_both("spaces_between_special_tokens", true);
     refuses_on_both("chat_format", "qwen");
     // vLLM's -1 is the no-truncation default; a count is a truncation.

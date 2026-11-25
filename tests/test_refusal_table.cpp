@@ -89,7 +89,7 @@ TEST(refusal_table_is_not_empty_and_every_entry_has_a_reason) {
     }
 }
 
-TEST(refusal_table_every_field_is_refused_on_both_routes_with_its_reason) {
+TEST(refusal_table_every_refused_field_is_refused_on_both_routes_with_its_reason_and_the_rest_parse) {
     const size_t n = request_field_refusal_count();
     const RequestFieldRefusal* rows = request_field_refusals();
     const auto& samples = trigger_values();
@@ -105,9 +105,16 @@ TEST(refusal_table_every_field_is_refused_on_both_routes_with_its_reason) {
         const auto chat_err = parse_chat_request(chat_with({{field, it->second}}), chat);
         CompletionRequest comp;
         const auto comp_err = parse_completion_request(completion_with({{field, it->second}}), comp);
+        const char* reason = request_field_refusal_reason(rows[i].field);
+        if (!rows[i].refused) {
+            // accepted and ignored: the request parses as if the field were absent
+            CHECK(!chat_err.has_value());
+            CHECK(!comp_err.has_value());
+            ++checked;
+            continue;
+        }
         CHECK(chat_err.has_value());
         CHECK(comp_err.has_value());
-        const char* reason = request_field_refusal_reason(rows[i].field);
         for (const auto* err : {&chat_err, &comp_err}) {
             if (!err->has_value()) continue;
             CHECK((*err)->find(field) != std::string::npos);
@@ -118,6 +125,24 @@ TEST(refusal_table_every_field_is_refused_on_both_routes_with_its_reason) {
     CHECK_EQ(checked, n);
 }
 
+TEST(refusal_table_split_is_the_operators) {
+    // 1.8.1 (operator): 400 only where a silently ignored value would change the
+    // answer the client expects; the rest are accepted with one warning per field.
+    const char* const kRefused[] = {"min_tokens", "cache_salt", "prompt_logprobs", "logit_bias", "grammar",
+                                    "json_schema", "best_of", "use_beam_search", "bad_words",
+                                    "allowed_token_ids", "truncate_prompt_tokens", "n_predict",
+                                    "include_stop_str_in_output", "skip_special_tokens", "chat_format"};
+    size_t refused = 0;
+    const size_t n = request_field_refusal_count();
+    const RequestFieldRefusal* rows = request_field_refusals();
+    for (size_t i = 0; i < n; ++i) if (rows[i].refused) ++refused;
+    CHECK_EQ(refused, sizeof(kRefused) / sizeof(kRefused[0]));
+    for (const char* f : kRefused) CHECK(request_field_refused(f));
+    CHECK_EQ(n - refused, size_t{19});
+    CHECK(!request_field_refused("response_format"));
+    CHECK(!request_field_refused("user"));   // outside the table: not refused
+}
+
 TEST(refusal_table_every_tabled_field_has_a_trigger) {
     // The reverse direction: a trigger without a table row means the server
     // refuses a field the release notes would not list.
@@ -125,6 +150,7 @@ TEST(refusal_table_every_tabled_field_has_a_trigger) {
     for (const auto& [field, value] : samples) {
         CHECK(request_field_refusal_reason(field.c_str()) != nullptr);
         ChatRequest chat;
-        CHECK(parse_chat_request(chat_with({{field, value}}), chat).has_value());
+        CHECK_EQ(parse_chat_request(chat_with({{field, value}}), chat).has_value(),
+                 request_field_refused(field.c_str()));
     }
 }
