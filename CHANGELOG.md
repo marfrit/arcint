@@ -31,8 +31,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   build names it in `/props` `build.red_case` (empty otherwise) and the packaging refuses it. The configure re-runs
   when the tree's `ggml-opencl.cpp` changes, so an existing build directory cannot keep the lift after 0209 left.
   Evidence: the decision's unit cases, red on the 1.8.1 rule, and a check that the build finds 0209 when the series
-  has it (`code`); 0209's op test and the probe's exact arms (contrib/llama.cpp/README.md); the served card gate at
-  the Inkling unit's settings is owed.
+  has it (`code`); 0209's op test and the probe's exact arms, and the card gate at the Inkling unit's settings (B60,
+  `measured-here`: served at about 40k tokens, KL against a full re-read 0.0010-0.0033 nats against a bar of 0.0317,
+  the answers right, the restore 23-29 ms against a 45.5 s re-read; contrib/llama.cpp/README.md, 0209's section).
 
 ## 1.8.2 — 2026-11-25
 

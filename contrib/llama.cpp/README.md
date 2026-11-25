@@ -10911,6 +10911,18 @@ the last recorded B60 full suite (157 failing of 14,016, from an older tree: the
 the probe's red arms once each, the three q8_0 / q4_0 arms three times on green, the f16 control once a tree (14
 runs). About 30 minutes by the same estimate.
 
+**The 1.8.3 checkpoint gate** (`measured-here`, 2026-11-25, B60; every criterion met, the checkpoint refusal lifted):
+- the exact arms at `GGML_OPENCL_FA_DPAS2_SPLIT=1`: without 0209 E1 / E2 read back 65,107,885 / 79,139,135 differing
+  bytes and 129 / 129 differing logit rows; with 0209 0 bytes and 1 of 129 rows (the decode row, max |d| 0.0043); the
+  matched raw K/V read 0 differing bytes;
+- at the default split the restored logits differ by rounding: the restored window sits in other cells (positions
+  128..1151 in cells 0..1023), so the dpas2 key split's boundaries move (at one split only the decode row differs);
+- served at about 40k tokens at the Inkling unit's settings: the read-back equal (92,977,268 bytes); KL against a full
+  re-read 0.0010-0.0033 nats against a bar of 0.0317 (two arms in other splits + 0.03), 33 / 33 rows, argmax 100 %,
+  the answers right, restored at the expected positions including a late edit at 38,790; the restore 23-29 ms
+  against a 45.5 s re-read, the checkpoint 88.7 MiB in host RAM;
+- without 0209 the served restore reads back 86.9 M differing bytes.
+
 ## 0210-vocab-inkling2-ignore-merges.patch
 
 **What.** Inkling 2 Mini's tokenizer pre (`inkling2`, added by 0133) now sets `ignore_merges = true`, as the model's
