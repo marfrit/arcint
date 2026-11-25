@@ -10952,6 +10952,17 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
 - The gate's red (CPU): drop `if (!wide) return KQ_I8_XT_NOT_WIDE;` from `kq_i8_xt64_refusal`; `test-opencl-kq-i8`
   must fail its not-wide checks (16 of them).
 
+**CPU evidence (`measured-here`, the recipe host, the tree of pin + 160 patches, 2026-11-25).**
+- `test-opencl-kq-i8`: all OK (0 FAIL). No clang on that host, so its OpenCL compile checks are skipped; the offline
+  compile below covers them.
+- The gate red (the not-wide line dropped, the test built against that .inc): 16 FAIL, all of them the not-wide checks
+  (4 shapes × 4 token counts), nothing else.
+- `test-backend-ops -b CPU -o MUL_MAT_ID -p 'routed='`: 8 / 8 OK (0208's 2, 0208b's 2, 0222's 4). The ROUTE lines
+  are as computed: tails tiles32 192, 128 experts, max 64; u512b 189 / 96 / 441; u1024a 314 / 96 / 685.
+- RED-A and RED-B edit OpenCL kernel text that the CPU backend never runs. They show only on the card (card row 2).
+- The recipe on 4fca07cc: 51 / 51 tests passed, the .deb built (the series of 160 patches, the new kernel text
+  embedded).
+
 **Offline compile (`measured-here`, ocloc 26.27, 256 GRF, `-DSG=16`, one core; the patched text).**
 
 | program | device | GRF | SLM | scratch | stack calls | `_1_` retries | DPAS a K-block body |
