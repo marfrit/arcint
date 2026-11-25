@@ -300,6 +300,9 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
 - With more than one KV stream (unnamed lanes, `kv_unified` off) an f16 restore into a stream other than the first
   lands in the first stream's rows: the generic write omits the view offset that the read adds (code reading; any
   multi-lane start with a non-unified cache). The fix is planned for 1.8.2 with the q8_0 / q4_0 write.
+- The checkpoint refusal keys on the model's sliding window as libllama reports it (`llama_model_n_swa`). DeepSeek4
+  reports 0 although its cache is sliding-window and hybrid, so a DeepSeek4 start (tier "runs", not served here) is
+  not covered (code reading).
 - A Qwen4exp GGUF that carries neither `attention.recurrent_layers` nor `full_attention_interval` now fails to load
   (1.8.0 assumed an interval of 4).
 - 1.8.0's S3 (the bias dispatcher's GQA decode variant has no fallback if it fails to build) is still open; the 1.8.0
