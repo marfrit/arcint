@@ -10911,6 +10911,16 @@ Each refusal under the knob is a `DOWNGRADE src=opencl op=MUL_MAT_ID type=… pa
 not-built, expert-cache, shape), counted. The route cache's key carries the tile, so the gate/up and down of a layer
 share one 64-pair route, and the Q8_0 layers cut their own.
 
+**Proof of reach.** The 64-pair kernels carry the 32-pair kernels' names (one source, two programs), so a profile
+cannot tell them apart. Each arm prints one `TAKEN src=opencl op=MUL_MAT_ID type=<iq4_nl|q8_0> path=xt64 tile=64
+skip=1` line a process at its first 64-pair launch. Every card row asserts that line per type, together with the
+absence of `path=xt32` for the Inkling shapes.
+
+**For the day the default flips (note).** With the knob on, every launch the 64-pair tile does not take is a counted
+DOWNGRADE, by design: not-wide for the narrow-tile formats, shape under 16 tokens, expert-cache. A "0 new downgrades"
+release gate will count them, and whether formats that never asked should be DOWNGRADE lines at all is to be decided
+then. With the knob unset nothing is printed; every environment read on the path is a `static`.
+
 **This is a deviation from the reference's geometry** (trellis-serve's `DownDpasKernel`, MB 32, record), priced in
 window C1b and approved by the operator on those rows (2026-11-25).
 
@@ -10949,8 +10959,16 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
   `sub_group_broadcast(te.z >> 3, 0)`: the partial last group of a tile is skipped and its rows store zeros.
   - Dropped: 448 of 4,160 pairs in tails (0.11), 328 of 4,096 in u512b (8.0e-2), 312 of 8,192 in u1024a (3.8e-2).
     Must fail all three, and 0208's routed=1 cases.
+- **RED-C, a 64-pair route handed to the 32-pair program**, the one new way to drop pairs silently:
+  - IQ4_NL arm: `i8_kernel = w64;` dropped.
+  - Q8_0 arm: the kernel choice forced to `kernel_mul_mm_id_q8_0_i8_wide`.
+  - The 32-pair program stores slots 1-32 of a tile only, so pairs 33-64 of every 64-pair tile are never computed.
+  - Dropped in tails: 1,056 of 4,160 pairs (0.25), in both arms. Must fail the IQ4_NL tails cases (down, gate/up) and
+    the Q8_0 tails case respectively. The TAKEN line still prints (the route was cut at 64), so this red is caught by the
+    output, not by the reach line.
 - The gate's red (CPU): drop `if (!wide) return KQ_I8_XT_NOT_WIDE;` from `kq_i8_xt64_refusal`; `test-opencl-kq-i8`
   must fail its not-wide checks (16 of them).
+- RED-A, RED-B and RED-C are card-only (OpenCL kernel text or the OpenCL dispatch).
 
 **CPU evidence (`measured-here`, the recipe host, the tree of pin + 160 patches, 2026-11-25).**
 - `test-opencl-kq-i8`: all OK (0 FAIL). No clang on that host, so its OpenCL compile checks are skipped; the offline
@@ -10962,6 +10980,9 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
 - RED-A and RED-B edit OpenCL kernel text that the CPU backend never runs. They show only on the card (card row 2).
 - The recipe on 4fca07cc: 51 / 51 tests passed, the .deb built (the series of 160 patches, the new kernel text
   embedded).
+- After the review's follow-up (the TAKEN lines, the static read): `test-opencl-kq-i8` all OK again, and
+  test-backend-ops relinked with the TAKEN format string in it. The CPU eval is unaffected: only the OpenCL dispatch
+  changed. The recipe on that commit is recorded in the commit's own follow-up.
 
 **Offline compile (`measured-here`, ocloc 26.27, 256 GRF, `-DSG=16`, one core; the patched text).**
 
@@ -10971,8 +10992,13 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
 | `I8W_XT=64 I8W_SKIP=1` | bmg-g21, bmg-g31 | 256 | 18,432 B | 0 | none | none | 16 (8 groups × 2 columns, unrolled) |
 
 - Both kernels (IQ4_NL, Q8_0) pass in both programs on both devices.
-- The default program's ISA on bmg-g21 is identical to the pre-0222 text's (IQ4_NL 4,113 instruction lines, Q8_0 3,681,
-  the same md5 of the listings).
+- The default program's ISA is identical to the pre-0222 text's on bmg-g21 and on bmg-g31: IQ4_NL 4,113 instruction
+  lines (listing md5 137a6c30), Q8_0 3,681 (206bc764), the same on both devices.
+
+**Applies against development only (note).** This branch is development f81d6175, without rel-183's 0209 / 0211 /
+0212, which also touch `ggml-opencl.cpp`. 0222's hunks depend on their context, so the apply, the write-tree and the
+recipe are owed again on the merged series. 0208b sorts after 0208 under LC_ALL=C. The four new eval cases change the
+op suite's case total.
 
 **Card rows (written before any run; B60 at 165 W; the unit's settings unless named: 262,144 cells,
 `--llama-swa-window`, ub 1024, q8_0 K/V, FA, all layers on the card, `GGML_OPENCL_KQ_MM_ID_I8=1`, `_I8_WIDE=1`,
@@ -10986,6 +11012,8 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
      depth, from ~915 t/s (the anchor, measured with the profiling build) to ~960-1,030 t/s (+5 to +12 %). At pp4096,
      +5 to +12 % as well. The Q8_0 layers add 4-15 ms (not counted in the range).
    - The gain counts only if the slowest on-run beats the fastest off-run.
+   - Every on-run's log carries both TAKEN lines and no `path=xt32` line; every off-run's carries neither. Otherwise
+     the round does not count.
 2. **The op rows and the reds.**
    - `test-backend-ops perf -b GPUOpenCL -o MUL_MAT_ID -p 'routed='`, off and on, 3 fresh-process repeats each.
      EXPECT a launch to save Δtiles·(c − 4d) + Δgroups·d with d ∈ [DPAS only, c/4]:
@@ -10993,11 +11021,19 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
      - u1024a gate/up 6,145 → 4,310-5,330 us;
      - routed=1 n512 (Δtiles 61, Δgroups 180): down 1,911 → 1,440-1,540 us, gate/up 3,789 → 2,760-2,985 us.
    - The eval list (`-p 'routed='` plus 0192's real-shape cases) on: all OK, and `DOWNGRADE … path=xt32` absent for
-     the IQ4_NL / Q8_0 Inkling shapes. The 64-pair load line and the "64 pairs" INFO line are printed.
-   - RED-A fails u512b / u1024a; RED-B fails tails / u512b / u1024a / routed=1. With the knob off the red trees' default
-     program is the shared text, so RED-A fails there too (it edits the shared route); RED-B passes there (I8W_SKIP unset).
-3. **The KL arm at the unit's settings.** `llama-perplexity -c 2048 --chunks 6`, on against off, and both against the CPU
-   base. EXPECT on vs off: KLD 0.000000, same top p 100 % (inference: per-pair arithmetic unchanged). Bar: the
-   answer-level bar (+0.03 nats, −1 point) against the off arm's KL.
+     the IQ4_NL / Q8_0 Inkling shapes. The 64-pair load line and both TAKEN lines (iq4_nl, q8_0) are printed, in every
+     eval and perf log of the on arm, and in none of the off arm.
+   - RED-A fails u512b / u1024a; RED-B fails tails / u512b / u1024a / routed=1; RED-C fails the IQ4_NL tails (down,
+     gate/up) in its IQ4_NL tree and the Q8_0 tails in its Q8_0 tree. With the knob off the red trees' default program
+     is the shared text, so RED-A fails there too (it edits the shared route); RED-B and RED-C pass there.
+3. **The KL arm at the unit's settings.** `llama-perplexity -c 2048 --chunks 6`. The arms: on against off, a second off
+   against the first off (the floor), and each against the CPU base. EXPECT: on vs off KLD 0.000000, same top p 100 %
+   (inference: per-pair arithmetic unchanged, but the two programs are separate compiles). Off vs off is 0.000000 too
+   (record: this path repeated bit-equal on the B60 in window B).
+   - Reading: 0 / 0 is identity. A non-zero on vs off with a zero floor is a finding (a compiler contraction or a bug),
+     judged by the answer-level bar (+0.03 nats, −1 point against the off arm's KL to the CPU base). Non-zero in both is
+     the card's floor.
+   - The on arm's log carries both TAKEN lines.
 4. **The answers.** The capital, the 45k needle and the task battery at the unit's settings, knob on. EXPECT: the same
-   greedy text as knob off (identical logits), the needle found, the battery's verdicts unchanged.
+   greedy text as knob off (identical logits), the needle found, the battery's verdicts unchanged. The on server's
+   log carries both TAKEN lines.
