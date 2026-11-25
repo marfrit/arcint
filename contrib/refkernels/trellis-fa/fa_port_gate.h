@@ -288,9 +288,11 @@ static inline int fa_port_split_wave(int n_cu, int grf, int threads_per_wg) {
 
 // p for one call: nwg work-groups, the wave, the call's keys and window. cap (GGML_OPENCL_FA_PORT_SPLIT_MAX,
 // 0 = none) bounds p; force (GGML_OPENCL_FA_PORT_SPLIT_FORCE, the tests only) sets it, windowed calls too,
-// bounded by 16 and the call's blocks. FA_PORT_SPLIT_RED_NO_FLOOR: the rule without the 128-block floor
-// (the unit test's red: it splits a 4k call).
-static inline int fa_port_splits(int64_t nwg, int64_t wave, int64_t n_kv, int32_t window, int cap, int force) {
+// bounded by 16 and the call's blocks. min_blocks (GGML_OPENCL_FA_PORT_SPLIT_MINBLK, 0 = the default
+// FA_PORT_SPLIT_MIN_BLOCKS) is the floor of blocks a split walks: a knob so that a window can price it
+// (1 = no floor, 0045's and CUDA's form). FA_PORT_SPLIT_RED_NO_FLOOR: the rule without the floor whatever
+// min_blocks says (the unit test's red: it splits a 4k call).
+static inline int fa_port_splits(int64_t nwg, int64_t wave, int64_t n_kv, int32_t window, int cap, int force, int min_blocks) {
     const int64_t blocks = (n_kv + 31) / 32;
     if (force > 0) {
         int64_t p = force < FA_PORT_SPLIT_MAX ? force : FA_PORT_SPLIT_MAX;
@@ -301,7 +303,7 @@ static inline int fa_port_splits(int64_t nwg, int64_t wave, int64_t n_kv, int32_
 #ifdef FA_PORT_SPLIT_RED_NO_FLOOR
     int64_t smax = blocks;
 #else
-    int64_t smax = blocks / FA_PORT_SPLIT_MIN_BLOCKS;
+    int64_t smax = blocks / (min_blocks > 0 ? min_blocks : FA_PORT_SPLIT_MIN_BLOCKS);
 #endif
     if (smax > FA_PORT_SPLIT_MAX) smax = FA_PORT_SPLIT_MAX;
     if (cap > 0 && smax > cap) smax = cap;

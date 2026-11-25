@@ -9993,10 +9993,11 @@ unit's settings).
   `GGML_OPENCL_FA_PORT_TRACE=1` adds a line a call.
 - **The other knobs:**
   - `_SPLIT_MAX=N` caps p;
+  - `_SPLIT_MINBLK=N` sets the floor of blocks a split walks (unset 128, 1 none: for pricing the floor);
   - `_SPLIT_FORCE=N` forces p (tests);
   - `_WAVE=W` overrides the wave;
-  - `_RED=10|11|12` are the split build's reds: the states without their maxima, split 1 dropped, and the
-    sink in every split.
+  - `_RED=10|11|12|13` are the split build's reds: the states without their maxima, split 1 dropped, the
+    sink in every split, and a lost seam block.
 
 **0223b** (`test-backend-ops.cpp`):
 - **The new cases:** six split cases, f16 and q8_0: kv 16384 × nb 1024, kv 12288 × nb 36, and kv 16384 × nb
@@ -10007,6 +10008,11 @@ unit's settings).
   split with the knob on. That last check is 0045's blind KL run, made a test.
 - **The counts:** `GGML_TEST_FA_PORT_DECISIONS` counts the split cases apart, and checks that the rule
   splits them at both cards' waves.
+- **The bound:** the split cases are bounded at 1e-5, f16 as well. A lost seam block moves their f16
+  answer by NMSE 1.8e-4 .. 3.5e-4, which 5e-4 would hide. `GGML_TEST_FA_PORT_SEAM=1` checks on the CPU
+  that the red stands at least 10x above the bound.
+- **Perf:** a perf row whose launch record is wrong prints `FAILED [launch record]`. Two perf cells
+  price the 128-block floor.
 
 **Without a device** (`measured-here`, the recipe host):
 - `contrib/refkernels/trellis-fa/port_split_test.cpp` on the six exports: green rc 0, red

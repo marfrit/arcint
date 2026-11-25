@@ -61,7 +61,8 @@ initializer order, `qtiles`/`qgroups`/`n`/`wg` arithmetic and
 | `opencl-plan.md` | (no code) 1a's plan: `fa::Kern`'s tile structure in OpenCL C, each ESIMD construct against the builtin ours already uses, what has no equivalent, and the binding plan |
 | `fa_port_gate.h` | a copy of the port's pure gate (the llama tree's `ggml/src/ggml-opencl/fa_port_gate.h`, patch 0198), so the test beside it builds from this directory |
 | `port_gate_test.cpp` | the gate's CPU unit test, fed the model's graph export lines; red with `-DFA_PORT_GATE_RED` |
-| `port_split_test.cpp` | the key split's rule (patch 0223, §split) on the same export lines widened to depth; red with `-DFA_PORT_SPLIT_RED_NO_FLOOR` |
+| `port_split_test.cpp` | the key split's rule (patch 0223, §split) on the same export lines widened to depth; red with `-DFA_PORT_SPLIT_RED_NO_FLOOR`; by hand, not a ctest |
+| `port_seam_model.py` | a numpy model of the six split cases: what a lost seam block (`RED=13`) does to the answer, against the cases' bounds |
 | `fixtures/` | the model's graph exports the gate test reads: `inkling-ub*.txt` (f16 KV) and `inkling-q8kv-ub*.txt` (q8_0 KV, §q8) |
 | `port_abi_check.py` | the kernel's parameter list against the launch's `clSetKernelArg` sequence, no device |
 | `isa_phases.py` | the key-block loop of a kernel's IGC `.asm` dump cut into phases, with instruction counts a phase (`--pre-dpas 8 --loop-dpas 40` for the q8_0 build) |
@@ -2624,43 +2625,100 @@ Both are scoping choices, not invariants, and are open to the operator.
   - the merge is 2,882 lines green, 2,821 with RED=10 and 2,833 with RED=11 (f16);
   - the attention kernel is 6,115 lines green and 6,042 with RED=12.
 
-**The card rows (written, not run; B60, the Inkling unit's settings: q8_0 K/V, ub = b = 1,024,
-flash attention, all layers on the card, the five prompt switches; ZE_AFFINITY_MASK=0).** The
-EXPECT lines come first in each row.
+**The review's fixes** (a follow-up commit; not on a card, the CPU checks below):
+- **The floor is a knob:** `GGML_OPENCL_FA_PORT_SPLIT_MINBLK=N`, with 0 / unset meaning 128 and 1
+  meaning none (0045's and CUDA's form), so that a window can price it.
+- **A fourth red:** `RED=13` skips the first block of every split ≥ 1, a lost seam block.
+- **The split cases' bound is 1e-5, f16 as well,** stated before their card run. A lost seam block
+  moves the f16 answer by NMSE 1.8e-4 .. 3.5e-4 only (`inference`, a numpy model of the cases' own
+  fill: `GGML_TEST_FA_PORT_SEAM=1` is the same check on the CPU backend). That is under the old 5e-4,
+  and 17-35x the new bound. The q8_0 port cases ran at 1.9e-6 .. 2.2e-6 on the card.
+- **A perf row now fails** (`FAILED [launch record]`) when its launch did not do what the case
+  requires.
+- **Two perf cells** price the floor: kv 4,096 × nb 1,024 (the 4k call it keeps unsplit) and kv 8,192
+  × nb 32 (the short turn it limits: p 2 with the floor, p 6 on the B60 without it).
+- **Not a ctest:** `port_split_test.cpp` runs by hand (the two g++ lines at its head); the recipe does
+  not run it.
+- **The apply check, stacked:** with 0220 (q8_0 2D GEMM) and 0221 (the loop controller) the series
+  applies, 162 patches. That was checked by apply only; that stacked tree was not built.
+- **A text change with the knob off:** the existing TAKEN line gains ` split=off` at its end. A script
+  that anchors that line's end must be checked.
 
-1. **The served pass, wall time, split off against on** (llama-bench `-d D -p 1024 -n 0`, fresh
-   processes, three interleaved rounds an arm, host load sampled a round).
-   - EXPECT d 40,960: on beats off, the slowest on above the fastest off. The chunk gains
-     +2.0 .. +3.9 % (25-48 ms of 1,290: 6-11 % of 455.7 ms, minus a 1.2-2.0 ms merge).
-   - EXPECT d 4,096: equal within the run-to-run spread. No call splits there: with
-     `GGML_OPENCL_FA_PORT_TRACE=1`, zero `split=` lines above 1.
-   - EXPECT on, d 40,960, TRACE: the chunk's 8 global calls log `nwg=1024 wave=200 split=3`, the
-     40 SWA calls `split=1`. One "split scratch grows to 38338560 bytes" line, and VRAM after the
-     first deep batch +36.6 MiB against off.
-2. **The op cases and the reds** (`test-backend-ops -o FLASH_ATTN_EXT`, a fresh process a cell).
+**The windowed calls never split: priced, the operator's to confirm.** The 40 SWA calls take 85 ms a
+ubatch (`measured-here`). Their fill gain is at most 6-11 % of that, 5-9 ms, and forty merges at
+0.15-0.25 ms cost 6-10 ms (`inference`). The net is about −5 to +3 ms a ubatch. The choice scopes
+out part of the reference mechanism and needs the operator's nod.
+
+**The card rows (written, not run; B60, the Inkling unit's settings: q8_0 K/V, ub = b = 1,024, flash
+attention, all layers on the card, the five prompt switches; ZE_AFFINITY_MASK=0).** EXPECT lines come
+first in each row. Every process is checked to name the B60 alone. The llama tools run at `-v`
+(llama-bench) or `-lv 4` (perplexity, batched-bench); without them the backend's lines are muted, and
+a missing line would read as absent.
+
+**The per-process assertions**, for every process of rows 1, 3 and 4:
+- **on** (`GGML_OPENCL_FA_PORT_SPLIT=1`):
+  - the port's TAKEN line with ` split=on max=0 force=0 minblk=0 wave=200`;
+  - a split TAKEN line (`kv=q8_0 split=3 … nwg=1024 wave=200`);
+  - zero `port=split-declined` and zero `port=split-not-built` lines;
+  - with `GGML_OPENCL_FA_PORT_TRACE=1`, set in both arms: every `FA_PORT call` with window 0 and
+    n_kv ≥ 12,288 at nwg 1,024 is `split=3`, and every call with window 1,024 is `split=1`.
+- **off** (knob unset): the TAKEN line ends in ` split=off`, no split TAKEN line, no trace line above
+  `split=1`.
+
+The rows:
+
+0. **The dry run.**
+   - EXPECT one split case, (a) q8_0, OK at `split=3` under `GGML_OPENCL_BOUNDS=1`.
+   - EXPECT a llama-bench `-v` run and a served start with the knob on, each printing the port's TAKEN
+     line with ` split=on … wave=200`. That shows the lines are not muted.
+1. **The served pass, wall time, split off against on** (llama-bench `-d D -p 1024 -n 0 -r 3 -v`,
+   fresh processes, three interleaved rounds an arm, host load sampled at every process).
+   - EXPECT d 40,960: the slowest on run beats the fastest off run, about +2.0 .. +3.9 % (25-48 ms of
+     1,290). The largest "the split scratch grows to … bytes" line reads 38338560 (36.6 MiB, which the
+     load-time guard does not see). Each chunk logs its 8 global calls at split=3, a positive multiple of
+     8 per process.
+   - EXPECT d 4,096: equal within the run-to-run spread, and no trace line above `split=1`.
+   - If the gain rule fails, rows 2 and 3 still run (they say why), and the window stops before
+     row 4.
+2. **The wave and the floor, priced** (`test-backend-ops perf -o FLASH_ATTN_EXT`).
+   - **R2, the wave:** case (a), f16 and q8_0, with `_SPLIT_FORCE=1`, `2`, `3`, `4`. EXPECT, with the
+     wave at 200: p 3 fastest and p 2 between. If the wave is 260 or more, p 1 is as fast as p 3 and
+     the gain is the merge's cost. The rule's p must be within 2 % of the fastest forced p.
+   - **R3, the floor:** the cells kv 4,096 × nb 1,024 at `_SPLIT_FORCE=1 / 2 / 3`, and kv 8,192 × nb 32
+     at `_SPLIT_FORCE=1`, at the knob's own p 2, and at `_SPLIT_MINBLK=1` (p 6). EXPECT 4k: within
+     ±3 % (the floor's reason). EXPECT the short turn: p 6 at least 1.5x faster than p 1. The two
+     prices go to the operator.
+3. **The op cases and the reds** (`test-backend-ops -o FLASH_ATTN_EXT`, a fresh process a cell).
    - EXPECT `GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_SPLIT=1`: the 6 split cases pass at
-     `[FA_PORT] split=3` (a, b, c on the B60) within 5e-4 (f16) and 1e-5 (q8_0). The 16 older port
-     cases pass at `split=1`.
-   - EXPECT with the knob unset: the 6 pass at `split=1`.
+     `[FA_PORT] split=3` (a, b, c on the B60), NMSE ≤ 1e-5, near 2e-6. The 16 older port cases pass at
+     `split=1`.
+   - EXPECT with the knob unset: the 6 split cases pass at `split=1`.
    - EXPECT `_SPLIT_FORCE=2` and `=3`: all 22 port cases pass at `split=2` / `3`.
-   - EXPECT `GGML_OPENCL_FA_PORT_WAVE=8` with the split on: the 6 split cases FAIL with "SPLIT
-     CASE DID NOT SPLIT". That is the check's own red.
-   - EXPECT RED=10, RED=11 and RED=12, each with the split on: the 6 split cases FAIL, at NMSE about
-     0.1-1, 0.05-0.3 and 1e-2 .. 5e-2 (the sink is 5-9 % of a row's denominator at these depths).
-   - EXPECT RED=10, 11 and 12 with `_SPLIT_FORCE=3`: the 16 older cases FAIL.
-   - Perf rows (a)-(c), split on against off: (a) gains, (b) and (c) are the short-turn shapes.
-3. **KL** (`llama-perplexity -m $G -c 16384 -b 1024 -ub 1024 -fa on -ctk q8_0 -ctv q8_0 -ngl 99
-   --chunks 4 -lv 4`, the five switches).
-   - The arms: off (saves the base logits), off again, split, and RED=10 with the split on
-     (1 chunk).
-   - EXPECT the second off: 0.000000.
-   - EXPECT TRACE in the split arm: per chunk, ubatches 7-10 split 2 and 11-15 split 3. That is 72
-     split calls a chunk and 288 in all, 0 in the off arms. The scored second half of each chunk
-     comes from split calls.
-   - EXPECT split paired against off: mean KL ≤ 0.004 and top p ≥ 98 %. Against the answer-level
-     bar: ≤ 0.03 nats worse and ≤ 1 point.
-   - EXPECT RED=10: mean KL ≥ 0.05.
-4. **The answers** at the unit's flags with `GGML_OPENCL_FA_PORT_SPLIT=1`.
-   - EXPECT the capital is right.
-   - EXPECT the needle at ≥ 40k (the 44k fixture) is found.
-   - EXPECT the acceptance task is 10/10.
+   - EXPECT `GGML_OPENCL_FA_PORT_WAVE=8` with the split on: the 6 split cases FAIL with "SPLIT CASE DID
+     NOT SPLIT" (the check's own red).
+   - EXPECT `RED=10`, `11`, `12` and `13`, each with the split on: the 6 split cases FAIL, at NMSE about
+     0.1-1, 0.05-0.3, 1e-2 .. 5e-2 and 1.8e-4 .. 3e-2 (the seam red at 17x the bound or more).
+   - EXPECT the same four reds with `_SPLIT_FORCE=3`: the 16 older cases FAIL (13 at least where a
+     forced seam lies on used keys).
+   - EXPECT the perf rows (a)-(c) on against off: no `FAILED [launch record]`.
+4. **KL** (`llama-perplexity -m $G -c 16384 -b 1024 -ub 1024 -fa on -ctk q8_0 -ctv q8_0 -ngl 99
+   --chunks 4 -lv 4`, the five switches, TRACE in every arm).
+   - The arms: off (saves the base logits), off again, split, and RED=10 with the split on (1 chunk).
+   - EXPECT the second off inside the card's own band: KL at most 0.001 and top p at least 99.5 %.
+     0.000000 / 100 % on the B60 so far.
+   - EXPECT TRACE in the split arm: per chunk, ubatches 7-10 split 2 and 11-15 split 3, which is 72
+     split calls a chunk and 288 in all. The off arms have 0 split calls.
+   - EXPECT split paired against off: mean KL at most 0.004 and top p at least 98 %.
+   - EXPECT the answer-level bar, read against a CPU base of the same text (the paired off arm's floor is
+     100 % and cannot serve as one): split at most off's + 0.03 nats, top p at most 1 point below off's.
+     The base is about 45-70 min on 6 CPU threads, outside a window; without it this line is not read.
+   - EXPECT RED=10: mean KL at least 0.05.
+5. **The answers** at the unit's flags, split on and off.
+   - EXPECT the capital right.
+   - EXPECT the 44k needle right.
+   - EXPECT the acceptance score with the split at least the score without it − 1.
+
+**Owed, not in these rows:**
+- the design's 32-row turn at 200k depth (the latency row);
+- the B70 block (op perf and the wave of 320);
+- the 261k chunk A/B (about 25 min).

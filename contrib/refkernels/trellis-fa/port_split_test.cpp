@@ -90,7 +90,7 @@ static void check_call(const char * file, int no, int64_t rows, int64_t n_head, 
         }
         for (int d = 0; d < 3; ++d) {
             const int64_t n_kv = (DEPTH[d] + rows + 255) / 256 * 256;
-            const int p = fa_port_splits(nwg, wave, n_kv, window, 0, 0);
+            const int p = fa_port_splits(nwg, wave, n_kv, window, 0, 0, 0);
             const int want = window != 0 ? 1 : e->p[d];
             const int bps = fa_port_split_blocks(n_kv, p);
             // a split walks at least 128 blocks (the floor), the splits cover every block, and none is past the call's
@@ -116,14 +116,20 @@ int main(int argc, char ** argv) {
     }
     {
         // force sets p (windowed calls too), bounded by 16 and the call's blocks; cap bounds the rule; cap 1 is off
-        struct { int64_t nwg, wave, n_kv; int32_t window; int cap, force, want; } K[] = {
-            { 1024, 200, 41984, 1024, 0, 3, 3 }, { 1024, 200, 160, 0, 0, 3, 3 }, { 1024, 200, 64, 0, 0, 3, 2 },
-            { 1024, 200, 41984, 0, 0, 40, 16 }, { 1024, 200, 41984, 0, 2, 0, 2 }, { 1024, 200, 41984, 0, 1, 0, 1 },
-            { 1024, 0, 41984, 0, 0, 0, 1 }, { 1024, 200, 8160, 0, 0, 0, 1 }, { 1024, 200, 8192, 0, 0, 0, 2 } };
+        // min_blocks (GGML_OPENCL_FA_PORT_SPLIT_MINBLK): 0 is the default 128; 1 is no floor (the reference's form)
+        struct { int64_t nwg, wave, n_kv; int32_t window; int cap, force, minblk, want; } K[] = {
+            { 1024, 200, 41984, 1024, 0, 3, 0, 3 }, { 1024, 200, 160, 0, 0, 3, 0, 3 }, { 1024, 200, 64, 0, 0, 3, 0, 2 },
+            { 1024, 200, 41984, 0, 0, 40, 0, 16 }, { 1024, 200, 41984, 0, 2, 0, 0, 2 }, { 1024, 200, 41984, 0, 1, 0, 0, 1 },
+            { 1024, 0, 41984, 0, 0, 0, 0, 1 }, { 1024, 200, 8160, 0, 0, 0, 0, 1 }, { 1024, 200, 8192, 0, 0, 0, 0, 2 },
+            { 1024, 200, 8192, 0, 0, 0, 128, 2 },     // the default spelled out
+            { 1024, 200, 5120, 0, 0, 0, 1, 3 },       // the 4k call at ub 1,024 without the floor: p 3
+            { 32, 200, 8192, 0, 0, 0, 0, 2 },         // the 32-row turn at 8k with the floor: p 2
+            { 32, 200, 8192, 0, 0, 0, 1, 6 },         // and without it: p 6
+            { 1024, 200, 5120, 1024, 0, 0, 1, 1 } };  // a window never splits, floor or not
         for (auto & k : K) {
-            const int got = fa_port_splits(k.nwg, k.wave, k.n_kv, k.window, k.cap, k.force);
-            printf("  knobs nwg %lld wave %lld kv %lld window %d cap %d force %d: p %d (want %d)%s\n", (long long) k.nwg, (long long) k.wave,
-                   (long long) k.n_kv, k.window, k.cap, k.force, got, k.want, got == k.want ? "" : "   <-- FAIL");
+            const int got = fa_port_splits(k.nwg, k.wave, k.n_kv, k.window, k.cap, k.force, k.minblk);
+            printf("  knobs nwg %lld wave %lld kv %lld window %d cap %d force %d minblk %d: p %d (want %d)%s\n", (long long) k.nwg, (long long) k.wave,
+                   (long long) k.n_kv, k.window, k.cap, k.force, k.minblk, got, k.want, got == k.want ? "" : "   <-- FAIL");
             if (got != k.want) ++fails;
         }
     }
