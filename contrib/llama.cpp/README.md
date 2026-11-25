@@ -9726,7 +9726,7 @@ buffers' furthest byte is checked under `GGML_OPENCL_BOUNDS=1`. The red is a bui
 `GGML_OPENCL_CPY_TRANSPOSE_RED=1` (`-DCPY_T_RED`): the write guard becomes `bin_w < d1 - 1`, which
 loses the last dim-1 edge - visible on 1,025 bins and on the `[33, 17, 3]` tile case.
 
-**cp39's finding and the fix.** The first eligibility used `nb02 == nb10 * ne00` and
+**The first card window's finding and the fix.** The first eligibility used `nb02 == nb10 * ne00` and
 `nb03 == nb02 * ne01`, both false for every real source: the token slab's stride is
 `ne00 * ne01 * sizeof(float)` (4 * 1025 * 24 = 98,400 for the bias table), not `4 * ne00`, and
 dim 3 steps by the dim-2 count. The path was therefore never taken (80/80 CONT cases passing off
@@ -9741,7 +9741,7 @@ strides derived from the graph: the bias table's view `[24, 1025, T]` with
 `nb = {4*1025, 4, 4*1025*24, ...}` from `inkling2.cpp:386/390`'s product and permute, and the
 depth mix's transpose view `[k, 2304, T]` with `nb = {9,216, 4, 9,216*slots, ...}` from `mix()`
 line 219 - and the negatives (a contiguous source, a slow step that is not one fast row, a
-non-contiguous destination, an f16 pair). Run here: all pass; **with cp39's old terms put back,
+non-contiguous destination, an f16 pair). Run here: all pass; **with the old terms put back,
 both real cases FAIL** (`eligible=0, want 1`, exit 1) - that is the red, on the CPU, no card.
 
 **The card can see the path ran** two ways, both in the script: the once-a-process stderr line
@@ -9784,7 +9784,7 @@ evidence" below, except step (f) for Inkling at ub 512, which is still owed):
     # (e) the prompt, at the Inkling standard arm (`GGML_OPENCL_KQ_MM_ID_I8=1`
     # GGML_OPENCL_KQ_MM_ID_I8_WIDE=1`, `--llama-swa-window`, ub 1024 the main batch size, 512 and
     # 2048 as extra columns; decode is unaffected, the wide tile is a prefill path). Reference
-    # (cp17, B60, measured-here): pp4096 with WIDE=1 = 722.2 / 765.7 / 723.4 t/s at ub
+    # (B60, measured-here): pp4096 with WIDE=1 = 722.2 / 765.7 / 723.4 t/s at ub
     # 512 / 1024 / 2048
     export GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1
     llama-bench -m <pinned IQ4_NL>.gguf -fa on -p 4096 -ub 1024 --llama-swa-window -r 3
@@ -9913,10 +9913,11 @@ Inkling pp4096, t/s, the port off / on: 769.2 / 909.8 (ub 512), 816.0 / 973.9 (u
 complete with the knob on (3,190 cases) and off (3,179); the reds fail every case they run; with the knob unset three
 models match the development build. Not through a release gate.
 
-**Limits, read before any unit uses the knob.** Every number above is at f16 KV (llama-bench's default). The port
-REFUSES a q8_0 KV cache, and the Inkling units serve q8_0 KV: at q8_0 `GGML_OPENCL_FA_PORT` changes nothing
+**Limits, read before any unit uses the knob.** Every number above is at f16 KV (llama-bench's default). This
+revision refused a q8_0 KV cache, which the Inkling units serve: at q8_0 `GGML_OPENCL_FA_PORT` changed nothing then
 (`measured-here`, pp4096 ub 1024 with `GGML_OPENCL_CPY_TRANSPOSE=1`: 816.3 with the port off, 816.6 with it on and 7
-refusals logged; 974 at f16 KV with the port taken). At the
+refusals logged; 974 at f16 KV with the port taken). Since 0199q1 / 0199q2 (below) the port reads a q8_0 cache in
+place. At the
 units' own flags (262,144 context, `--llama-swa-window`) f16 KV does not fit the 24 GB card beside the model: arcint's
 load-time spill guard refuses it (`measured-here`: context 8,516 MiB at f16 against 4,526 MiB at q8_0, which loads). So the port helps a served Inkling only once it reads
 a q8_0 cache. Not verified: a partial offload (`-ngl` below all layers). At `-ngl 12` the run faulted (`measured-here`). The

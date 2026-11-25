@@ -13,6 +13,7 @@ Reference material, not compiled into arcint or its package:
 | component | version | license | file |
 |---|---|---|---|
 | trellis-serve, `fa::Kern<128>` (the prefill attention kernel) | commit `8f8e2fcc`, `xpu/csrc/inkling2_ops.sycl` lines 509-654 | MIT, Copyright (c) 2026 0xSero | `contrib/refkernels/trellis-fa/fa_kern.sycl` (the block verbatim, with its notice); `contrib/llama.cpp/patches/0198-opencl-flash-attn-port-kernel.patch` adds `flash_attn_port.cl`, an OpenCL kernel written after its structure |
+| trellis-serve, the depth mix's `_mix_kernel` form | `xpu/exl3xpu/inkling2/fused.py` (line 41) | MIT, Copyright (c) 2026 0xSero | no code copied: `contrib/llama.cpp/patches/0205-opencl-depth-mix-kernel.patch` adds `depth_mix.cl`, an OpenCL kernel that computes the depth mix in the reference's one-pass form (scores, the normalized weights, the weighted sum of the normalized states) |
 
 `third_party/httplib.h` is cpp-httplib **0.18.3** with two small local
 changes. The exact diff against a fresh upstream v0.18.3 `httplib.h` is

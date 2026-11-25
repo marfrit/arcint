@@ -115,7 +115,7 @@ index 71d61fd..11ce300 100644
 +        // the kernel indexes one token's slab as a stamp: src + gz*s_nb2 + dim0*s_nb0 + dim1*s_nb1,
 +        // so the token stride must be the slab's float count (ne00*ne01, whatever the source's
 +        // internal strides) and the dim-3 stride must step by the dim-2 count. The earlier form
-+        // (nb02 == nb10*ne00, nb03 == nb02*ne01) is false for every real source - cp39's finding.
++        // (nb02 == nb10*ne00, nb03 == nb02*ne01) is false for every real source - the first card run's finding.
 +        // the eligibility is a pure function (no cl_ calls) so a host unit test can feed it a
 +        // graph node's real strides; the kernel's own index form is what it checks
 +        const int64_t ct_ne0[4] = { ne00, ne01, ne02, ne03 };
