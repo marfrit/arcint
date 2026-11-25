@@ -10914,6 +10914,12 @@ share one 64-pair route, and the Q8_0 layers cut their own.
 **This is a deviation from the reference's geometry** (trellis-serve's `DownDpasKernel`, MB 32, record), priced in
 window C1b and approved by the operator on those rows (2026-11-25).
 
+**The in-tile skip is part of it.** 0222 builds the group skip (`I8W_SKIP=1`) inside the 64-pair tile. That is
+option 1's mechanism, and on its own it stays within the reference's geometry. A 64-pair tile without it would run
+eight DPAS groups for every tile, more than the 32-pair tile runs today. C1b's priced saving (124.4 tiles fewer and
+191.7 groups skipped a launch) needs both. Read every A/B of this knob as **option 2 including the in-tile skip**; the
+skip is not measured apart.
+
 **Tests (CPU, `test-opencl-kq-i8`).**
 - The knob's parse: only `64` asks.
 - The gate on the graph exports' shapes, all accepted at 512 / 1,024 / 2,048 / 16 tokens under the knob, and refused
