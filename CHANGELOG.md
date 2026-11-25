@@ -40,6 +40,10 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   context. A partial offload of Inkling faulted at `-ngl 12` (`measured-here`); the cause by code reading, not
   reproduced, is its depth-mix stacks written through views across devices, the same code without the port. Serve
   Inkling fully offloaded.
+  Patches 0199q1 / 0199q2 add a q8_0 read path to the port (the kernel reads ggml's q8_0 blocks in place, nothing
+  staged; same knob): designed, compiled offline (256 GRF, no scratch) and tested on the CPU only, **not run on a
+  card**. Predicted (`inference`) 816 -> 953 t/s at pp4096 ub 1,024 with q8_0 KV. Record:
+  `contrib/refkernels/trellis-fa/README.md` §q8.
 - **Inkling 2 Mini's depth mix as one op** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`). The prefill's depth
   attention (`src/models/inkling2.cpp:191`) ran as 8-12 nodes a mix call: a copy of the k+1 states as a transposed view
   (341 ms of a pp4096 pass), the first product on 0178's split-K GEMV (309), the weighted sum on 0171's tiny-K kernel

@@ -9924,6 +9924,25 @@ cause, by code reading and the fault's arithmetic (not reproduced): Inkling's de
 through views from layers on both devices, which faults or silently loses rows at a CPU / card boundary. The code
 involved is byte-identical on the development build without the port (`code`). Serve Inkling fully offloaded.
 
+**0199q1 / 0199q2: the port reads a q8_0 K/V cache (design and CPU tests; not run on a card).** The same knob. The
+kernel has a second build (`-DPORT_KV8=1`) that reads ggml's q8_0 blocks in place: nothing is staged (the reference
+stages an f16 copy every call, 1,074 MB for one global layer at 262,144 keys - a deviation, named and priced in the
+record). K by five transposed dword reads a 16-key group, V by transformed byte reads on the 4-byte grid the extension
+defines (a third read and a lane splice for the blocks that start 2 bytes off it); the codes become
+f16 by integer operations on the dwords (`1152 + code`, the 1152 taken out through the accumulator's start), K's scale
+multiplies the f32 sum once a block, V's scale goes into P (`f16(p d 128)`). 256 GRF, scratch 0 (`measured-here`, ocloc
+bmg-g21, 9 of 9 variants). The gate accepts K and V both f16 or both q8_0 (`nb[0]` 34, head stride and view offset
+multiples of 4, pitch a multiple of 16 and at least 196); its unit reads the model's export with `-ctk q8_0 -ctv q8_0`
+(K/V nb `[34, 1088, 136]`), red with the rule before and with a wrong stride rule. A CPU model of the read path on
+the cases' own bytes: NMSE 9e-8 against a double-precision attention, every 2D read inside the extension's stated limits,
+four reds 0.012 to 0.5 and a fifth on the 4-byte rule (`measured-here`, the
+recipe host). Red on the card: `GGML_OPENCL_FA_PORT_RED=6` (K's scale twice), `=7` (V's scale from the next block).
+`TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0 …` once a process. Prediction (`inference`): pp4096 ub 1,024 at
+q8_0 KV 816 -> 953 t/s (range 935 to 974); the op 930 / 2,630 / 3,720 us at the three shapes against the f16 port's
+736 / 2,078 / 2,906. The record, the prediction's arithmetic and the card commands:
+`contrib/refkernels/trellis-fa/README.md` §q8. Until a card run, every statement above about the units stands: the
+measured build refuses q8_0.
+
 Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
 (`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
 

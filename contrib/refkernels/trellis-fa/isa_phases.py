@@ -10,6 +10,12 @@ tile's setup (the last load before the first K load that is not part of the loop
 knowable from the text alone, so the header is cut at the nearest preceding label run of
 the loop: the lines after the last pre-loop Q/sink load). Counts are static: a branch arm
 that a given block does not take is still counted, so the score pass is an upper bound.
+
+--pre-dpas N: the kernel runs N DPAS a tile before its key-block loop (the q8_0 build's
+sums of Q, 8 of them), so the loop's 16th and 32nd are the (N+16)th and (N+32)th. P V then
+starts at the first 2D block load after the softmax's first math.exp, whatever its form
+(the q8_0 build reads V's codes as bytes). --loop-dpas M: the DPAS a key block runs (32;
+the q8_0 build 40: two more a q8_0 block, the sums of its P).
 """
 import re, sys
 
@@ -40,17 +46,27 @@ def parse(path):
     return ins
 
 def main():
-    for path in sys.argv[1:]:
+    args = sys.argv[1:]
+    pre_d, loop_d = 0, 32
+    while args and args[0] in ('--pre-dpas', '--loop-dpas'):
+        if args[0] == '--pre-dpas': pre_d = int(args[1])
+        else: loop_d = int(args[1])
+        args = args[2:]
+    for path in args:
         ins = parse(path)
         k = [i for i, x in enumerate(ins) if x[0].startswith('load_block2d') and 'd32t' in x[0]]
         v = [i for i, x in enumerate(ins) if x[0].startswith('load_block2d') and 'd16' in x[0]]
         d = [i for i, x in enumerate(ins) if x[0].startswith('dpas')]
-        if not k or not v or len(d) < 32:
+        d = d[pre_d:]
+        if pre_d and len(d) >= loop_d:
+            e0 = [i for i, x in enumerate(ins) if x[0] == 'math.exp' and i > d[15]]
+            v = [i for i, x in enumerate(ins) if x[0].startswith('load_block2d') and e0 and i > e0[0]]
+        if not k or not v or len(d) < loop_d:
             print(path, ': landmarks missing', len(k), len(v), len(d)); continue
         s0, s1 = k[0], d[15] + 1
         e = [i for i, x in enumerate(ins) if x[0] == 'math.exp' and i >= s1]
         m0 = e[0] if e else v[0]
-        p0, p1 = v[0], d[31] + 1
+        p0, p1 = v[0], d[loop_d - 1] + 1
         pre = [i for i, x in enumerate(ins) if x[0].startswith('load') and i < s0 and i < k[0]]
         # the header: after the last load that belongs to the tile's setup: the last load in the
         # longest run of loads before S (the Q rows / the sink), else 60 instructions back
