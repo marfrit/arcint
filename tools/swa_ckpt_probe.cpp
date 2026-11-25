@@ -63,7 +63,9 @@
 //   E0' a second untouched context, the same calls: partial and full state bytes
 //      and every tail logit row (unequal: the card is not deterministic here)
 //   R1 / R2 after E1's / E2's restore, seq 0's K / V rows read from the WHOLE
-//      storage tensors (not the views the state I/O uses), in position order, vs U's
+//      storage tensors (not the views the state I/O uses), compared with U's by
+//      position: the positions both hold, one by one (the cells differ: a restore
+//      refills the SWA window from cell 0)
 //   E3 the restore without a history: a context's own partial state restored into
 //      it at once (the restored layout, none of the lane's history), vs U and E1
 //   C  the lane's history without a restore: the lane runs on as E1's, is cleared
@@ -362,24 +364,21 @@ void print_layout(const char* who, const Layout& L) {
     std::fprintf(stderr, " | recurrent %s\n", L.recr.c_str());
 }
 
-// per cache: for each layer, the K and V rows of seq 0's cells at positions [0, n_pos), in position order,
-// read from the whole storage tensor (ggml_backend_tensor_get on the base, not a view)
+// per cache: seq 0's K and V bytes per position below n_pos (all layers' rows of that position, in layer order),
+// read from the whole storage tensor (ggml_backend_tensor_get on the base, not a view). Two contexts are compared
+// by POSITION (the positions both hold), not by cell: a restore refills the window from cell 0
 struct RawKV {
     std::vector<std::string> names;
-    std::vector<std::vector<uint8_t>> k, v;   // [cache][bytes], all layers concatenated
-    std::vector<size_t> row_k, row_v, n_rows;  // per cache: bytes a row (all layers), rows
-    std::string note;
+    std::vector<std::vector<llama_pos>> pos;                  // [cache][i]
+    std::vector<std::vector<std::vector<uint8_t>>> k, v;      // [cache][i] = the position's bytes, all layers
 };
 
 RawKV raw_kv(llama_context* /*ctx*/, const Layout& L, int n_pos) {
     RawKV R;
     for (const auto& c : L.caches) {
-        std::vector<uint8_t> ks, vs;
-        size_t rk = 0, rv = 0;
         std::vector<std::pair<llama_pos, uint32_t>> sel;
         for (const auto& pc : c.cells) if (pc.first < n_pos) sel.push_back(pc);
-        // one layer at a time, rows in position order: [layer][pos][row]
-        std::vector<std::vector<uint8_t>> kl, vl;
+        std::vector<std::vector<uint8_t>> ks(sel.size()), vs(sel.size());
         for (uint32_t il : c.kv->get_layer_ids()) {
             ggml_tensor* kt = c.kv->get_k_storage((int32_t) il);
             llama_kv_cache::slot_info si;
@@ -394,42 +393,56 @@ RawKV raw_kv(llama_context* /*ctx*/, const Layout& L, int n_pos) {
             ggml_backend_tensor_get(kt, kall.data(), 0, kall.size());
             ggml_backend_tensor_get(vt, vall.data(), 0, vall.size());
             const size_t krow = kt->nb[1];
-            const size_t vrow = v_trans ? ggml_type_size(vt->type) * (size_t) vt->ne[0] : vt->nb[1];
-            rk += krow; rv += vrow;
-            for (const auto& pc : sel) {
-                ks.insert(ks.end(), kall.begin() + (size_t) pc.second * krow, kall.begin() + (size_t) (pc.second + 1) * krow);
+            const size_t vrow = vt->nb[1];
+            for (size_t i = 0; i < sel.size(); ++i) {
+                const size_t cell = sel[i].second;
+                ks[i].insert(ks[i].end(), kall.begin() + cell * krow, kall.begin() + (cell + 1) * krow);
                 if (!v_trans) {
-                    vs.insert(vs.end(), vall.begin() + (size_t) pc.second * vrow, vall.begin() + (size_t) (pc.second + 1) * vrow);
+                    vs[i].insert(vs[i].end(), vall.begin() + cell * vrow, vall.begin() + (cell + 1) * vrow);
                 } else {
                     const size_t es = ggml_type_size(vt->type), kvs = (size_t) vt->ne[1];
                     for (int64_t j = 0; j < vt->ne[0]; ++j) {
-                        const size_t off = ((size_t) j * kvs + pc.second) * es;
-                        vs.insert(vs.end(), vall.begin() + off, vall.begin() + off + es);
+                        const size_t off = ((size_t) j * kvs + cell) * es;
+                        vs[i].insert(vs[i].end(), vall.begin() + off, vall.begin() + off + es);
                     }
                 }
             }
         }
+        std::vector<llama_pos> ps;
+        for (const auto& pc : sel) ps.push_back(pc.first);
         R.names.push_back(c.name);
+        R.pos.push_back(std::move(ps));
         R.k.push_back(std::move(ks));
         R.v.push_back(std::move(vs));
-        R.row_k.push_back(rk);
-        R.row_v.push_back(rv);
-        R.n_rows.push_back(sel.size());
     }
     return R;
 }
 
+// matched positions: for each cache, the positions both contexts hold, their K / V bytes compared one by one
 bool report_raw(const char* what, const RawKV& a, const RawKV& b) {
     bool ok = a.names == b.names;
     std::string detail;
-    for (size_t i = 0; ok && i < a.names.size(); ++i) {
-        const ByteDiff dk = diff_bytes(a.k[i], b.k[i]);
-        const ByteDiff dv = diff_bytes(a.v[i], b.v[i]);
-        char buf[200];
-        std::snprintf(buf, sizeof(buf), " %s: %zu cells, K %zu of %zu bytes differ, V %zu of %zu;", a.names[i].c_str(), b.n_rows[i],
-                      dk.n_diff, std::max(dk.n_a, dk.n_b), dv.n_diff, std::max(dv.n_a, dv.n_b));
+    for (size_t c = 0; ok && c < a.names.size(); ++c) {
+        size_t ia = 0, ib = 0, n_common = 0, pos_k = 0, pos_v = 0, bytes_k = 0, bytes_v = 0, total_k = 0, total_v = 0;
+        llama_pos first_bad = -1;
+        while (ia < a.pos[c].size() && ib < b.pos[c].size()) {
+            if (a.pos[c][ia] < b.pos[c][ib]) { ++ia; continue; }
+            if (b.pos[c][ib] < a.pos[c][ia]) { ++ib; continue; }
+            ++n_common;
+            const ByteDiff dk = diff_bytes(a.k[c][ia], b.k[c][ib]);
+            const ByteDiff dv = diff_bytes(a.v[c][ia], b.v[c][ib]);
+            total_k += std::max(dk.n_a, dk.n_b); total_v += std::max(dv.n_a, dv.n_b);
+            if (dk.n_diff) { ++pos_k; bytes_k += dk.n_diff; }
+            if (dv.n_diff) { ++pos_v; bytes_v += dv.n_diff; }
+            if ((dk.n_diff || dv.n_diff) && first_bad < 0) first_bad = a.pos[c][ia];
+            ++ia; ++ib;
+        }
+        char buf[320];
+        std::snprintf(buf, sizeof(buf), " %s: %zu matched positions (%zu / %zu held), K %zu positions %zu of %zu bytes differ, V %zu positions %zu of %zu bytes differ%s;",
+                      a.names[c].c_str(), n_common, a.pos[c].size(), b.pos[c].size(), pos_k, bytes_k, total_k, pos_v, bytes_v, total_v,
+                      first_bad >= 0 ? (std::string(", first at position ") + std::to_string(first_bad)).c_str() : "");
         detail += buf;
-        ok = ok && dk.equal() && dv.equal() && a.n_rows[i] == b.n_rows[i];
+        ok = ok && n_common > 0 && pos_k == 0 && pos_v == 0;
     }
     std::fprintf(stderr, "%s %-58s%s\n", ok ? "PASS" : "FAIL", what, a.names == b.names ? detail.c_str() : " the caches differ");
     return ok;
