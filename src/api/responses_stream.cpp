@@ -744,6 +744,8 @@ bool Stream::run(const Context& ctx, int slot) {
     ToolCallParse parsed;
     if (parse_calls) {
         parsed = parse_tool_calls(content_, prep_.dialect, &prep_.schemas);
+        // ids unique across turns (core/toolcall.h): after the history's call_N
+        number_calls(parsed.calls, next_call_index(prep_.req));
         if (parsed.truncated) {
             log::warn("tools", "unterminated %s block; returned as raw content%s",
                       std::string(tool_call_open(prep_.dialect)).c_str(),

@@ -28,6 +28,8 @@
 - Flash-Next's production quant is ISTA-DASLab's GSQ-RCO IQ3_S since
   2026-10-20 (operator): 33.3 t/s decode on six answers, KL 0.127 against
   Q8_0 (IQ3_XXS 38.0 t/s, 0.217, the rollback).
+- Version 1.8.2 (2026-11-25): FIX Inkling 2 Mini's prompt cache: the tokenizer's ignore_merges rule (337 words were
+  split, patch 0210) and tool call ids unique across turns; both made a served conversation re-read its prompt.
 - Version 1.8.1 (2026-11-25): FIX the q8_0 / q4_0 KV checkpoint restore on OpenCL (positions restored, bytes not;
   Inkling's sliding-window layers read stale K/V after a resume). New defaults: the spill guard (--llama-allow-spill),
   admission tiers, the request-field split (15 refused, 19 ignored with a warning), default-on OpenCL paths. New:

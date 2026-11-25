@@ -18,6 +18,41 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## 1.8.2 — 2026-11-25
+
+A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn
+contained one of 337 vocabulary words the tokenizer split (the `ignore_merges` rule was missing since Inkling
+support, 1.8.0), and after the second tool call (tool call ids repeated across turns). Conversations begun on 1.8.1
+re-read once. A rare miss remains when the model samples a split the tokenizer would not produce; at q8_0 / q4_0
+K/V such a turn re-reads the whole prompt (1.8.1's checkpoint refusal; the write fix is planned for 1.8.3).
+Tested: the recipe's suite (51 / 51) and a card gate on the B60 (`measured-here`, the Inkling unit's flags: 21 of
+21 word turns and 4 of 4 tool turns reused the cache, against 1 of 4 on 1.8.1; the agent and Dory answer and number
+their calls across turns) on the build ce51085d, whose code this release carries unchanged; on the release binary
+the tokenizer check only.
+
+- **Inkling 2 Mini's tokenizer takes a whole-word vocabulary entry whole** (patch 0210, mainline d2bceda3d; no switch).
+  1.8.x split words whose single token is in the vocabulary but not reachable by the BPE merges (` welches` became
+  ` `, `welch`, `es`; 337 entries, about one occurrence in 18k-24k tokens of English or C++ text): such prompts were
+  tokenized differently from training, and in a served conversation the re-tokenized history no longer matched the
+  sampled tokens, so the lane re-read the whole prompt (two of two turns with ` welches` missed the cache on the
+  1.8.1 unit; the controls hit). CPU red / green on ` welches`, ` voices`, ` kwargs` against the vocabulary's ids
+  (`measured-here`); the recorded Inkling KL rows used the old rule on both sides and stay valid as comparisons.
+- **Tool call ids unique across the turns of a conversation.** Every response numbered its tool calls from
+  `call_0`, so a later turn's call repeated an earlier turn's id. Inkling 2 Mini's chat template looks a tool
+  result's function name up by `tool_call_id` over all messages and appends every match to the tool header (a
+  `read` and a `bash` call both named `call_0` render the first result as `readbash`), which rewrites earlier
+  prompt text, so the lane's prefix stops matching and each follow-up re-reads the whole prompt (~48 s at 41k
+  tokens on 1.8.1, the B60 at q8_0 KV). Now a response's calls are numbered after the highest `call_N` already in the request's
+  history: assistant `tool_calls[].id`, tool messages' `tool_call_id`, and on `/v1/responses` the
+  `function_call` / `function_call_output` `call_id`s, input and stored (`previous_response_id`) alike; an id
+  not of the form `call_<digits>` is ignored. The ids stay deterministic (the same request gives the same
+  ids), and a request without call ids in its history still starts at `call_0`. One rule for
+  `/v1/chat/completions` (streamed and not) and `/v1/responses` (streamed and not); `/v1/completions` parses
+  no tool calls. Evidence: the operator's 5-turn tool test on the served Inkling 1.8.1 (`measured-here`),
+  prefix hits in the 4 follow-up turns: as-is 1, unique ids 4 (a `name` on the tool result message: 4);
+  the routes' ids and the Inkling render's unchanged first-turn prefix in the unit suite (`code`, red with
+  1.8.1's numbering).
+
 ## 1.8.1 — 2026-11-25
 
 Release gate against 1.8.0 (`measured-here`, 2026-11-25, one window: the B60 at 165 W, then the B70 at 220 W; the
@@ -47,7 +82,7 @@ since `--llama-swa-window` also Dory1.0-4B with that flag at q8_0 / q4_0 (`code`
 such a start keeps no checkpoints (one load warning; `/props` `checkpoints` says "off: ..." with the reason) and a
 restore is refused before any cell is touched ("nothing restored ... full re-prefill"), so the follow-up re-reads its prompt (at an Inkling unit's settings about 1,067 t/s).
 f16 K/V keeps checkpoints and is not affected, nor are models without a sliding window (the 27B agent). The fix of the
-write itself, which brings the checkpoints back, is planned for 1.8.2.
+write itself, which brings the checkpoints back, is planned for 1.8.3.
 
 **Read first — what changes with no switch set:**
 - **A start that does not fit the card is refused** (the spill guard, below). `--llama-allow-spill` restores 1.8.0's
@@ -305,12 +340,12 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
   its feature's switch is on. Do not set them on a serving unit.
 - `set_tensor`'s q8_0 / q4_0 conversion to the split layout is keyed on a whole-tensor write, not on weights: a
   whole-tensor write into a non-weights q8_0 tensor would convert it. No served path does that today (a cache restore
-  writes views and at most the window's cells); a weights-only rule is owed for 1.8.2.
+  writes views and at most the window's cells); a weights-only rule is owed for 1.8.3.
 - The CPU-miss staging buffers of the expert cache are allocated once; a layer registered later would launch without
   them (code reading; not shown to happen).
 - With more than one KV stream (unnamed lanes, `kv_unified` off) an f16 restore into a stream other than the first
   lands in the first stream's rows: the generic write omits the view offset that the read adds (code reading; any
-  multi-lane start with a non-unified cache). The fix is planned for 1.8.2 with the q8_0 / q4_0 write.
+  multi-lane start with a non-unified cache). The fix is planned for 1.8.3 with the q8_0 / q4_0 write.
 - The checkpoint refusal keys on the model's sliding window as libllama reports it (`llama_model_n_swa`). DeepSeek4
   reports 0 although its cache is sliding-window and hybrid, so a DeepSeek4 start (tier "runs", not served here) is
   not covered (code reading).

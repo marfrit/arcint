@@ -1,4 +1,5 @@
 #include "core/toolcall.h"
+#include "core/chat.h"
 #include "harness.h"
 
 #include <nlohmann/json.hpp>
@@ -171,4 +172,105 @@ TEST(toolcall_values_keep_angle_brackets) {
                                          "\"}}\n</tool_call>");
     CHECK_EQ(j.calls.size(), 1u);
     if (j.calls.size() == 1) CHECK_EQ(json::parse(j.calls[0].arguments)["sql"].get<std::string>(), sql);
+}
+
+// ---------------------------------------------- ids unique across turns (1.8.2)
+// The parser numbers a turn's calls from call_0; the routes renumber them after
+// the highest call_N in the request's history (next_call_index, number_calls).
+namespace {
+
+ToolCall named_call(const char* id) { return ToolCall{id, "read_file", "{}"}; }
+
+ChatMessage tool_result(const char* id) {
+    ChatMessage m;
+    m.role         = "tool";
+    m.tool_call_id = id;
+    m.content      = "x";
+    return m;
+}
+
+// user, an assistant turn calling call_0 and call_1, both results
+ChatRequest two_call_history() {
+    ChatRequest req;
+    ChatMessage user;
+    user.role    = "user";
+    user.content = "read both";
+    req.messages.push_back(user);
+    ChatMessage a;
+    a.role       = "assistant";
+    a.tool_calls = {named_call("call_0"), named_call("call_1")};
+    req.messages.push_back(a);
+    req.messages.push_back(tool_result("call_0"));
+    req.messages.push_back(tool_result("call_1"));
+    return req;
+}
+
+std::vector<std::string> ids_of(const std::vector<ToolCall>& calls) {
+    std::vector<std::string> out;
+    for (const ToolCall& c : calls) out.push_back(c.id);
+    return out;
+}
+
+const char* kTwoCalls =
+    "<tool_call>{\"name\": \"read_file\", \"arguments\": {}}</tool_call>"
+    "<tool_call>{\"name\": \"bash\", \"arguments\": {}}</tool_call>";
+
+}  // namespace
+
+// Mutation: next_call_index returning 0 (the 1.8.1 numbering) and the new calls
+// are call_0, call_1 again.
+TEST(toolcall_ids_follow_the_history) {
+    const ChatRequest req = two_call_history();
+    CHECK_EQ(next_call_index(req), 2u);
+    ToolCallParse p = parse_qwen_tool_calls(kTwoCalls);
+    CHECK(ids_of(p.calls) == (std::vector<std::string>{"call_0", "call_1"}));   // the parser's own
+    number_calls(p.calls, next_call_index(req));
+    CHECK(ids_of(p.calls) == (std::vector<std::string>{"call_2", "call_3"}));
+    CHECK_EQ(p.calls[0].name, std::string("read_file"));   // only the ids move
+    CHECK_EQ(p.calls[1].name, std::string("bash"));
+}
+
+TEST(toolcall_ids_without_history_start_at_zero) {
+    ChatRequest req;
+    ChatMessage user;
+    user.role    = "user";
+    user.content = "hi";
+    req.messages.push_back(user);
+    CHECK_EQ(next_call_index(req), 0u);
+    CHECK_EQ(next_call_index(ChatRequest{}), 0u);
+    ToolCallParse p = parse_qwen_tool_calls(kTwoCalls);
+    number_calls(p.calls, next_call_index(req));
+    CHECK(ids_of(p.calls) == (std::vector<std::string>{"call_0", "call_1"}));
+}
+
+// Only call_<decimal digits> counts; anything else is the client's own id.
+TEST(toolcall_ids_ignore_foreign_ids) {
+    ChatRequest req;
+    ChatMessage a;
+    a.role       = "assistant";
+    a.tool_calls = {named_call("toolu_abc"), named_call("call_abc"), named_call("call_"),
+                    named_call("call_-1"), named_call("call_+4"), named_call("call_ 3"),
+                    named_call("call_3x"), named_call("Call_9"), named_call("xcall_9"),
+                    named_call(""), named_call("call_99999999999999999999999999"),
+                    named_call("call_18446744073709551615")};
+    req.messages.push_back(a);
+    req.messages.push_back(tool_result("toolu_abc"));
+    CHECK_EQ(next_call_index(req), 0u);
+    // a call_N among them still sets the offset
+    req.messages[0].tool_calls.push_back(named_call("call_4"));
+    CHECK_EQ(next_call_index(req), 5u);
+}
+
+// The highest N wins wherever it appears: out of order, in a later turn, or
+// only as a tool message's tool_call_id (its call turn dropped by the client).
+TEST(toolcall_ids_take_the_highest_anywhere) {
+    ChatRequest req = two_call_history();
+    ChatMessage a;
+    a.role       = "assistant";
+    a.tool_calls = {named_call("call_7"), named_call("call_5")};
+    req.messages.push_back(a);
+    CHECK_EQ(next_call_index(req), 8u);
+    req.messages.push_back(tool_result("call_12"));
+    CHECK_EQ(next_call_index(req), 13u);
+    CHECK_EQ(next_call_index(req), 13u);   // deterministic: a pure function of the request
 }
