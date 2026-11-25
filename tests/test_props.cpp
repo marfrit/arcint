@@ -624,6 +624,18 @@ TEST(props_reports_the_chat_template_kwarg_defaults) {
     CHECK(d.value("tone", nlohmann::json()) == nlohmann::json("warm"));
 }
 
+TEST(props_carries_the_checkpoint_state) {
+    // 1.8.1: a client can see that checkpoints are off and why (red: the key absent)
+    Config      cfg;
+    FakeBackend backend;
+    SlotPool    slots(1);
+    Context     ctx{&cfg, &backend, &slots};
+    CHECK(lgc::api::props(ctx).at("checkpoints").is_null());   // the stub says nothing
+    backend.st.checkpoints = "off: a q8_0 / q4_0 sliding-window cache cannot be restored on OpenCL in this release";
+    const nlohmann::json j = lgc::api::props(ctx);
+    CHECK(j.at("checkpoints").get<std::string>().rfind("off: ", 0) == 0);
+}
+
 TEST(props_carries_the_admission_tier_and_the_spill_verdict) {
     // 1.8.1: the tier decision and the guard's verdict are readable without the log.
     Config      cfg;

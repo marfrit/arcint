@@ -235,6 +235,9 @@ struct ModelStatus {
     // or --chat-template-file carried a template. A "runs" start without one serves
     // /v1/completions and answers chat routes with a 400; there is no ChatML guess.
     std::string admission_tier;   // "optimized for", "verified", "runs"; empty on the stub
+    // 1.8.1: the context checkpoints of this start, "on", "off" (none asked, or nothing to snapshot)
+    // or "off: <reason>" (a q8_0 / q4_0 sliding-window cache on OpenCL); empty on the stub
+    std::string checkpoints;
     bool        has_chat_template = true;   // the stub and test fixtures render; the llama load sets it
 
     SamplerDefaults sampler_defaults;

@@ -34,8 +34,8 @@ without `--llama-swa-window`) a follow-up that resumed from a checkpoint could a
 up to 1,024 positions, with no error. Affected since 1.8.0 (the first release with Inkling; the dropped write is in
 the pinned llama.cpp's OpenCL backend, the full-size cache's restore lands the window on other positions' cells), and
 since `--llama-swa-window` also Dory1.0-4B with that flag at q8_0 / q4_0 (`code`). 1.8.1 refuses it:
-such a start keeps no checkpoints (one load warning) and a restore is refused before any cell is touched ("nothing
-restored ... full re-prefill"), so the follow-up re-reads its prompt (at an Inkling unit's settings about 1,067 t/s).
+such a start keeps no checkpoints (one load warning; `/props` `checkpoints` says "off: ..." with the reason) and a
+restore is refused before any cell is touched ("nothing restored ... full re-prefill"), so the follow-up re-reads its prompt (at an Inkling unit's settings about 1,067 t/s).
 f16 K/V keeps checkpoints and is not affected, nor are models without a sliding window (the 27B agent). The fix of the
 write itself, which brings the checkpoints back, is planned for 1.8.2.
 
@@ -150,8 +150,10 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
   default: at the full-size SWA cache prefix reuse is exact without the rule. A build without patch 0153 fails at
   configure. Card (B60, q8_0 KV): 49,152 cells VRAM 21,334 -> 17,382 MiB; decode after a 15,790-token prompt 20.6 ->
   30.5 t/s (+48 %), prefill 333 -> 370; 131,072 and 262,144 cells decode 30.4, needles at 120k and 250k right (262k:
-  20,918 MiB after load, 22,031 after the needle); an edited follow-up resumes from its checkpoint (10,836 of 11,351
-  tokens reused, 1.6 s instead of 30.3 s); the agent's checkpoint resume unchanged. CPU depth cost at 16,384
+  20,918 MiB after load, 22,031 after the needle); an edited follow-up resumed from its checkpoint (10,836 of 11,351
+  tokens reused, 1.6 s instead of 30.3 s; token reuse and time, not logits: that resume restored no sliding-window
+  bytes, see the first item, and 1.8.1 refuses it at q8_0 / q4_0, so at the units' q8_0 such a follow-up takes the
+  30 s); the agent's checkpoint resume unchanged. CPU depth cost at 16,384
   (llama-bench, one repetition each, f16): Gemma 4 E4B pp 48.33 -> 61.56 t/s, tg64 8.67 -> 12.56 with the window
   (+27 %, +45 %); Inkling pp 18.79 -> 19.87, tg16 7.34 -> 7.94 (its 16-token CPU decode is weight-bound, no separable
   effect; the card's 30.4/31.9 at depth 16,384 against 20.5 q8_0 / 24.3 f16 served full-size is the device evidence).

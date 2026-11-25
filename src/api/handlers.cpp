@@ -504,6 +504,8 @@ json props(const Context& ctx) {
         {"model", std::move(model)},
         // 1.8.1: the admission decision, "optimized for" / "verified" / "runs" (null on the stub)
         {"admission_tier", st.admission_tier.empty() ? json(nullptr) : json(st.admission_tier)},
+        // 1.8.1: whether this start keeps context checkpoints, and why not (null on the stub)
+        {"checkpoints", st.checkpoints.empty() ? json(nullptr) : json(st.checkpoints)},
         {"chat_template", {{"present", st.has_chat_template}}},
         {"chat_template_caps", ctx.backend->template_caps()},
         // feyntalk W6a (docs/campaigns/feyntalk.md, D4; review findings 1/3):
