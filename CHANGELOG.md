@@ -103,7 +103,8 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
   and arcint's spill guard refuses f16 KV at the units' 262,144 context.)
   *Limits.* Not run at the units' own flags (262,144 context, `--llama-swa-window`) and not on the B70. A partial
   offload of Inkling faulted at `-ngl 12`; the cause by code reading, not reproduced, is its depth-mix stacks written
-  through views across devices — 1.8.0's code (patch 0148), not the port's: serve Inkling fully offloaded.
+  through views across devices — patch 0148's code, by code reading also in 1.8.0 (the fault was measured on the
+  development tree), not the port's: serve Inkling fully offloaded.
   `GGML_OPENCL_FA_PORT_PROBE=nobias` is a timing probe with wrong answers; the other `GGML_OPENCL_FA_PORT_*` variables
   are tuning and red-case hooks. Record: `contrib/refkernels/trellis-fa/README.md` §q8 and §q8-card.
 - **Inkling 2 Mini's depth mix as one op** (patches 0204-0207, opt-in `GGML_OPENCL_DEPTH_MIX=1`; unset = off, and
