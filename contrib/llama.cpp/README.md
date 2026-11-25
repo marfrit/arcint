@@ -11019,3 +11019,186 @@ and local memory are the driver's answers for the compiled kernel, so the cell f
 **Card result, item 3** (`measured-here`, 2026-11-25, B60, `llama-perplexity` over 1,024 scored rows at batch 8): the
 forced fallback equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against
 the unforced kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route.
+
+## 0208b-test-backend-ops-p5-routing-replay.patch
+
+Test-only, on 0208: two routings of 0208's expert projections next to its fixed random draw (`routed=1`). Both use
+IQ4_NL, 128 experts, top-8; down is 2,304 rows at K 1,152, gate/up 2,304 rows at K 2,304 with b broadcast.
+
+- `routed=2`, balanced: token t's slot i takes expert (8t + i) mod 128, so every expert holds exactly 8n/128 pairs.
+  That is 128 tiles at both 128 and 512 tokens. The pair of cells measures the stage and store cost of real pairs at a
+  fixed tile and group count (the wide kernel runs every group of a tile).
+- `routed=3`, a served launch replayed: the per-expert pair counts of nine MUL_MAT_ID launches of Inkling 2 Mini on the
+  4,096-token served fixture (sha256 400a7dd1), three each at 512, 1,024 and 2,048 tokens. They come from one CPU run of
+  the fixture with an eval callback on every MUL_MAT_ID node. The counts are laid out as a run-length list, and token
+  t's slot i takes entry i·n + t, which keeps a token's eight experts distinct while no count exceeds n (asserted).
+
+Every case prints one `P5 ROUTE <vars> tiles32=.. touched=.. max=.. skip8=..` line from the ids it set. Two
+correctness cases sit in the eval list; the perf list has 4 balanced and 18 replay cases. Card evidence (`measured-here`,
+B60 at 165 W, the 2026-11-25 profile):
+
+- Every log tested GPUOpenCL on the B60 with its case count and its ROUTE lines.
+- Option 2's rule held: saving_low 221 − band 2 = 218 ms a 4,096-token pass at ub 1024.
+- The split, from the medians:
+  - down: a 10.50 us a tile, s 0.563 us a real 8-pair group, c = a − 4s = 8.25 us;
+  - gate/up: a 20.11 us, s 0.550 us, c = 17.91 us.
+- The replays sat at routed=1's level (−1.9 % mean), not at the served figure. The wide tile kernel's own time was
+  +11.4 / +13.8 % above another session's served figure. Same-window anchor, ub 1024 chunk: down 2,930 us,
+  gate/up 5,623 us a launch, against the u1024 replays at 3,081-3,147 / 6,079-6,242.
+
+## 0222-opencl-q8_iq4-mul_mat_id-wide-64-pair-tile.patch
+
+The wide int8 expert tile at 64 pairs, behind `GGML_OPENCL_KQ_MM_ID_I8_XT=64`. Unset (or anything but the exact
+`64`) is today's tile and route: the 64-pair program is not built, and the default program's ISA is unchanged (below).
+
+**The change.**
+- The route kernel (unchanged) is handed `tile = 64` and cuts each expert into ceil(c/64) tiles.
+- The wide program (`mul_mm_kq_i8_wide.cl`, shared by the IQ4_NL arm and the Q8_0 prompt arm) is built a second time
+  with `-DI8W_XT=64 -DI8W_SKIP=1`. Under `I8W_SKIP` a tile computes ng = ceil(te.z / 8) once, the same in every lane
+  (`sub_group_broadcast`), and only its groups below ng run:
+  - the two staging loops are bounded by `I8W_ROWS` = ng·8 rows;
+  - the DPAS + scale body is behind `I8W_GROUP_ON(g)` = g < ng.
+- Why the output does not change: a skipped group's slots lie at or past te.z, and `I8W_STORE` never stores those. Per
+  pair the K loop and its order are unchanged, so every output value is the same arithmetic as the 32-pair tile's
+  (inference: the logits should be bit-identical knob off / on; card row 3 checks it).
+- Unset, `I8W_ROWS` is `I8W_XT` and `I8W_GROUP_ON(g)` is 1.
+
+**The gate.** It is a pure host function in `kq_i8_ops.inc`:
+`kq_i8_xt64_refusal(xt_wanted, wide, kernel64_built, cache_src, ne00, ne01, n_expert, n_tok)` → `kq_i8_tile_pairs`.
+The tile is 64 only when all of these hold:
+- the knob asks for 64;
+- the launch is on the wide tile, and the 64-pair kernel is built for the format;
+- the weights are not an expert cache's `.slots` / `.bank`;
+- K is a multiple of 32 and rows a multiple of 16;
+- at most 512 experts and at least 16 tokens.
+
+Each refusal under the knob is a `DOWNGRADE src=opencl op=MUL_MAT_ID type=… path=xt32 reason=…` line (not-wide,
+not-built, expert-cache, shape), counted. The route cache's key carries the tile, so the gate/up and down of a layer
+share one 64-pair route, and the Q8_0 layers cut their own.
+
+**Proof of reach.** The 64-pair kernels carry the 32-pair kernels' names (one source, two programs), so a profile
+cannot tell them apart. Each arm prints one `TAKEN src=opencl op=MUL_MAT_ID type=<iq4_nl|q8_0> path=xt64 tile=64
+skip=1` line a process at its first 64-pair launch. Every card row asserts that line per type, together with the
+absence of `path=xt32` for the Inkling shapes.
+
+**For the day the default flips (note).** With the knob on, every launch the 64-pair tile does not take is a counted
+DOWNGRADE, by design: not-wide for the narrow-tile formats, shape under 16 tokens, expert-cache. A "0 new downgrades"
+release gate will count them, and whether formats that never asked should be DOWNGRADE lines at all is to be decided
+then. With the knob unset nothing is printed; every environment read on the path is a `static`.
+
+**This is a deviation from the reference's geometry** (trellis-serve's `DownDpasKernel`, MB 32, record), priced in
+the 2026-11-25 profile and approved by the operator on those rows (2026-11-25).
+
+**The in-tile skip is part of it.** 0222 builds the group skip (`I8W_SKIP=1`) inside the 64-pair tile. That is
+option 1's mechanism, and on its own it stays within the reference's geometry. A 64-pair tile without it would run
+eight DPAS groups for every tile, more than the 32-pair tile runs today. C1b's priced saving (124.4 tiles fewer and
+191.7 groups skipped a launch) needs both. Read every A/B of this knob as **option 2 including the in-tile skip**; the
+skip is not measured apart.
+
+**Tests (CPU, `test-opencl-kq-i8`).**
+- The knob's parse: only `64` asks.
+- The gate on the graph exports' shapes, all accepted at 512 / 1,024 / 2,048 / 16 tokens under the knob, and refused
+  with the right reason when the knob is off, not wide, not built, or on an expert cache:
+  - Inkling `ffn_moe_down` [1152, 2304, 128] and `ffn_moe_gate_up` [2304, 2304, 128], IQ4_NL and Q8_0;
+  - 0192's 4,608-row gate/up;
+  - Flash-Next's down [640, 2560, 512].
+- The shape refusals: K 1,150, rows 2,306, 520 experts, 15 tokens.
+- The skip's text: ng rounds up, both staging loops and the scale index use `I8W_ROWS`, the store stops at te.z, and
+  the defaults restore today's program.
+- With a clang present, the assembled program compiles as OpenCL C both ways.
+
+**Tests (`test-backend-ops`).**
+- `routed=4`, tails: expert e holds (e mod 64) + 1 pairs at 520 tokens, so every count 1..64 occurs twice. That covers
+  every partial last tile at 64 and at 32, and two full 64-pair tiles.
+- Eval: tails for down, gate/up and the Q8_0 arm, plus the served launch u1024a for down (counts up to 685: full 64-pair
+  tiles and a partial last one in one expert). Perf: tails for down and gate/up.
+
+**Reds (named mutations, each in a red tree of its own, knob on).** The bound: an unwritten row costs its share of the
+energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
+- **RED-A, a tile boundary off by one.** In `kernel_moe_route_tiles` (`mul_mm_kq_f16.cl`),
+  `min(tile, cnt[e] - s0)` becomes `min(tile - 1, cnt[e] - s0)`: every full 64-pair tile carries 63, so its 64th pair
+  is never computed.
+  - Dropped: 35 of 4,096 pairs in u512b (8.5e-3), 100 of 8,192 in u1024a (1.2e-2). Must fail those cases.
+  - The tails case drops 2 of 4,160 (4.8e-4) and may pass: it is not this red's evidence.
+- **RED-B, a wrong per-tile real count.** In `mul_mm_kq_i8_wide.cl`, `sub_group_broadcast((te.z + 7) >> 3, 0)` becomes
+  `sub_group_broadcast(te.z >> 3, 0)`: the partial last group of a tile is skipped and its rows store zeros.
+  - Dropped: 448 of 4,160 pairs in tails (0.11), 328 of 4,096 in u512b (8.0e-2), 312 of 8,192 in u1024a (3.8e-2).
+    Must fail all three, and 0208's routed=1 cases.
+- **RED-C, a 64-pair route handed to the 32-pair program**, the one new way to drop pairs silently:
+  - IQ4_NL arm: `i8_kernel = w64;` dropped.
+  - Q8_0 arm: the kernel choice forced to `kernel_mul_mm_id_q8_0_i8_wide`.
+  - The 32-pair program stores slots 1-32 of a tile only, so pairs 33-64 of every 64-pair tile are never computed.
+  - Dropped in tails: 1,056 of 4,160 pairs (0.25), in both arms. Must fail the IQ4_NL tails cases (down, gate/up) and
+    the Q8_0 tails case respectively. The TAKEN line still prints (the route was cut at 64), so this red is caught by the
+    output, not by the reach line.
+- The gate's red (CPU): drop `if (!wide) return KQ_I8_XT_NOT_WIDE;` from `kq_i8_xt64_refusal`; `test-opencl-kq-i8`
+  must fail its not-wide checks (16 of them).
+- RED-A, RED-B and RED-C are card-only (OpenCL kernel text or the OpenCL dispatch).
+
+**CPU evidence (`measured-here`, the recipe host, the tree of pin + 160 patches, 2026-11-25).**
+- `test-opencl-kq-i8`: all OK (0 FAIL). No clang on that host, so its OpenCL compile checks are skipped; the offline
+  compile below covers them.
+- The gate red (the not-wide line dropped, the test built against that .inc): 16 FAIL, all of them the not-wide checks
+  (4 shapes × 4 token counts), nothing else.
+- `test-backend-ops -b CPU -o MUL_MAT_ID -p 'routed='`: 8 / 8 OK (0208's 2, 0208b's 2, 0222's 4). The ROUTE lines
+  are as computed: tails tiles32 192, 128 experts, max 64; u512b 189 / 96 / 441; u1024a 314 / 96 / 685.
+- RED-A and RED-B edit OpenCL kernel text that the CPU backend never runs. They show only on the card (card row 2).
+- The recipe on 4fca07cc: 51 / 51 tests passed, the .deb built (the series of 160 patches, the new kernel text
+  embedded).
+- After the review's follow-up (the TAKEN lines, the static read): `test-opencl-kq-i8` all OK again, and
+  test-backend-ops relinked with the TAKEN format string in it. The CPU eval is unaffected: only the OpenCL dispatch
+  changed. The recipe on that commit is recorded in the commit's own follow-up.
+
+**Offline compile (`measured-here`, ocloc 26.27, 256 GRF, `-DSG=16`, one core; the patched text).**
+
+| program | device | GRF | SLM | scratch | stack calls | `_1_` retries | DPAS a K-block body |
+|---|---|---|---|---|---|---|---|
+| default | bmg-g21, bmg-g31 | 256 | 9,216 B | 0 | none | none | 8 |
+| `I8W_XT=64 I8W_SKIP=1` | bmg-g21, bmg-g31 | 256 | 18,432 B | 0 | none | none | 16 (8 groups × 2 columns, unrolled) |
+
+- Both kernels (IQ4_NL, Q8_0) pass in both programs on both devices.
+- The default program's ISA is identical to the pre-0222 text's on bmg-g21 and on bmg-g31: IQ4_NL 4,113 instruction
+  lines (listing md5 137a6c30), Q8_0 3,681 (206bc764), the same on both devices.
+
+**Applies against development only (note).** This branch is development f81d6175, without rel-183's 0209 / 0211 /
+0212, which also touch `ggml-opencl.cpp`. 0222's hunks depend on their context, so the apply, the write-tree and the
+recipe are owed again on the merged series. 0208b sorts after 0208 under LC_ALL=C. The four new eval cases change the
+op suite's case total.
+
+**Card rows (written before any run; B60 at 165 W; the unit's settings unless named: 262,144 cells,
+`--llama-swa-window`, ub 1024, q8_0 K/V, FA, all layers on the card, `GGML_OPENCL_KQ_MM_ID_I8=1`, `_I8_WIDE=1`,
+`CPY_TRANSPOSE`, `DEPTH_MIX`, `FA_PORT`; off = `GGML_OPENCL_KQ_MM_ID_I8_XT` unset, on = `=64`).**
+1. **Wall-time A/B of the served pass, first.**
+   - Arms: off / on interleaved, a fresh process each arm, at least 3 rounds. Host load (loadavg, the other containers'
+     CPU) recorded beside each run.
+   - The cell: llama-batched-bench of the 0222 tree (plain build), `-c 262144 -b 1024 -ub 1024 -npp 40960,4096 -ntg 0
+     -npl 1 -fa on -ctk q8_0 -ctv q8_0 -ngl 99`.
+   - EXPECT: C1b's option-2 range, 221-492 ms saved a 4,096-token pass (inference, d not measured). At the 40,960-token
+     depth, from ~915 t/s (the anchor, measured with the profiling build) to ~960-1,030 t/s (+5 to +12 %). At pp4096,
+     +5 to +12 % as well. The Q8_0 layers add 4-15 ms (not counted in the range).
+   - The gain counts only if the slowest on-run beats the fastest off-run.
+   - Every on-run's log carries both TAKEN lines and no `path=xt32` line; every off-run's carries neither. Otherwise
+     the round does not count.
+2. **The op rows and the reds.**
+   - `test-backend-ops perf -b GPUOpenCL -o MUL_MAT_ID -p 'routed='`, off and on, 3 fresh-process repeats each.
+     EXPECT a launch to save Δtiles·(c − 4d) + Δgroups·d with d ∈ [DPAS only, c/4]:
+     - u1024a down 3,156 → 2,320-2,780 us;
+     - u1024a gate/up 6,145 → 4,310-5,330 us;
+     - routed=1 n512 (Δtiles 61, Δgroups 180): down 1,911 → 1,440-1,540 us, gate/up 3,789 → 2,760-2,985 us.
+   - The eval list (`-p 'routed='` plus 0192's real-shape cases) on: all OK, and `DOWNGRADE … path=xt32` absent for
+     the IQ4_NL / Q8_0 Inkling shapes. The 64-pair load line and both TAKEN lines (iq4_nl, q8_0) are printed, in every
+     eval and perf log of the on arm, and in none of the off arm.
+   - RED-A fails u512b / u1024a; RED-B fails tails / u512b / u1024a / routed=1; RED-C fails the IQ4_NL tails (down,
+     gate/up) in its IQ4_NL tree and the Q8_0 tails in its Q8_0 tree. With the knob off the red trees' default program
+     is the shared text, so RED-A fails there too (it edits the shared route); RED-B and RED-C pass there.
+3. **The KL arm at the unit's settings.** `llama-perplexity -c 2048 --chunks 6`. The arms: on against off, a second off
+   against the first off (the floor), and each against the CPU base. EXPECT: on vs off KLD 0.000000, same top p 100 %
+   (inference: per-pair arithmetic unchanged, but the two programs are separate compiles). Off vs off is 0.000000 too
+   (record: this path repeated bit-equal on the B60 in window B).
+   - Reading: 0 / 0 is identity. A non-zero on vs off with a zero floor is a finding (a compiler contraction or a bug),
+     judged by the answer-level bar (+0.03 nats, −1 point against the off arm's KL to the CPU base). Non-zero in both is
+     the card's floor.
+   - The on arm's log carries both TAKEN lines.
+4. **The answers.** The capital, the 45k needle and the task battery at the unit's settings, knob on. EXPECT: the same
+   greedy text as knob off (identical logits), the needle found, the battery's verdicts unchanged. The on server's
+   log carries both TAKEN lines.

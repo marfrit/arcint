@@ -60,6 +60,17 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against the unforced
   kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route.
 
+- Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
+  ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are
+  skipped, for Inkling 2 Mini's IQ4_NL experts and its Q8_0 layers. Priced on the B60 at 221-492 ms saved a
+  4,096-token pass at ub 1024 (option 2 of the profile). Card rows (`measured-here`, B60 at 165 W, the Inkling unit's
+  settings, `llama-batched-bench`, 3 interleaved rounds, a fresh process an arm): prompt 40,960 tokens 921.0 -> 1,002.2
+  t/s (+8.8 %), 4,096 tokens 1,176.6 -> 1,313.0 t/s (+11.6 %), the slowest on-run above the fastest off-run at both;
+  the routed op cases -17 to -26 % a call; KL on vs off 0 with a floor of 0; the capital, arithmetic, JSON and binary
+  search answers' text identical and the needle found on both arms; three reds (route boundary, rounding, tile
+  count) fail their cases. The knob stays off by default until the operator changes it. Patch 0208b adds the test
+  cases (balanced and served-routing replay).
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn
