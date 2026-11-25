@@ -22,6 +22,14 @@
 // Red first: built with -DFA_PORT_GATE_RED the header carries 0198's original contiguity rule
 // and this test must fail on 222 / 223 with "layout" (the card's the first card window decline).
 //
+// A q8_0 K/V cache (0199q1). fixtures/inkling-q8kv-ub*.txt are the same model's exports with
+// -ctk q8_0 -ctv q8_0: K/V are type 8, [128, n_kv, 8] with nb [34, 1088, 136] - a head's
+// stride is 136 bytes, not a multiple of 64. Their lines 222 / 223 must be ACCEPTED and say
+// "q8_0" to fa_port_kv_q8 (the launch picks the kernel's q8_0 build by it); each is then bent
+// into what that build cannot read. Red, two ways: -DFA_PORT_GATE_RED_KV8_TYPE is the rule
+// before (an f16 cache only: "kv-type" on every q8_0 line), -DFA_PORT_GATE_RED_KV8_STRIDE a
+// wrong rule (the f16 build's 64-byte head stride asked of q8_0: "layout-k" on every line).
+//
 //   g++ -O2 -I <llama-tree>/ggml/include -I <llama-tree>/ggml/src/ggml-opencl port_gate_test.cpp -o port_gate_test
 //   ./port_gate_test fixtures/inkling-ub512.txt fixtures/inkling-ub1024.txt fixtures/inkling-ub2048.txt
 // (the fixtures are the model's graph exports: test-export-graph-ops on the CPU, context 4,096, flash attention on)
@@ -159,12 +167,60 @@ int main(int argc, char ** argv) {
                 continue;
             }
             ++n_prefill;
+            const bool kv8 = l.src[1].type == T_Q8_0;
             if (l.src[0].nb[1] != (size_t) n_head * 512 || l.src[0].nb[2] != 512 ||
-                l.src[1].nb[1] != (size_t) l.src[1].ne[2] * 256 || l.src[1].nb[2] != 256) {
+                (!kv8 && (l.src[1].nb[1] != (size_t) l.src[1].ne[2] * 256 || l.src[1].nb[2] != 256)) ||
+                (kv8 && (l.src[2].type != T_Q8_0 || l.src[1].nb[0] != 34 || l.src[1].nb[1] != (size_t) l.src[1].ne[2] * 136 ||
+                         l.src[1].nb[2] != 136 || l.src[2].nb[1] != l.src[1].nb[1] || l.src[2].nb[2] != 136))) {
                 printf("  %s line %d: FAIL, not the permuted views this test is about\n", file, l.no);
                 ++fails;
             }
             expect(file, l.no, tag, c, true, "");
+            if (kv8) {
+                // the op-level form: the same verdict at supports_op and at the launch, and the
+                // launch's choice of build
+                {
+                    call_t m = c;
+                    struct ggml_tensor op = m.dst;
+                    op.src[0] = &m.q; op.src[1] = &m.k; op.src[2] = &m.v; op.src[3] = &m.mask;
+                    op.src[FA_PORT_SRC_TABLE] = &m.table; op.src[FA_PORT_SRC_IDX] = &m.indices; op.src[FA_PORT_SRC_SINK_Q] = &m.sinks;
+                    op.src[FA_PORT_SRC_KPOS] = &m.kpos; op.src[FA_PORT_SRC_QPOS] = &m.qpos;
+                    op.src[FA_PORT_SRC_CFLAG] = &m.cflag; op.src[FA_PORT_SRC_RFLAG] = &m.rflag;
+                    const int32_t one = 1;
+                    memcpy((char *) op.op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), &one, sizeof one);
+                    memcpy((char *) op.op_params + FA_PORT_PARAM_WINDOW * sizeof(int32_t), &m.window, sizeof m.window);
+                    const char * w0 = "", * w1 = "";
+                    const int sup = fa_port_gate_op(&op, m.align, m.wg_max, 1, &w0);
+                    const int now = fa_port_gate_at_launch(&op, 1, 0, 1, m.align, m.wg_max, 1, &w1);
+                    const bool good = fa_port_carries(&op) && sup && now && fa_port_kv_q8(&op);
+                    printf("  %s line %d   the op: supports_op %s, launch %s, build %s%s\n", file, l.no, sup ? "ACCEPT" : w0,
+                           now ? "ACCEPT" : w1, fa_port_kv_q8(&op) ? "q8_0" : "f16", good ? "" : "   <-- FAIL");
+                    if (!good) ++fails;
+                }
+#if !defined(FA_PORT_GATE_RED) && !defined(FA_PORT_GATE_RED_KV8_TYPE) && !defined(FA_PORT_GATE_RED_KV8_STRIDE)
+                // what the q8_0 build cannot read, one property at a time - and what it can
+                { call_t m = c; m.v.type = GGML_TYPE_F16;             expect(file, l.no, "  K q8_0, V f16", m, false, "kv-type"); }
+                { call_t m = c; m.k.type = GGML_TYPE_F16;             expect(file, l.no, "  K f16, V q8_0", m, false, "kv-type"); }
+                { call_t m = c; m.k.type = m.v.type = GGML_TYPE_Q4_0; expect(file, l.no, "  a q4_0 cache", m, false, "kv-type"); }
+                { call_t m = c; m.k.view_offs = 2;                    expect(file, l.no, "  K view offset 2", m, false, "layout-k"); }
+                { call_t m = c; m.v.view_offs = 34;                   expect(file, l.no, "  V view offset 34", m, false, "layout-v"); }
+                { call_t m = c; m.k.view_offs = 4;                    expect(file, l.no, "  K view offset 4", m, true, ""); }
+                { call_t m = c; m.k.view_offs = 136;                  expect(file, l.no, "  K view one head in", m, true, ""); }
+                { call_t m = c; m.k.view_offs = 1088 * 512;           expect(file, l.no, "  K view 512 rows in", m, true, ""); }
+                { call_t m = c; m.k.nb[2] = 138;                      expect(file, l.no, "  K head stride 138", m, false, "layout-k"); }
+                { call_t m = c; m.v.nb[2] = 134;                      expect(file, l.no, "  V head stride 134", m, false, "layout-v"); }
+                { call_t m = c; m.k.nb[1] = 1080;                     expect(file, l.no, "  K row pitch 1080", m, false, "layout-k"); }
+                { call_t m = c; m.v.nb[1] = 192;                      expect(file, l.no, "  V row pitch 192", m, false, "layout-v"); }
+                { call_t m = c; m.k.nb[0] = 2;                        expect(file, l.no, "  K element stride 2", m, false, "layout-k"); }
+                { call_t m = c; m.q.ne[0] = m.k.ne[0] = m.v.ne[0] = 256; expect(file, l.no, "  head 256", m, false, "head"); }
+                { call_t m = c; m.align = 32;                         expect(file, l.no, "  buffer alignment 32", m, false, "layout-align"); }
+                { call_t m = c; m.paged = 1;                          expect(file, l.no, "  paged K/V", m, false, "paged"); }
+                { call_t m = c; m.wg_max = 32;                        expect(file, l.no, "  a 32-lane work-group", m, false, "work-group"); }
+                { call_t m = c; m.q.ne[1] = 8;                        expect(file, l.no, "  8 query rows", m, false, "decode"); }
+                { call_t m = c; m.q.ne[1] = 9;                        expect(file, l.no, "  9 query rows", m, true, ""); }
+#endif
+                continue;
+            }
 #ifndef FA_PORT_GATE_RED
             // out of scope, one property at a time
             { call_t m = c; m.k.type = GGML_TYPE_Q8_0;                  expect(file, l.no, "  K q8_0", m, false, "kv-type"); }

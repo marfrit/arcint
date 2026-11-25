@@ -7,6 +7,14 @@
 //   k/v:   the 2D block reads, surface (D*2-1, n_kv-1, nb[1]-1) at base + kvh*nb[2]: f16,
 //          the head's base 64-byte aligned, the row pitch a multiple of 16 bytes and
 //          at least 64 and D*2, below 2^24 (the rules flash_attn_dpas2.cl's reads have);
+//   k/v, a q8_0 cache (0199q1, the kernel's PORT_KV8 build): ggml's blocks, 34 bytes for 32
+//          values, so a (key, kv head) is 136 bytes and nb[0] is 34. The kernel rounds a head's
+//          first byte (base + kvh*nb[2]) down to 64 for the surface base and puts the
+//          remainder into the x coordinate, in dwords for K: the head's first byte must be
+//          a multiple of 4 (view offset and head stride), NOT of 64 - the model's head stride
+//          is 136. The surface row then holds up to 60 + 136 bytes, so the row pitch is at
+//          least 196 (and a multiple of 16, below 2^24, as for f16). K and V are both f16 or
+//          both q8_0; any other pair is refused (kv-type).
 //   mask:  f16, row*nb[1]/2 + key;
 //   table: f32 [n_bins, n_head, rows], ((row*n_head + head)*n_bins + bin), a run of 16 bins;
 //   sink:  f32 [n_head, rows], row*n_head + head;
@@ -51,7 +59,12 @@ static inline int fa_port_gate_why(
     if (kpos == NULL || qpos == NULL || cflag == NULL || rflag == NULL) REFUSE("no-positions");
     if (sinks_q == NULL) REFUSE("no-sinks");
     if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) REFUSE("streams");
+#ifdef FA_PORT_GATE_RED_KV8_TYPE
+    // the rule before 0199q1: an f16 cache only - refuses the q8_0 lines
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) REFUSE("kv-type");
+#endif
+    const int kv8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
+    if (q->type != GGML_TYPE_F32 || !(kv8 || (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16))) REFUSE("kv-type");
     if (q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) REFUSE("head");
     if (q->ne[1] < 9) REFUSE("decode");          // n_q <= 8: the model keeps today's graph and kernels
     if (mask == NULL || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) REFUSE("mask");
@@ -80,10 +93,22 @@ static inline int fa_port_gate_why(
         q->view_offs % 4 != 0) REFUSE("layout-q");
     // k/v: the 2D block reads' surface
     if (buf_align % 64 != 0) REFUSE("layout-align");
+    if (kv8) {
+#ifdef FA_PORT_GATE_RED_KV8_STRIDE
+        // a wrong rule, the f16 build's head stride asked of a q8_0 cache: refuses the model (136)
+        if (k->nb[2] % 64 != 0 || v->nb[2] % 64 != 0) REFUSE("layout-k");
+#endif
+        const size_t hb = (size_t) (D / 32) * 34;      // 136 bytes a (key, kv head)
+        if (k->nb[0] != 34 || k->nb[1] % 16 != 0 || k->nb[1] < 60 + hb || k->nb[1] >= ((size_t) 1 << 24) ||
+            k->nb[2] % 4 != 0 || k->view_offs % 4 != 0) REFUSE("layout-k");
+        if (v->nb[0] != 34 || v->nb[1] % 16 != 0 || v->nb[1] < 60 + hb || v->nb[1] >= ((size_t) 1 << 24) ||
+            v->nb[2] % 4 != 0 || v->view_offs % 4 != 0) REFUSE("layout-v");
+    } else {
     if (k->nb[0] != 2 || k->nb[1] % 16 != 0 || k->nb[1] < 64 || k->nb[1] < (size_t) (D * 2) ||
         k->nb[1] >= ((size_t) 1 << 24) || k->nb[2] % 64 != 0 || k->view_offs % 64 != 0) REFUSE("layout-k");
     if (v->nb[0] != 2 || v->nb[1] % 16 != 0 || v->nb[1] < 64 || v->nb[1] < (size_t) (D * 2) ||
         v->nb[1] >= ((size_t) 1 << 24) || v->nb[2] % 64 != 0 || v->view_offs % 64 != 0) REFUSE("layout-v");
+    }
 #endif
 
     if (sinks_q->type != GGML_TYPE_F32 || sinks_q->ne[0] != n_head || sinks_q->ne[1] < rows ||
@@ -144,6 +169,12 @@ static inline int fa_port_carries(const struct ggml_tensor * op) {
     int32_t flag;
     memcpy(&flag, (const char *) op->op_params + FA_PORT_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
     return flag != 0 && op->src[FA_PORT_SRC_SINK_Q] != NULL;
+}
+
+// 0199q1: the op's K/V are a q8_0 cache (the kernel's PORT_KV8 build serves it). Asked only
+// of an op the gate accepted, so K and V are then both q8_0 or both f16.
+static inline int fa_port_kv_q8(const struct ggml_tensor * op) {
+    return op->src[1]->type == GGML_TYPE_Q8_0 && op->src[2]->type == GGML_TYPE_Q8_0;
 }
 
 // THE gate, on the op: supports_op and the launch both call this and nothing else of their own
