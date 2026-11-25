@@ -10674,7 +10674,8 @@ and 978.5 with `=nofold`; f16 KV 815.8 -> 978.6.
 *The profile, one pp4096 pass at ub 512 (a profiling build; read the ms, not its t/s):* all
 kernels 5,229 ms with the chain, 4,431 ms with the arm; `kernel_depth_mix_f32` **99.1 ms over
 960 launches, 103 us a launch**. The reference's own mix kernel is 399 ms a pass on this card
-(`measured-here`: trellis-serve @8f8e2fcc, a profile of its 4,096-token prefill at chunk 512),
+(`measured-here` on the reference stack, a trace of its 4,096-token prefill at chunk 512, first
+recorded in this section's plan as 398.96 ms; the reference run's commit is not recorded here),
 the chain's four probed parts were 765 ms (699 with 0187).
 
 *The prediction's miss, on the record.* Predicted 150-300 us a call and 145-290 ms a pass;
@@ -10724,8 +10725,9 @@ rounds):
 
 Every arm's log carried its own TAKEN lines and none of the other's. The two savings add: 831.6
 ms for the arm and 813.2 ms for the port are 1,644.8 ms, both together save 1,648.2 - an overlap of
--3.4 ms, on disjoint launches. The reference stack's row on this card is 1,220 t/s (from the
-operator's record; its tree and commit are in the open list below). At the unit's
+-3.4 ms, on disjoint launches. The reference stack's row on this card is 1,220 t/s
+(`measured-here` on the reference stack; this is the row's first record in the repository, and
+the reference run's commit is not recorded here). At the unit's
 q8_0 KV the arm alone is 979.2 t/s (above); the arm with the port at q8_0 KV is the last table
 of this section.
 
@@ -10780,7 +10782,8 @@ touched for it now, because that would move the card-proven tree `13ab33b8`):
 - two comments in 0205 are wrong: "0178's bounds helper" at the forward declarations (the helper
   is 0198's), and "the card run of 0.5.1", which names a version where it means this arm's
   first card result;
-- the reference stack's 1,220 t/s row needs its evidence class with the tree and commit it was
-  measured on; this section only carries the number;
+- the two reference readings in this section (399 ms a pass for its mix kernel, 1,220 t/s for
+  its pp4096 row) are `measured-here` on the reference stack, but no document in the repository
+  names the tree and commit of those runs: they need that line, from the runs' own record;
 - `GGML_OPENCL_DEPTH_MIX_OPTS` (the reds' route: extra compiler options for `depth_mix.cl`) is a
   test hook that lives in the production dispatch.
