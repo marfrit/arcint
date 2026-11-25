@@ -101,7 +101,7 @@ Card evidence below is `measured-here` on the B60 at a 165 W cap unless named (B
   0.002069 (four seeds, sd 0.000062): inside the noise. The op itself is 1.6 to 1.8 x the f16 port where 1.27 x was
   predicted: a miss, recorded. (Before 0199q1 / 0199q2 the port refused a q8_0 cache, which the Inkling units serve,
   and arcint's spill guard refuses f16 KV at the units' 262,144 context.)
-  *Limits.* Not run at the units' own flags (262,144 context, `--llama-swa-window`) and not on the B70. A partial
+  *Limits.* Served once at an Inkling unit's own flags (262,144 context, `--llama-swa-window`; the known limits below); not on the B70. A partial
   offload of Inkling faulted at `-ngl 12`; the cause by code reading, not reproduced, is its depth-mix stacks written
   through views across devices — patch 0148's code, by code reading also in 1.8.0 (the fault was measured on the
   development tree), not the port's: serve Inkling fully offloaded.
