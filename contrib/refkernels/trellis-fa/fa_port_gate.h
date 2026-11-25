@@ -262,6 +262,70 @@ static inline int fa_port_gate_at_launch(const struct ggml_tensor * op, int port
     return fa_port_gate_op(&dv, buf_align, wg_max, is_intel, why_out);
 }
 
+// ---- 0223: the key split of a global call (0045's rule, on the port's wave) ----
+//
+// A call's work-groups are n_head_kv x ngroups (ngroups = ceil(n_q / 8 / qtw)); at ub1024 that is
+// 1,024, 5.12 waves on the B60 with the last 12 % full. A split gives each work-group 1/p of the key
+// blocks, with its own online-softmax state, and a merge kernel joins the p states. The rule is
+// llama.cpp CUDA's parallel_blocks as 0045 has it: the fewest p whose waves are at least 95 % full,
+// else the fullest. Two port-specific limits: every split walks at least FA_PORT_SPLIT_MIN_BLOCKS
+// 32-key blocks (4,096 keys: a split repeats the tile's setup, and the merge costs a launch), which
+// also means no call below 2 x 128 blocks (8,192 keys) splits; and a windowed call (the SWA ring)
+// never splits (its visited keys lie in one part of the ring, and the seam moves).
+
+// The port's wave: the work-groups the device holds at once. A work-group is G x qtw SIMD16
+// threads, one an (head, 8-row tile); a Xe core holds 32 threads at 256 GRF and 64 at 128 (8
+// vector engines x 4 or 8), and CL_DEVICE_MAX_COMPUTE_UNITS counts the engines. B60 (160) at 256
+// GRF, G 3, qtw 1: 20 x 10 = 200; B70 (256): 320.
+static inline int fa_port_split_wave(int n_cu, int grf, int threads_per_wg) {
+    if (n_cu < 8 || threads_per_wg < 1) return 0;
+    const int per_core = (grf == 256 ? 32 : 64) / threads_per_wg;
+    return per_core < 1 ? 0 : (n_cu / 8) * per_core;
+}
+
+#define FA_PORT_SPLIT_MAX        16
+#define FA_PORT_SPLIT_MIN_BLOCKS 128
+
+// p for one call: nwg work-groups, the wave, the call's keys and window. cap (GGML_OPENCL_FA_PORT_SPLIT_MAX,
+// 0 = none) bounds p; force (GGML_OPENCL_FA_PORT_SPLIT_FORCE, the tests only) sets it, windowed calls too,
+// bounded by 16 and the call's blocks. FA_PORT_SPLIT_RED_NO_FLOOR: the rule without the 128-block floor
+// (the unit test's red: it splits a 4k call).
+static inline int fa_port_splits(int64_t nwg, int64_t wave, int64_t n_kv, int32_t window, int cap, int force) {
+    const int64_t blocks = (n_kv + 31) / 32;
+    if (force > 0) {
+        int64_t p = force < FA_PORT_SPLIT_MAX ? force : FA_PORT_SPLIT_MAX;
+        if (p > blocks) p = blocks;
+        return p < 1 ? 1 : (int) p;
+    }
+    if (window != 0 || wave <= 0 || nwg <= 0) return 1;
+#ifdef FA_PORT_SPLIT_RED_NO_FLOOR
+    int64_t smax = blocks;
+#else
+    int64_t smax = blocks / FA_PORT_SPLIT_MIN_BLOCKS;
+#endif
+    if (smax > FA_PORT_SPLIT_MAX) smax = FA_PORT_SPLIT_MAX;
+    if (cap > 0 && smax > cap) smax = cap;
+    if (smax <= 1) return 1;
+    int best = 1;
+    int64_t eff_best = 0, nw_best = 0;
+    for (int p = 1; p <= smax; ++p) {
+        const int64_t nb = nwg * p, nw = (nb + wave - 1) / wave, eff = 100 * nb / (nw * wave);
+        if (eff_best >= 95 && nw > nw_best) break;
+        if (eff > eff_best) { eff_best = eff; nw_best = nw; best = p; }
+    }
+    return best;
+}
+
+// the 32-key blocks a split walks: split s takes [s * b, min(B, (s + 1) * b)) of the call's B blocks.
+// A split past B (p does not divide B evenly) walks none: its state is (M_INIT, 0) and weighs 0.
+static inline int fa_port_split_blocks(int64_t n_kv, int p) {
+    const int64_t blocks = (n_kv + 31) / 32;
+    return (int) ((blocks + p - 1) / (p < 1 ? 1 : p));
+}
+
+// a split state's floats: O as a sub-group holds it (8 chunks x 8 rows x 16 lanes), then m (8) and l (8)
+#define FA_PORT_SPLIT_STATE_FLOATS (8 * 128 + 16)
+
 #if defined(__cplusplus)
 }
 #endif
