@@ -43,7 +43,8 @@ Card-proven, not yet through a release gate. Each item names its card evidence (
   Patches 0199q1 / 0199q2 add a q8_0 read path to the port (the kernel reads ggml's q8_0 blocks in place, nothing
   staged; same knob). On the card (`measured-here`, B60 at 165 W): Inkling pp4096 ub 1,024 at q8_0 KV 817.2 -> 945.8 t/s
   (+15.7 %; predicted 953), the five q8_0 op cases at nmse 2e-6 against a bound of 1e-5, mean KL 0.002464 -> 0.002545
-  and top p 98.240 -> 98.273 % (inside the bar). The op itself is 1.6 to 1.8 x the f16 port where 1.27 x was predicted:
+  and top p 98.240 -> 98.273 % (inside the bar). Paired against the off arm's own logits on the card the port moves
+  the answer by 0.002083 nats where one-ulp noise moves it by 0.002069 (four seeds, sd 0.000062): inside the noise. The op itself is 1.6 to 1.8 x the f16 port where 1.27 x was predicted:
   a miss, recorded. Not run at the units' own flags (262,144 context, `--llama-swa-window`). Record:
   `contrib/refkernels/trellis-fa/README.md` §q8 and §q8-card.
 

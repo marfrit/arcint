@@ -2424,6 +2424,36 @@ executes one arm of the score pass, so the executed loop is about 1,180
 instructions for f16 and about 2,150 for q8_0, 1.8 × on the whole loop - which is
 what the card shows.
 
+## The answer level, paired: the read path moves the answer no more than one-ulp noise {#q8-paired}
+
+`measured-here`, the card host, B60 at 165 W, the combined MIX + P18 tree (applied
+`a52a4c2a…`; the port's files are the bytes of `59732cfe…`), q8_0 KV, `-c 2048 -b 512`,
+6 chunks (6,144 scored tokens), every arm's TAKEN lines asserted.
+
+Against the CPU base every arm carries the card's own distance from the CPU (0.0025
+nats) and the arms differ by less than its standard error: off 0.002464 ± 0.000073,
+the port 0.002545 ± 0.000088. So the off arm's logits were saved on the card and every
+arm compared with THEM, over the same tokens - how far an arm moves today's q8_0
+output, directly - beside a control that moves every depth-mix result of the chain by
+one ulp at random (four seeds), and a second off run:
+
+| arm | KL(off on the card, arm), mean ± SE | KL(CPU base, arm) |
+|---|---|---|
+| off again | 0.000000 (the card is deterministic run to run) | 0.002464 ± 0.000073 |
+| **the port on q8_0 (P18)** | **0.002083 ± 0.000089** | 0.002545 ± 0.000088 |
+| the depth mix (MIX) | 0.002041 ± 0.000060 | 0.002470 ± 0.000085 |
+| both | 0.002125 ± 0.000077 | 0.002571 ± 0.000087 |
+| one-ulp noise, seeds 1 .. 4 | 0.002031 / 0.002051 / 0.002032 / 0.002161 (mean 0.002069, sd 0.000062) | 0.002441 / 0.002416 / 0.002462 / 0.002563 |
+
+The port minus the noise mean is +0.000014 nats, 0.2 of the seeds' standard deviation:
+**inside the noise.** Against the CPU base its 0.002545 lies inside the four seeds'
+range as well. The question was written into the script before the run (is the port
+above the noise by more than twice its spread?) and the answer is no. What this shows:
+about 0.002 nats is what any change of rounding costs this model on this card, and
+the read path's own differences from today's q8_0 kernels (K's scale applied to an f32
+sum, V's scale folded into the f16 P operand) are of that size and no larger. What it
+does not show: anything at the units' own flags, or on another prompt set.
+
 ## Where the extra instructions are (`measured-here`, ocloc 26.27.1, bmg-g21, static, a key row)
 
 | kind | S = Q Kᵀ | softmax + P V | both |

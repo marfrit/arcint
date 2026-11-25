@@ -9946,7 +9946,9 @@ ub 1,024 at q8_0 KV 817.2 t/s off, 945.8 on (+15.7 %), three interleaved rounds;
 98.240 / 98.273 %: inside the bar. The op prediction above missed: the op is 3,946 us at q2048 x kv2048 with the
 test's rebuild, about 1.6 to 1.8 x the f16 port without it. So with these two patches the port does take a q8_0
 cache; "refuses q8_0" above describes the build before them. Still not measured: the units' own flags (262,144
-context, `--llama-swa-window`). §q8-card of the record has the figures and what follows from them.
+context, `--llama-swa-window`). §q8-card of the record has the figures and what follows from them. Paired against
+the off arm's own logits on the card (6 chunks) the port moves the answer by 0.002083 ± 0.000089 nats, a one-ulp noise
+control by 0.002031 .. 0.002161 over four seeds: inside the noise (§q8-paired).
 
 Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
 (`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
