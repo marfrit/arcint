@@ -10072,6 +10072,63 @@ unit's settings).
   smallest is case kv 16384 x nb 64 on the B60's split). 0223c had relaxed both to 1x. The case comment's rounding is
   3.55e-4 and 1.76x.
 
+## 0225-opencl-flash-attn-port-q4_0-v.patch / 0225b-flash-attn-port-q4_0-v-tests.patch
+
+The FA port reads a **q8_0 K with a q4_0 V** in place (the Inkling unit's target cache, `-ctk q8_0 -ctv q4_0`, with
+every 1.8.3 switch). Before it the gate took f16:f16 and q8_0:q8_0 only. An 8:4 cache therefore ran port-off: the
+9 to 64-row indexed-bias batches went to the CPU ("FLASH_ATTN indexed-bias path=declined reason=row-blocks"), and
+`GGML_OPENCL_FA_PORT_SPLIT` could not act. The knob is the port's own (`GGML_OPENCL_FA_PORT=1`); nothing else changes.
+
+**0225** (`fa_port_gate.h`, `ggml-opencl.cpp`, `kernels/flash_attn_port.cl`):
+- **The gate** accepts K q8_0 with V q4_0 as a third pair. V's rules: `nb[0]` 18, a row pitch that is a multiple of
+  16 and at least 132 (60 + 72), and a head stride and view offset that are multiples of 4. The model's V is
+  `[18, 576, 72]`. A q4_0 K, an f16 K with a q4_0 V and every other pair stay refused ("kv-type").
+  `fa_port_kv_v4` names the pair for the launch.
+- **The kernel** is a build of its own (`-DPORT_KV8=1 -DPORT_V4=1`): the q8_0 build's K, and a q4_0 V read. A q4_0
+  block is 18 bytes, an f16 scale then 16 bytes whose byte j holds value j in its low nibble and j + 16 in its high
+  one.
+  - One transformed byte read a block (16 byte columns x 32 keys) gives both of the block's D chunks.
+  - An odd block's quant bytes start on the 4-byte grid the extension asks of a byte read. An even block's start 2
+    bytes off it; they are read 2 bytes on, and the two missing bytes are spliced in from a read at the block's first
+    byte, as the q8_0 build does for its codes.
+  - The nibbles become f16 by integer operations on whole dwords (`0x6400 | n` = 1024 + n = 1032 + (n − 8)), in the
+    q8_0 build's key order, so P's lane shuffle and the scale in P (`pe = f16(p d 128)`) are unchanged. The
+    accumulator starts 1032 Σ pe lower.
+  - The key split works the same: the split build and the merge store with the q4_0 lane-to-dim map.
+- **The logs:** a TAKEN line of its own, once a process, WARN (0224's rule):
+  `TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0:q4_0 …`, the pair written K:V as the repository's DOWNGRADE
+  lines write it. The split's TAKEN line names `kv=q8_0:q4_0`.
+- **The reds** (`GGML_OPENCL_FA_PORT_RED`, the q4_0 V build only): 14 swaps the nibbles, 15 takes V's scale from the
+  next block.
+
+**0225b** (`test-backend-ops.cpp`):
+- **The cases:** the five q8_0 port shapes and the three key-split shapes with a q8_0 K and a q4_0 V, the model's
+  layout, filled the same way as the q8_0 cases (per-block amplitudes, so a wrong block's scale moves the answer)
+  and quantized by ggml's q4_0. The three split shapes are in the perf list too.
+- **The bound:** the q8_0 port cases' 1e-5 against the CPU, stated before any card run.
+- **The counts:** the decisions table counts the new cases apart and asserts that each reaches the q4_0 V build. The
+  device-free seam check covers the new split cases, 18 cells.
+
+**Without a device** (`measured-here`, the recipe host, one core):
+- **The gate unit** (`contrib/refkernels/trellis-fa/port_gate_test.cpp`, now with the q8_0:q4_0 lines and their
+  refusals): green rc 0, red (`-DFA_PORT_GATE_RED_KV84`, the rule before) rc 1, 54 failures. The unit now reads the
+  fixtures' op numbers as their own export's, because the tree's later ops shift the enum; the type numbers are
+  checked against the tree.
+- **The device-free test-backend-ops checks:**
+  - `GGML_TEST_FA_PORT_DECISIONS` rc 0: "q8_0:q4_0 port=1 5, split 3", every case accepted at supports_op and at the
+    launch;
+  - the route red rc 1;
+  - `_GUARD`, `_REFUSED`, `_SETTLE`, `_TWINS` and `_KV8` rc 0;
+  - `_SEAM` rc 0 with 18 cells, the q8_0:q4_0 ones at 17.4x .. 3,034x of 1e-5 (the margin asks 10x).
+- **ocloc 26.27.1** (bmg-g21 and bmg-g31):
+  - the q4_0 V build, unsplit and split, at 256 GRF, scratch 0, no retry dump;
+  - the f16, q8_0 and q8_0 split programs give the same ISA as before on both devices;
+  - the reds change the q4_0 V kernel's ISA.
+
+**Not run on a card.** The card rows: the port cases and the reds; split against unsplit by the dump hook (≤ 1e-5);
+KL at 4k and 40k against the CPU base for the 8:4 port-on arm beside 8:8 and 8:4 port-off; the served TAKEN line;
+the "row-blocks" key gone from the journal.
+
 ## 0208-test-backend-ops-inkling-expert-projection-perf.patch
 
 The expert DOWN projection next to the fused GATE_UP as perf cases, so one card run compares them, plus

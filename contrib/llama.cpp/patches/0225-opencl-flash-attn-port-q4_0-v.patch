@@ -1,0 +1,410 @@
+diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
+index b84e8035d..695e66da4 100644
+--- a/ggml/src/ggml-opencl/fa_port_gate.h
++++ b/ggml/src/ggml-opencl/fa_port_gate.h
+@@ -15,6 +15,11 @@
+ //          is 136. The surface row then holds up to 60 + 136 bytes, so the row pitch is at
+ //          least 196 (and a multiple of 16, below 2^24, as for f16). K and V are both f16 or
+ //          both q8_0; any other pair is refused (kv-type).
++//   k/v, a q8_0 K with a q4_0 V (0225, the kernel's PORT_KV8 + PORT_V4 build): K as above; V ggml's q4_0 blocks,
++//          18 bytes for 32 values, so a (key, kv head) is 72 bytes and nb[0] is 18. V's surface base and x coordinate
++//          as K's (the head's first byte a multiple of 4 from the 64-rounded base); the row holds up to 60 + 72 bytes,
++//          so V's row pitch is at least 132 (a multiple of 16, below 2^24). Every other pair is refused (kv-type),
++//          a q4_0 K among them: the kernel reads K as q8_0 or f16 only.
+ //   mask:  f16, row*nb[1]/2 + key;
+ //   table: f32 [n_bins, n_head, rows], ((row*n_head + head)*n_bins + bin), a run of 16 bins;
+ //   sink:  f32 [n_head, rows], row*n_head + head;
+@@ -64,7 +69,13 @@ static inline int fa_port_gate_why(
+     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || v->type != GGML_TYPE_F16) REFUSE("kv-type");
+ #endif
+     const int kv8 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q8_0;
+-    if (q->type != GGML_TYPE_F32 || !(kv8 || (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16))) REFUSE("kv-type");
++#ifdef FA_PORT_GATE_RED_KV84
++    // the rule before 0225: K and V both f16 or both q8_0 - refuses the q8_0:q4_0 lines
++    const int kv84 = 0;
++#else
++    const int kv84 = k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0;
++#endif
++    if (q->type != GGML_TYPE_F32 || !(kv8 || kv84 || (k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16))) REFUSE("kv-type");
+     if (q->ne[0] != 128 || k->ne[0] != 128 || v->ne[0] != 128) REFUSE("head");
+     if (q->ne[1] < 9) REFUSE("decode");          // n_q <= 8: the model keeps today's graph and kernels
+     if (mask == NULL || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1) REFUSE("mask");
+@@ -103,6 +114,13 @@ static inline int fa_port_gate_why(
+             k->nb[2] % 4 != 0 || k->view_offs % 4 != 0) REFUSE("layout-k");
+         if (v->nb[0] != 34 || v->nb[1] % 16 != 0 || v->nb[1] < 60 + hb || v->nb[1] >= ((size_t) 1 << 24) ||
+             v->nb[2] % 4 != 0 || v->view_offs % 4 != 0) REFUSE("layout-v");
++    } else if (kv84) {
++        // 0225: K as the q8_0 cache's; V q4_0, 72 bytes a (key, kv head) (the model's row: 8 heads x 72 = 576)
++        const size_t hb = (size_t) (D / 32) * 34, hb4 = (size_t) (D / 32) * 18;
++        if (k->nb[0] != 34 || k->nb[1] % 16 != 0 || k->nb[1] < 60 + hb || k->nb[1] >= ((size_t) 1 << 24) ||
++            k->nb[2] % 4 != 0 || k->view_offs % 4 != 0) REFUSE("layout-k");
++        if (v->nb[0] != 18 || v->nb[1] % 16 != 0 || v->nb[1] < 60 + hb4 || v->nb[1] >= ((size_t) 1 << 24) ||
++            v->nb[2] % 4 != 0 || v->view_offs % 4 != 0) REFUSE("layout-v");
+     } else {
+     if (k->nb[0] != 2 || k->nb[1] % 16 != 0 || k->nb[1] < 64 || k->nb[1] < (size_t) (D * 2) ||
+         k->nb[1] >= ((size_t) 1 << 24) || k->nb[2] % 64 != 0 || k->view_offs % 64 != 0) REFUSE("layout-k");
+@@ -177,6 +195,12 @@ static inline int fa_port_kv_q8(const struct ggml_tensor * op) {
+     return op->src[1]->type == GGML_TYPE_Q8_0 && op->src[2]->type == GGML_TYPE_Q8_0;
+ }
+ 
++// 0225: the op's K is a q8_0 cache and its V a q4_0 one (the kernel's PORT_KV8 + PORT_V4 build serves it). Asked only
++// of an op the gate accepted: then it is the one q8_0:q4_0 pair the gate takes.
++static inline int fa_port_kv_v4(const struct ggml_tensor * op) {
++    return op->src[1]->type == GGML_TYPE_Q8_0 && op->src[2]->type == GGML_TYPE_Q4_0;
++}
++
+ // THE gate, on the op: supports_op and the launch both call this and nothing else of their own
+ static inline int fa_port_gate_op(const struct ggml_tensor * op, size_t buf_align, size_t wg_max, int is_intel,
+                                   const char ** why_out) {
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index e83801ad0..631fad5be 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1580,13 +1580,19 @@ struct ggml_backend_opencl_context {
+     cl_program program_fa_port_kv8 = nullptr;
+     bool fa_port_kv8_tried = false;
+     size_t fa_port_kv8_wg = 0;
++    // 0225: the q8_0 K build with a q4_0 V (-DPORT_KV8=1 -DPORT_V4=1)
++    cl_kernel kernel_fa_port_kv84 = nullptr;
++    cl_program program_fa_port_kv84 = nullptr;
++    bool fa_port_kv84_tried = false;
++    size_t fa_port_kv84_wg = 0;
+     // 0223: the key split's build of each (the same options + -DPORT_SPLIT=1, so the unsplit
+     // programs above stay what they were), [0] f16, [1] q8_0, made at the first call that splits
+-    std::string fa_port_opts[2];
+-    cl_kernel kernel_fa_port_split[2] = {}, kernel_fa_port_merge[2] = {};
+-    cl_program program_fa_port_split[2] = {};
+-    bool fa_port_split_tried[2] = {};
+-    size_t fa_port_split_wg[2] = {};
++    // [0] f16, [1] q8_0, [2] q8_0 K with a q4_0 V (0225)
++    std::string fa_port_opts[3];
++    cl_kernel kernel_fa_port_split[3] = {}, kernel_fa_port_merge[3] = {};
++    cl_program program_fa_port_split[3] = {};
++    bool fa_port_split_tried[3] = {};
++    size_t fa_port_split_wg[3] = {};
+     int fa_port_n_cu = -1;   // CL_DEVICE_MAX_COMPUTE_UNITS, asked once (-1: not yet)
+     int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
+     // 0106: the build options of the head-256 prompt kernels, so that the
+@@ -13356,7 +13362,7 @@ static bool ggml_cl_port_on() {
+ // model attaches them to a prompt batch only) and that its gate covers; anything else
+ // carrying them is declined with a reason, never served by a kernel that would read it
+ // another way. The rules are fa_port_gate.h's pure function; this is only its argument list.
+-static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx, bool kv8);
++static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx, bool kv8, bool v4 = false);
+ 
+ // THE decision whether the port serves an op that carries its sources. supports_op and the
+ // launch both call this, and neither has a rule of its own: the pure gate on the op
+@@ -13374,12 +13380,15 @@ static bool ggml_cl_port_decide(ggml_backend_opencl_context * backend_ctx, const
+     }
+     // 0199q1: a q8_0 cache has its own build of the kernel (the gate accepted f16 / f16 or
+     // q8_0 / q8_0 and nothing else); the f16 build also needs its Q prepass
+-    const bool kv8 = fa_port_kv_q8(op) != 0;
+-    if (ggml_cl_port_kernel(backend_ctx, kv8) == nullptr || (!kv8 && backend_ctx->kernel_fa_port_q16 == nullptr)) {
+-        *why = kv8 ? "not-built-q8" : "not-built";
++    // 0225: a q8_0 K with a q4_0 V has a third build (the q8_0 build's K, a q4_0 V read)
++    const bool v4 = fa_port_kv_v4(op) != 0;
++    const bool kv8 = fa_port_kv_q8(op) != 0 || v4;
++    if (ggml_cl_port_kernel(backend_ctx, kv8, v4) == nullptr || (!kv8 && backend_ctx->kernel_fa_port_q16 == nullptr)) {
++        *why = v4 ? "not-built-q4v" : kv8 ? "not-built-q8" : "not-built";
+         return false;
+     }
+-    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) > (kv8 ? backend_ctx->fa_port_kv8_wg : backend_ctx->fa_port_wg)) {
++    if ((size_t) 16 * (op->src[0]->ne[2] / op->src[1]->ne[2]) >
++        (v4 ? backend_ctx->fa_port_kv84_wg : kv8 ? backend_ctx->fa_port_kv8_wg : backend_ctx->fa_port_wg)) {
+         *why = "no-fit";
+         return false;
+     }
+@@ -13387,8 +13396,12 @@ static bool ggml_cl_port_decide(ggml_backend_opencl_context * backend_ctx, const
+ }
+ 
+ // built once a device and K/V type, on the first call the gate lets through
+-static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx, bool kv8) {
+-    if (kv8) {
++static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx, bool kv8, bool v4) {
++    if (v4) {
++        if (backend_ctx->kernel_fa_port_kv84 != nullptr) return backend_ctx->kernel_fa_port_kv84;
++        if (backend_ctx->fa_port_kv84_tried) return nullptr;
++        backend_ctx->fa_port_kv84_tried = true;
++    } else if (kv8) {
+         if (backend_ctx->kernel_fa_port_kv8 != nullptr) return backend_ctx->kernel_fa_port_kv8;
+         if (backend_ctx->fa_port_kv8_tried) return nullptr;
+         backend_ctx->fa_port_kv8_tried = true;
+@@ -13449,6 +13462,7 @@ static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx,
+         }
+         grf = 256; qhoist = 1; qf32 = 1;
+         opts += " -DPORT_KV8=1";
++        if (v4) opts += " -DPORT_V4=1";    // 0225: V a q4_0 cache
+     }
+     if (grf == 256) {
+         opts += " -cl-intel-256-GRF-per-thread";
+@@ -13492,10 +13506,14 @@ static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx,
+         // FAIL the q8_0 cases (the f16 build has neither and passes)
+         if (r == 6) opts += " -DGB_KV8_K_SCALE2";
+         if (r == 7) opts += " -DGB_KV8_V_BLOCK";
++        // 0225, the q4_0 V build's own: =14 swaps the nibbles (the high for the low dims), =15 takes V's scale
++        // from the next q4_0 block; each must FAIL the q8_0:q4_0 cases (the f16 and q8_0 builds have neither)
++        if (r == 14) opts += " -DGB_V4_NIBBLE_SWAP";
++        if (r == 15) opts += " -DGB_V4_SCALE_BLOCK";
+         // 0223's reds (10 .. 13) are the split build's own: ggml_cl_port_split_kernels adds them
+     }
+     // 0223: the split build takes these same options (and the source again) plus its own
+-    backend_ctx->fa_port_opts[kv8 ? 1 : 0] = opts;
++    backend_ctx->fa_port_opts[v4 ? 2 : kv8 ? 1 : 0] = opts;
+     cl_program p = build_program_from_source_optional(backend_ctx, src.c_str(), opts);
+     if (p == nullptr) {
+         ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s", kv8 ? "compile-q8" : "compile");
+@@ -13512,6 +13530,15 @@ static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx,
+     }
+     size_t wg = 0;
+     CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
++    if (v4) {
++        CL_CHECK(clReleaseKernel(k16));
++        backend_ctx->fa_port_kv84_wg = wg;
++        backend_ctx->program_fa_port_kv84 = p;
++        backend_ctx->kernel_fa_port_kv84 = k;
++        backend_ctx->fa_port_skip = skip;
++        backend_ctx->fa_port_nobias = nobias;
++        return k;
++    }
+     if (kv8) {
+         // the Q prepass is the f16 build's; skip and the probe are read the same way for both
+         // builds, so either build's store of them is the same value
+@@ -13566,8 +13593,8 @@ static void ggml_backend_opencl_fa_port_split_stats(int64_t out[5]) {
+ 
+ // the split build of the port kernel and its merge, once a device and K/V type, after the unsplit
+ // build (whose options it takes). A failure is said once and the calls stay unsplit.
+-static bool ggml_cl_port_split_kernels(ggml_backend_opencl_context * backend_ctx, bool kv8) {
+-    const int i = kv8 ? 1 : 0;
++static bool ggml_cl_port_split_kernels(ggml_backend_opencl_context * backend_ctx, bool kv8, bool v4 = false) {
++    const int i = v4 ? 2 : kv8 ? 1 : 0;
+     if (backend_ctx->kernel_fa_port_split[i] != nullptr) return true;
+     if (backend_ctx->fa_port_split_tried[i]) return false;
+     backend_ctx->fa_port_split_tried[i] = true;
+@@ -26996,20 +27023,24 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+     const float scale = ((const float *) dst->op_params)[0];
+     // 0199q1: a q8_0 cache is read in place by the kernel's q8_0 build (the gate accepted
+     // f16 / f16 or q8_0 / q8_0); kv_bytes is what a (key, kv head) holds
+-    const bool kv8 = fa_port_kv_q8(dst) != 0;
++    // 0225: or a q8_0 K with a q4_0 V (the build's V read is q4_0's: 72 bytes a (key, kv head)); kvi indexes the builds
++    const bool v4 = fa_port_kv_v4(dst) != 0;
++    const bool kv8 = fa_port_kv_q8(dst) != 0 || v4;
++    const int kvi = v4 ? 2 : kv8 ? 1 : 0;
+     const size_t kv_bytes = kv8 ? (size_t) (d_head_q / 32) * 34 : (size_t) d_head_q * sizeof(cl_half);
++    const size_t v_bytes = v4 ? (size_t) (d_head_q / 32) * 18 : kv_bytes;
+     // a q8_0 tensor that was written with set_tensor is stored as planes (codes, scales);
+     // its blocks are rebuilt into a buffer that lives until the launch has run, as the
+     // dispatch below does for today's kernels. The model's cache is written by the graph
+     // and is blocks already. Declared here: the rebuilt buffers outlive the enqueue
+     ggml_cl_flash_attn_temp_buffer kv8_temp_k, kv8_temp_v;
+     {
+-        cl_kernel kp = kv8 ? backend_ctx->kernel_fa_port_kv8 : backend_ctx->kernel_fa_port;
++        cl_kernel kp = v4 ? backend_ctx->kernel_fa_port_kv84 : kv8 ? backend_ctx->kernel_fa_port_kv8 : backend_ctx->kernel_fa_port;
+         cl_kernel kq16 = backend_ctx->kernel_fa_port_q16;
+         const int G = n_head / n_head_kv;
+         // GGML_OPENCL_FA_PORT_QTW: adjacent query tiles a work-group (the reference's server
+         // runs 4), clamped to what the device's work-group holds; one tile always fits
+-        const size_t wg_limit = kv8 ? backend_ctx->fa_port_kv8_wg : backend_ctx->fa_port_wg;   // asked once, when the kernel was built
++        const size_t wg_limit = v4 ? backend_ctx->fa_port_kv84_wg : kv8 ? backend_ctx->fa_port_kv8_wg : backend_ctx->fa_port_wg;   // asked once, when the kernel was built
+         static const char * qtw_env = getenv("GGML_OPENCL_FA_PORT_QTW");
+         int qtw = qtw_env != nullptr ? std::max(1, atoi(qtw_env)) : 1;
+         if ((size_t) 16 * G * qtw > wg_limit) {
+@@ -27041,11 +27072,11 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+             static const int minblk   = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_MINBLK", 0);
+             wave = wave_env > 0 ? wave_env : fa_port_split_wave(backend_ctx->fa_port_n_cu, kv8 ? 256 : backend_ctx->fa_port_grf, G * qtw);
+             n_split = fa_port_splits(nwg, wave, n_kv, window, cap, force, minblk);
+-            if (n_split > 1 && !ggml_cl_port_split_kernels(backend_ctx, kv8)) {
++            if (n_split > 1 && !ggml_cl_port_split_kernels(backend_ctx, kv8, v4)) {
+                 ggml_cl_downgrade("op=FLASH_ATTN port=split-declined reason=%s", "not-built");   // a call the rule splits, run unsplit
+                 n_split = 1;
+             }
+-            if (n_split > 1 && (size_t) 16 * G * qtw > backend_ctx->fa_port_split_wg[kv8 ? 1 : 0]) {
++            if (n_split > 1 && (size_t) 16 * G * qtw > backend_ctx->fa_port_split_wg[kvi]) {
+                 ggml_cl_downgrade("op=FLASH_ATTN port=split-declined reason=%s", "work-group");
+                 n_split = 1;
+             }
+@@ -27132,7 +27163,7 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+             ggml_cl_bounds("op=FLASH_ATTN port", "q16", qsrc, q16_size);
+         }
+         ggml_cl_bounds("op=FLASH_ATTN port", "k",  bk,  ok  + (size_t)(n_head_kv - 1) * k_nb2p + (size_t)(n_kv - 1) * k_nb1p + kv_bytes);
+-        ggml_cl_bounds("op=FLASH_ATTN port", "v",  bv,  ov  + (size_t)(n_head_kv - 1) * v_nb2p + (size_t)(n_kv - 1) * v_nb1p + kv_bytes);
++        ggml_cl_bounds("op=FLASH_ATTN port", "v",  bv,  ov  + (size_t)(n_head_kv - 1) * v_nb2p + (size_t)(n_kv - 1) * v_nb1p + v_bytes);
+         ggml_cl_bounds("op=FLASH_ATTN port", "o",  bo,  oo  + (size_t)(n_head - 1) * dst->nb[1] + (size_t)(rows - 1) * o_nb2p + (size_t) d_head_q * sizeof(float));
+         ggml_cl_bounds("op=FLASH_ATTN port", "mask", bm, om + (size_t)(rows - 1) * mask_nb1 + (size_t)n_kv * sizeof(cl_half));
+         ggml_cl_bounds("op=FLASH_ATTN port", "sink", bs, os + (size_t)rows * n_head * sizeof(float));
+@@ -27168,7 +27199,16 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+         } else {
+             snprintf(split_desc, sizeof split_desc, " split=off");
+         }
+-        if (kv8) {
++        if (v4) {
++            // 0225: a line of its own, once a process (WARN, 0224's rule): the K and V types as the repository writes a
++            // pair, K:V
++            static std::once_flag taken84;
++            std::call_once(taken84, [&] {
++                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0:q4_0 grf=256 qhoist=1 qf32=1 skip=%d uniform=1 qtw=%d%s%s\n",
++                              backend_ctx->fa_port_skip, qtw,
++                              backend_ctx->fa_port_nobias ? " probe=nobias-WRONG-ANSWERS" : "", split_desc);
++            });
++        } else if (kv8) {
+             // a line of its own, once a process: the f16 line below keeps its text
+             static std::once_flag taken8;
+             std::call_once(taken8, [&] {
+@@ -27187,12 +27227,12 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+         }
+         if (n_split > 1) {
+             // the first call that splits, a line of its own a K/V type
+-            static std::once_flag taken_split[2];
+-            std::call_once(taken_split[kv8 ? 1 : 0], [&] {
++            static std::once_flag taken_split[3];
++            std::call_once(taken_split[kvi], [&] {
+                 GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=%s split=%d n_q=%d n_kv=%d nwg=%d wave=%d blocks=%d\n",
+-                              kv8 ? "q8_0" : "f16", n_split, n_q, n_kv, nwg, wave, split_blocks);
++                              v4 ? "q8_0:q4_0" : kv8 ? "q8_0" : "f16", n_split, n_q, n_kv, nwg, wave, split_blocks);
+             });
+-            kp = backend_ctx->kernel_fa_port_split[kv8 ? 1 : 0];
++            kp = backend_ctx->kernel_fa_port_split[kvi];
+         }
+ 
+         if (!qf32) {
+@@ -27262,7 +27302,7 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+         size_t gws[3] = { 16, (size_t) G, (size_t) n_head_kv * n_split * ngroups * qtw };
+         backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
+         if (n_split > 1) {
+-            cl_kernel km = backend_ctx->kernel_fa_port_merge[kv8 ? 1 : 0];
++            cl_kernel km = backend_ctx->kernel_fa_port_merge[kvi];
+             int b = 0;
+             CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &partbuf->buffer));
+             CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &bo));
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+index 0a165caf0..28ee88e07 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+@@ -208,6 +208,52 @@ uint8   __builtin_IB_subgroup_block_read_flat_transform_u8_k32(long base, int w,
+ #endif
+ #endif
+ 
++// PORT_V4 (0225): the q8_0 K build with a q4_0 V cache read in place - ggml's blocks, 18 bytes for 32 values (an f16
++// scale d, then 16 bytes whose byte j holds value j in its low nibble and value j + 16 in its high one, each value
++// (nibble - 8) d), DKQ/32 blocks a (key, kv head) = HB4 bytes. K is read as the q8_0 build reads it; only V changes.
++//   V: one transformed byte read a block (16 byte columns x 32 key rows: lane = quant byte j, a byte a key) gives the
++//      block's two D chunks: dims 32 b + j from the low nibbles, 32 b + 16 + j from the high ones. The extension asks a
++//      byte read's column on the 4-byte grid: an odd block's quant bytes start on it (18 b + 2 = 20, 56); an even
++//      block's start 2 bytes off it (2, 38), so it is read at 18 b + 4 (lanes 0..13 = quant bytes 2..15, lanes 14, 15
++//      the next block's scale) and lanes 14, 15 take quant bytes 0, 1 from lanes 2, 3 of a read at the block's first
++//      byte (18 b), as the q8_0 build splices its even blocks. The store has the lane-to-dim map (V4_ODIM).
++//   The nibbles become f16 by integer operations on whole dwords, as B16 does for q8_0 codes: 0x6400 | n is the f16 of
++//   1024 + n = 1032 + (n - 8), in the same key order as B16 (a dword's keys 0 and 2, then 1 and 3), so P's shuffle and
++//   the scale in P (pe = f16(p d 128), d gathered a key) are the q8_0 build's; the accumulator starts 1032 sum pe lower.
++// Red (GGML_OPENCL_FA_PORT_RED): 14 (GB_V4_NIBBLE_SWAP) takes the high nibble for the low dims and the low for the high;
++// 15 (GB_V4_SCALE_BLOCK) takes V's scale from the next block of the row. Each must FAIL every q8_0:q4_0 case.
++#ifndef PORT_V4
++#define PORT_V4 0
++#endif
++#if PORT_V4 && !PORT_KV8
++#error "PORT_V4 is the q8_0 K build's (K q8_0, V q4_0)"
++#endif
++#if PORT_V4
++#define HB4 (DKQ / 32 * 18)   // q4_0: bytes a (key, kv head)
++#define V4R(xb, y) __builtin_IB_subgroup_block_read_flat_transform_u8_k32(vb, vx + HB4 - 1, n_kv - 1, vp - 1, (int2)(vx + (xb), (y) + GB_PAD_KEYS_OFF))
++#define V4X(b) (18 * (b) + (((b) & 1) ? 2 : 4))
++#if (18 * 0 + 4) % 4 != 0 || (18 * 1 + 2) % 4 != 0 || (18 * 2 + 4) % 4 != 0 || (18 * 3 + 2) % 4 != 0 || (18 * 2) % 4 != 0
++#error "PORT_V4: a V read off the 4-byte grid"
++#endif
++// the quant byte (of the block's 16) lane l of block b's read holds after the splice, and the dim (of the block's 32)
++// lane l of chunk c holds
++#define V4J(b, l) (((b) & 1) ? (l) : ((l) < 14 ? (l) + 2 : (l) - 14))
++#define V4_ODIM(c, l) (16 * ((c) & 1) + V4J((c) / 2, (l)))
++#define V4_BIAS 1032.0f
++#ifdef GB_V4_NIBBLE_SWAP
++#define B16L(w) ((uint8)((((w) >> 4) & 0x000F000Fu) | 0x64006400u, (((w) >> 12) & 0x000F000Fu) | 0x64006400u))
++#define B16H(w) ((uint8)(((w) & 0x000F000Fu) | 0x64006400u, (((w) >> 8) & 0x000F000Fu) | 0x64006400u))
++#else
++#define B16L(w) ((uint8)(((w) & 0x000F000Fu) | 0x64006400u, (((w) >> 8) & 0x000F000Fu) | 0x64006400u))
++#define B16H(w) ((uint8)((((w) >> 4) & 0x000F000Fu) | 0x64006400u, (((w) >> 12) & 0x000F000Fu) | 0x64006400u))
++#endif
++#ifdef GB_V4_SCALE_BLOCK
++#define V4B(b) (((b) + 1) % NB8)   // the red case: the scale of the next block
++#else
++#define V4B(b) (b)
++#endif
++#endif
++
+ // Q to f16, unscaled, [head][row][DKQ]: a work-item per 8 values. q_nb1 is the op's
+ // query-row stride and q_nb2 its head stride, whatever the view (the model's Q is a
+ // permuted [D, Lq, Hq] with nb1 = Hq*D*4, nb2 = D*4).
+@@ -558,7 +604,52 @@ kernel void kernel_flash_attn_port(
+ 
+         // ---- O = O alpha + P V, lane = dim, components = rows ----
+         const float8 av = (float8)(alpha[0], alpha[1], alpha[2], alpha[3], alpha[4], alpha[5], alpha[6], alpha[7]);
+-#if PORT_KV8
++#if PORT_V4
++        // O += sum over keys of p d (nibble - 8): the q8_0 build's P V with a q4_0 V (see PORT_V4 above)
++        const int vord = lane < 8 ? 2 * lane : 2 * lane - 15;
++        float ps[NKB][QR];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) ps[gb][r] = intel_sub_group_shuffle(pf[gb][r], (uint) vord);
++        }
++        _Pragma("unroll")
++        for (int b = 0; b < NB8; ++b) {
++            short8 pe[NKB];
++            _Pragma("unroll")
++            for (int gb = 0; gb < NKB; ++gb) {
++                // the scale of this lane's key: a row past n_kv repeats the last one (its p is 0)
++                const int kr = min(t0 + gb * 16 + vord + GB_PAD_KEYS_OFF, n_kv - 1);
++                const float ds = fmin(KV8_PSCALE * vload_half(0, (global const half *)(v + v_offset + (ulong) kvh * v_nb2 +
++                                                                                       (ulong) kr * v_nb1 + 18 * V4B(b))), 65504.0f);
++                half eh[QR];
++                _Pragma("unroll")
++                for (int r = 0; r < QR; ++r) eh[r] = (half)(ps[gb][r] * ds);
++                pe[gb] = as_short8((half8)(eh[0], eh[1], eh[2], eh[3], eh[4], eh[5], eh[6], eh[7]));
++            }
++            const float8 ns = DPAS(pe[1], KV8_ONES, DPAS(pe[0], KV8_ONES, (float8)(0.f))) * -V4_BIAS;
++            uint8 vr = V4R(V4X(b), t0);          // 4 dwords a lane: the first key group, then the second
++            if ((b & 1) == 0) {
++                // an even block: lanes 14, 15 read the next block's scale; they take the block's quant bytes 0, 1 from
++                // lanes 2, 3 of a read at the block's first byte
++                const uint8 v0 = V4R(18 * b, t0);
++                const uint vsrc = (uint) (lane >= 14 ? lane - 12 : lane);
++                const int  vfix = lane >= 14;
++                vr = (uint8)(vfix ? intel_sub_group_shuffle(v0.s0, vsrc) : vr.s0, vfix ? intel_sub_group_shuffle(v0.s1, vsrc) : vr.s1,
++                             vfix ? intel_sub_group_shuffle(v0.s2, vsrc) : vr.s2, vfix ? intel_sub_group_shuffle(v0.s3, vsrc) : vr.s3,
++                             vfix ? intel_sub_group_shuffle(v0.s4, vsrc) : vr.s4, vfix ? intel_sub_group_shuffle(v0.s5, vsrc) : vr.s5,
++                             vfix ? intel_sub_group_shuffle(v0.s6, vsrc) : vr.s6, vfix ? intel_sub_group_shuffle(v0.s7, vsrc) : vr.s7);
++            }
++            float8 acc = o[2 * b] * av + ns;     // the low nibbles: dims 32 b + j
++            acc = DPAS(pe[0], as_int8(B16L(vr.lo)), acc);
++            acc = DPAS(pe[1], as_int8(B16L(vr.hi)), acc);
++            o[2 * b] = acc;
++            acc = o[2 * b + 1] * av + ns;        // the high nibbles: dims 32 b + 16 + j
++            acc = DPAS(pe[0], as_int8(B16H(vr.lo)), acc);
++            acc = DPAS(pe[1], as_int8(B16H(vr.hi)), acc);
++            o[2 * b + 1] = acc;
++        }
++#elif PORT_KV8
+         // O += sum over keys of p d code. The scale d of (key, q8_0 block) stands under the sum
+         // over keys, so it goes into the a operand, which has the key in its lane: pe =
+         // f16(p d 128), a block's own P. 128 keeps p d in f16's range for every |v| an f16
+@@ -702,7 +793,9 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
+         for (int r = 0; r < QR; ++r) {
+             if (r >= nrow) continue;
+             global float * orow = (global float *)(dst + o_offset + (size_t) head * o_nb1 + (size_t) (q0 + r) * o_nb2);
+-#if PORT_KV8
++#if PORT_V4
++            orow[32 * (c / 2) + V4_ODIM(c, lane)] = ov[r] * inv[r];
++#elif PORT_KV8
+             orow[32 * (c / 2) + KV8_ODIM(c, lane)] = ov[r] * inv[r];
+ #else
+             orow[c * 16 + lane] = ov[r] * inv[r];
+@@ -730,7 +823,9 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
+             if (r >= nrow) continue;
+             // the op's dst is [D, n_head, n_q]: o_nb1 is a head's stride, o_nb2 a query row's
+             global float * orow = (global float *)(dst + o_offset + (size_t)head * o_nb1 + (size_t)(q0 + r) * o_nb2);
+-#if PORT_KV8
++#if PORT_V4
++            orow[32 * (c / 2) + V4_ODIM(c, lane)] = ov[r] * inv[r];
++#elif PORT_KV8
+             orow[32 * (c / 2) + KV8_ODIM(c, lane)] = ov[r] * inv[r];
+ #else
+             orow[c * 16 + lane] = ov[r] * inv[r];
