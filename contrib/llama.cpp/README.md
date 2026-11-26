@@ -10013,6 +10013,16 @@ unit's settings).
   that the red stands at least 10x above the bound.
 - **Perf:** a perf row whose launch record is wrong prints `FAILED [launch record]`. Two perf cells
   price the 128-block floor.
+- **The split against the unsplit port:** `GGML_TEST_FA_PORT_DUMP=<dir>` writes each port case's output on the
+  backend (raw f32, under the FNV-1a 64 hash of the case's vars, with an `index.txt`). Two runs of the same seeded case,
+  the key split on and off, can then be compared with each other instead of with the CPU, which is what the split
+  changes, apart from the CPU reference's own floor. The window's bound: NMSE ≤ 1e-5 per case, f16 and q8_0, and
+  RED=13 above it.
+- **The bound on the CPU reference, revised after the first card run:** the unsplit f16 port's own error against the
+  CPU was 3.88e-5 on the card, so the split f16 cases' 1e-5 sat below the kernel's floor by construction (`measured-here`:
+  the split f16 cases 4.3e-5, q8_0 1.9e-6). The window judges the split f16 cases at 1e-4 from the logged NMSE (RED=13:
+  1.75e-4 .. 3.82e-4) and records the binary's 1e-5 verdict beside it; the split-against-unsplit bound above is the
+  check of the split itself.
 
 **Without a device** (`measured-here`, the recipe host):
 - `contrib/refkernels/trellis-fa/port_split_test.cpp` on the six exports: green rc 0, red
