@@ -1,0 +1,752 @@
+0226: the fused loop controller (GGML_OP_LOOP_CONTROL, 0221) for 1 .. 8 rows: a decode step, a draft's verify rows, a short prompt tail. That is the range the reference fuses (the vLLM-XPU Inkling port's loop_control.sycl, check_rows: 1 .. 8 rows) and the one 0221 left on the chain (it emitted the op for more than 8 rows only). 0221's kernel owns a work-group a Xe core, so at most 8 rows are ONE work-group: one core reading the control's 2.36 MB of weights. The small pair spreads the work as the reference does, in two launches (loop_control_small.cl): kernel_loop_control_gate, a work-group of 64 lanes a (row, half, output) - the half's down product and its sum of squares in one pass, the partial s_h*(Wd_h[r] . x_h) to a scratch [T][2][64] of the backend context - and kernel_loop_control_out, a lane a column - the two partials summed to g, the gain and forget products, tanh and the combine, T rows in one pass over the weight rows (row templates 1, 2, 4, 8). The switch stays GGML_OPENCL_LOOP_CONTROL: 1, f32 and all-layers now emit the op from one row; f32-t2 from two rows (one-row decode keeps the chain); f32-prompt is 0221's range (more than 8 rows); f32-onewg emits from one row and serves at most 8 rows with 0221's one-work-group kernel (the geometry's comparison arm); bf16 is unchanged (more than 8 rows, its own kernel). Unset, nothing changes: the chain is emitted node for node. ggml.h/ggml.c: ggml_loop_control_min_rows, ggml_loop_control_small_on, the plan's small launch. The model: n_tokens >= the switch's least row count, every other guard as it was. A second TAKEN line, WARN once a process: "loop_control: TAKEN opencl f32 small two-launch rows=.. gate_wg=.. out_tr=..". Reds through GGML_OPENCL_LOOP_CONTROL_OPTS=-DLOOP_CONTROL_RED=n: 1 - 4 as 0221's, 6 (the scratch's row step) and 7 (the tail row not stored) for 2 .. 8 rows. test-backend-ops: LOOP_CONTROL cases at 2, 3, 4, 5, 6, 8 rows (plain, a mix column's view; 6 rows is the verify of a 5-token draft), rows at a padded step (view=2) at 1 .. 57 rows, twins at 1, 2, 4, 6, 8 rows, perf cases op against chain at 1, 2, 4, 6, 8 rows.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index ed4ad33..0607d59 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -1924,7 +1924,8 @@ extern "C" {
+     // when covered, else a fixed reason for the DOWNGRADE line. Covered: F32 everywhere, n_embd a
+     // multiple of 256 (16 K-split parts of a half, each a multiple of 16), rank 64, cur and msg
+     // [n_embd, T] with contiguous rows at any row step (a mix column's view), the three weights
+-    // contiguous. Any T >= 1 (the model emits the op only for T > 8; the op itself takes any).
++    // contiguous. Any T >= 1 (the model emits the op from the switch's least T, 0226:
++    // ggml_loop_control_min_rows; the op itself takes any).
+     GGML_API const char * ggml_loop_control_refuse(const struct ggml_tensor * cur,
+                                                    const struct ggml_tensor * msg,
+                                                    const struct ggml_tensor * down,
+@@ -1940,6 +1941,19 @@ extern "C" {
+     GGML_API int  ggml_loop_control_mode(const char * env_value);
+     GGML_API bool ggml_loop_control_all_layers(const char * env_value);
+ 
++    // 0226: the switch's row range and its geometry at T <= 8 (decode, and a draft's verify
++    // rows). The values of ggml_loop_control_mode above keep their mode; three more are mode 1:
++    //   "1", "f32", "all-layers"   the op from T = 1; T <= 8 as the small pair (below)
++    //   "f32-t2"                    the op from T = 2: one-row decode keeps the chain
++    //   "f32-prompt"                0221's range: the op for T > 8 only
++    //   "f32-onewg"                 the op from T = 1, T <= 8 on 0221's kernel (one work-group):
++    //                               the geometry's comparison arm
++    //   "bf16"                      unchanged: T > 8 only, its own kernel at any T it is handed
++    // min_rows: the least T the model emits the op for (0 when the mode is off or not a value).
++    // small_on: whether a T <= GGML_LOOP_CONTROL_SMALL_ROWS node takes the small pair.
++    GGML_API int  ggml_loop_control_min_rows(const char * env_value);
++    GGML_API bool ggml_loop_control_small_on(const char * env_value);
++
+     // the capability a backend declares through its registry's get_proc_address (any non-null
+     // pointer) when it serves GGML_OP_LOOP_CONTROL; the model emits the op only on such a layer
+     #define GGML_LOOP_CONTROL_CAPABILITY_PROC "ggml_backend_loop_control"
+@@ -1951,6 +1965,15 @@ extern "C" {
+     #define GGML_LOOP_CONTROL_RANK     64
+     #define GGML_LOOP_CONTROL_ROWS_MAX 64
+ 
++    // 0226: the small pair (loop_control_small.cl), T <= 8, the reference's decode case. Two
++    // launches a control: the gate (one work-group of GATE_W lanes a (row, half, output): its
++    // half's down product and the half's sum of squares, the partial s_h*(Wd_h[r] . x_h) to a
++    // scratch [T][2][64]) and the out (a lane a column: both partials summed to g, the gain and
++    // forget products, tanh and the combine, T rows in one pass over the weights).
++    #define GGML_LOOP_CONTROL_SMALL_ROWS 8
++    #define GGML_LOOP_CONTROL_GATE_W     64
++    #define GGML_LOOP_CONTROL_OUT_W      64
++
+     // what a launch reads and writes, from the node and the device's core count alone (no
+     // device): the geometry, the strides the kernel is handed and the furthest byte each argument
+     // reaches past its tensor's own offset. The OpenCL dispatch binds exactly these, and the host
+@@ -1965,6 +1988,13 @@ extern "C" {
+         uint64_t nbw1, nbg1, nbf1;              // down, gain, forget row steps, bytes
+         uint64_t reach_cur, reach_msg, reach_down, reach_gain, reach_forget, reach_dst;   // bytes
+         uint64_t local_floats;  // g store (rows_wg*64) + K-split partials (NSG*16*16) + row sums (NSG*16)
++        // 0226, the small pair's launch (set for any nt; used where nt <= SMALL_ROWS):
++        int      small;         // nt <= GGML_LOOP_CONTROL_SMALL_ROWS
++        int      out_tr;        // the out kernel's row template: 1, 2, 4 or 8 rows a pass, >= nt
++        uint64_t gate_gws[3];   // { GATE_W, 2*rank, nt }, local { GATE_W, 1, 1 }
++        uint64_t out_gws;       // ne0, local OUT_W
++        uint64_t gp_floats;     // the scratch: nt * 2 * rank partials
++        uint64_t gate_local_floats;   // the gate's reduction: 2 * (GATE_W / SG)
+     };
+     GGML_API void ggml_loop_control_plan_make(const struct ggml_tensor * dst, int n_cores,
+                                               struct ggml_loop_control_plan * plan);
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index c1eac5e..52a91f7 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -111,6 +111,7 @@ set(GGML_OPENCL_KERNELS
+     norm_clip
+     depth_mix
+     loop_control
++    loop_control_small
+     cpy
+     cvt
+     diag_mask_inf
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 61d33f9..3901fa0 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -735,6 +735,9 @@ static void ggml_cl_depth_mix(ggml_backend_t backend, const ggml_tensor * blocks
+ // 0221: the loop-controller arm, defined below; supports_op at the top reaches it
+ static int ggml_cl_loop_control_mode();
+ static cl_kernel ggml_cl_loop_control_kernel(ggml_backend_opencl_context * backend_ctx, const char ** why);
++// 0226: the small pair (T <= 8) and whether the switch's value takes it
++static bool ggml_cl_loop_control_small_on();
++static bool ggml_cl_loop_control_small_kernels(ggml_backend_opencl_context * backend_ctx, const char ** why);
+ static void ggml_cl_loop_control(ggml_backend_t backend, const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * dst);
+ // 0178's bounds helper, defined below supports_op
+ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);
+@@ -938,6 +941,7 @@ struct ggml_backend_opencl_context {
+     ggml_cl_buffer prealloc_moe_combine_w;
+     ggml_cl_buffer prealloc_kq_xq;   // q8_1 activation of the K-quant matvec: int8 codes
+     ggml_cl_buffer prealloc_f32_splitk;   // K slices of the skinny F32 GEMM (ggml_cl_mul_mat_f32_skinny)
++    ggml_cl_buffer prealloc_loop_control_gp;   // 0226: the small pair's gate partials [T <= 8][2][64]
+     ggml_cl_buffer prealloc_fa_partial;   // flash-decoding partial records (split -> merge)
+     ggml_cl_buffer prealloc_kq_xd;   // per-32 scale (float)
+     ggml_cl_buffer prealloc_kq_xs;   // per-32 sum (float)
+@@ -1134,7 +1138,13 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_loop_control = nullptr;
+     bool        loop_control_tried  = false;     // per context (a device): a second device builds its own
+     const char * loop_control_reason = nullptr;  // why the build was refused, for the DOWNGRADE line
+-    int       loop_control_calls_graph = 0;   // GGML_OPENCL_LOOP_CONTROL_STATS=1: launches a graph
++    // 0226: the small pair for T <= 8 (loop_control_small.cl): the gate and the out, two launches
++    // a control. Built on the first eligible node of at most 8 rows, per context as the kernel above
++    cl_kernel kernel_loop_control_gate = nullptr;
++    cl_kernel kernel_loop_control_out  = nullptr;
++    bool        loop_control_small_tried  = false;
++    const char * loop_control_small_reason = nullptr;
++    int       loop_control_calls_graph = 0;   // GGML_OPENCL_LOOP_CONTROL_STATS=1: controls served a graph
+     int       loop_control_nodes_graph = 0;   // and the nodes the graph handed it
+     cl_kernel kernel_geglu, kernel_reglu, kernel_swiglu, kernel_swiglu_oai, kernel_swiglu_clamp, kernel_geglu_erf,
+               kernel_geglu_quick, kernel_geglu_f16, kernel_reglu_f16, kernel_swiglu_f16, kernel_swiglu_clamp_f16,
+@@ -13894,6 +13904,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 return false;
+             }
+             const char * kwhy = nullptr;
++            // 0226: a node of at most 8 rows takes the small pair where the switch's value says
++            // so; its build is this node's condition, the one-work-group kernel's is not
++            if (op->src[0]->ne[1] <= GGML_LOOP_CONTROL_SMALL_ROWS && ggml_cl_loop_control_small_on()) {
++                if (!ggml_cl_loop_control_small_kernels(backend_ctx, &kwhy)) {
++                    ggml_cl_downgrade("op=LOOP_CONTROL path=cpu reason=%s", kwhy ? kwhy : "small-not-built");
++                    return false;
++                }
++                return true;
++            }
+             if (ggml_cl_loop_control_kernel(backend_ctx, &kwhy) == nullptr) {
+                 ggml_cl_downgrade("op=LOOP_CONTROL path=cpu reason=%s", kwhy ? kwhy : "not-built");
+                 return false;
+@@ -22350,7 +22369,7 @@ static int ggml_cl_loop_control_mode() {
+         const char * e = getenv("GGML_OPENCL_LOOP_CONTROL");
+         const int m = ggml_loop_control_mode(e);
+         if (m < 0) {
+-            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_LOOP_CONTROL=%s is not a value (0, off, 1, f32, bf16, all-layers): the arm is off\n", e);
++            GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_LOOP_CONTROL=%s is not a value (0, off, 1, f32, f32-t2, f32-prompt, f32-onewg, bf16, all-layers): the arm is off\n", e);
+             return 0;
+         }
+         return m;
+@@ -22417,6 +22436,64 @@ static cl_kernel ggml_cl_loop_control_kernel(ggml_backend_opencl_context * backe
+     return backend_ctx->kernel_loop_control;
+ }
+ 
++// 0226: whether a node of at most 8 rows takes the small pair: every f32 value but f32-onewg
++// (ggml.h, ggml_loop_control_small_on); bf16 keeps its own kernel at any row count
++static bool ggml_cl_loop_control_small_on() {
++    static const bool on = ggml_loop_control_small_on(getenv("GGML_OPENCL_LOOP_CONTROL"));
++    return on;
++}
++
++// the small pair, built on the first eligible node of at most 8 rows with loop_control.cl's
++// options (256 GRF, the reds' GGML_OPENCL_LOOP_CONTROL_OPTS); a failed build or a work-group
++// the gate cannot take refuses those nodes with the reason
++static bool ggml_cl_loop_control_small_kernels(ggml_backend_opencl_context * backend_ctx, const char ** why) {
++    bool &        tried  = backend_ctx->loop_control_small_tried;
++    const char *& reason = backend_ctx->loop_control_small_reason;
++    if (!tried && backend_ctx->kernel_loop_control_gate == nullptr) {
++        tried = true;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++        const std::string kernel_src {
++            #include "loop_control_small.cl.h"
++        };
++#else
++        const std::string kernel_src = read_file("loop_control_small.cl");
++#endif
++        const char * extra = getenv("GGML_OPENCL_LOOP_CONTROL_OPTS");
++        const std::string opts = backend_ctx->kernel_compile_opts + " -cl-intel-256-GRF-per-thread" +
++                                 (extra != nullptr ? std::string(" ") + extra : std::string());
++        cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), opts);
++        if (prog == nullptr) {
++            reason = "small-not-built";
++            GGML_LOG_WARN("ggml_opencl: loop_control_small.cl did not build; GGML_OP_LOOP_CONTROL of at most %d rows stays on the CPU\n",
++                          GGML_LOOP_CONTROL_SMALL_ROWS);
++        } else {
++            cl_int err;
++            cl_kernel kg = clCreateKernel(prog, "kernel_loop_control_gate", &err);
++            CL_CHECK(err);
++            cl_kernel ko = clCreateKernel(prog, "kernel_loop_control_out", &err);
++            CL_CHECK(err);
++            CL_CHECK(clReleaseProgram(prog));
++            size_t wg_g = 0, wg_o = 0;
++            CL_CHECK(clGetKernelWorkGroupInfo(kg, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg_g), &wg_g, nullptr));
++            CL_CHECK(clGetKernelWorkGroupInfo(ko, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof(wg_o), &wg_o, nullptr));
++            if (wg_g < GGML_LOOP_CONTROL_GATE_W || wg_o < GGML_LOOP_CONTROL_OUT_W) {
++                reason = "small-wg-size";
++                GGML_LOG_WARN("ggml_opencl: the loop-control small pair takes %zu / %zu work-items a group, it needs %d / %d\n",
++                              wg_g, wg_o, GGML_LOOP_CONTROL_GATE_W, GGML_LOOP_CONTROL_OUT_W);
++                CL_CHECK(clReleaseKernel(kg));
++                CL_CHECK(clReleaseKernel(ko));
++            } else {
++                backend_ctx->kernel_loop_control_gate = kg;
++                backend_ctx->kernel_loop_control_out  = ko;
++            }
++        }
++    }
++    if (why != nullptr) {
++        *why = reason;
++    }
++    return backend_ctx->kernel_loop_control_gate != nullptr && backend_ctx->kernel_loop_control_out != nullptr;
++}
++
+ static void ggml_cl_loop_control(ggml_backend_t backend, const ggml_tensor * cur, const ggml_tensor * msg, ggml_tensor * dst) {
+     ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *)backend->context;
+ 
+@@ -22455,11 +22532,81 @@ static void ggml_cl_loop_control(ggml_backend_t backend, const ggml_tensor * cur
+     ggml_cl_bounds_always("loop control", "forget", ef->data_device, (size_t) (offf + plan.reach_forget));
+     ggml_cl_bounds_always("loop control", "dst",    ed->data_device, (size_t) (offd + plan.reach_dst));
+ 
++    const float eps = ggml_get_op_params_f32(dst, 0);
++    const cl_ulong nbc1 = plan.nbc1, nbm1 = plan.nbm1, nbw1 = plan.nbw1, nbg1 = plan.nbg1, nbf1 = plan.nbf1, nbd1 = plan.nbd1;
++
++    // 0226: at most 8 rows (a decode step, a verify's rows, a short prompt tail) - the small
++    // pair, two launches: the gate's partials to the context's scratch, then the out. The
++    // queue is in order, so the next control's gate cannot write the scratch before this
++    // control's out has read it (the skinny F32 GEMM's slice scratch works the same way).
++    if (plan.small && ggml_cl_loop_control_small_on()) {
++        GGML_ASSERT(ggml_cl_loop_control_small_kernels(backend_ctx, nullptr));
++        cl_kernel kg = backend_ctx->kernel_loop_control_gate;
++        cl_kernel ko = backend_ctx->kernel_loop_control_out;
++        const size_t gp_bytes = (size_t) plan.gp_floats*sizeof(float);
++        backend_ctx->prealloc_loop_control_gp.allocate(backend_ctx->context,
++                (size_t) GGML_LOOP_CONTROL_SMALL_ROWS*2*GGML_LOOP_CONTROL_RANK*sizeof(float));
++        ggml_cl_bounds_always("loop control", "gp", backend_ctx->prealloc_loop_control_gp.buffer, gp_bytes);
++        const cl_ulong offp = 0;
++
++        CL_CHECK(clSetKernelArg(kg,  0, sizeof(cl_mem),   &ec->data_device));
++        CL_CHECK(clSetKernelArg(kg,  1, sizeof(cl_ulong), &offc));
++        CL_CHECK(clSetKernelArg(kg,  2, sizeof(cl_ulong), &nbc1));
++        CL_CHECK(clSetKernelArg(kg,  3, sizeof(cl_mem),   &em->data_device));
++        CL_CHECK(clSetKernelArg(kg,  4, sizeof(cl_ulong), &offm));
++        CL_CHECK(clSetKernelArg(kg,  5, sizeof(cl_ulong), &nbm1));
++        CL_CHECK(clSetKernelArg(kg,  6, sizeof(cl_mem),   &ew->data_device));
++        CL_CHECK(clSetKernelArg(kg,  7, sizeof(cl_ulong), &offw));
++        CL_CHECK(clSetKernelArg(kg,  8, sizeof(cl_ulong), &nbw1));
++        CL_CHECK(clSetKernelArg(kg,  9, sizeof(cl_mem),   &backend_ctx->prealloc_loop_control_gp.buffer));
++        CL_CHECK(clSetKernelArg(kg, 10, sizeof(cl_ulong), &offp));
++        CL_CHECK(clSetKernelArg(kg, 11, sizeof(int),      &plan.ne0));
++        CL_CHECK(clSetKernelArg(kg, 12, sizeof(int),      &plan.nt));
++        CL_CHECK(clSetKernelArg(kg, 13, sizeof(float),    &eps));
++        CL_CHECK(clSetKernelArg(kg, 14, (size_t) plan.gate_local_floats*sizeof(float), nullptr));
++
++        CL_CHECK(clSetKernelArg(ko,  0, sizeof(cl_mem),   &ec->data_device));
++        CL_CHECK(clSetKernelArg(ko,  1, sizeof(cl_ulong), &offc));
++        CL_CHECK(clSetKernelArg(ko,  2, sizeof(cl_ulong), &nbc1));
++        CL_CHECK(clSetKernelArg(ko,  3, sizeof(cl_mem),   &em->data_device));
++        CL_CHECK(clSetKernelArg(ko,  4, sizeof(cl_ulong), &offm));
++        CL_CHECK(clSetKernelArg(ko,  5, sizeof(cl_ulong), &nbm1));
++        CL_CHECK(clSetKernelArg(ko,  6, sizeof(cl_mem),   &eg->data_device));
++        CL_CHECK(clSetKernelArg(ko,  7, sizeof(cl_ulong), &offg));
++        CL_CHECK(clSetKernelArg(ko,  8, sizeof(cl_ulong), &nbg1));
++        CL_CHECK(clSetKernelArg(ko,  9, sizeof(cl_mem),   &ef->data_device));
++        CL_CHECK(clSetKernelArg(ko, 10, sizeof(cl_ulong), &offf));
++        CL_CHECK(clSetKernelArg(ko, 11, sizeof(cl_ulong), &nbf1));
++        CL_CHECK(clSetKernelArg(ko, 12, sizeof(cl_mem),   &backend_ctx->prealloc_loop_control_gp.buffer));
++        CL_CHECK(clSetKernelArg(ko, 13, sizeof(cl_ulong), &offp));
++        CL_CHECK(clSetKernelArg(ko, 14, sizeof(cl_mem),   &ed->data_device));
++        CL_CHECK(clSetKernelArg(ko, 15, sizeof(cl_ulong), &offd));
++        CL_CHECK(clSetKernelArg(ko, 16, sizeof(cl_ulong), &nbd1));
++        CL_CHECK(clSetKernelArg(ko, 17, sizeof(int),      &plan.ne0));
++        CL_CHECK(clSetKernelArg(ko, 18, sizeof(int),      &plan.nt));
++        CL_CHECK(clSetKernelArg(ko, 19, sizeof(int),      &plan.out_tr));
++
++        size_t gate_gws[] = { (size_t) plan.gate_gws[0], (size_t) plan.gate_gws[1], (size_t) plan.gate_gws[2] };
++        size_t gate_lws[] = { (size_t) GGML_LOOP_CONTROL_GATE_W, 1, 1 };
++        size_t out_gws[]  = { (size_t) plan.out_gws, 1, 1 };
++        size_t out_lws[]  = { (size_t) GGML_LOOP_CONTROL_OUT_W, 1, 1 };
++
++        // WARN, once a process, as the one-launch line below (0224)
++        static std::once_flag small_told;
++        std::call_once(small_told, [&] {
++            GGML_LOG_WARN("loop_control: TAKEN opencl f32 small two-launch rows=%d gate_wg=%d out_tr=%d\n",
++                          plan.nt, (int) (plan.gate_gws[1]*plan.gate_gws[2]), plan.out_tr);
++        });
++        backend_ctx->loop_control_calls_graph++;
++
++        backend_ctx->enqueue_ndrange_kernel(kg, 3, gate_gws, gate_lws, dst);
++        backend_ctx->enqueue_ndrange_kernel(ko, 3, out_gws, out_lws, dst);
++        return;
++    }
++
+     cl_kernel kernel = ggml_cl_loop_control_kernel(backend_ctx, nullptr);
+     GGML_ASSERT(kernel != nullptr);
+ 
+-    const float eps = ggml_get_op_params_f32(dst, 0);
+-    const cl_ulong nbc1 = plan.nbc1, nbm1 = plan.nbm1, nbw1 = plan.nbw1, nbg1 = plan.nbg1, nbf1 = plan.nbf1, nbd1 = plan.nbd1;
+     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &ec->data_device));
+     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offc));
+     CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_ulong), &nbc1));
+diff --git a/ggml/src/ggml-opencl/kernels/loop_control_small.cl b/ggml/src/ggml-opencl/kernels/loop_control_small.cl
+new file mode 100644
+index 0000000..199675a
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/loop_control_small.cl
+@@ -0,0 +1,253 @@
++//------------------------------------------------------------------------------
++// loop_control_small (0226)
++//------------------------------------------------------------------------------
++// Inkling 2 Mini's loop controller at T <= 8 rows (a decode step, a draft's verify rows, a short
++// prompt tail): the reference's own fused case (the vLLM-XPU port's loop_control.sycl, check_rows:
++// 1 .. 8 rows), which 0221 left on the chain.
++//
++//   g   = s_c * (Wd_a . cur) + s_m * (Wd_b . msg)    [64]   s_x = 1/sqrt(mean(x^2) + eps)
++//   out = (cur - tanh(Wf . g) * cur) + tanh(Wg . g) * msg
++//
++// loop_control.cl (0221) owns a work-group a Xe core and keeps g in local memory; at T <= 8 that
++// is ONE work-group, one core reading the control's 2.36 MB of weights. Here the work is spread
++// as the reference spreads it (control_many: a work-group a (row, output) for the down product,
++// a work-item a (row, column) for the up products), in two launches:
++//
++//   kernel_loop_control_gate  one work-group of LCS_GATE_W lanes a (row t, half h, output r):
++//       the half's down product Wd_h[r] . x_h and the half's sum of squares in ONE pass over
++//       the row (the norm folded in as a scale after the product, 0221's algebra), reduced over
++//       the group; the partial s_h * (Wd_h[r] . x_h) goes to the scratch gp [T][2][64].
++//       128 T work-groups; no concat, no normed copy.
++//   kernel_loop_control_out   one lane a column d: g = gp[t][0] + gp[t][1] (uniform), the gain
++//       and forget products, tanh and the combine in registers, out written once. ONE pass over
++//       the two weight rows serves all T rows (the row template TR = 1, 2, 4 or 8 accumulators
++//       a lane; rows past T are the last row again and are not stored).
++//
++// The scratch (512 T bytes) is the only intermediate in global memory; the reference writes the
++// normed inputs, the hidden and the mixed rows.
++//
++// Reds (GGML_OPENCL_LOOP_CONTROL_OPTS=-DLOOP_CONTROL_RED=<n>, loop_control.cl's numbers where
++// the red exists there; 1 - 4 must fail every case, 6 and 7 every case of 2 .. 8 rows):
++//   1 gain and forget swapped in the combine
++//   2 s_c used for both halves (the msg half scaled by cur's sum of squares)
++//   3 the gain's tanh dropped
++//   4 the last sub-group's part of the msg half dropped from the reduction
++//   6 the scratch's row step taken as 64 floats (a row's two halves are 128): rows >= 1 read
++//     another row's partials
++//   7 the tail row not stored (the last of 2 .. 8 rows)
++
++#ifndef LOOP_CONTROL_HOST_REPLAY
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#define LC_REQD_SG  __attribute__((intel_reqd_sub_group_size(16)))
++#define LC_SGID()   ((int) get_sub_group_id())
++#define LC_LANE()   ((int) get_sub_group_local_id())
++#endif
++
++#ifdef LOOP_CONTROL_HOST_REPLAY
++// the host replay (arcint tests/test_loop_control.cpp) includes this text once a build
++#undef LCS_RANK
++#undef LCS_GATE_W
++#undef LCS_GATE_NSG
++#undef LCS_GP_ROW
++#undef LCS_TG
++#undef LCS_COMBINE
++#undef LCS_OUT
++#endif
++
++#ifndef LOOP_CONTROL_RED
++#define LOOP_CONTROL_RED 0
++#endif
++
++#define LCS_RANK      64
++#define LCS_GATE_W    64                  // lanes a gate work-group (GGML_LOOP_CONTROL_GATE_W)
++#define LCS_GATE_NSG  (LCS_GATE_W/16)
++#if LOOP_CONTROL_RED == 6
++#define LCS_GP_ROW    LCS_RANK
++#else
++#define LCS_GP_ROW    (2*LCS_RANK)        // the scratch: a row's cur half, then its msg half
++#endif
++
++// the combine, in the chain's node order (mul, sub, mul, add)
++#if LOOP_CONTROL_RED == 1
++#define LCS_TG(ag) tanh(ag)
++#define LCS_COMBINE(c, m, tg, tf) ((c) - (tg)*(c)) + (tf)*(m)
++#elif LOOP_CONTROL_RED == 3
++#define LCS_TG(ag) (ag)
++#define LCS_COMBINE(c, m, tg, tf) ((c) - (tf)*(c)) + (tg)*(m)
++#else
++#define LCS_TG(ag) tanh(ag)
++#define LCS_COMBINE(c, m, tg, tf) ((c) - (tf)*(c)) + (tg)*(m)
++#endif
++
++// The gate. Global (LCS_GATE_W, 2*64, T), local (LCS_GATE_W, 1, 1): group id 1 is h*64 + r,
++// group id 2 the row. A lane takes every LCS_GATE_W-th float4 of the half (n_embd is a
++// multiple of 256, the rule's, so every lane runs n_embd/256 chunks).
++LC_REQD_SG
++kernel void kernel_loop_control_gate(
++        global const char * cur,
++        ulong               offc,
++        ulong               nbc1,
++        global const char * msg,
++        ulong               offm,
++        ulong               nbm1,
++        global const char * down,
++        ulong               offw,
++        ulong               nbw1,
++        global char *       gp,
++        ulong               offp,
++        int                 ne0,
++        int                 nt,
++        float               eps,
++        local float *       slm          // [2][LCS_GATE_NSG]: the sub-groups' dot parts, their sums of squares
++) {
++    const int D   = ne0;
++    const int lid = (int) get_local_id(0);
++    const int sg  = LC_SGID();
++    const int hr  = (int) get_global_id(1);
++    const int t   = (int) get_global_id(2);
++    const int h   = hr / LCS_RANK;
++    const int r   = hr % LCS_RANK;
++
++    const global float * xc = (const global float *) (cur + offc + (ulong) t*nbc1);
++    const global float * xm = (const global float *) (msg + offm + (ulong) t*nbm1);
++    const global float * x  = h ? xm : xc;
++    const global float * w  = (const global float *) (down + offw + (ulong) r*nbw1) + h*D;
++
++    float acc = 0.0f, ss = 0.0f;
++    const int n4 = D/4;
++    for (int k = lid; k < n4; k += LCS_GATE_W) {
++        const float4 xv = vload4(k, x);
++#if LOOP_CONTROL_RED == 2
++        const float4 qv = vload4(k, xc);
++#else
++        const float4 qv = xv;                 // the sum of squares takes the floats the product reads
++#endif
++        const float4 wv = vload4(k, w);
++        _Pragma("unroll")
++        for (int e = 0; e < 4; ++e) {
++            acc = fma(wv[e], xv[e], acc);
++            ss  = fma(qv[e], qv[e], ss);
++        }
++    }
++    const float a_sg = sub_group_reduce_add(acc);
++    const float q_sg = sub_group_reduce_add(ss);
++    if (LC_LANE() == 0) {
++        slm[sg]                = a_sg;
++        slm[LCS_GATE_NSG + sg] = q_sg;
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    if (lid == 0) {
++        float a = 0.0f, q = 0.0f;
++        const int na = LCS_GATE_NSG - ((LOOP_CONTROL_RED == 4 && h == 1) ? 1 : 0);
++        for (int p = 0; p < na; ++p) {
++            a += slm[p];
++        }
++        for (int p = 0; p < LCS_GATE_NSG; ++p) {
++            q += slm[LCS_GATE_NSG + p];
++        }
++        const float s = 1.0f/sqrt(q/(float) D + eps);
++        ((global float *) (gp + offp))[(t*2 + h)*LCS_RANK + r] = s*a;
++    }
++}
++
++// The out, TR rows a pass: lane d's gain and forget rows are read once, 8 k a chunk, and every
++// row's two products accumulate beside each other; g's two halves are uniform loads (the same
++// address for every lane) and their sum a uniform add. A row index past nt - 1 is the last row
++// again (the loads stay inside the tensors) and is not stored.
++#define LCS_OUT(TR)                                                                          \
++static void lcs_out_##TR(const global char * cur, ulong nbc1, const global char * msg,      \
++        ulong nbm1, const global char * gain, ulong nbg1, const global char * forget,        \
++        ulong nbf1, const global float * gp, global char * dst, ulong nbd1, int nt, int d) { \
++    const global float * pg = (const global float *) (gain   + (ulong) d*nbg1);              \
++    const global float * pf = (const global float *) (forget + (ulong) d*nbf1);              \
++    float ag[TR], af[TR];                                                                    \
++    _Pragma("unroll")                                                                        \
++    for (int i = 0; i < TR; ++i) {                                                           \
++        ag[i] = 0.0f;                                                                        \
++        af[i] = 0.0f;                                                                        \
++    }                                                                                        \
++    _Pragma("unroll")                                                                        \
++    for (int q = 0; q < LCS_RANK/8; ++q) {                                                   \
++        const float8 wg = vload8(q, pg);                                                     \
++        const float8 wf = vload8(q, pf);                                                     \
++        _Pragma("unroll")                                                                    \
++        for (int i = 0; i < TR; ++i) {                                                       \
++            const int tt = min(i, nt - 1);                                                   \
++            const global float * gr = gp + (ulong) tt*LCS_GP_ROW;                            \
++            const float8 gc = vload8(q, gr);                                                 \
++            const float8 gm = vload8(q, gr + LCS_RANK);                                      \
++            _Pragma("unroll")                                                                \
++            for (int e = 0; e < 8; ++e) {                                                    \
++                const float gv = gc[e] + gm[e];                                              \
++                ag[i] = fma(wg[e], gv, ag[i]);                                               \
++                af[i] = fma(wf[e], gv, af[i]);                                               \
++            }                                                                                \
++        }                                                                                    \
++    }                                                                                        \
++    const int nstore = (LOOP_CONTROL_RED == 7 && nt > 1) ? nt - 1 : nt;                      \
++    _Pragma("unroll")                                                                        \
++    for (int i = 0; i < TR; ++i) {                                                           \
++        const int tt = min(i, nt - 1);                                                       \
++        const float c  = ((const global float *) (cur + (ulong) tt*nbc1))[d];                \
++        const float m  = ((const global float *) (msg + (ulong) tt*nbm1))[d];                \
++        const float tg = LCS_TG(ag[i]);                                                      \
++        const float tf = tanh(af[i]);                                                        \
++        const float o  = LCS_COMBINE(c, m, tg, tf);                                          \
++        if (i < nstore) {                                                                    \
++            ((global float *) (dst + (ulong) i*nbd1))[d] = o;                                \
++        }                                                                                    \
++    }                                                                                        \
++}
++
++LCS_OUT(1)
++LCS_OUT(2)
++LCS_OUT(4)
++LCS_OUT(8)
++
++// Global (n_embd), local (GGML_LOOP_CONTROL_OUT_W): a work-item a column. tr is the plan's row
++// template (the least of 1, 2, 4, 8 that holds nt), uniform over the launch.
++LC_REQD_SG
++kernel void kernel_loop_control_out(
++        global const char * cur,
++        ulong               offc,
++        ulong               nbc1,
++        global const char * msg,
++        ulong               offm,
++        ulong               nbm1,
++        global const char * gain,
++        ulong               offg,
++        ulong               nbg1,
++        global const char * forget,
++        ulong               offf,
++        ulong               nbf1,
++        global const char * gp,
++        ulong               offp,
++        global char *       dst,
++        ulong               offd,
++        ulong               nbd1,
++        int                 ne0,
++        int                 nt,
++        int                 tr
++) {
++    const int d = (int) get_global_id(0);
++    if (d >= ne0) {
++        return;
++    }
++    cur    = cur    + offc;
++    msg    = msg    + offm;
++    gain   = gain   + offg;
++    forget = forget + offf;
++    dst    = dst    + offd;
++    const global float * g = (const global float *) (gp + offp);
++
++    if (tr == 1) {
++        lcs_out_1(cur, nbc1, msg, nbm1, gain, nbg1, forget, nbf1, g, dst, nbd1, nt, d);
++    } else if (tr == 2) {
++        lcs_out_2(cur, nbc1, msg, nbm1, gain, nbg1, forget, nbf1, g, dst, nbd1, nt, d);
++    } else if (tr == 4) {
++        lcs_out_4(cur, nbc1, msg, nbm1, gain, nbg1, forget, nbf1, g, dst, nbd1, nt, d);
++    } else {
++        lcs_out_8(cur, nbc1, msg, nbm1, gain, nbg1, forget, nbf1, g, dst, nbd1, nt, d);
++    }
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 488323c..7c74694 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -4431,9 +4431,33 @@ int ggml_loop_control_mode(const char * env_value) {
+     if (strcmp(env_value, "1") == 0 || strcmp(env_value, "f32") == 0 || strcmp(env_value, "all-layers") == 0) {
+         return 1;
+     }
++    // 0226: the f32 arm at another row range, or on the other geometry at T <= 8 (ggml.h)
++    if (strcmp(env_value, "f32-t2") == 0 || strcmp(env_value, "f32-prompt") == 0 || strcmp(env_value, "f32-onewg") == 0) {
++        return 1;
++    }
+     return -1;   // not a value: the callers keep the arm off and say so (a mistyped "BF16" must not run f32)
+ }
+ 
++// 0226: the least T the model emits the op for. 0221 emitted it for T > 8 only; the reference
++// fuses exactly the other range (<= 8 rows, its check_rows), which is every decode step.
++int ggml_loop_control_min_rows(const char * env_value) {
++    const int mode = ggml_loop_control_mode(env_value);
++    if (mode <= 0) {
++        return 0;
++    }
++    if (mode == 2 || strcmp(env_value, "f32-prompt") == 0) {
++        return GGML_LOOP_CONTROL_SMALL_ROWS + 1;
++    }
++    if (strcmp(env_value, "f32-t2") == 0) {
++        return 2;
++    }
++    return 1;
++}
++
++bool ggml_loop_control_small_on(const char * env_value) {
++    return ggml_loop_control_mode(env_value) == 1 && strcmp(env_value, "f32-onewg") != 0;
++}
++
+ bool ggml_loop_control_all_layers(const char * env_value) {
+     return env_value != NULL && strcmp(env_value, "all-layers") == 0;
+ }
+@@ -4491,6 +4515,17 @@ void ggml_loop_control_plan_make(const struct ggml_tensor * dst, int n_cores, st
+     plan->local_floats = (uint64_t) rows*GGML_LOOP_CONTROL_RANK +
+                          (uint64_t) GGML_LOOP_CONTROL_NSG*GGML_LOOP_CONTROL_SG*16 +
+                          (uint64_t) GGML_LOOP_CONTROL_NSG*16;
++
++    // 0226: the small pair's launch. The strides and reaches above are the tensors' own and
++    // hold for it as they are; the scratch is the backend's, [nt][2][rank] floats.
++    plan->small  = plan->nt <= GGML_LOOP_CONTROL_SMALL_ROWS;
++    plan->out_tr = plan->nt <= 1 ? 1 : plan->nt <= 2 ? 2 : plan->nt <= 4 ? 4 : 8;
++    plan->gate_gws[0] = GGML_LOOP_CONTROL_GATE_W;
++    plan->gate_gws[1] = (uint64_t) 2*GGML_LOOP_CONTROL_RANK;
++    plan->gate_gws[2] = (uint64_t) plan->nt;
++    plan->out_gws     = (uint64_t) plan->ne0;
++    plan->gp_floats   = (uint64_t) plan->nt*2*GGML_LOOP_CONTROL_RANK;
++    plan->gate_local_floats = 2*(GGML_LOOP_CONTROL_GATE_W/GGML_LOOP_CONTROL_SG);
+ }
+ 
+ struct ggml_tensor * ggml_loop_control(
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index d6fdaaa..f994646 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -336,7 +336,10 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
+ }
+ 
+ // 0221: the loop controller's arm. GGML_OPENCL_LOOP_CONTROL set (ggml_loop_control_mode != 0)
+-// emits one ggml_loop_control for a prompt batch (more than 8 rows) on a layer whose backend
++// emits one ggml_loop_control for a batch of at least the switch's least row count (0226,
++// ggml_loop_control_min_rows: 1 for "1" / "f32" / "all-layers" / "f32-onewg", so every decode
++// step and every verify of a draft; 2 for "f32-t2"; 9, 0221's prompt batches only, for
++// "f32-prompt" and "bf16") on a layer whose backend
+ // declares the op (GGML_LOOP_CONTROL_CAPABILITY_PROC through its registry; the FA port's layer
+ // guard, fa_port_layer_attaches): every other layer - the CPU, another GPU backend, a remote
+ // one, no device - keeps the chain, so a CPU-only run with the knob set builds the graph it
+@@ -348,13 +351,18 @@ static int inkling2_loop_control_mode() {
+         const char * e = getenv("GGML_OPENCL_LOOP_CONTROL");
+         const int m = ggml_loop_control_mode(e);
+         if (m < 0) {
+-            LLAMA_LOG_WARN("GGML_OPENCL_LOOP_CONTROL=%s is not a value (0, off, 1, f32, bf16, all-layers): the chain is emitted\n", e);
++            LLAMA_LOG_WARN("GGML_OPENCL_LOOP_CONTROL=%s is not a value (0, off, 1, f32, f32-t2, f32-prompt, f32-onewg, bf16, all-layers): the chain is emitted\n", e);
+             return 0;
+         }
+         return m;
+     }();
+     return mode;
+ }
++// 0226: the least row count the op is emitted for; 0 (never) when the arm is off
++static int inkling2_loop_control_min_rows() {
++    static const int rows = inkling2_loop_control_mode() != 0 ? ggml_loop_control_min_rows(getenv("GGML_OPENCL_LOOP_CONTROL")) : 0;
++    return rows;
++}
+ static bool inkling2_loop_control_all_layers() {
+     static const bool all = ggml_loop_control_all_layers(getenv("GGML_OPENCL_LOOP_CONTROL"));
+     return all;
+@@ -390,7 +398,7 @@ static void inkling2_loop_control_refused(const void * gf, const std::string & k
+ 
+ // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
+ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl, int il) {
+-    if (inkling2_loop_control_mode() != 0 && n_tokens > 8) {
++    if (inkling2_loop_control_mode() != 0 && inkling2_loop_control_min_rows() >= 1 && n_tokens >= inkling2_loop_control_min_rows()) {
+         ggml_tensor * w[3] = { loop.ctrl_down[ctrl], loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl] };
+         // the chain's products go through build_lora_mm: an adapter, a Hadamard rotation or a
+         // precision entry on one of the three weights changes them, so the chain serves those
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 1fa0958..f53c695 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -7236,14 +7236,17 @@ struct test_depth_mix : public test_case {
+ //         BACKEND (both halves of the backend's own output), and on the CPU the same pair;
+ // mode 2: the chain alone (the perf list's knob-off arm).
+ // The shapes are the model's: n_embd 2304, rank 64; cur / msg are a mix column's view
+-// (view = 1: column 1 of a [2304, nt, 3] tensor, as ggml_depth_mix_column hands them) or plain
+-// tensors. msg runs at 10x cur and the rows at amplitudes 0.25 .. 4, so both norms' scales
++// (view = 1: column 1 of a [2304, nt, 3] tensor, as ggml_depth_mix_column hands them), plain
++// tensors, or (0226, view = 2) rows at a padded step - cur every 2nd row of a [2304, 2, nt]
++// tensor, msg every 4th of a [2304, 4, nt] one: the rule takes any row step, and a kernel that
++// steps one tensor's rows by another's stride is right on every case whose strides are equal.
++// msg runs at 10x cur and the rows at amplitudes 0.25 .. 4, so both norms' scales
+ // matter; the weights are bf16 values (as the model's F32 weights are) at scales that keep the
+ // tanh arguments near 1, unsaturated, so every red moves the output.
+ struct test_loop_control : public test_case {
+     const int64_t nt;
+     const int     mode;
+-    const bool    view;
++    const int     view;
+ 
+     std::string vars() override {
+         return VARS_TO_STR3(nt, mode, view);
+@@ -7280,7 +7283,7 @@ struct test_loop_control : public test_case {
+         return (uint64_t) 2*nt*(2*2304*64 + 2*64*2304);
+     }
+ 
+-    test_loop_control(int64_t nt = 1024, int mode = 0, bool view = false) : nt(nt), mode(mode), view(view) {}
++    test_loop_control(int64_t nt = 1024, int mode = 0, int view = 0) : nt(nt), mode(mode), view(view) {}
+ 
+     void initialize_tensors(ggml_context * ctx) override {
+         std::mt19937 gen(2211);
+@@ -7314,12 +7317,16 @@ struct test_loop_control : public test_case {
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t d = 2304, rank = 64;
+-        ggml_tensor * cur_src = view ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nt, 3) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
++        ggml_tensor * cur_src = view == 2 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 2, nt) :
++                                view ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nt, 3) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
+         ggml_set_name(cur_src, "cur_src");
+-        ggml_tensor * msg_src = view ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nt, 3) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
++        ggml_tensor * msg_src = view == 2 ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 4, nt) :
++                                view ? ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, nt, 3) : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, nt);
+         ggml_set_name(msg_src, "msg_src");
+-        ggml_tensor * cur = view ? ggml_view_2d(ctx, cur_src, d, nt, cur_src->nb[1], 1*cur_src->nb[2]) : cur_src;
+-        ggml_tensor * msg = view ? ggml_view_2d(ctx, msg_src, d, nt, msg_src->nb[1], 2*msg_src->nb[2]) : msg_src;
++        ggml_tensor * cur = view == 2 ? ggml_view_2d(ctx, cur_src, d, nt, cur_src->nb[2], 1*cur_src->nb[1]) :
++                            view ? ggml_view_2d(ctx, cur_src, d, nt, cur_src->nb[1], 1*cur_src->nb[2]) : cur_src;
++        ggml_tensor * msg = view == 2 ? ggml_view_2d(ctx, msg_src, d, nt, msg_src->nb[2], 2*msg_src->nb[1]) :
++                            view ? ggml_view_2d(ctx, msg_src, d, nt, msg_src->nb[1], 2*msg_src->nb[2]) : msg_src;
+         if (view) {
+             ggml_set_name(cur, "cur");
+             ggml_set_name(msg, "msg");
+@@ -13941,14 +13948,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     // 8-row tail, more rows than one wave's work-groups hold at 1,027), plain and as a mix
+     // column's view, then the twin against the unfused chain at the same row counts
+     for (int64_t nt : {1, 7, 9, 16, 1024, 1027}) {
+-        test_cases.emplace_back(new test_loop_control(nt, 0, false));
+-        test_cases.emplace_back(new test_loop_control(nt, 0, true));
++        test_cases.emplace_back(new test_loop_control(nt, 0, 0));
++        test_cases.emplace_back(new test_loop_control(nt, 0, 1));
++    }
++    // 0226: the reference's own range, 1 .. 8 rows (a decode step, a verify's rows): every row
++    // template of the small pair's out kernel (1, 2, 4, 8) full and with a tail (3 of 4; 5,
++    // 6 and, above, 7 of 8; 6 rows is the verify of a 5-token draft), plain and as a mix
++    // column's view; then rows at a padded step on both sides of the 8-row border (view = 2)
++    for (int64_t nt : {2, 3, 4, 5, 6, 8}) {
++        test_cases.emplace_back(new test_loop_control(nt, 0, 0));
++        test_cases.emplace_back(new test_loop_control(nt, 0, 1));
++    }
++    for (int64_t nt : {1, 2, 3, 5, 6, 8, 16, 57}) {
++        test_cases.emplace_back(new test_loop_control(nt, 0, 2));
+     }
+     // a partial 16-row tile (tvalid 9..15) on the B60's 20 cores: 300 rows = 16 rows a group, the
+     // last group 12 (a tail ubatch reaches it; review F6)
+-    test_cases.emplace_back(new test_loop_control(300, 0, true));
+-    for (int64_t nt : {9, 1024, 1027}) {
+-        test_cases.emplace_back(new test_loop_control(nt, 1, true));
++    test_cases.emplace_back(new test_loop_control(300, 0, 1));
++    for (int64_t nt : {1, 2, 4, 6, 8, 9, 1024, 1027}) {
++        test_cases.emplace_back(new test_loop_control(nt, 1, 1));
+     }
+ 
+     test_cases.emplace_back(new test_diag_mask_inf(GGML_TYPE_F32, {10, 10, 1, 1}, 5));
+@@ -15236,8 +15254,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+ 
+     // 0221: the loop controller, the op (one launch) against the chain it replaces (12 launches)
+     for (int64_t nt : {1024, 1027}) {
+-        test_cases.emplace_back(new test_loop_control(nt, 0, true));
+-        test_cases.emplace_back(new test_loop_control(nt, 2, true));
++        test_cases.emplace_back(new test_loop_control(nt, 0, 1));
++        test_cases.emplace_back(new test_loop_control(nt, 2, 1));
++    }
++    // 0226: the same pair at decode's and a verify's row counts (the op two launches, or one
++    // work-group under GGML_OPENCL_LOOP_CONTROL=f32-onewg; the chain 12)
++    for (int64_t nt : {1, 2, 4, 6, 8}) {
++        test_cases.emplace_back(new test_loop_control(nt, 0, 1));
++        test_cases.emplace_back(new test_loop_control(nt, 2, 1));
+     }
+ 
+     // Inkling 2 Mini's depth mix as one launch a call - the shape it replaced is 8 nodes

@@ -970,7 +970,9 @@ if(ARCINT_TESTS)
     set_tests_properties(taken-lines-183 PROPERTIES LABELS unit)
     # patch 0221's device-free cell: the loop controller's rule on the exported graph's
     # LOOP_CONTROL lines (red first), the launch plan, the CPU op against the unfused chain, and
-    # loop_control.cl itself replayed on host threads (f32 and bf16 builds, and the five reds)
+    # loop_control.cl itself replayed on host threads (f32 and bf16 builds, and the five reds);
+    # patch 0226: loop_control_small.cl, the pair for 1 .. 8 rows, replayed the same way with its
+    # six reds, its plan and the switch's row ranges
     add_executable(arcint-loop-control tests/test_loop_control.cpp)
     target_link_libraries(arcint-loop-control PRIVATE arcint_core)
     target_include_directories(arcint-loop-control PRIVATE

@@ -1,8 +1,8 @@
 // Patch 0221's device-free cell: Inkling 2 Mini's loop controller as one op (GGML_OP_LOOP_CONTROL).
 //
-// Every shape is read off the model's exported prefill graph (tests/loop_control_export_lines.inc:
+// Every shape is read off the model's exported graphs (tests/loop_control_export_lines.inc:
 // test-export-graph-ops lines, verbatim, at ub 512, 1024 and 2048, with and without the depth
-// mix). Four parts:
+// mix, and since 0226 at 1, 2, 3, 4, 5, 6 and 8 rows). The parts:
 //
 //  1. the rule (ggml_loop_control_refuse) on the exported calls: the tensors are built with the
 //     graph's constructors and compared with the lines' ne and nb, and every exported call must be
@@ -25,6 +25,17 @@
 //     op-case bound); the bf16 build at <= 1e-4 (its own bound). The reds of the same text
 //     (LOOP_CONTROL_RED 1..4 in the f32 build, 5 in the bf16 build) must each miss the op on every
 //     case by more than the bound.
+//
+//  5. (0226) the small pair, kernels/loop_control_small.cl, for 1 .. 8 rows - the reference's own
+//     fused range, every decode step: the plan's small launch, the switch's row ranges
+//     (ggml_loop_control_min_rows / _small_on), and a host replay of both kernels (the gate's
+//     work-groups of 64 lane threads with their sub-group reduce and barrier, the out a lane a
+//     column) through a scratch with guard floats, cur and msg at different padded row steps,
+//     against the CPU op and the chain at every row count 1 .. 8: nmse <= 1e-6. Reds of the
+//     same text: 1 - 4 must miss every case; 6 (the scratch's row step) and 7 (the tail row not
+//     stored) are defects of rows past the first, so they must miss every case of 2 .. 8 rows
+//     and must PASS the one-row case - which is why the one-row case alone proves nothing
+//     about a row step.
 //
 // What this cannot see: the device's DPAS operand layout (the emulation below encodes the
 // documented one, mul_mm_kq_f16.cl's card-proven SG16 layout), the device's tanh / sqrt, and
@@ -64,6 +75,7 @@ template <typename T, int N> struct vec {
     T &       operator[](int i)       { return s[i]; }
     const T & operator[](int i) const { return s[i]; }
 };
+typedef vec<float, 4>  float4;
 typedef vec<float, 8>  float8;
 typedef vec<float, 16> float16;
 typedef vec<short, 8>  short8;
@@ -77,11 +89,13 @@ struct wg_state {
     int8   b[32][16];
 };
 thread_local int        g_group = 0;
+thread_local int        g_gid[3] = {0, 0, 0};   // 0226: the small pair's kernels read global ids
 thread_local int        g_lid   = 0;
 thread_local wg_state * g_wg    = nullptr;
 
 inline size_t get_group_id(int)    { return (size_t) g_group; }
 inline size_t get_local_id(int)    { return (size_t) g_lid; }
+inline size_t get_global_id(int d) { return (size_t) g_gid[d]; }
 inline int    lc_host_sg()         { return g_lid / 16; }
 inline int    lc_host_lane()       { return g_lid % 16; }
 inline void   barrier(int)         { pthread_barrier_wait(&g_wg->wg); }
@@ -91,6 +105,7 @@ inline float  tanh(float x)        { return std::tanh(x); }
 inline float  fma(float a, float b, float c) { return std::fma(a, b, c); }
 inline uint   as_uint(float f)     { uint u; memcpy(&u, &f, 4); return u; }
 inline void   prefetch(const float *, int) {}
+inline float4  vload4 (size_t o, const float * p) { float4  v; for (int i = 0; i < 4;  ++i) v[i] = p[o*4  + i]; return v; }
 inline float8  vload8 (size_t o, const float * p) { float8  v; for (int i = 0; i < 8;  ++i) v[i] = p[o*8  + i]; return v; }
 inline float16 vload16(size_t o, const float * p) { float16 v; for (int i = 0; i < 16; ++i) v[i] = p[o*16 + i]; return v; }
 
@@ -183,6 +198,41 @@ LC_KERNEL_NS(k_red5)
 LC_KERNEL_END
 #undef LOOP_CONTROL_RED
 #undef LC_BF16
+// 0226: the small pair's text, green and its reds
+LC_KERNEL_NS(ks_f32)
+#include "loop_control_small.cl"
+LC_KERNEL_END
+#undef LOOP_CONTROL_RED
+#define LOOP_CONTROL_RED 1
+LC_KERNEL_NS(ks_red1)
+#include "loop_control_small.cl"
+LC_KERNEL_END
+#undef LOOP_CONTROL_RED
+#define LOOP_CONTROL_RED 2
+LC_KERNEL_NS(ks_red2)
+#include "loop_control_small.cl"
+LC_KERNEL_END
+#undef LOOP_CONTROL_RED
+#define LOOP_CONTROL_RED 3
+LC_KERNEL_NS(ks_red3)
+#include "loop_control_small.cl"
+LC_KERNEL_END
+#undef LOOP_CONTROL_RED
+#define LOOP_CONTROL_RED 4
+LC_KERNEL_NS(ks_red4)
+#include "loop_control_small.cl"
+LC_KERNEL_END
+#undef LOOP_CONTROL_RED
+#define LOOP_CONTROL_RED 6
+LC_KERNEL_NS(ks_red6)
+#include "loop_control_small.cl"
+LC_KERNEL_END
+#undef LOOP_CONTROL_RED
+#define LOOP_CONTROL_RED 7
+LC_KERNEL_NS(ks_red7)
+#include "loop_control_small.cl"
+LC_KERNEL_END
+#undef LOOP_CONTROL_RED
 #undef kernel
 #undef global
 #undef local
@@ -540,13 +590,206 @@ std::vector<float> replay(kernel_fn kfn, const case_data & c, int cores) {
     return r;
 }
 
+// ---------------------------------------------------------------------------------------
+// 5. the small pair (0226): loop_control_small.cl's two kernels on the host
+// ---------------------------------------------------------------------------------------
+typedef void (*gate_fn)(const char *, u64, u64, const char *, u64, u64, const char *, u64, u64,
+                        char *, u64, int, int, float, float *);
+typedef void (*out_fn)(const char *, u64, u64, const char *, u64, u64, const char *, u64, u64,
+                       const char *, u64, u64, const char *, u64, char *, u64, u64, int, int, int);
+
+// The launch the dispatch makes, from the same plan: the gate's work-groups one after the other,
+// GATE_W lane threads that walk the groups in step (a barrier ends each group, so no lane enters
+// the next group's local memory early); then the out, a work-item a column (it has no barrier
+// and no collective, so the items run one after the other). The scratch sits at a non-zero
+// offset between NaN guards: a read before a write, or a write past nt*2*64 floats, shows.
+std::vector<float> replay_small(gate_fn kg, out_fn ko, const case_data & c, bool * scratch_ok) {
+    const uint64_t pad  = 64;
+    const uint64_t nbc1 = (uint64_t) c.d*4 + pad, nbm1 = (uint64_t) c.d*4 + 2*pad, nbd1 = (uint64_t) c.d*4;
+    uint64_t off = 4096;
+    auto place = [&](uint64_t bytes) { const uint64_t o = off; off += (bytes + 4095)/4096*4096 + 4096; return o; };
+    const uint64_t oc = place(nbc1*c.nt), om = place(nbm1*c.nt);
+    const uint64_t ow = place(c.down.size()*4), og = place(c.gain.size()*4), of = place(c.forget.size()*4);
+    const uint64_t od = place(nbd1*c.nt) + 128;
+    std::vector<char> buf(off + 4096 + 128, 0);
+    for (int64_t r = 0; r < c.nt; ++r) {
+        memcpy(&buf[oc + r*nbc1], &c.cur[(size_t) (r*c.d)], (size_t) c.d*4);
+        memcpy(&buf[om + r*nbm1], &c.msg[(size_t) (r*c.d)], (size_t) c.d*4);
+    }
+    memcpy(&buf[ow], c.down.data(), c.down.size()*4);
+    memcpy(&buf[og], c.gain.data(), c.gain.size()*4);
+    memcpy(&buf[of], c.forget.data(), c.forget.size()*4);
+
+    ggml_init_params p = { 16*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(p);
+    ggml_tensor * big_c = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (nbc1*c.nt/4));
+    ggml_tensor * big_m = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (int64_t) (nbm1*c.nt/4));
+    ggml_tensor * cur    = ggml_view_2d(ctx, big_c, c.d, c.nt, nbc1, 0);
+    ggml_tensor * msg    = ggml_view_2d(ctx, big_m, c.d, c.nt, nbm1, 0);
+    ggml_tensor * down   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 2*c.d, 64);
+    ggml_tensor * gain   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, c.d);
+    ggml_tensor * forget = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 64, c.d);
+    ggml_tensor * dst = ggml_loop_control(ctx, cur, msg, down, gain, forget, 1e-6f);
+    ggml_loop_control_plan pl;
+    ggml_loop_control_plan_make(dst, 20, &pl);
+    ggml_free(ctx);
+    CHECK(pl.small == 1, "replay_small at %lld rows: the plan is not small", (long long) c.nt);
+    CHECK(oc + pl.reach_cur <= buf.size() && od + pl.reach_dst <= buf.size(), "replay buffer too small");
+
+    // the scratch: 16 guard floats, the plan's floats, 64 guard floats
+    const uint64_t offp = 16*4;
+    std::vector<float> gp((size_t) (16 + pl.gp_floats + 64), std::nanf(""));
+
+    const int W = (int) pl.gate_gws[0];
+    std::vector<float> slm((size_t) pl.gate_local_floats);
+    host_cl::wg_state st;
+    pthread_barrier_init(&st.wg, nullptr, (unsigned) W);
+    for (int s = 0; s < 32; ++s) pthread_barrier_init(&st.sg[s], nullptr, 16);
+    const int n1 = (int) pl.gate_gws[1], n2 = (int) pl.gate_gws[2];
+    std::vector<std::thread> th;
+    th.reserve((size_t) W);
+    for (int lid = 0; lid < W; ++lid) {
+        th.emplace_back([&, lid]() {
+            host_cl::g_lid = lid;
+            host_cl::g_wg  = &st;
+            for (int g2 = 0; g2 < n2; ++g2) {
+                for (int g1 = 0; g1 < n1; ++g1) {
+                    host_cl::g_gid[0] = lid;
+                    host_cl::g_gid[1] = g1;
+                    host_cl::g_gid[2] = g2;
+                    kg(buf.data(), oc, pl.nbc1, buf.data(), om, pl.nbm1, buf.data(), ow, pl.nbw1,
+                       (char *) gp.data(), offp, pl.ne0, pl.nt, 1e-6f, slm.data());
+                    pthread_barrier_wait(&st.wg);   // the group ends for every lane before the next begins
+                }
+            }
+        });
+    }
+    for (std::thread & t : th) t.join();
+    pthread_barrier_destroy(&st.wg);
+    for (int s = 0; s < 32; ++s) pthread_barrier_destroy(&st.sg[s]);
+
+    bool ok = true;
+    for (size_t i = 0; i < 16; ++i) ok = ok && std::isnan(gp[i]);
+    for (size_t i = 0; i < (size_t) pl.gp_floats; ++i) ok = ok && !std::isnan(gp[16 + i]);
+    for (size_t i = 0; i < 64; ++i) ok = ok && std::isnan(gp[(size_t) (16 + pl.gp_floats) + i]);
+    if (scratch_ok != nullptr) *scratch_ok = ok;
+
+    host_cl::g_lid = 0;
+    for (int d = 0; d < (int) pl.out_gws; ++d) {
+        host_cl::g_gid[0] = d;
+        host_cl::g_gid[1] = 0;
+        host_cl::g_gid[2] = 0;
+        ko(buf.data(), oc, pl.nbc1, buf.data(), om, pl.nbm1, buf.data(), og, pl.nbg1, buf.data(), of, pl.nbf1,
+           (const char *) gp.data(), offp, buf.data(), od, pl.nbd1, pl.ne0, pl.nt, pl.out_tr);
+    }
+    std::vector<float> r((size_t) (c.d*c.nt));
+    for (int64_t t = 0; t < c.nt; ++t) {
+        memcpy(&r[(size_t) (t*c.d)], &buf[od + t*nbd1], (size_t) c.d*4);
+    }
+    return r;
+}
+
+// the small launch's plan and the switch's ranges
+void check_small_plan_and_switch() {
+    ggml_init_params p = { 512*ggml_tensor_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(p);
+    for (int64_t nt = 1; nt <= 16; ++nt) {
+        call_tensors c = build_call(ctx, 2304, nt);
+        ggml_tensor * dst = ggml_loop_control(ctx, c.cur, c.msg, c.down, c.gain, c.forget, 1e-6f);
+        ggml_loop_control_plan pl;
+        ggml_loop_control_plan_make(dst, 20, &pl);
+        const int tr = nt == 1 ? 1 : nt == 2 ? 2 : nt <= 4 ? 4 : 8;
+        CHECK(pl.small == (nt <= 8 ? 1 : 0), "nt %lld: small %d", (long long) nt, pl.small);
+        if (nt <= 8) {
+            CHECK(pl.out_tr == tr && pl.out_tr >= nt, "nt %lld: out_tr %d", (long long) nt, pl.out_tr);
+            CHECK(pl.gate_gws[0] == GGML_LOOP_CONTROL_GATE_W && pl.gate_gws[1] == 128 && pl.gate_gws[2] == (uint64_t) nt,
+                  "nt %lld: the gate's global size", (long long) nt);
+            CHECK(pl.out_gws == 2304 && pl.out_gws % GGML_LOOP_CONTROL_OUT_W == 0, "nt %lld: the out's global size", (long long) nt);
+            CHECK(pl.gp_floats == (uint64_t) nt*128 && pl.gp_floats <= (uint64_t) GGML_LOOP_CONTROL_SMALL_ROWS*128,
+                  "nt %lld: the scratch %llu floats", (long long) nt, (unsigned long long) pl.gp_floats);
+            CHECK(pl.gate_local_floats == 8, "the gate's local floats %llu", (unsigned long long) pl.gate_local_floats);
+            // a lane's chunks: n_embd/4 float4 over GATE_W lanes, whole
+            CHECK((2304/4) % GGML_LOOP_CONTROL_GATE_W == 0, "the gate's lanes do not divide the row");
+            CHECK(pl.reach_cur == ggml_nbytes(c.cur) && pl.reach_msg == ggml_nbytes(c.msg) && pl.reach_dst == ggml_nbytes(dst),
+                  "nt %lld: a reach differs from its tensor", (long long) nt);
+        }
+    }
+    ggml_free(ctx);
+
+    // the switch (ggml.h, 0226): mode, the model's least row count, whether <= 8 rows take the pair
+    struct kv { const char * v; int mode; int min_rows; bool small; };
+    const kv t[] = {
+        { nullptr,      0, 0, false }, { "0",          0, 0, false }, { "off",       0, 0, false },
+        { "1",          1, 1, true  }, { "f32",        1, 1, true  }, { "all-layers", 1, 1, true },
+        { "f32-t2",     1, 2, true  }, { "f32-prompt", 1, 9, true  }, { "f32-onewg",  1, 1, false },
+        { "bf16",       2, 9, false }, { "BF16",      -1, 0, false }, { "f32-t3",    -1, 0, false },
+        { "F32",       -1, 0, false },
+    };
+    for (const kv & e : t) {
+        CHECK(ggml_loop_control_mode(e.v) == e.mode && ggml_loop_control_min_rows(e.v) == e.min_rows &&
+              ggml_loop_control_small_on(e.v) == e.small,
+              "switch value %s: mode %d min_rows %d small %d", e.v ? e.v : "(unset)", ggml_loop_control_mode(e.v),
+              ggml_loop_control_min_rows(e.v), (int) ggml_loop_control_small_on(e.v));
+    }
+    printf("small plan: 1 .. 8 rows small, out_tr 1 / 2 / 4 / 8, gate 64 x 128 x T; switch ranges hold\n");
+}
+
+// the pair against the CPU op and the chain, and its reds
+void check_small_replay() {
+    struct sarm { const char * name; gate_fn g; out_fn o; int kind; };   // kind 0 green, 1 red at every T, 2 red at T >= 2 only
+    const sarm arms[] = {
+        { "small f32",       ks_f32::kernel_loop_control_gate,  ks_f32::kernel_loop_control_out,  0 },
+        { "small RED=1",     ks_red1::kernel_loop_control_gate, ks_red1::kernel_loop_control_out, 1 },
+        { "small RED=2",     ks_red2::kernel_loop_control_gate, ks_red2::kernel_loop_control_out, 1 },
+        { "small RED=3",     ks_red3::kernel_loop_control_gate, ks_red3::kernel_loop_control_out, 1 },
+        { "small RED=4",     ks_red4::kernel_loop_control_gate, ks_red4::kernel_loop_control_out, 1 },
+        { "small RED=6",     ks_red6::kernel_loop_control_gate, ks_red6::kernel_loop_control_out, 2 },
+        { "small RED=7",     ks_red7::kernel_loop_control_gate, ks_red7::kernel_loop_control_out, 2 },
+    };
+    const double bound = 1e-6;
+    double worst = 0.0, least[7];
+    for (double & v : least) v = 1e30;
+    for (int64_t nt : {1, 2, 3, 4, 5, 6, 7, 8}) {
+        const case_data c = make_case(nt, 2000u + (uint32_t) nt);
+        const std::vector<float> op    = cpu_eval(c, false);
+        const std::vector<float> chain = cpu_eval(c, true);
+        for (int a = 0; a < 7; ++a) {
+            const sarm & A = arms[a];
+            bool scratch_ok = false;
+            const std::vector<float> k = replay_small(A.g, A.o, c, &scratch_ok);
+            const double e_op = nmse(k, op), e_ch = nmse(k, chain);
+            printf("replay %-12s nt %lld: nmse vs CPU op %.3g, vs chain %.3g (bound %.0e)\n", A.name, (long long) nt, e_op, e_ch, bound);
+            CHECK(scratch_ok, "%s nt %lld: the scratch was read unwritten or written past its floats", A.name, (long long) nt);
+            if (A.kind == 0) {
+                worst = std::max(worst, std::max(e_op, e_ch));
+                CHECK(e_op <= bound && e_ch <= bound, "%s nt %lld: above its bound", A.name, (long long) nt);
+            } else if (A.kind == 1 || nt >= 2) {
+                least[a] = std::min(least[a], e_op);
+                CHECK(e_op > bound, "%s nt %lld: the red passes (nmse %.3g)", A.name, (long long) nt, e_op);
+            } else {
+                // a row-step or tail-row defect cannot show on one row: stated, and asserted
+                CHECK(e_op <= bound, "%s nt 1: a defect of rows past the first shows on one row (nmse %.3g)", A.name, e_op);
+            }
+        }
+    }
+    printf("summary small: f32 worst %.3g; reds least", worst);
+    for (int a = 1; a < 7; ++a) printf(" %s %.3g", arms[a].name + 6, least[a]);
+    printf("\n");
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
     const bool quick = argc > 1 && strcmp(argv[1], "quick") == 0;
     const std::vector<export_line> ex = parse_export();
     printf("export lines: %zu\n", ex.size());
-    CHECK(ex.size() == 6, "expected 6 export lines, got %zu", ex.size());
+    CHECK(ex.size() == 13, "expected 13 export lines (6 prompt, 7 of 1 .. 8 rows), got %zu", ex.size());
+    {
+        // 0226: the seven small-row lines are the rows the model now emits the op for
+        int n_small = 0;
+        for (const export_line & l : ex) n_small += l.ne[1] <= GGML_LOOP_CONTROL_SMALL_ROWS ? 1 : 0;
+        CHECK(n_small == 7, "expected 7 export lines of at most 8 rows, got %d", n_small);
+    }
 
     // 1. the rule, red first
     g_quiet = true;
@@ -618,6 +861,10 @@ int main(int argc, char ** argv) {
             }
         }
     }
+    // 5. the small pair (0226)
+    check_small_plan_and_switch();
+    check_small_replay();
+
     printf("summary: CPU op vs chain worst %.3g; replay f32 worst %.3g, bf16 worst %.3g; reds least",
            worst_cpu_chain, worst[0], worst[1]);
     for (int a = 2; a < 7; ++a) printf(" %s %.3g", arms[a].name, least_red[a]);

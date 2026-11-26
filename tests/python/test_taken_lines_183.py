@@ -11,6 +11,8 @@ depth mix's TAKEN line to WARN for that reason. The 1.8.3 items' lines, read fro
   0221 loop control  "loop_control: TAKEN opencl "                               INFO under a static bool before
                                                                                   0224; WARN, call_once since
   0222 64-pair tile  "TAKEN src=opencl op=MUL_MAT_ID type=%s path=xt64"         WARN, call_once (two sites)
+  0226 loop control, "loop_control: TAKEN opencl f32 small two-launch"          WARN, call_once (0226): the small pair
+       <= 8 rows                                                                  of a decode step has a line of its own
 
 The cell asserts for each: its GGML_LOG_* macro is one route_llama_log shows outside -v, and every call site is
 inside a std::call_once on a static std::once_flag (an element of a static once_flag array for a line a mode). It
@@ -34,6 +36,7 @@ LINES = [
     ("0220", r"TAKEN src=opencl op=MUL_MAT type=q8_0 path=2d-%s k=%d m=%d n=%d wg=%dx%d\n", 1, "mode"),
     ("0221", r"loop_control: TAKEN opencl %s one-launch rows_wg=%d n_wg=%d\n", 1, None),
     ("0222", r"TAKEN src=opencl op=MUL_MAT_ID type=%s path=xt64 tile=64 skip=1\n", 2, None),
+    ("0226", r"loop_control: TAKEN opencl f32 small two-launch rows=%d gate_wg=%d out_tr=%d\n", 1, None),
 ]
 
 
