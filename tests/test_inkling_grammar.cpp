@@ -215,8 +215,9 @@ TEST(inkling_each_reject_logs_its_own_reason) {
 TEST(inkling_grammar_names_the_declared_tools_and_the_reference_trigger) {
     const std::string g = generate_inkling_tool_grammar(ink_tools());
     CHECK(g.find("root ::= ink-call") != std::string::npos);
-    CHECK(g.find("\"bash<|content_invoke_tool_json|>{\\\"name\\\":\\\"bash\\\",\\\"args\\\":\"") != std::string::npos);
-    CHECK(g.find("\"read_file<|content_invoke_tool_json|>") != std::string::npos);
+    CHECK(g.find("\"bash\" ink-name-ws \"<|content_invoke_tool_json|>{\\\"name\\\":\\\"bash\\\",\\\"args\\\":\"") !=
+          std::string::npos);
+    CHECK(g.find("\"read_file\" ink-name-ws \"<|content_invoke_tool_json|>") != std::string::npos);
     CHECK(g.find("\\x00-\\x1F") != std::string::npos);   // the strict string rule
     CHECK(generate_inkling_tool_grammar({}).empty());
     // mainline's trigger (inkling.cpp, grammar_triggers: <\|message_model\|>([^<])),
