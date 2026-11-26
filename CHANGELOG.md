@@ -44,6 +44,18 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   thinking block that spells the call syntax with a raw TAB inside leaves the grammar dormant and the turn ends by
   itself, mask on and off, while the same turn with the tracker unarmed wakes the grammar inside the block; in the
   token-id layout no thinking token reaches the constraint. Not yet served on a card.
+  After review: the trigger skips whitespace after the header (`<\|message_model\|>\s*([^<\s])`) and the grammar
+  admits it before the call marker, since the parser trims the name: with mainline's trigger a space after the header
+  desynced the grammar and the call ran unconstrained; a header, layout and a content marker is still no call. A
+  `\u` escape may not be a lone surrogate (nlohmann refuses one). The Inkling 1 refusal reads the prompt's last token
+  ids, layout after the header ignored, so a request given as ids is judged too; it happens before the prefill. The
+  name / args reason no longer quotes the header's name (model text), and the "no `{`" reject keeps the text before
+  the block. Known limit, counted: the grammar is dormant in the first thinking block of a turn only; a trigger after
+  a later thinking block logs one line and adds `grammar after a later think block 1` to the decode line. The dormant
+  trigger's search of the turn's text costs 67 us a token after 2,000 tokens and 530 us after 16,000
+  (`tools/inkling_trigger_cost.cpp`, `measured-here` on the recipe host's CPU; mainline's trigger the same; bounded to
+  the tail from the last header start, 0.3 us). `<|content_model_end_sampling|>` is the GGUF's eos and eot id
+  (`measured-here`, metadata of ggml-org's IQ4_NL file), so a completed call can end the turn.
 - **Context checkpoints again at q8_0 / q4_0 K/V for a sliding-window cache on OpenCL** (Inkling 2 Mini at its unit's
   q8_0, Dory1.0-4B with `--llama-swa-window`). 1.8.1 and 1.8.2 kept none there, because the restore's writes through
   views of the K / V tensors were dropped (positions restored, bytes not); patch 0209 performs them. The refusal now
