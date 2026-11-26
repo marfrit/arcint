@@ -12132,6 +12132,15 @@ rule takes any row step, and a kernel that steps one tensor by another's stride 
 equal - and twins at 1, 2, 4, 6 and 8 rows beside 0221's. Bound, stated before the card run: **1e-6** (the pair
 reorders sums only; host replay 3.8e-13). Perf: the op and the chain at 1, 2, 4, 6 and 8 rows.
 
+**Recipe** (`measured-here`, the recipe host, the commit that adds 0226): `RECIPE ffc4c6d4: 100% tests passed, 0 tests
+failed out of 58 EXIT 0` - the series applies from the pin in byte order (173 patches, applied tree
+`c1934f36dab2bf0007c42bf9c64c7d22f339a1d1`; the series without 0226 `3208b64d6bb6b03f711a3168c76efb8a66cf6c06`),
+`loop-control` (25.4 s) and `taken-lines-183` among the unit tests. This paragraph is README text added after that run.
+The recipe builds no llama test: test-backend-ops was compiled and linked in a separate llama build of the applied
+tree (its 41 LOOP_CONTROL cases run on the CPU backend there, 41/41, which proves they are found and do not abort,
+nothing about a device); the last change to `loop_control_small.cl` after that build (the gate's duplicate load of
+its row dropped) was checked by ocloc and the host replay, not by another llama build.
+
 **Card rows (written, not run), in this order** (the B60, the unit's own Environment lines with any
 `GGML_OPENCL_LOOP_CONTROL` replaced by the arm's; q8_0 K/V, ub 1,024; `G` the published Inkling 2 Mini IQ4_NL).
 Three arms: **pre** = the series without 0226, `=f32` (the op above 8 rows only); **new** = this tree, `=f32`;
