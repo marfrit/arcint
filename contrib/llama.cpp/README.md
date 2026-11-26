@@ -8449,6 +8449,8 @@ logged for all three types, none with the switch at 0 (the red case); MUL_MAT 29
 was not run: its id takes the unchanged branch (`code`). The real gap (the fp16 Q5_K and
 Q6_K GEMMs at bandwidth) needs a structural change, an int8 path for those types,
 not a tile.
+That path will not be built: the operator decided on 2026-11-26 that Q6_K and Q5_K weights are never computed through
+an int8 requantised copy, for correctness (`docs/decisions/2026-11-26-no-int8-requantised-q6k-q5k.md`).
 
 ## 0133-inkling2-arch-and-hparams.patch
 

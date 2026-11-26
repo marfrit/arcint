@@ -20,6 +20,11 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased
 
+- **Decision record: no int8 requantised path for Q6_K and Q5_K.** The operator decided (2026-11-26) that Q6_K and
+  Q5_K weights are never computed through an int8 copy, not as a default and not as an opt-in: the few percent of
+  decode (an inferred 3-4 % for the 27B, never measured) are not worth a lossy, likely cumulative error that KL on
+  short text can hide. Lossy arms elsewhere stay opt-in and need an agent-level check before any default.
+  `docs/decisions/2026-11-26-no-int8-requantised-q6k-q5k.md`.
 - **`--tool-grammar` for Inkling 2 Mini, and the reject reason in the tool-call log line.** A served Inkling unit
   returned a correctly framed bash call as raw content, twice (`measured-here`): the "command" string held
   tab-indented C copied raw into a heredoc, the JSON inside the block held a raw TAB, and the parser's `json::parse`
