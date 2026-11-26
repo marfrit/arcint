@@ -276,7 +276,7 @@ index e83801ad0..631fad5be 100644
              CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &partbuf->buffer));
              CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &bo));
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
-index 0a165caf0..28ee88e07 100644
+index 0a165caf0..526f1af16 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 @@ -208,6 +208,52 @@ uint8   __builtin_IB_subgroup_block_read_flat_transform_u8_k32(long base, int w,
@@ -301,7 +301,7 @@ index 0a165caf0..28ee88e07 100644
 +#define PORT_V4 0
 +#endif
 +#if PORT_V4 && !PORT_KV8
-+#error "PORT_V4 is the q8_0 K build's (K q8_0, V q4_0)"
++#error "PORT_V4 is the q8_0 K build's: K q8_0, V q4_0"
 +#endif
 +#if PORT_V4
 +#define HB4 (DKQ / 32 * 18)   // q4_0: bytes a (key, kv head)
