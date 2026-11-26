@@ -1,0 +1,42 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index b741e0de3..c5c8bdc94 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10073,7 +10073,7 @@ struct test_flash_attn_ext : public test_case {
+         // run, on a basis independent of the split result: the UNSPLIT f16 port's own error against the CPU
+         // reference was 3.88e-5 on the card (the older f16 port cases), so 0223b's 1e-5 sat below the kernel's
+         // floor by construction (the split f16 cases measured 4.3e-5). A lost seam block (RED=13) still moves
+-        // these cases' f16 answer above it: NMSE 1.76e-4 .. 3.5e-4 (a numpy model of the cases, and
++        // these cases' f16 answer above it: NMSE 1.76e-4 .. 3.55e-4 (a numpy model of the cases, and
+         // GGML_TEST_FA_PORT_SEAM=1 on the CPU backend; 1.75e-4 .. 3.82e-4 on the card). The sharper check of the
+         // split itself is against the UNSPLIT port's output (GGML_TEST_FA_PORT_DUMP): 1.6e-9 .. 5.9e-8 on the card,
+         // bound 1e-5, which RED=13 exceeds by 17x or more
+@@ -16475,9 +16475,10 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+ // case. The kernel's RED=13 skips the first 32-key block of every split >= 1; here those cells are taken as
+ // empty (the same keys missing) and the CPU's answer is compared with the case's own, at the split the
+ // rule gives on the B60 (200) and the B70 (320). The red is visible only if that NMSE is above the case's
+-// bound: each must be, or the check fails (the case is too blunt for the red); the factor is printed. (0223c: with
+-// the f16 split bound at 1e-4 the smallest factor is about 1.8, case kv 16384 x nb 64 on the B60's split; 0223b asked
+-// 10x of a 1e-5 bound.)
++// bound by a margin, or the check fails (the case is too blunt for the red); the factor is printed. The margin is per
++// type (0223d): the q8_0 cells 10x of their 1e-5 bound, as 0223b asked (they stand at 17.3x .. 3,046x); the f16 cells
++// 1.5x of their 1e-4 bound since 0223c (they stand at 1.76x .. 307x; the smallest, 1.76x, is case kv 16384 x nb 64 on
++// the B60's split). 0223c had relaxed both to 1x.
+ static bool test_fa_port_seam(ggml_backend_t backend) {
+     auto run = [&](test_flash_attn_ext & tc, std::vector<float> & out) {
+         ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
+@@ -16514,10 +16515,11 @@ static bool test_fa_port_seam(ggml_backend_t backend) {
+             double num = 0.0, den = 0.0;
+             for (size_t e = 0; e < ref.size(); ++e) { const double d = (double) out[e] - ref[e]; num += d*d; den += (double) ref[e]*ref[e]; }
+             const double nmse = den > 0.0 ? num/den : 0.0, bound = base.max_nmse_err();
+-            const bool ok = nmse > bound;
+-            printf("  seam %s kv=%lld nb=%lld n_empty=%lld wave %d p %d: a lost seam block moves the answer by nmse %.3g, bound %.3g (x%.1f): %s\n",
++            const double margin = fa->type_K == GGML_TYPE_Q8_0 ? 10.0 : 1.5;   // 0223d: per type, see above
++            const bool ok = nmse > margin * bound;
++            printf("  seam %s kv=%lld nb=%lld n_empty=%lld wave %d p %d: a lost seam block moves the answer by nmse %.3g, bound %.3g (x%.2f, needs x%.1f): %s\n",
+                    ggml_type_name(fa->type_K), (long long) fa->kv, (long long) fa->nb, (long long) fa->n_empty, wave, p, nmse, bound,
+-                   bound > 0.0 ? nmse / bound : 0.0, ok ? "visible" : "FAIL, not above the bound");
++                   bound > 0.0 ? nmse / bound : 0.0, margin, ok ? "visible" : "FAIL, under the margin");
+             n_fail += !ok; n_run++;
+         }
+     }

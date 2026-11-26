@@ -10066,9 +10066,11 @@ unit's settings).
   closest cell is kv 16384 x nb 64 with 8,000 empty cells at the B60's split (1.76e-4). It detects a whole lost seam
   block only; one lost seam of a call's two would sit near half of that, under the bound (`inference`).
   `GGML_TEST_FA_PORT_SEAM=1` now asks the red to be above the bound (it asked 10x of 1e-5) and prints the factor.
-- **Open, proposed as 0223d (not built):** the seam check's relaxation reaches the q8_0 cells too, whose bound did not
-  move (they still stand at 17x or more of 1e-5): keep 10x there and a margin above 1x for f16, e.g. `nmse > (bound <=
-  1e-5 ? 10.0 : 1.5) * bound`; and the case comment's rounding ("3.5e-4", "about 1.8") to 3.55e-4 and 1.76x.
+- **Since 0223d** (`0223d-flash-attn-port-seam-margin.patch`, tests only): `GGML_TEST_FA_PORT_SEAM=1` asks the red
+  above the bound by a margin per type, the stricter direction (accepted by the operator): the q8_0 cells 10x of their
+  unchanged 1e-5, as 0223b did (they stand at 17.3x to 3,046x), the f16 cells 1.5x of 1e-4 (1.76x to 307x; the
+  smallest is case kv 16384 x nb 64 on the B60's split). 0223c had relaxed both to 1x. The case comment's rounding is
+  3.55e-4 and 1.76x.
 
 ## 0208-test-backend-ops-inkling-expert-projection-perf.patch
 
