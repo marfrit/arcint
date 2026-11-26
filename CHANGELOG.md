@@ -28,8 +28,19 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   the new configuration above every round of the unit: prefill at 4k +17.9 % (1,304 against 1,106 t/s), at 32k
   +20.0 % (1,096 against 913), decode at depth 0 +9.4 % (42.96 against 39.27), at 32k +9.1 % (31.38 against 28.76).
   Token level the 8:4 cache costs what was known when it was chosen: KL against the CPU reference 0.0084 against
-  0.0026 at 2k and 0.0151 against 0.0059 at 32k, top-1 -1.4 to -1.7 pt. The units are unchanged in this entry; an
-  agent-level check comes first.
+  0.0026 at 2k and 0.0151 against 0.0059 at 32k, top-1 -1.4 to -1.7 pt. The agent-level check, one run on this
+  configuration (a served unit, the pi agent, thinking medium; `measured-here`, verified on an x64 build host): the
+  JIT task of the earlier agent runs (35 "bad argument type" trace aborts in one benchmark script: a fix, a regression
+  test and the CI script), the same base and prompt. PASS: one commit after ~120 min (190 turns, 189 tool calls);
+  the abort count 35 -> 0 (4 loop-unroll aborts remain, unrelated); output with the JIT on and off byte-identical; the
+  CI script's every stage passing; the new regression test failing on the unfixed base and passing on the fix; the
+  garbage check that the 8:8 run's fix had failed (2e7 float writes) bounded at 263 KB with the JIT on (44 KB off;
+  the 8:8 fix: 964,919 KB); the formatting and int64 cases byte-identical to the reference interpreter. Agent level:
+  0 thinking loops (the 8-gram rule), 0 duplicate calls, 0 call leaks, 4 tool errors, 1 failed build along the way;
+  the grammar armed on 190 turns with 0 masked draws and 0 rejects; no card fault. Next to the earlier runs (one each,
+  not a rate): 8:8 passed in 66 min with the garbage defect in its fix, 8:4 with the port off passed in 129 min, every
+  switch without the grammar did not finish and leaked two calls. The units are unchanged in this entry: the unit
+  change is the operator's.
 - **Decision record: no int8 requantised path for Q6_K and Q5_K.** The operator decided (2026-11-26) that Q6_K and
   Q5_K weights are never computed through an int8 copy, not as a default and not as an opt-in: the few percent of
   decode (an inferred 3-4 % for the 27B, never measured) are not worth a lossy, likely cumulative error that KL on
