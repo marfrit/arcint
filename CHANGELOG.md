@@ -20,6 +20,16 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased
 
+- **Inkling 2 Mini at 8:4 K/V with every 1.8.3 switch, measured as one configuration** (the operator's target,
+  2026-11-26: q8_0:q4_0, `GGML_OPENCL_Q8_2D=1`, `GGML_OPENCL_KQ_MM_ID_I8_XT=64`, `GGML_OPENCL_LOOP_CONTROL=f32`,
+  `GGML_OPENCL_FA_PORT_SPLIT=1`, `--tool-grammar`, on the series with 0225 and 0226), against the 1.8.2 unit at 8:8
+  (B60, `measured-here`). Answers: the capital, the needles at 44k and 131k right on both; the Lua CSV acceptance
+  battery 9 / 10 runs at 10 / 10 against the unit's 7 / 10 (sampled, N = 10). Speed, 3 rotated rounds, every round of
+  the new configuration above every round of the unit: prefill at 4k +17.9 % (1,304 against 1,106 t/s), at 32k
+  +20.0 % (1,096 against 913), decode at depth 0 +9.4 % (42.96 against 39.27), at 32k +9.1 % (31.38 against 28.76).
+  Token level the 8:4 cache costs what was known when it was chosen: KL against the CPU reference 0.0084 against
+  0.0026 at 2k and 0.0151 against 0.0059 at 32k, top-1 -1.4 to -1.7 pt. The units are unchanged in this entry; an
+  agent-level check comes first.
 - **Decision record: no int8 requantised path for Q6_K and Q5_K.** The operator decided (2026-11-26) that Q6_K and
   Q5_K weights are never computed through an int8 copy, not as a default and not as an opt-in: the few percent of
   decode (an inferred 3-4 % for the 27B, never measured) are not worth a lossy, likely cumulative error that KL on
@@ -48,7 +58,14 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   TAB without the grammar (the call lost) and `\t` with it (the call parsed, the decoded command holding the tabs); a
   thinking block that spells the call syntax with a raw TAB inside leaves the grammar dormant and the turn ends by
   itself, mask on and off, while the same turn with the tracker unarmed wakes the grammar inside the block; in the
-  token-id layout no thinking token reaches the constraint. Not yet served on a card.
+  token-id layout no thinking token reaches the constraint. On the card (B60, served, `measured-here`): the tab
+  heredoc, the call-syntax reasoning with the thinking mask off and on, two calls in one turn and the forced reject
+  with its reason line all pass, and decode with the grammar on equals off (37.19 / 37.14 / 37.18 against 37.12 /
+  37.19 / 37.20 t/s). The model escapes every TAB itself at the unit's sampler and at temperature 1.8, so the masking
+  was exercised through a test-only bias (`ARCINT_TEST_TOOL_TAB_BIAS`, not in this release): masking proven on CPU on
+  the GPT-2 and the Inkling 2 Mini vocabularies (red-checked), and exercised on the card: under a raw-TAB bias of
+  +24 to +48, every call valid with no raw tab in a string (28 / 28), where the unmasked control at the same bias
+  leaks raw tabs into the strings (+24: 3 / 3) or destroys the call (+32 / +48: 0 / 6 formed).
   After review: the trigger skips whitespace after the header (`<\|message_model\|>\s*([^<\s])`) and the grammar
   admits up to 8 bytes of it before the call marker, since the parser trims the name: with mainline's trigger a space after the header
   desynced the grammar and the call ran unconstrained; a header, layout and a content marker is still no call. A
@@ -147,15 +164,25 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   to the previous series' at 1 to 1,024 rows). Removes the keys `op=MUL_MAT type=f32 k=64 cols=1-4` (2 to 4-row
   batches) and `cols=5-15` at 5 to 8 rows. 25 more test cases, red builds 6 and 7. Built and checked without a card (the pair replayed on host
   threads against the CPU op and the chain, ocloc on both cards' targets, the device-free emission and model
-  checks); not yet run on a card: whether two launches beat twelve at one row is the card's question, and the switch
-  has a value for either answer (`contrib/llama.cpp/README.md`, 0226).
+  checks). On the card (B60, 8:4 K/V and the 1.8.3 switches, `measured-here`): the device cases 41 / 41 (worst NMSE
+  2.1e-13), the red builds caught; a control 6.1 us at one row against the chain's 25.8 us in the served profile;
+  KL paired on the same chunks at one-row decode -0.00002 nats and -0.08 pt top-1 against the series without 0226,
+  2k and 32k identical, the direct on-vs-off KL 0.00063; plain decode in 3 rotated rounds +9.3 % at depth 0 (39.24 ->
+  42.90 t/s) and +6.6 % at 32k (29.45 -> 31.39), every round of the new arm above every round of the old; 6 rows a
+  step +13.2 %; served decode +8.9 % (37.70 -> 41.04 t/s); the k=64 cols=1-4 key gone. The reference's int8 weights
+  are not taken (`docs/decisions/2026-11-26-no-int8-requantised-q6k-q5k.md`'s scope) (`contrib/llama.cpp/README.md`,
+  0226).
 - llama.cpp patches 0225 / 0225b (with `GGML_OPENCL_FA_PORT=1`): the FA port reads a q8_0 K with a q4_0 V in place, the
   Inkling unit's 8:4 cache. Before it an 8:4 cache ran port-off: its 9 to 64-row bias batches went to the CPU and the
   key split could not act. A build of its own (`PORT_V4`), the q8_0 build's K and a q4_0 V read; the TAKEN line
   `port=fa_kern kv=q8_0:q4_0`, once a process. The scale in P is `p d 8` (q4_0's d is signed and 16 times q8_0's:
   q8_0's `p d 128` left f16 above a block maximum of 4,094 and gave NaN rows for a negative d). Nine test cases (the
   q8_0 port shapes, the split shapes and a large-V case), red builds 14 / 15 / 16. Built and checked without a card (the gate unit red / green, ocloc on both cards' targets, the
-  device-free checks); not yet run on a card (`contrib/llama.cpp/README.md`, 0225).
+  device-free checks). On the card (B60, `measured-here`): the red builds caught (the nibble swap, the next block's
+  scale, the old scale line on the large-V case with a finite error); the q8_0:q4_0 cases 31 / 31, split against
+  unsplit within 1e-5; KL of 0225 plus the 1.8.3 switches against 8:4 port-off at 2k -0.0004 nats / -0.13 pt and at
+  32k +0.00003 nats / -0.25 pt; served: the TAKEN line, the 44k needle right with 288 split calls, the row-blocks
+  fallback gone (`contrib/llama.cpp/README.md`, 0225).
 - llama.cpp patch 0223d (tests only): the device-free seam check (`GGML_TEST_FA_PORT_SEAM=1`) asks a lost seam block
   to stand 10x above the bound for the q8_0 split cases (their bound unchanged at 1e-5, as before 0223c) and 1.5x for
   the f16 ones (bound 1e-4): every cell clears it, the smallest at 1.76x (f16) and 17.3x (q8_0) (`inference`, a
