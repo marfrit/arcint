@@ -131,6 +131,13 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   unchanged. The sharper evidence is the split against the unsplit port, 1.6e-9 to 5.9e-8 per case (`measured-here`,
   bound 1e-5); a lost seam block still exceeds the new bound, at 1.76x. The red of record for the split is the split-vs-unsplit comparison (bound 1e-5, RED=13 at 17x or more), a window procedure (`GGML_TEST_FA_PORT_DUMP` plus an external compare), not a verdict the binary prints; the f16 CPU-referenced bound detects only a whole lost seam block (1.76x). (`contrib/llama.cpp/README.md`,
   0223c).
+- llama.cpp patches 0225 / 0225b (with `GGML_OPENCL_FA_PORT=1`): the FA port reads a q8_0 K with a q4_0 V in place, the
+  Inkling unit's 8:4 cache. Before it an 8:4 cache ran port-off: its 9 to 64-row bias batches went to the CPU and the
+  key split could not act. A build of its own (`PORT_V4`), the q8_0 build's K and a q4_0 V read; the TAKEN line
+  `port=fa_kern kv=q8_0:q4_0`, once a process. The scale in P is `p d 8` (q4_0's d is signed and 16 times q8_0's:
+  q8_0's `p d 128` left f16 above a block maximum of 4,094 and gave NaN rows for a negative d). Nine test cases (the
+  q8_0 port shapes, the split shapes and a large-V case), red builds 14 / 15 / 16. Built and checked without a card (the gate unit red / green, ocloc on both cards' targets, the
+  device-free checks); not yet run on a card (`contrib/llama.cpp/README.md`, 0225).
 - llama.cpp patch 0223d (tests only): the device-free seam check (`GGML_TEST_FA_PORT_SEAM=1`) asks a lost seam block
   to stand 10x above the bound for the q8_0 split cases (their bound unchanged at 1e-5, as before 0223c) and 1.5x for
   the f16 ones (bound 1e-4): every cell clears it, the smallest at 1.76x (f16) and 17.3x (q8_0) (`inference`, a
