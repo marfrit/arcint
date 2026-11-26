@@ -1,5 +1,5 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c5c8bdc94..bb95361e7 100644
+index c5c8bdc94..1fa095839 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -10008,6 +10008,9 @@ struct test_flash_attn_ext : public test_case {
@@ -67,7 +67,7 @@ index c5c8bdc94..bb95361e7 100644
                      GGML_ASSERT(off + i1*tv->nb[1] + i2*tv->nb[2] + rb <= buf.size());
                  }
                  // the base's only write, and all of it: offset 0, its full byte size (zero where
-@@ -14860,6 +14869,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14860,6 +14869,32 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                  1, 0, 0, c[2], 0.0f, 1));
          }
      }
@@ -91,15 +91,16 @@ index c5c8bdc94..bb95361e7 100644
 +    }
 +    // 0225: the large-V case: V's values x 4,000 (block maxima 1,000 .. 8,000, about half of the blocks with a
 +    // positive maximum, so a negative q4_0 d, |d| up to 1,000). The scale in P is p d 8 (the kernel's PORT_V4
-+    // header), in f16's range for all of them; RED=16 (q8_0's p d 128, clamped above only) must FAIL it with
-+    // non-finite rows (-inf in P where d < -511.75 and p is near 1). Bound: 1e-5, as the other q8_0:q4_0 cases
++    // header), in f16's range for all of them; RED=16 (q8_0's p d 128, clamped above only) must FAIL it: by a finite
++    // error where the fmin clamps a d > 511.75 (up to about half the block's value), or by -inf in P where
++    // d < -511.75 and p > 65504 / (128 |d|). Bound: 1e-5, as the other q8_0:q4_0 cases
 +    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1040, 20, true, true, 0, 0,
 +        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
 +        1, 0, 0, 17, 0.0f, 0, 4000.0f));
      // 0199: a table whose pad bin is not zero, with keys far past the extent (2,200 keys, no
      // window): the port must read the bin (GGML_OPENCL_FA_PORT_RED=4 assumes zero and must
      // FAIL this case), and its twin gives today's kernels the same table
-@@ -15282,6 +15316,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -15282,6 +15317,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                  1, 0, 0, c[2], 0.0f, 1));
          }
      }
@@ -112,7 +113,7 @@ index c5c8bdc94..bb95361e7 100644
      // 0223: the price of the 128-block floor (a scoping choice against 0045 / CUDA, which have none):
      // the 4k global call the floor keeps unsplit (kv 4096 x nb 1024) and the short turn it limits
      // (kv 8192 x nb 32: p 2 with the floor, p 6 on the B60 without it). Not split cases: the window runs
-@@ -16183,6 +16223,10 @@ static const int FA_PORT_EVAL_PORT2_Q8  = 2;
+@@ -16183,6 +16224,10 @@ static const int FA_PORT_EVAL_PORT2_Q8  = 2;
  // at the B60's wave (200) and the B70's (320) once GGML_OPENCL_FA_PORT_SPLIT=1
  static const int FA_PORT_EVAL_SPLIT     = 3;
  static const int FA_PORT_EVAL_SPLIT_Q8  = 3;
@@ -123,7 +124,7 @@ index c5c8bdc94..bb95361e7 100644
  
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
  
-@@ -16195,13 +16239,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+@@ -16195,13 +16240,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
  static bool test_fa_port_decisions() {
      const bool red = getenv("GGML_TEST_FA_PORT_ROUTE_RED") != nullptr;
      auto cases = make_test_cases_eval();
@@ -140,7 +141,7 @@ index c5c8bdc94..bb95361e7 100644
          if (fa->port == 2) {
              if (q8) { n2_q8++; continue; }
              n2++; n2_pad += fa->pad_bias != 0.0f;
-@@ -16216,8 +16261,8 @@ static bool test_fa_port_decisions() {
+@@ -16216,8 +16262,8 @@ static bool test_fa_port_decisions() {
                     (long long) fa->kv, (long long) fa->nb, (long long) fa->n_empty, p60, p70,
                     fa_port_split_blocks(fa->kv, p60), fa_port_split_blocks(fa->kv, p70), sok ? "OK" : "FAIL, a split case the rule does not split");
              n_fail += !sok;
@@ -151,7 +152,7 @@ index c5c8bdc94..bb95361e7 100644
          ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
          ggml_context * ctx = ggml_init(params);
          ggml_tensor * op = fa->build_graph(ctx);
-@@ -16229,8 +16274,10 @@ static bool test_fa_port_decisions() {
+@@ -16229,8 +16275,10 @@ static bool test_fa_port_decisions() {
              lau[gqa_wide] = fa_port_gate_at_launch(op, red ? 0 : 1, gqa_wide, 1, 4096, 256, 1, &wl[gqa_wide]);
              ok = ok && sup != 0 && lau[gqa_wide] == sup;
          }
@@ -164,7 +165,7 @@ index c5c8bdc94..bb95361e7 100644
                 sup ? "ACCEPT" : "refuse ", sup ? "" : ws, lau[0] ? "ACCEPT" : "refuse ", lau[0] ? "" : wl[0],
                 lau[1] ? "ACCEPT" : "refuse ", lau[1] ? "" : wl[1], ok ? "OK" : "FAIL");
          n_fail += !ok;
-@@ -16239,9 +16286,10 @@ static bool test_fa_port_decisions() {
+@@ -16239,9 +16287,10 @@ static bool test_fa_port_decisions() {
      const bool counts = n1 == FA_PORT_EVAL_PORT1 && n1_pad == FA_PORT_EVAL_PORT1_PAD &&
                          n2 == FA_PORT_EVAL_PORT2 && n2_pad == FA_PORT_EVAL_PORT2_PAD &&
                          n1_q8 == FA_PORT_EVAL_PORT1_Q8 && n2_q8 == FA_PORT_EVAL_PORT2_Q8 &&
@@ -178,7 +179,7 @@ index c5c8bdc94..bb95361e7 100644
             counts ? "as the table says" : "FAIL, the table above is stale");
      printf("  port decisions%s: %s\n", red ? " (the old dispatch order)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
      return n_fail == 0 && counts;
-@@ -16517,14 +16565,14 @@ static bool test_fa_port_seam(ggml_backend_t backend) {
+@@ -16517,14 +16566,14 @@ static bool test_fa_port_seam(ggml_backend_t backend) {
              const double nmse = den > 0.0 ? num/den : 0.0, bound = base.max_nmse_err();
              const double margin = fa->type_K == GGML_TYPE_Q8_0 ? 10.0 : 1.5;   // 0223d: per type, see above
              const bool ok = nmse > margin * bound;

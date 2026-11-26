@@ -311,7 +311,7 @@ index e83801ad0..61d33f9e4 100644
              CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &partbuf->buffer));
              CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &bo));
 diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
-index 0a165caf0..a22c71e1d 100644
+index 0a165caf0..8012e1bc2 100644
 --- a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 +++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
 @@ -106,7 +106,8 @@
@@ -334,7 +334,7 @@ index 0a165caf0..a22c71e1d 100644
  #define HB8 (DKQ / 32 * 34)   // q8_0: bytes a (key, kv head)
  #define NB8 (DKQ / 32)        // q8_0: blocks a (key, kv head)
  
-@@ -208,6 +212,72 @@ uint8   __builtin_IB_subgroup_block_read_flat_transform_u8_k32(long base, int w,
+@@ -208,6 +212,75 @@ uint8   __builtin_IB_subgroup_block_read_flat_transform_u8_k32(long base, int w,
  #endif
  #endif
  
@@ -354,12 +354,15 @@ index 0a165caf0..a22c71e1d 100644
 +//   (signed, 16 times q8_0's d for the same values), so p d 8 is p times that value, as q8_0's p d 128 is (d = amax /
 +//   127), and stays in f16's range for every block an f16 cache could hold (|value| <= 65504, |d| <= 8188). p d 128
 +//   would leave it above a block maximum of 4,094 at p = 1, and on the negative side, which q8_0's d never has, as
-+//   -inf. 8 * d is clamped to +-65504 on both sides (only blocks past an f16 cache's range reach it). 8 comes off
-+//   in the final division (PV_PSCALE).
++//   -inf. 8 * d is clamped to +-65504 on both sides: only a block past an f16 cache's range (|d| > 8,188, a block
++//   maximum past 65,504) reaches it, and there the clamp is silent, as the q8_0 build's fmin is past its own range.
++//   8 comes off in the final division and in the merge (PV_PSCALE).
 +// Red (GGML_OPENCL_FA_PORT_RED): 14 (GB_V4_NIBBLE_SWAP) takes the high nibble for the low dims and the low for the high;
 +// 15 (GB_V4_SCALE_BLOCK) takes V's scale from the next block of the row. Each must FAIL every q8_0:q4_0 case.
 +// 16 (GB_V4_PSCALE128) restores q8_0's scale in P (p d 128, clamped above only): it must FAIL the large-V case
-+// (test-backend-ops v_amp, block maxima to 8,000) by non-finite rows, and pass the other q8_0:q4_0 cases.
++// (test-backend-ops v_amp, block maxima to 8,000) and pass the other q8_0:q4_0 cases. Either way of failing counts: a
++// block with a negative maximum past 4,094 (d > 511.75) is clamped by the fmin, a finite error up to about half its
++// value; one with a positive maximum past it (d < -511.75) gives -inf in P on a key with p > 65504 / (128 |d|).
 +#ifndef PORT_V4
 +#define PORT_V4 0
 +#endif
@@ -379,8 +382,8 @@ index 0a165caf0..a22c71e1d 100644
 +#define V4_ODIM(c, l) (16 * ((c) & 1) + V4J((c) / 2, (l)))
 +#define V4_BIAS 1032.0f
 +#ifdef GB_V4_PSCALE128
-+// the red case: 0225's first scale line, q8_0's (p d 128, clamped above only): a block maximum past 4,094 at p = 1
-+// leaves f16, as -inf when d < 0
++// the red case: 0225's first scale line, q8_0's (p d 128, clamped above only): past a block maximum of 4,094 a d > 0
++// is clamped (a finite error) and a d < 0 leaves f16 as -inf once p > 65504 / (128 |d|)
 +#define V4_PSCALE 128.0f
 +#define V4_DS(d) fmin(V4_PSCALE * (d), 65504.0f)
 +#else
@@ -407,7 +410,7 @@ index 0a165caf0..a22c71e1d 100644
  // Q to f16, unscaled, [head][row][DKQ]: a work-item per 8 values. q_nb1 is the op's
  // query-row stride and q_nb2 its head stride, whatever the view (the model's Q is a
  // permuted [D, Lq, Hq] with nb1 = Hq*D*4, nb2 = D*4).
-@@ -558,7 +628,52 @@ kernel void kernel_flash_attn_port(
+@@ -558,7 +631,52 @@ kernel void kernel_flash_attn_port(
  
          // ---- O = O alpha + P V, lane = dim, components = rows ----
          const float8 av = (float8)(alpha[0], alpha[1], alpha[2], alpha[3], alpha[4], alpha[5], alpha[6], alpha[7]);
@@ -461,16 +464,16 @@ index 0a165caf0..a22c71e1d 100644
          // O += sum over keys of p d code. The scale d of (key, q8_0 block) stands under the sum
          // over keys, so it goes into the a operand, which has the key in its lane: pe =
          // f16(p d 128), a block's own P. 128 keeps p d in f16's range for every |v| an f16
-@@ -690,7 +805,7 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
+@@ -690,7 +808,7 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
      _Pragma("unroll")
      for (int r = 0; r < QR; ++r) {
  #if PORT_KV8
 -        inv[r] = ls[r] > 0.f ? (1.f / KV8_PSCALE) / ls[r] : 0.f;
-+        inv[r] = ls[r] > 0.f ? (1.f / PV_PSCALE) / ls[r] : 0.f;
++        inv[r] = ls[r] > 0.f ? (1.f / PV_PSCALE) / ls[r] : 0.f;   // the states' O holds PV_PSCALE x the sum: it comes off here
  #else
          inv[r] = ls[r] > 0.f ? 1.f / ls[r] : 0.f;
  #endif
-@@ -702,7 +817,9 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
+@@ -702,7 +820,9 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
          for (int r = 0; r < QR; ++r) {
              if (r >= nrow) continue;
              global float * orow = (global float *)(dst + o_offset + (size_t) head * o_nb1 + (size_t) (q0 + r) * o_nb2);
@@ -481,7 +484,7 @@ index 0a165caf0..a22c71e1d 100644
              orow[32 * (c / 2) + KV8_ODIM(c, lane)] = ov[r] * inv[r];
  #else
              orow[c * 16 + lane] = ov[r] * inv[r];
-@@ -717,7 +834,7 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
+@@ -717,7 +837,7 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
      for (int r = 0; r < QR; ++r) {
          const float lv = sub_group_reduce_add(l[r]);
  #if PORT_KV8
@@ -490,7 +493,7 @@ index 0a165caf0..a22c71e1d 100644
  #else
          inv[r] = lv > 0.f ? 1.f / lv : 0.f;
  #endif
-@@ -730,7 +847,9 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
+@@ -730,7 +850,9 @@ kernel void kernel_flash_attn_port_merge(global const float * part, global char
              if (r >= nrow) continue;
              // the op's dst is [D, n_head, n_q]: o_nb1 is a head's stride, o_nb2 a query row's
              global float * orow = (global float *)(dst + o_offset + (size_t)head * o_nb1 + (size_t)(q0 + r) * o_nb2);

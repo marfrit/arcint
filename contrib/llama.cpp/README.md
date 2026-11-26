@@ -10096,7 +10096,8 @@ every 1.8.3 switch). Before it the gate took f16:f16 and q8_0:q8_0 only. An 8:4 
   - **The scale in P is `pe = f16(p d 8)`**, not q8_0's `p d 128`. q4_0's d is the block's largest-magnitude value
     over −8: signed, and 16 times q8_0's d for the same values. `p d 8` is p times that value, as q8_0's `p d 128`
     is, so it stays in f16's range for every block an f16 cache could hold (|value| ≤ 65,504, |d| ≤ 8,188). `8 d` is
-    clamped to ±65,504 on both sides; only blocks past an f16 cache's range reach the clamp. The final division
+    clamped to ±65,504 on both sides; only blocks past an f16 cache's range (|d| > 8,188, a block maximum past
+    65,504) reach the clamp, and there it is silent, as the q8_0 build's is past its own range. The final division
     takes the 8 off (`PV_PSCALE`, the merge too). The first form, q8_0's line `fmin(128 d, 65504)`, left f16 above
     a block maximum of 4,094 at p = 1, and for a negative d it gave −inf in P and NaN rows, with no log line (the
     review of 0225).
@@ -10117,7 +10118,10 @@ every 1.8.3 switch). Before it the gate took f16:f16 and q8_0:q8_0 only. An 8:4 
   layout, filled the same way as the q8_0 cases (per-block amplitudes, so a wrong block's scale moves the answer)
   and quantized by ggml's q4_0. The three split shapes are in the perf list too.
 - **The large-V case** (`v_amp=4000`, kv 1,040 x nb 20): V's values times 4,000, block maxima 1,000 .. 8,000, about
-  half of them positive (a negative d). RED=16 must FAIL it (non-finite rows); the fix must pass it at 1e-5.
+  half of them positive (a negative d). RED=16 must FAIL it, the fix pass it at 1e-5. RED=16 can fail it two ways,
+  and either counts: a negative block maximum past 4,094 (d > 511.75) is clamped by the fmin, a finite error up to
+  about half the block's value; a positive one (d < -511.75) gives −inf in P on a key with p > 65,504 / (128 |d|).
+  The card check asserts the FAIL, not a NaN.
 - **The bound:** the q8_0 port cases' 1e-5 against the CPU, stated before any card run.
 - **The counts:** the decisions table counts the new cases apart and asserts that each reaches the q4_0 V build. The
   device-free seam check covers the new split cases, 18 cells.
