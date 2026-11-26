@@ -2629,10 +2629,14 @@ Both are scoping choices, not invariants, and are open to the operator.
 - **The floor is a knob:** `GGML_OPENCL_FA_PORT_SPLIT_MINBLK=N`, with 0 / unset meaning 128 and 1
   meaning none (0045's and CUDA's form), so that a window can price it.
 - **A fourth red:** `RED=13` skips the first block of every split ≥ 1, a lost seam block.
-- **The split cases' bound is 1e-5, f16 as well,** stated before their card run. A lost seam block
-  moves the f16 answer by NMSE 1.8e-4 .. 3.5e-4 only (`inference`, a numpy model of the cases' own
+- **The split cases' bound was 1e-5, f16 as well,** stated before their card run. A lost seam block
+  moves the f16 answer by NMSE 1.76e-4 .. 3.55e-4 only (`inference`, a numpy model of the cases' own
   fill: `GGML_TEST_FA_PORT_SEAM=1` is the same check on the CPU backend). That is under the old 5e-4,
-  and 17-35x the new bound. The q8_0 port cases ran at 1.9e-6 .. 2.2e-6 on the card.
+  and 17.6x .. 35.5x the 1e-5 bound. The q8_0 port cases ran at 1.9e-6 .. 2.2e-6 on the card. **Since 0223c** the f16
+  split cases are bounded at 1e-4: the card's first run showed the unsplit f16 port's own error against the CPU at
+  3.88e-5 (`measured-here`), so 1e-5 sat below that floor, and the operator set 1e-4 on that basis, independent of the
+  split result. Against 1e-4 the f16 seam red stands at 1.76x .. 3.55x; the q8_0 cells keep 17x or more of their
+  1e-5. The red of record for the split is the split-vs-unsplit comparison (bound 1e-5, RED=13 at 17x or more), a window procedure (`GGML_TEST_FA_PORT_DUMP` plus an external compare), not a verdict the binary prints; the f16 CPU-referenced bound detects only a whole lost seam block (1.76x).
 - **A perf row now fails** (`FAILED [launch record]`) when its launch did not do what the case
   requires.
 - **Two perf cells** price the floor: kv 4,096 × nb 1,024 (the 4k call it keeps unsplit) and kv 8,192
@@ -2690,14 +2694,16 @@ The rows:
      prices go to the operator.
 3. **The op cases and the reds** (`test-backend-ops -o FLASH_ATTN_EXT`, a fresh process a cell).
    - EXPECT `GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_SPLIT=1`: the 6 split cases pass at
-     `[FA_PORT] split=3` (a, b, c on the B60), NMSE ≤ 1e-5, near 2e-6. The 16 older port cases pass at
+     `[FA_PORT] split=3` (a, b, c on the B60), NMSE ≤ 1e-4 for f16 (since 0223c; the card measured 4.3e-5) and ≤ 1e-5
+     for q8_0 (near 2e-6). The 16 older port cases pass at
      `split=1`.
    - EXPECT with the knob unset: the 6 split cases pass at `split=1`.
    - EXPECT `_SPLIT_FORCE=2` and `=3`: all 22 port cases pass at `split=2` / `3`.
    - EXPECT `GGML_OPENCL_FA_PORT_WAVE=8` with the split on: the 6 split cases FAIL with "SPLIT CASE DID
      NOT SPLIT" (the check's own red).
    - EXPECT `RED=10`, `11`, `12` and `13`, each with the split on: the 6 split cases FAIL, at NMSE about
-     0.1-1, 0.05-0.3, 1e-2 .. 5e-2 and 1.8e-4 .. 3e-2 (the seam red at 17x the bound or more).
+     0.1-1, 0.05-0.3, 1e-2 .. 5e-2 and 1.76e-4 .. 3e-2 (the seam red at 1.76x the f16 bound of 1e-4 or more since
+     0223c, 17x or more of the q8_0 bound; the red of record is the split-vs-unsplit comparison, 17x or more of 1e-5).
    - EXPECT the same four reds with `_SPLIT_FORCE=3`: the 16 older cases FAIL (13 at least where a
      forced seam lies on used keys).
    - EXPECT the perf rows (a)-(c) on against off: no `FAILED [launch record]`.
