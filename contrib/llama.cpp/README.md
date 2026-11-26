@@ -11648,6 +11648,13 @@ it runs its base's (trellis-serve 8f8e2fc, `sgl_model.py` `_control`) torch chai
 into one bf16 product (`code`). This patch fuses the prompt rows: the operator approved that addition to the reference
 (arm F, prompt rows included), f32 math by default and the bf16 products as an opt-in variant.
 
+**Since 0226 the reference's own case is fused as well.** 0221 emitted the op for more than 8 rows only, so the
+reference's range (1 to 8 rows: every decode step, a draft's verify rows, a short prompt tail) stayed on the chain.
+0226 (its section follows this one) emits the op from one row with the same switch (`GGML_OPENCL_LOOP_CONTROL=f32`)
+and serves at most 8 rows with a pair of small kernels in the reference's geometry; this section's kernel is unchanged
+and serves more than 8 rows. The one-row leg is measured on its own (`f32-t2` keeps one-row decode on the chain), and
+`f32-prompt` is this section's range.
+
 **The op.** `GGML_OP_LOOP_CONTROL(cur, msg, down, gain, forget)`, appended after `GGML_OP_GATED_DELTA_NET_REPLAY`
 (106 ops; no earlier op's id moves, so the knob-off export below compares line for line). One pure rule,
 `ggml_loop_control_refuse` (F32; n_embd a multiple of 256; rank 64; cur and msg `[n_embd, T]` with contiguous rows at
@@ -11675,7 +11682,8 @@ the dispatch and the host replay.
   `hadamard`, `prec`): the chain's products go through `build_lora_mm`, the op's do not.
 
 **Knob and lines.** `GGML_OPENCL_LOOP_CONTROL`: unset, `0`, `off` = off; `1` or `f32` = the f32 kernel; `bf16` = the
-bf16-DPAS build of the same text; `all-layers` = `1` and the guard lifted. Any other value is not a value: the model
+bf16-DPAS build of the same text; `all-layers` = `1` and the guard lifted (0226 adds `f32-t2`, `f32-prompt` and
+`f32-onewg`, and moves `1` / `f32` / `all-layers` to "from one row": its section). Any other value is not a value: the model
 and the backend keep the arm off and each says so in one WARN line (a mistyped `BF16` must not run the f32 kernel;
 review F1). One line when taken: `loop_control: TAKEN opencl <f32|bf16> one-launch rows_wg=<r> n_wg=<n>` (INFO
 in 0221, so a served unit showed it only at arcint's `-v`; WARN, once a process, since 0224). Refusals:
@@ -11938,6 +11946,247 @@ unchanged. Write-up line: `row 5: capital right|wrong, needle at 44k right|wrong
 acceptance task with the knob off as well, its comparison), setup 5: **~70 min** (B60). The window body is
 operator-local (not in this repository); it follows these rows and assertions in this order, and on a failed check
 it still requests that step's kernel-fault check, prints the rows not reached and a FAIL verdict.
+
+## 0226-loop-control-small-rows.patch
+
+**Status: built and checked without a card; not run on a card.** Opt-in through 0221's switch. The card rows are
+written below, each with its expected result, before any of them ran.
+
+**What it adds.** `GGML_OP_LOOP_CONTROL` (0221) for **1 to 8 rows**: a decode step (one row), a draft's verify rows
+(a 5-token draft verifies in 6), a prompt's last ubatch of 2 to 8 rows. That is the range the reference fuses (the
+vLLM-XPU Inkling port 6b71b90, `inkling_xpu/csrc/loop_control.sycl`, `check_rows`: `size(0) >= 1 && size(0) <= 8`,
+`code`) and the one 0221 left on the chain: its model-side condition was `n_tokens > 8`. On a served Inkling 2 Mini
+every decode step is a one-row graph (the loop arch refuses an MTP head, `inkling2-loop.cpp`, and no drafter exists
+for it on this series, `code`; a served unit's 6,000 decode graphs were all one-row, `measured-here`), so today the
+range is decode; 2 to 8 rows reach the chain as a prompt's tail, are the verify shape of a drafter to come, and are
+the source of the keys `DOWNGRADE src=opencl op=MUL_MAT type=f32 k=64 cols=1-4 path=generic reason=no-fast-path` (2 to 4
+rows) and `cols=5-15` at 5 to 8 rows (`measured-here`; at one row the two products are a GEMV and print no key).
+
+**What the chain costs at these row counts** (`measured-here`, 2026-11-26, the B60 at 165 W, the profiling build,
+llama-batched-bench at depth 4,096, ubatch 1,024, the unit's switches with the 1.8.3 ones and `=f32`, K/V q8_0:q4_0;
+device time a graph, medians over 16 to 32 graphs; 96 controls a graph):
+
+| rows | graph, ms | the chain, ms | share | a control, us | its two k=64 products, ms |
+|---|---|---|---|---|---|
+| 1 | 26.055 | 2.473 | 9.49 % | 25.8 | 0.862 (3.31 %) |
+| 4 | 51.887 | 7.961 | 15.34 % | 82.9 | 2.606 (5.02 %) |
+| 6 | 65.018 | 8.400 | 12.92 % | 87.5 | 2.638 (4.06 %) |
+| 8 | 77.054 | 8.441 | 10.95 % | 87.9 | 2.646 (3.43 %) |
+
+Served decode on that unit: 35.7 t/s after a 3,000-token prompt, 29.3 t/s at 32,000. The one-row chain, 2.47 ms of a
+26 ms graph, is the main prize: an op at 0.3 to 0.5 ms a graph would be worth up to about 8 % of decode.
+
+**The geometry decision: a decode-shaped pair, not 0221's kernel at 8 rows** (written down before any card run).
+- 0221's plan gives a work-group ceil(T / cores) rows rounded up to 8, so 1 to 8 rows are **one work-group**: one Xe
+  core (`code`, `ggml_loop_control_plan_make`). A control's weights are 2.36 MB whatever T is (down 1.18 MB, gain and
+  forget 0.59 MB each), and that one core reads all of them.
+- What a work-group of that kernel moves (`measured-here`, 0221's row 2, B60 at 165 W): 393 us a launch at 1,024 rows
+  on 19 work-groups, 30.7 to 49.6 MB a launch by the two readings, so **1.6 to 2.6 MB a work-group in 393 us, 4 to
+  7 GB/s a core**, memory-bound (bf16 / f32 1.10).
+- So at 1 to 8 rows one work-group needs **about 0.35 to 0.6 ms a control for the weights alone** (`inference` from
+  the two lines above; the compute, at most 4.7 M FMA at 8 rows, is some 15 us of a core).
+- The chain it would replace (`measured-here`, one decode token's profile on the B60 at depth 4,096, 5,306 launches,
+  26.48 ms device time): **96 controls a token, 12 launches each, 25.7 us a control at the median (24.2 to 37.0),
+  2.49 ms a token, 9.4 %**. Its two big launches are already spread: the down product as a split-K GEMV (256
+  work-groups of 64 lanes, 4.4 us for the 1.18 MB) and each up product as 2,304 work-groups of 32 lanes (4.5 us).
+- One work-group would therefore be **10 to 20 times slower than the chain at one row** (`inference`), and the
+  reference does not do it either: `control_many` spreads the down product over a work-group a (row, output) and the
+  up products over a work-item a (row, column), in four launches for three controllers (`code`).
+- Decision: at most 8 rows take a **pair of small kernels in the reference's geometry, two launches a control** (the
+  reference's average: four launches for q, k and v together, four for ffn). 0221's kernel stays, unchanged, for more
+  than 8 rows. Both geometries are in the binary: `GGML_OPENCL_LOOP_CONTROL=f32-onewg` serves at most 8 rows with
+  0221's one work-group, so the card measures the decision instead of inheriting it (row a's perf lines).
+- Expected (`inference`, an ESTIMATE): the gate about the split-K GEMV's 4 to 6 us, the out about one up product's 5
+  to 9 us, **10 to 15 us a control against 25.8: 1.0 to 1.4 ms a graph where the chain takes 2.47, about 1.0 to 1.5
+  ms saved of 26.06 (4 to 6 %)** at one row; at 4 to 8 rows, where a control costs 83 to 88 us, 15 to 25 us a control
+  would save 6 to 7 ms of a 52 to 77 ms graph (8 to 12 %). The launch floor of two launches a control (192 a graph at
+  the about 1 us of this card's smallest launches) is 0.2 ms; the 0.3 to 0.5 ms a graph named above needs the pair at
+  3 to 5 us a control, under this estimate. Whether two launches beat twelve at one row is the card's question; the
+  switch has a value for either answer.
+
+**The switch** (no new knob; `ggml_loop_control_mode`, `_min_rows`, `_small_on` in ggml.c, one table in the unit test):
+
+| `GGML_OPENCL_LOOP_CONTROL` | the model emits the op for | at most 8 rows are served by |
+|---|---|---|
+| unset, `0`, `off` | never: the chain, node for node | - |
+| `1`, `f32` | 1 row and more (0221: more than 8) | the small pair |
+| `f32-t2` | 2 rows and more: one-row decode keeps the chain | the small pair |
+| `f32-prompt` | more than 8 rows (0221's range) | - |
+| `f32-onewg` | 1 row and more | 0221's kernel, one work-group (the comparison arm) |
+| `bf16` | more than 8 rows (unchanged) | its own kernel when handed such a node (unchanged) |
+| `all-layers` | 1 row and more, the layer guard lifted (the device-free check) | the small pair |
+
+Any other value is still not a value (WARN, the arm off). `1` and `f32` change their meaning with this patch: a unit
+that sets `f32` now fuses its decode steps too. `f32-t2` is the range to fall back to if the card finds one-row
+decode slower with the op; `f32-prompt` is 0221's behaviour in the same binary. Every other guard of the emission is
+as it was: an adapter, a Hadamard rotation or a precision entry on a controller weight keeps the chain, the layer's
+backend must declare the op, the rule decides.
+
+**The pair** (`loop_control_small.cl`, `code`; built with `loop_control.cl`'s options, 256 GRF):
+- `kernel_loop_control_gate`, global (64, 128, T), local (64, 1, 1): **one work-group of 64 lanes a (row, half,
+  output)**, 128 T groups. A group makes one pass over its half's row (cur or msg, 2,304 floats, 9 float4 a lane): the
+  down product `Wd_h[r] . x_h` and the half's sum of squares together, reduced by `sub_group_reduce_add` and four
+  floats of local memory, and writes the partial `s_h * (Wd_h[r] . x_h)`, `s_h = 1/sqrt(mean(x_h^2) + eps)`, to a
+  scratch `[T][2][64]` (512 T bytes, the backend context's, as the skinny F32 GEMM's slice scratch). 0221's algebra:
+  the norm as a scale after the product, no concat, no normed copy. Every group of a row recomputes the row's sum of
+  squares from the floats it reads anyway (64 times redundant, one FMA an element).
+- `kernel_loop_control_out`, global (2,304), local 64: **a lane a column**. `g = gp[t][0] + gp[t][1]` (uniform loads
+  and a uniform add), the gain and forget products, tanh and `(cur - tf*cur) + tg*msg` in registers, out written
+  once. One pass over the lane's two weight rows serves all T rows: row templates of 1, 2, 4 and 8 accumulator pairs
+  (`out_tr`, the least that holds T; a row past T is the last row again and is not stored).
+- The queue is in order, so a control's out reads the scratch before the next control's gate writes it.
+- The scratch is the one intermediate in global memory (0221's "nothing intermediate" was a requirement of the
+  prompt kernel, 0.26 MB a control there; the reference writes the normed inputs, the hidden and the mixed rows at
+  these row counts).
+- A second TAKEN line, WARN, once a process: `loop_control: TAKEN opencl f32 small two-launch rows=<T> gate_wg=<128 T>
+  out_tr=<1|2|4|8>` (0221's one-launch line stays for more than 8 rows). A pair that does not build refuses nodes of
+  at most 8 rows: `DOWNGRADE src=opencl op=LOOP_CONTROL path=cpu reason=small-not-built` (or `small-wg-size`); the
+  stats line counts a control once.
+- Bounds: the six tensor arguments as in 0221 and the scratch, always, before the two launches.
+- Reds (`GGML_OPENCL_LOOP_CONTROL_OPTS=-DLOOP_CONTROL_RED=<n>`): 1 to 4 as 0221's, in the pair's own text (the swap,
+  s_c for both halves, the gain's tanh dropped, the msg half's last sub-group dropped), so 0221's "every case must
+  FAIL" still holds for the cases of at most 8 rows; 6 the scratch's row step taken as 64 floats; 7 the tail row not
+  stored. 6 and 7 are defects of rows past the first: they must fail every case of 2 to 8 rows and they pass a
+  one-row case, which is why a one-row case alone proves nothing about a row step.
+
+**Offline gate** (`tools/ocloc_loop_control.sh`, extended to the pair and to an ISA md5; `measured-here`, ocloc
+26.27.39122.11): **PASS on bmg-g21 and bmg-g31** - 256 GRF, scratch 0, one dump a kernel (no `_1_` retry). The same
+ISA on both targets:
+
+| kernel | load.ugm | load.slm | store.ugm | store.slm | sync | asm lines | ISA md5 |
+|---|---|---|---|---|---|---|---|
+| `kernel_loop_control_gate` | 13 | 1 | 1 | 2 | 1 | 573 | 1bc13cb5dfe4 |
+| `kernel_loop_control_out` (four templates) | 337 | 0 | 15 | 0 | 102 | 10,875 | 7762724b4383 |
+
+`loop_control.cl` is the same file in both trees (md5 15cc8dbb), and its ISA is identical before and after (f32
+3b5a462fdeed, bf16 9b60dfb1492f, both targets; counts as 0221's revision 2). The pair also compiles at the default
+128 GRF without scratch (informational: which GRF mode dispatches these few hundred threads faster is not known
+here).
+
+**Tests** (`measured-here`, the recipe host, device-free).
+
+*The unit test* (`tests/test_loop_control.cpp`, `arcint-loop-control`), its part 5:
+- the plan's small launch at 1 to 16 rows (small up to 8; `out_tr` 1 / 2 / 4 / 8; gate 64 x 128 x T; the scratch T x
+  128 floats) and the switch's table above (mode, least row count, the pair on or off, 13 values);
+- the rule accepts the 7 new export lines (1, 2, 3, 4, 5, 6 and 8 rows; 13 lines in all);
+- **the pair itself on host threads** (the gate's 64 lane threads a work-group with their sub-group reduce and
+  barrier, the out a lane a column; cur and msg at different padded row steps, the scratch between NaN guards)
+  against the CPU op and against the chain:
+
+| build | rows | nmse | bound | |
+|---|---|---|---|---|
+| the pair | 1, 2, 3, 4, 5, 6, 7, 8 | worst 3.8e-13 | 1e-6 | green |
+| `RED=1` (gain / forget swapped) | the same | least 1.88 | must exceed 1e-6 | red, every case |
+| `RED=2` (s_c for both halves) | the same | least 0.983 | | red, every case |
+| `RED=3` (the gain's tanh dropped) | the same | least 0.39 | | red, every case |
+| `RED=4` (a sub-group of the msg half dropped) | the same | least 0.103 | | red, every case |
+| `RED=6` (the scratch's row step) | 2 .. 8 | least 0.835 | | red, every case; one row passes (1.2e-13), asserted |
+| `RED=7` (the tail row not stored) | 2 .. 8 | least 0.0082 | | red, every case; one row passes, asserted |
+
+  The scratch guards hold in every run. 0221's replay of its own kernel is unchanged (f32 3.4e-13, bf16 7.1e-6).
+
+*The emission, device-free* (`test-export-graph-ops`, CPU, Inkling 2 Mini IQ4_NL, c 4096, fa on; `-b` = `-ub` = T,
+so the tool's prompt graph has T rows and its one-token graph one row):
+
+| T | unset: this tree against the base tree | `=all-layers`, this tree | `=all-layers`, the base tree (the red) |
+|---|---|---|---|
+| 1, 2, 3, 4, 5, 6, 8 | byte-identical files | both graphs -1,056 nodes (96 controls x 11): 9,875 -> 8,819 (T = 1: 9,755 -> 8,699), one-token 9,755 -> 8,699; LOOP_CONTROL lines at 1 and T rows | no LOOP_CONTROL line, the file is the unset file |
+| 9, 1,024 | byte-identical files (1,024: md5 594e05dc, 0221's) | as above | the prompt graph only: 8,819 / 9,755, one line |
+
+  (T = 6 was exported on this tree only; the base tree's red rows are 1, 2, 3, 4, 5, 8, 9 and 1,024.) The range of
+  each value, read from the model's `DOWNGRADE src=llama op=LOOP_CONTROL ... reason=layer-backend device=CPU` line
+  (the op was attempted and the layer guard kept the chain; the file is the unset file byte for byte in every such
+  run): `1` and `f32-onewg` attempt at every T from 1; `f32-t2` not at T = 1, from T = 2; `f32-prompt` and `bf16` not
+  at T <= 8, from T = 9; `BF16` never, with its WARN line. On the base tree the three new values are not values.
+
+*The CPU model check* (`measured-here`, CPU, llama-perplexity, Inkling 2 Mini IQ4_NL, wiki.test, c 256, 3 chunks,
+the BASE tree's switch-unset logits as the base; `-b` = `-ub` = 1, every token a one-row decode, and `-b` = `-ub` =
+4):
+
+| rows a decode | arm | mean KL, nats | max KL | same top p | PPL |
+|---|---|---|---|---|---|
+| 1 | this tree, switch unset | -0.000000 ± 0.000001 | 0.000035 | 100.000 % | 7.3020 |
+| 1 | this tree, `=1` (CPU device: the guard keeps the chain) | -0.000000 ± 0.000001 | 0.000035 | 100.000 % | 7.3020 |
+| 1 | this tree, `=all-layers` (the op at one row on every layer, the CPU reference) | 0.000581 ± 0.000074 | 0.0217 | 97.900 ± 0.735 % | 7.3076 |
+| 4 | this tree, switch unset | -0.000001 ± 0.000001 | 0.000046 | 100.000 % | 7.2407 |
+| 4 | this tree, `=1` | -0.000001 ± 0.000001 | 0.000046 | 100.000 % | 7.2407 |
+| 4 | this tree, `=all-layers` | 0.000573 ± 0.000057 | 0.0131 | 99.475 ± 0.371 % | 7.2605 |
+
+- **The off path's outputs**: the unset arm of this tree against the base tree's logits is KL 0 with the same top
+  token at every one of the 381 scored positions, at one row and at 4 (the residue, a maximum of 3.5e-5 nats, is the
+  base file's own rounding of its logits; 0221's "off again" row has the same size). With the byte-identical exports
+  above that is the off path's identity, graphs and outputs.
+- The `=1` runs' statistics equal the unset runs' **line for line** (34 lines, `cmp`) at both row counts, with the
+  layer-backend DOWNGRADE lines: the guard.
+- The all-layers arms move the logits by 0.0006 nats, under what one ulp at the depth mix's sites costs on this host's
+  CPU (0.0015 to 0.0027 nats, 0204-0207's noise control). The one-row arm changes the top token at 8 of 381 positions
+  (2.1 ± 0.7 points) at that KL: near-ties on a small sample, and above the 1-point bar if it were read as a card
+  result. It is the CPU reference op (0221's, unchanged) against the chain on a CPU, not the pair; the comparative
+  reading on the card, 6,144 scored tokens a one-row arm, is row b, and its bar decides.
+
+*test-backend-ops* (compiled and linked in a llama build of the applied tree on the recipe host, OpenCL on; no
+device here, so the cases ran nowhere): **41 LOOP_CONTROL cases** (0221: 16) - the op at 1, 2, 3, 4, 5, 6, 7 and 8
+rows plain and as a mix column's view (every row template full and with a tail; 6 rows is the verify of a 5-token
+draft), rows at a padded step (`view=2`: cur every 2nd row, msg every 4th) at 1, 2, 3, 5, 6, 8, 16 and 57 rows - the
+rule takes any row step, and a kernel that steps one tensor by another's stride is right wherever the strides are
+equal - and twins at 1, 2, 4, 6 and 8 rows beside 0221's. Bound, stated before the card run: **1e-6** (the pair
+reorders sums only; host replay 3.8e-13). Perf: the op and the chain at 1, 2, 4, 6 and 8 rows.
+
+**Card rows (written, not run), in this order** (the B60, the unit's own Environment lines with any
+`GGML_OPENCL_LOOP_CONTROL` replaced by the arm's; q8_0 K/V, ub 1,024; `G` the published Inkling 2 Mini IQ4_NL).
+Three arms: **pre** = the series without 0226, `=f32` (the op above 8 rows only); **new** = this tree, `=f32`;
+**t2** = this tree, `=f32-t2`. About 60 minutes; about 85 if llama-bench cannot restore its depth state.
+
+*What every process asserts:* the B60 alone; no `op=LOOP_CONTROL` DOWNGRADE line from either source; new prints the
+small TAKEN line wherever it runs a graph of at most 8 rows, pre never prints it.
+
+*Row a - the device op cases* (~8 min). The dry run: 33 cases SUPPORTED (support mode lists no twin), the one-row
+case OK under `GGML_OPENCL_BOUNDS=1`. **The reds first**, on the 27 cases of 1 to 8 rows: `RED=1..4` 0/27 each;
+`RED=6` and `RED=7` 4/27 each, the four one-row cases the ones that pass. Green: 41/41 at <= 1e-6 with both TAKEN
+lines; `=f32-onewg` 27/27 with the one-launch line only. Perf (data, and a NOTE where it fails): the pair, one
+work-group and the chain at 1, 2, 4, 6 and 8 rows; expected the pair 10 to 15 us, the chain about 26 us at one row,
+one work-group 0.2 ms or more. Write-up: `a: 33 found; reds 0/27 x4, 4/27 x2; 41/41 worst x; onewg 27/27; us a run at
+1 / 2 / 4 / 6 / 8 rows: pair .., one-wg .., chain ..`.
+
+*Row b - KL against the CPU bases, pre and new* (~20 min): one-row decode (the 2k base at `-b 1 -ub 1`: every token
+its own graph), then 2k and 32k at ub 1,024. **The bar at each: new at most pre's KL + 0.03 nats and its top p at
+most 1 point below.** Expected within about 0.001 nats. The one-row new arm prints the small TAKEN line and stats
+lines with nodes == calls; the one-row pre arm prints no loop-control TAKEN line at all. Write-up: `b: T1 pre x / y %,
+new x / y %; 2k ..; 32k ..`.
+
+*Row e0 - the paths each arm takes* (~3 min; llama-bench `-v`, 2 / 3 / 4-row prompts and 8 one-row steps): pre
+prints the key `op=MUL_MAT type=f32 k=64 cols=1-4 path=generic reason=no-fast-path` (the check can see it) and no
+small line; new and t2 print the small line and no `type=f32 k=64` key. The timing rows run the same binaries and
+switches without `-v`.
+
+*Row c - the timing, before and after* (~20 min, up to 40): llama-bench `-p 4 -n 128 -r 3 -d 0,32768` and
+llama-batched-bench with 6 sequences (`-npp 16 -ntg 64 -npl 6`: every step a 6-row graph), the three arms in 3
+rotated rounds, a fresh process each, the host's load recorded.
+- **The gate, the operator's condition: one-row decode must not get slower.** new's tg median at depth 0 and at
+  32,768 at least pre's median minus pre's own range over the rounds (at least 1 %).
+- If new fails it and t2 holds it, **0226 covers 2 to 8 rows only** and the verdict says `range=f32-t2`; if both
+  fail, FAIL.
+- pp4 and the 6-row decode: data, with a NOTE unless min(new) > max(pre).
+- Expected (`inference`): tg +3 to +6 % at depth 0, less at depth; t2 level with pre at one row; pp4 and 6 rows
+  above pre (the two k=64 products leave the generic kernel, 14.2 us each at 16 rows in the warm-up graph's profile).
+- Write-up: `c: tg d0 pre a / new b / t2 c, d32768 ..; pp4 ..; 6 rows ..; range f32|f32-t2`.
+
+*Row d - the served process* (~5 min; the unit's command with the arm's binary and switch; the arm row c supports,
+then pre): the capital right; plain decode t/s over 3 counted requests (data; no request drafts); **the prompt
+tail**: a 1,027-token prompt (a full ubatch, then a last ubatch of 3 rows), 3 counted requests, its prefill time,
+with a NOTE if the arm is more than 2 % slower than pre. Write-up: `d: capital right; decode pre x, new y t/s; tail
+1,027 tokens pre a ms, new b ms`.
+
+*Row e - the DOWNGRADE lists of the served logs* (in row d's logs): the arm has **no `type=f32 k=64` key** (cols=1-4
+and, at 5 to 8 rows, 5-15 gone; 16+ and 5-15 above 8 rows are 0221's) and no `op=LOOP_CONTROL` DOWNGRADE, and no key new with 0226; pre, the control, has
+the `k=64 cols=1-4` key after the prompt tail. Both lists are written out and compared.
+
+The window body is operator-local (not in this repository); it was rehearsed against stand-ins for every tool: the
+green run and 21 failure cases (a card named wrong, a red that passes, a red that fails a one-row case, a green
+FAIL, a summary that disagrees, a missing or misplaced TAKEN line, each KL bar, the key missing in the control or
+left in the arm, a slower one-row decode with and without the fallback range, a wrong capital, a refused node, a
+kernel-fault answer, a unit that came back), each stopping at its check or, for the fallback, passing with
+`range=f32-t2`.
 
 ## 0224-opencl-taken-lines-warn.patch
 

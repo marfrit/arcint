@@ -131,6 +131,19 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   unchanged. The sharper evidence is the split against the unsplit port, 1.6e-9 to 5.9e-8 per case (`measured-here`,
   bound 1e-5); a lost seam block still exceeds the new bound, at 1.76x. The red of record for the split is the split-vs-unsplit comparison (bound 1e-5, RED=13 at 17x or more), a window procedure (`GGML_TEST_FA_PORT_DUMP` plus an external compare), not a verdict the binary prints; the f16 CPU-referenced bound detects only a whole lost seam block (1.76x). (`contrib/llama.cpp/README.md`,
   0223c).
+- llama.cpp patch 0226 (with `GGML_OPENCL_LOOP_CONTROL=f32`): the fused loop controller of Inkling 2 Mini (0221) for
+  1 to 8 rows - every decode step, a draft's verify rows, a prompt's short last ubatch. That is the range the
+  reference fuses and the one 0221 left on the 12-launch chain (96 controls a graph: 2.47 ms of a 26.1 ms one-row
+  decode graph on the B60, 8.4 ms of a 65 ms 6-row graph, `measured-here`). 0221's kernel would be one work-group there, one Xe core reading 2.36 MB of
+  weights; at most 8 rows take a pair of small kernels in the reference's geometry instead, two launches a control,
+  and 0221's kernel is unchanged for more than 8 rows. **`f32` (and `1`) now mean "from one row"**: a unit that sets
+  it fuses its decode steps too. `f32-t2` keeps one-row decode on the chain, `f32-prompt` is 0221's range, `f32-onewg`
+  the one-work-group comparison arm; `bf16` and the unset switch are unchanged (the unset graphs are byte-identical
+  to the previous series' at 1 to 1,024 rows). Removes the keys `op=MUL_MAT type=f32 k=64 cols=1-4` (2 to 4-row
+  batches) and `cols=5-15` at 5 to 8 rows. 25 more test cases, red builds 6 and 7. Built and checked without a card (the pair replayed on host
+  threads against the CPU op and the chain, ocloc on both cards' targets, the device-free emission and model
+  checks); not yet run on a card: whether two launches beat twelve at one row is the card's question, and the switch
+  has a value for either answer (`contrib/llama.cpp/README.md`, 0226).
 - llama.cpp patches 0225 / 0225b (with `GGML_OPENCL_FA_PORT=1`): the FA port reads a q8_0 K with a q4_0 V in place, the
   Inkling unit's 8:4 cache. Before it an 8:4 cache ran port-off: its 9 to 64-row bias batches went to the CPU and the
   key split could not act. A build of its own (`PORT_V4`), the q8_0 build's K and a q4_0 V read; the TAKEN line
