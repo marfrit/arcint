@@ -84,7 +84,7 @@ const std::string kCommand = "cat > /tmp/dbg.c <<'EOF'\n"
 std::string args_escaped() { return nlohmann::json{ { "command", kCommand } }.dump(); }
 
 // As the model wrote it when the call was lost: the newlines escaped, the
-// tabs raw (His' reading of the original bytes: 0 raw newlines, a raw 0x09).
+// tabs raw (the original bytes of the served block: 0 raw newlines, a raw 0x09).
 std::string args_raw_tab() {
     std::string a = args_escaped();
     for (size_t at = a.find("\\t"); at != std::string::npos; at = a.find("\\t", at + 1)) a.replace(at, 2, "\t");
