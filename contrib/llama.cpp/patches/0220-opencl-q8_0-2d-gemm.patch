@@ -146,18 +146,18 @@ index 0000000..d7a8c89
 +
 +#endif // GGML_OPENCL_Q8_2D_H
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 7b04b86..13dd0cc 100644
+index 89c7963..d5a150d 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -14,6 +14,7 @@
- #include "ggml-impl.h"
+@@ -15,6 +15,7 @@
  #include "ggml-opencl-fa-paged.h"
+ #include "ggml-opencl-fa-bias-route.h"   // 0212: the indexed-bias decode route, a pure function (CPU-testable)
  #include "ggml-opencl-cpy-t01.h"
 +#include "ggml-opencl-q8-2d.h"   // 0220: the dense Q8_0 2D GEMM's gate and launch shape, pure
  #include <cstdarg>
  #include <cstdio>
  #include "ggml-backend-impl.h"
-@@ -745,6 +746,27 @@ static void ggml_cl_downgrade(const char * fmt, ...) {
+@@ -746,6 +747,27 @@ static void ggml_cl_downgrade(const char * fmt, ...) {
      }
  }
  
@@ -185,7 +185,7 @@ index 7b04b86..13dd0cc 100644
  size_t ggml_backend_opencl_downgrades(char * buf, size_t size) {
      std::string out;
      {
-@@ -924,6 +946,16 @@ struct ggml_backend_opencl_context {
+@@ -925,6 +947,16 @@ struct ggml_backend_opencl_context {
      ggml_cl_buffer prealloc_kq_ids8_q, prealloc_kq_ids8_d, prealloc_kq_ids8_s, prealloc_kq_ids8_o;
      // what the activation buffers hold, and the graph count that dates it
      ggml_cl_kq_act kq_q8, kq_f16, kq_few, kq_i8, kq_id8, kq_ids8, kq_fewq;
@@ -202,7 +202,7 @@ index 7b04b86..13dd0cc 100644
      // kq_ids8 also holds to one route and the output's strides (the offsets it packed)
      uint64_t       kq_ids8_route = 0;
      cl_ulong       kq_ids8_nb1 = 0, kq_ids8_nb2 = 0;
-@@ -1295,6 +1327,11 @@ struct ggml_backend_opencl_context {
+@@ -1296,6 +1328,11 @@ struct ggml_backend_opencl_context {
      int       kq40_sg8_tm = 32, kq40_sg8_wg = 8;
      cl_kernel kernel_mul_mm_f16w_f16      = nullptr;   // F16 / BF16 weights on the XMX tiles
      cl_kernel kernel_mul_mm_q8_0_f16     = nullptr;   // Q8_0 code+scale on the same XMX tiles (0058)
@@ -214,7 +214,7 @@ index 7b04b86..13dd0cc 100644
      cl_kernel kernel_mul_mm_id_kq_f16[14] = {};   // null for Q3_K and Q2_K (0116, 0117)
      // MUL_MAT_ID with the tokens as the DPAS a operand (kernel_mul_mm_id2_*):
      // KQ_ID2_XT pairs x KQ_ID2_XSG sub-groups of rows per work-group
-@@ -2192,6 +2229,52 @@ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_conte
+@@ -2193,6 +2230,52 @@ static std::string ggml_opencl_make_compile_opts(const ggml_backend_opencl_conte
      return compile_opts;
  }
  
@@ -267,7 +267,7 @@ index 7b04b86..13dd0cc 100644
  static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
      if (backend_ctx->kernels_loaded) {
          return;
-@@ -3302,6 +3385,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+@@ -3303,6 +3386,10 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                              }
                          }
                      }
@@ -278,7 +278,7 @@ index 7b04b86..13dd0cc 100644
                      if (!fits) {
                          for (int i = 0; i < 3; ++i) {
                              CL_CHECK(clReleaseKernel(backend_ctx->kernel_mul_mm_kq2d[i]));
-@@ -12416,6 +12503,8 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
+@@ -12448,6 +12535,8 @@ static bool ggml_cl_fa_paged_timeline();    // 0130p: the roll-up and the summar
  static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
      ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
      backend_ctx->graph_gen++;
@@ -287,7 +287,7 @@ index 7b04b86..13dd0cc 100644
      // 0205: the depth-mix arm's count for this graph, printed at the graph's end
      // with GGML_OPENCL_DEPTH_MIX_STATS=1
      backend_ctx->depth_mix_calls_graph = 0;
-@@ -12752,6 +12841,19 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
+@@ -12784,6 +12873,19 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
          }
      }
  
@@ -307,7 +307,7 @@ index 7b04b86..13dd0cc 100644
      return GGML_STATUS_SUCCESS;
  }
  
-@@ -33402,6 +33504,12 @@ static void ggml_cl_kq_forget(ggml_backend_opencl_context * backend_ctx, const g
+@@ -33488,6 +33590,12 @@ static void ggml_cl_kq_forget(ggml_backend_opencl_context * backend_ctx, const g
              *a = {};
          }
      }
@@ -320,7 +320,7 @@ index 7b04b86..13dd0cc 100644
  }
  
  static void ggml_cl_kq_quantize_src1(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src1,
-@@ -35093,6 +35201,169 @@ static bool ggml_cl_mul_mat_f16_copy(ggml_backend_t backend, const ggml_tensor *
+@@ -35179,6 +35287,169 @@ static bool ggml_cl_mul_mat_f16_copy(ggml_backend_t backend, const ggml_tensor *
      return true;
  }
  
@@ -490,7 +490,7 @@ index 7b04b86..13dd0cc 100644
  static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
      GGML_ASSERT(src0);
      GGML_ASSERT(src0->extra);
-@@ -35227,6 +35498,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
+@@ -35313,6 +35584,12 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
          }
      }
  
@@ -745,7 +745,7 @@ index 7f138d6..c699ec1 100644
 +}
 +#endif // Q8_2D_KERNELS
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c3ff1b1..ef8dee6 100644
+index 46bae67..c3e5760 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
 @@ -5836,6 +5836,12 @@ struct test_mul_mat : public test_case {
@@ -807,7 +807,7 @@ index c3ff1b1..ef8dee6 100644
  // ARC-LAB 0116: a 2-D view of a quantized weight that is not a whole slice of it: [K, N, E] reshaped to
  // [K, N E] (the elements of the parent, not its slices), or (rows > 0) the first `rows` rows of a [K, N]
  // weight at offset 0. OpenCL keeps the low-bit types and Q3_K in planes per slice of the parent, so a
-@@ -13324,6 +13369,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -13405,6 +13450,37 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8, 4, true, 520, 512, 256));
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 520, 8, true, 512, 512, 256));
  
@@ -845,8 +845,8 @@ index c3ff1b1..ef8dee6 100644
      // multiple blocks per row: exercises the block-stride loop and the
      // per-expert base offset, which k == 256 alone leaves untested
      test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_TQ1_0, GGML_TYPE_F32, 28, 10, false, 1024, 1, 4096));
-@@ -15151,6 +15227,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
-         test_cases.emplace_back(new test_mul_mat_id_routed(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, bs, 2304));
+@@ -15242,6 +15318,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_id_p5(3, i, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, p5_replay[i].n, 2304));
      }
  
 +    // 0220: Inkling 2 Mini's dense Q8_0 products (M rows x K, the graph export's MUL_MAT lines) at

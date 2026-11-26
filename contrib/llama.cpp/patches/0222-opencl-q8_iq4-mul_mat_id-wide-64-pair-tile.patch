@@ -1,8 +1,10 @@
 0222: the wide int8 expert tile at 64 pairs, behind GGML_OPENCL_KQ_MM_ID_I8_XT=64 (unset: today's 32-pair tile and route, the 64-pair program not built): the route cuts each expert into ceil(c/64) tiles, the wide program is built a second time with I8W_XT=64 and I8W_SKIP=1 (a tile's 8-pair groups past its real count skip their staging, DPAS and scale), for the IQ4_NL arm and the Q8_0 prompt arm; the gate is a pure host function (kq_i8_xt64_refusal) with its DOWNGRADE reasons; tests: the gate on the export shapes, the skip's text and the 64-pair program's compile (test-opencl-kq-i8), the tails routing (routed=4) and a served 1,024-token launch in test-backend-ops.
 
+diff --git a/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc b/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
+index 5adebad..8a29c34 100644
 --- a/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
 +++ b/ggml/src/ggml-opencl/kernels/kq_i8_ops.inc
-@@ -244,6 +244,40 @@
+@@ -244,6 +244,40 @@ static inline int kq_i8_wide_wanted(const char *env) {
      return env[0] == '1' ? 1 : 0;                // "1", "1..." on; anything else off
  }
  
@@ -43,6 +45,8 @@
  // The group's mean routed pairs (rows) per expert. n_expert is the matrix's
  // expert count; min(n_expert, n_pairs) is the upper bound of the experts a
  // call touches, so the mean is never understated (Strata reads the real cnt
+diff --git a/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl b/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl
+index 7cf4611..1e24853 100644
 --- a/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl
 +++ b/ggml/src/ggml-opencl/kernels/mul_mm_kq_i8_wide.cl
 @@ -46,6 +46,25 @@
@@ -115,9 +119,11 @@
      const int lane = get_sub_group_local_id(), sgi = get_sub_group_id();                                \
      const int r0 = get_group_id(1) * I8W_BW + sgi * 16 + lane;                                     \
      const int r1 = r0 + I8W_XSG * 16;                                                                   \
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index d5a150d..55aca77 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -1313,6 +1313,10 @@
+@@ -1351,6 +1351,10 @@ struct ggml_backend_opencl_context {
      // built only when GGML_OPENCL_KQ_MM_ID_I8_WIDE asks for it.
      cl_kernel kernel_mul_mm_id_iq4_nl_i8_wide = nullptr;
      cl_kernel kernel_mul_mm_id_q8_0_i8_wide   = nullptr;
@@ -128,7 +134,7 @@
      // the route in prealloc_kq_pairs / _tiles / _ntiles: a MoE layer's gate,
      // up and down share their ids tensor, so it is computed once a layer
      struct {
-@@ -3579,6 +3583,21 @@
+@@ -3667,6 +3671,21 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
                                      CL_CHECK((backend_ctx->kernel_mul_mm_id_q8_0_i8_wide = clCreateKernel(wide_prog, "kernel_mul_mm_id_q8_0_i8_wide", &err), err));
                                      CL_CHECK(clReleaseProgram(wide_prog));
                                      GGML_LOG_INFO("ggml_opencl: int8 DPAS expert GEMM (MUL_MAT_ID, 512-column band) built\n");
@@ -150,7 +156,7 @@
                                  }
                              }
                          }
-@@ -37937,6 +37956,26 @@
+@@ -38300,6 +38319,26 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      if (i8_wide) {
          i8_kernel = i8w_kernel;
      }
@@ -177,7 +183,7 @@
      cl_kernel kernel = ids8 ? ids8_kernel :
                         i8 ? i8_kernel :
                         id2 ? backend_ctx->kernel_mul_mm_id2_kq_f16[ti] :
-@@ -38158,7 +38197,7 @@
+@@ -38521,7 +38560,7 @@ static bool ggml_cl_mul_mat_id_kq(ggml_backend_opencl_context * backend_ctx, con
      const ggml_cl_kq_tile & t = backend_ctx->kq_mm_id;
      const int sg        = backend_ctx->kq_mm_sg;
      const int id2_xt = backend_ctx->kq_id2_xt, id2_xsg = backend_ctx->kq_id2_xsg;   // XT, XSG of mul_mm_kq_f16.cl
@@ -186,7 +192,7 @@
      const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min(n_expert, n_pairs);
      backend_ctx->prealloc_kq_pairs.allocate(backend_ctx->context, (size_t)n_pairs * sizeof(cl_int));
      backend_ctx->prealloc_kq_tiles.allocate(backend_ctx->context, (size_t)max_tiles * sizeof(cl_int4));
-@@ -38450,8 +38489,17 @@
+@@ -38813,8 +38852,17 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
      const int n_vals = n_cols * ne00;
      const cl_ulong offset1 = extra1->offset + src1->view_offs;
  
@@ -206,7 +212,7 @@
      const int sg = backend_ctx->kq_mm_sg;
      const int i8_xsg = 8;
      const int max_tiles = CEIL_DIV(n_pairs, tile) + std::min((int) src0->ne[2], n_pairs);
-@@ -38510,7 +38558,15 @@
+@@ -38873,7 +38921,15 @@ static bool ggml_cl_mul_mat_id_q8_0_prompt(ggml_backend_opencl_context * backend
      const bool w_on = kq_i8_wide_wanted(w_env) != 0;
      const bool w_wide = w_on && backend_ctx->kernel_mul_mm_id_q8_0_i8_wide != nullptr;
      if (w_wide) {
@@ -223,9 +229,11 @@
      }
      cl_uint a = 0;
      const cl_ulong offq = 0;   // the flat planes' extra starts at the tensor's base (the decode arm's offq)
+diff --git a/tests/test-opencl-kq-i8.cpp b/tests/test-opencl-kq-i8.cpp
+index 70cf464..02c5ea0 100644
 --- a/tests/test-opencl-kq-i8.cpp
 +++ b/tests/test-opencl-kq-i8.cpp
-@@ -275,6 +275,54 @@
+@@ -275,6 +275,54 @@ static void check_wide(void) {
      CHECK(kq_i8_wide_wanted("yes") == 0, "wide: an unparsable word -> off");
  }
  
@@ -280,7 +288,7 @@
  // ---- the activation's column mapping ----
  // the fp16 tile kernel's column, (i % ne11) + t * ne11, not the route pair: a
  // broadcast b (ne11 = 1, the served gate/up) holds one activation a token.
-@@ -658,6 +706,32 @@
+@@ -658,6 +706,32 @@ static void check_wide_text(void) {
      const int rc = std::system(cmd.c_str());
      if (rc != 0) std::printf("FAIL: opencl-wide: the assembled wide program does not compile (%s)\n", cc.c_str());
      CHECK(rc == 0, "opencl-wide: the assembled wide program compiles as OpenCL C");
@@ -313,7 +321,7 @@
  }
  
  int main() {
-@@ -670,10 +744,12 @@
+@@ -670,10 +744,12 @@ int main() {
      check_formats();
      check_program();
      check_wide();
@@ -326,9 +334,11 @@
      if (g_bad == 0) std::printf("test-opencl-kq-i8: all OK\n");
      return g_bad == 0 ? 0 : 1;
  }
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c3e5760..73c6041 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -6372,18 +6372,23 @@
+@@ -6417,18 +6417,23 @@ struct test_mul_mat_id_p5 : public test_mul_mat_id {
                         int64_t m, int64_t n, int64_t k)
          : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k), mode(mode), replay(replay) {
          GGML_ASSERT(n_mats == 128 && n_used == 8);
@@ -356,7 +366,7 @@
              }
              GGML_ASSERT((int64_t) list.size() == n * n_used && mx <= n);
          }
-@@ -13399,6 +13404,14 @@
+@@ -13444,6 +13449,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
      // 0208b: one correctness case each new routing (balanced down at 128 tokens, a served launch's gate/up at 512)
      test_cases.emplace_back(new test_mul_mat_id_p5(2, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, 128, 1152));
      test_cases.emplace_back(new test_mul_mat_id_p5(3, 1, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, 512, 2304));
@@ -371,13 +381,13 @@
  
      // 0168's Q8_0 prompt arm refuses rows that are not a multiple of 16 and more
      // than 512 experts; these two take its fallback, so that text is run too.
-@@ -15241,6 +15254,9 @@
-         test_cases.emplace_back(new test_mul_mat_id_p5(3, i, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, p5_replay[i].n, 1152));
-         test_cases.emplace_back(new test_mul_mat_id_p5(3, i, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, p5_replay[i].n, 2304));
+@@ -15297,6 +15310,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,  GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
+         test_cases.emplace_back(new test_mul_mat_id_skew(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
      }
 +    // 0222: the tails routing in the perf list too (the 64-pair knob's op rows time it off and on)
 +    test_cases.emplace_back(new test_mul_mat_id_p5(4, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, false, 2304, 520, 1152));
 +    test_cases.emplace_back(new test_mul_mat_id_p5(4, 0, GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 128, 8, true,  2304, 520, 2304));
  
-     // Qwen3.8-Flash-Next GSQ-RCO IQ2_XS: 512 experts, 10 used, gate/up 2560 -> 640, down 640 -> 2560; decode and a verify
-     for (int bs : {1, 3}) {
+     // 0208: DOWN against the fused GATE_UP at the real token counts, the same
+     // fixed routing (seed 20261124), so one card run compares the two expert
