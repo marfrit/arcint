@@ -11323,6 +11323,11 @@ the gate text 0.002598 nats / same top 98.159 % off, the fp16 arm identical to o
 97.964 % (at ub 32 0.002878 / 98.029 %; slots off and the dedup off identical to the int8 arm); the battery 8 of 8
 right on both arms (the arithmetic and binary search texts differ, the verdicts do not).
 
+**Which arm for a default** (the operator, 2026-11-26): no lossy speed trade. When a default changes, the arm that
+keeps the result's class is preferred: the fp16 arm (`GGML_OPENCL_Q8_2D=1`, KL identical to the tile's on the card)
+over the int8 arm (`=2`, which quantizes the activations: +0.00023 nats, same top -0.2 pt, inside the answer-level
+bar). The int8 arm stays opt-in.
+
 **Why.** On Xe2 every dense Q8_0 product of 16 or more columns runs 0058's local-memory tile,
 `kernel_mul_mm_q8_0_f16` (`code`, `mul_mm_kq_f16.cl`): one work-group of 64 rows x 512 tokens walks all
 of K, stops every 256 of K to dequantise 64 x 256 weights into local memory between two barriers, and
