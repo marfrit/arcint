@@ -90,8 +90,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   faster). The knob stays off by default until the operator changes it (`contrib/llama.cpp/README.md`, 0221).
   Served reach: the card window ran its served processes with arcint's `-v` and saw the TAKEN line (1,536 calls a
   4,096-token pass); the stacked series' first check ran a unit without `-v`, and the line was INFO, which arcint
-  keeps for its verbose level, so it could not show. Since 0224 it is WARN (below). The stacked tree's reach of 0221
-  is still owed to the combined relaunch.
+  keeps for its verbose level, so it could not show. Since 0224 it is WARN (below). On the stacked series with every
+  1.8.3 knob on (`measured-here`, B60), a served unit at its own verbosity, without `-v`, prints the TAKEN lines of
+  0220 (`2d-i8`), 0222 (`xt64`, both types) and 0221 (`loop_control`): each item reaches in the served process.
 
 - llama.cpp patch 0224: the 1.8.3 items' TAKEN lines at WARN, once a process. 0221's `loop_control: TAKEN` was INFO
   (shown only at arcint `-v`) and is WARN under `std::call_once`; 0220's line (already WARN) is guarded by a
