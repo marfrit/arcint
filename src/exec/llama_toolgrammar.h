@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "core/chat.h"
+#include "core/dialect.h"
 #include "core/sampler.h"
 
 namespace lgc {
@@ -25,7 +26,13 @@ public:
     // the generator or llama.cpp's grammar parser refuses (the reference
     // fails the request the same way: "failed to parse grammar"), and
     // InputError (a 400) when a declared schema cannot be constrained.
-    LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel);
+    //
+    // `dialect` Inkling: Inkling 2 Mini's call form instead
+    // (core/toolgrammar.h generate_inkling_tool_grammar), triggered by the
+    // reference's pattern (the header followed by a character other than
+    // `<`), never by a token. Every other dialect takes the Qwen form.
+    LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel,
+                     ChatDialect dialect = ChatDialect{});
     ~LlamaToolGrammar() override;
     LlamaToolGrammar(const LlamaToolGrammar&)            = delete;
     LlamaToolGrammar& operator=(const LlamaToolGrammar&) = delete;

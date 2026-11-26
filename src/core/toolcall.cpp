@@ -326,6 +326,21 @@ ToolCallParse parse_gemma_tool_calls(std::string_view text, const ToolSchemas* s
 // `open` and `tool_choice`). The header name and the JSON name must agree; the
 // arguments are one JSON object, whose strings may contain the block closer.
 
+// A JSON exception's text as one log line: nlohmann appends "; last read:
+// '<the token so far>'", which for a string is the model's text up to the
+// failure (a whole heredoc, newlines and all) and is cut here; any control
+// byte left is written as \xNN.
+std::string one_line_json_error(std::string_view what) {
+    const size_t cut = what.find("; last read");
+    if (cut != std::string_view::npos) what = what.substr(0, cut);
+    std::string out;
+    for (const char c : what) {
+        if (static_cast<unsigned char>(c) < 0x20) out += log::format("\\x%02X", static_cast<unsigned>(static_cast<unsigned char>(c)));
+        else out += c;
+    }
+    return out;
+}
+
 ToolCallParse parse_inkling_tool_calls(std::string_view text) {
     ToolCallParse result;
     size_t cursor = 0;
@@ -352,7 +367,9 @@ ToolCallParse parse_inkling_tool_calls(std::string_view text) {
         const size_t json_start = tj + markers::kInkContentToolJson.size();
         size_t       json_end   = json_start;
         if (json_start >= text.size() || text[json_start] != '{') {
-            result.truncated = true;
+            result.truncated     = true;
+            result.reject_reason = "no '{' after the call marker";
+            result.reject_offset = json_start - h;
             result.content.append(text.substr(h));
             break;
         }
@@ -374,15 +391,29 @@ ToolCallParse parse_inkling_tool_calls(std::string_view text) {
             }
         }
         if (depth != 0 || in_str) {
-            result.truncated = true;
+            result.truncated     = true;
+            result.reject_reason = in_str ? "the object never closes: a string is still open at the end of the text"
+                                          : "the object never closes: unbalanced braces";
+            result.reject_offset = json_end - h;
             result.content.append(text.substr(cursor));
             break;
         }
         json parsed;
         try {
             parsed = json::parse(text.substr(json_start, json_end - json_start));
-        } catch (const json::exception&) {
-            result.truncated = true;
+        } catch (const json::parse_error& e) {
+            result.truncated     = true;
+            result.reject_reason = "JSON parse error: " + one_line_json_error(e.what());
+            // nlohmann's byte: the count of bytes read when it failed, so the
+            // failing byte is the one before it (a raw TAB in a string points
+            // at the TAB)
+            result.reject_offset = json_start - h + (e.byte > 0 ? e.byte - 1 : 0);
+            result.content.append(text.substr(cursor));
+            break;
+        } catch (const json::exception& e) {
+            result.truncated     = true;
+            result.reject_reason = "JSON parse error: " + one_line_json_error(e.what());
+            result.reject_offset = json_start - h;
             result.content.append(text.substr(cursor));
             break;
         }
@@ -393,8 +424,18 @@ ToolCallParse parse_inkling_tool_calls(std::string_view text) {
                                    markers::kInkEndMessage
                                ? json_end + markers::kInkEndMessage.size()
                                : std::string_view::npos;
-        if (!named || end == std::string_view::npos) {
-            result.truncated = true;
+        if (!named) {
+            result.truncated     = true;
+            result.reject_reason = "name / args mismatch: the object must be {\"name\": \"" + name +
+                                   "\" (the header's name), \"args\": <object>}";
+            result.reject_offset = json_start - h;
+            result.content.append(text.substr(cursor));
+            break;
+        }
+        if (end == std::string_view::npos) {
+            result.truncated     = true;
+            result.reject_reason = "no " + std::string(markers::kInkEndMessage) + " right after the object's '}'";
+            result.reject_offset = json_end - h;
             result.content.append(text.substr(cursor));
             break;
         }
@@ -420,6 +461,14 @@ std::string_view tool_call_close(ChatDialect dialect) {
     if (dialect.neutral()) return {};
     if (dialect.inkling()) return markers::kInkEndMessage;
     return dialect.gemma4() ? markers::kGemmaToolClose : kClose;
+}
+
+std::string tool_call_reject_message(const ToolCallParse& parsed, ChatDialect dialect) {
+    const std::string opener(tool_call_open(dialect));
+    if (parsed.reject_reason.empty()) return "unterminated " + opener + " block";
+    std::string out = opener + " block rejected: " + parsed.reject_reason;
+    if (parsed.reject_offset != std::string::npos) out += log::format(" (at byte %zu of the block)", parsed.reject_offset);
+    return out;
 }
 
 const ToolCallTags& tool_call_tags() {
@@ -476,7 +525,11 @@ ToolCallParse parse_qwen_tool_calls(std::string_view text, const ToolSchemas* sc
 }
 
 ToolCallParse parse_tool_calls(std::string_view text, ChatDialect dialect, const ToolSchemas* schemas) {
-    if (dialect.neutral()) return ToolCallParse{std::string(text), {}, false};   // "runs" parses no calls
+    if (dialect.neutral()) {   // "runs" parses no calls
+        ToolCallParse plain;
+        plain.content = std::string(text);
+        return plain;
+    }
     if (dialect.inkling()) return parse_inkling_tool_calls(text);
     return dialect.gemma4() ? parse_gemma_tool_calls(text, schemas) : parse_qwen_tool_calls(text, schemas);
 }

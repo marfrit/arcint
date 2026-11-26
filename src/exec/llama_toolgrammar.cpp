@@ -24,26 +24,35 @@ std::string regex_escape(const std::string& s) {
 
 }  // namespace
 
-LlamaToolGrammar::LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel) {
+LlamaToolGrammar::LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel,
+                                   ChatDialect dialect) {
+    const bool inkling = dialect.inkling();
     try {
-        gbnf_ = generate_tool_grammar(tools, parallel);
+        gbnf_ = inkling ? generate_inkling_tool_grammar(tools, parallel) : generate_tool_grammar(tools, parallel);
     } catch (const std::invalid_argument& e) {
         // the client's schema: a 400, before any token (handlers.cpp guarded())
         throw InputError(std::string("tool_grammar: ") + e.what());
     }
     if (gbnf_.empty()) throw std::runtime_error("tool grammar: no tools declared");
 
-    const std::string opener = tool_grammar_trigger();
-    std::vector<llama_token> ids(opener.size() + 4);
-    const int n = llama_tokenize(vocab, opener.c_str(), static_cast<int32_t>(opener.size()), ids.data(),
-                                 static_cast<int32_t>(ids.size()), /*add_special*/ false, /*parse_special*/ true);
     std::vector<llama_token> trigger_tokens;
     std::vector<std::string> patterns;
-    if (n == 1) {
-        trigger_tokens.push_back(ids[0]);
-        trigger_is_token_ = true;
+    if (inkling) {
+        // the header is a special token, but the trigger is the header AND a
+        // following character other than `<` (mainline's inkling.cpp): a
+        // pattern, never a token
+        patterns.push_back(inkling_tool_grammar_trigger_pattern());
     } else {
-        patterns.push_back(regex_escape(opener));
+        const std::string opener = tool_grammar_trigger();
+        std::vector<llama_token> ids(opener.size() + 4);
+        const int n = llama_tokenize(vocab, opener.c_str(), static_cast<int32_t>(opener.size()), ids.data(),
+                                     static_cast<int32_t>(ids.size()), /*add_special*/ false, /*parse_special*/ true);
+        if (n == 1) {
+            trigger_tokens.push_back(ids[0]);
+            trigger_is_token_ = true;
+        } else {
+            patterns.push_back(regex_escape(opener));
+        }
     }
     std::vector<const char*> patterns_c;
     for (const std::string& p : patterns) patterns_c.push_back(p.c_str());

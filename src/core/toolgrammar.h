@@ -70,4 +70,59 @@ std::string generate_tool_grammar(const std::vector<ToolSpec>& tools, bool paral
 // pattern, as llama.cpp's common_sampling_add_grammar_triggers does.
 std::string tool_grammar_trigger();
 
+// Inkling 2 Mini's call form (ChatDialect::Inkling), modelled on mainline
+// llama.cpp's common/parsers/inkling.cpp (commit 690b87d8, 2026-11-21:
+// common_chat_params_init_inkling, `open` / `args` / the lazy trigger). One
+// block per call:
+//
+//   <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>
+//
+// The grammar starts at NAME (the trigger below matches the header and the
+// pattern's capture group starts at the name, as the reference's does): NAME
+// is one of the declared tools' names, the object's prefix is the template's
+// compact `{"name":<NAME as JSON>,"args":`, `args` is a JSON object, then `}`
+// and the block closer. With `parallel` (the request's parallel_tool_calls)
+// another `<|message_model|>` + call may follow, as the reference's `calls`;
+// the turn then ends (a complete grammar admits only the end-of-generation
+// token).
+//
+// Two deviations from the reference, both stricter:
+//   - a JSON string admits no raw control byte 0x00-0x1F (`\t`, `\n` and the
+//     other escapes stay legal). The reference builds args from its PEG
+//     builder's p.json(), whose string rule in GBNF is `[^"\\]` plus the
+//     escapes (common/peg-parser.cpp, the common_peg_string_parser case), so a
+//     raw TAB passes its grammar and then fails every JSON parser.
+//     `measured-here` (served, Inkling 2 Mini, twice on 2026-11-26): a bash
+//     call whose "command" held tab-indented C copied raw into a heredoc was
+//     correctly framed but returned as raw content ("Invalid control
+//     character"). json-schema-to-grammar's own `char` rule excludes the
+//     control bytes as here.
+//   - `args` is a JSON object, not any JSON value: the template writes an
+//     object (it refuses anything else) and the parser (core/toolcall.cpp)
+//     takes only an object.
+// The reference also adds an anchored "[^<]+" trigger for Inkling 1, whose
+// generation prompt ends with the header; Inkling 2 Mini's template has no
+// generation prompt (the model writes the header), and the backend refuses
+// the grammar for a prompt that ends with the header (backend_llama.cpp,
+// prepare_tool_grammar), since the think-block tracker that keeps the
+// grammar dormant while the model thinks (operator, 2026-11-26) does not see
+// a header the prompt wrote.
+//
+// `reference_strings`: the reference's string rule instead of the strict one,
+// for the red arm of the tests only.
+//
+// Throws std::invalid_argument for a tool name the form cannot carry: empty,
+// starting with `<` (the trigger needs a character other than `<` after the
+// header), with whitespace at either end (the parser reads the header name
+// trimmed), or holding a NUL or the call marker. Returns an empty string when
+// no tools are declared.
+std::string generate_inkling_tool_grammar(const std::vector<ToolSpec>& tools, bool parallel = true,
+                                          bool reference_strings = false);
+
+// The lazy trigger, as the reference's COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
+// the header followed by a character that is not `<` (a content marker after
+// the header is a reasoning or text block, not a call). The capture group
+// marks where the grammar starts.
+std::string inkling_tool_grammar_trigger_pattern();
+
 }  // namespace lgc

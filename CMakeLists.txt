@@ -383,6 +383,7 @@ if(ARCINT_TESTS)
     tests/test_slot_loan.cpp
     tests/test_loan_book.cpp
     tests/test_toolgrammar.cpp
+    tests/test_inkling_grammar.cpp
     tests/test_force_content.cpp
     tests/test_tokenize_once.cpp
     tests/test_disconnect.cpp
@@ -419,6 +420,12 @@ if(ARCINT_TESTS)
     # LLAMA_SLOT_LOAN_BYTES_ENV and llama_model_default_params (finding 8's rule
     # lives in the pinned tree's init and its default params, not in the tool)
     target_include_directories(arcint-test PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/include")
+    # test_inkling_grammar.cpp drives the Inkling call grammar through arcint's
+    # Sampler on a real vocabulary: the pinned tree's vocab-only GGUF (part of
+    # the llama.cpp source tarball), loaded with no device. A missing file
+    # fails the case, it does not skip.
+    target_compile_definitions(arcint-test PRIVATE
+      ARCINT_LLAMA_VOCAB_GGUF="${ARCINT_LLAMA_DIR}/models/ggml-vocab-gpt-2.gguf")
     # contrib/llama.cpp 0116: test_planes.cpp runs the OpenCL backend's planar layout (the low-bit types
     # and Q3_K), a device-free header of the pinned tree's ggml-opencl
     if(EXISTS "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/ggml-opencl-planes.h")

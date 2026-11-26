@@ -81,7 +81,10 @@ SHELL_ARG = re.compile(r"(unexpected eof while looking for matching"
                        r"|here-document .* delimited by end-of-file)", re.I)
 
 # Served-unit log lines.
-JOURNAL_WARN = re.compile(r"unterminated .*block; returned as raw content")
+# 1.8.3: an Inkling block names its reject reason ("... block rejected: <reason>
+# (at byte N of the block); returned as raw content"); the Qwen and Gemma forms
+# keep "unterminated ... block".
+JOURNAL_WARN = re.compile(r"(unterminated .*block|block rejected: .*); returned as raw content")
 JOURNAL_COMPLETION = re.compile(r"^\s*lgc\s+slot \d+: prefill\s+\d+ tok")
 JOURNAL_ABORT = re.compile(r"abort", re.I)
 

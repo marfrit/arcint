@@ -9,6 +9,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "core/markers.h"
 #include "core/toolcall.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
@@ -352,5 +353,100 @@ std::string generate_tool_grammar(const std::vector<ToolSpec>& tools, bool paral
 }
 
 std::string tool_grammar_trigger() { return tag_text(tool_call_tags().open); }
+
+namespace {
+
+// A GBNF string literal: the grammar parser's escapes for the quote, the
+// backslash and the line bytes, \xNN for any other control byte. UTF-8 is
+// written as is (the parser decodes it).
+std::string gbnf_literal(std::string_view s) {
+    std::string out = "\"";
+    for (const char c : s) {
+        const auto u = static_cast<unsigned char>(c);
+        switch (c) {
+            case '"': out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (u < 0x20) {
+                    static const char* hex = "0123456789ABCDEF";
+                    out += "\\x";
+                    out += hex[u >> 4];
+                    out += hex[u & 0xF];
+                } else {
+                    out += c;
+                }
+        }
+    }
+    return out + "\"";
+}
+
+std::string regex_escaped(std::string_view s) {
+    static const std::string special = "^$.|?*+()[]{}\\";
+    std::string              out;
+    for (const char c : s) {
+        if (special.find(c) != std::string::npos) out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+}  // namespace
+
+std::string generate_inkling_tool_grammar(const std::vector<ToolSpec>& tools, bool parallel, bool reference_strings) {
+    if (tools.empty()) return {};
+    const std::string header(markers::kInkMessageModel);
+    const std::string marker(markers::kInkContentToolJson);
+    const std::string closer(markers::kInkEndMessage);
+
+    std::string calls;
+    std::string tool_rules;
+    for (size_t i = 0; i < tools.size(); i++) {
+        const std::string& name = tools[i].name;
+        if (name.empty()) throw std::invalid_argument("a tool without a name");
+        if (name.front() == '<')
+            throw std::invalid_argument("tool '" + name + "': a name that starts with '<' cannot trigger the call grammar");
+        if (name.find('\0') != std::string::npos) throw std::invalid_argument("a tool name holds a NUL");
+        if (name.find(marker) != std::string::npos)
+            throw std::invalid_argument("tool '" + name + "': the name holds the call marker");
+        const auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+        if (ws(name.front()) || ws(name.back()))
+            throw std::invalid_argument("tool '" + name + "': whitespace at the ends of the name (the parser trims it)");
+        const std::string rule = "ink-tool-" + std::to_string(i);
+        // the reference's `open`: the name, the call marker, the compact prefix
+        // {"name":<the name as JSON>,"args": ; then the args, `}` and the closer
+        const std::string open = name + marker + "{\"name\":" + nlohmann::json(name).dump() + ",\"args\":";
+        tool_rules += rule + " ::= " + gbnf_literal(open) + " ink-object " + gbnf_literal("}" + closer) + "\n";
+        calls += (i == 0 ? "" : " | ") + rule;
+    }
+
+    // a JSON value, as the reference's p.json() (object, array, string,
+    // number, true / false / null, the same optional space), with the
+    // strict string rule (core/toolgrammar.h)
+    const std::string chr = reference_strings
+                                // the reference's GBNF for a "-delimited string's content, verbatim
+                                // (common/peg-parser.cpp, common_peg_string_parser)
+                                ? R"(( [^"\\] | "\\" ( ["\\/ bfnrt] | "u" [0-9a-fA-F]{4} ) ))"
+                                : R"(( [^"\\\x00-\x1F] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) ))";
+    std::string g;
+    g += "root ::= ink-call" + std::string(parallel ? " ( " + gbnf_literal(header) + " ink-call )*" : "") + "\n";
+    g += "ink-call ::= " + calls + "\n";
+    g += tool_rules;
+    g += "ink-value ::= ink-object | ink-array | ink-string | ink-number | \"true\" | \"false\" | \"null\"\n";
+    g += "ink-object ::= \"{\" ink-ws ( ink-member ( ink-ws \",\" ink-ws ink-member )* ink-ws )? \"}\"\n";
+    g += "ink-member ::= ink-string ink-ws \":\" ink-ws ink-value\n";
+    g += "ink-array ::= \"[\" ink-ws ( ink-value ( ink-ws \",\" ink-ws ink-value )* ink-ws )? \"]\"\n";
+    g += "ink-string ::= \"\\\"\" ink-char* \"\\\"\"\n";
+    g += "ink-char ::= " + chr + "\n";
+    g += "ink-number ::= \"-\"? ( \"0\" | [1-9] [0-9]* ) ( \".\" [0-9]+ )? ( [eE] [-+]? [0-9]+ )?\n";
+    g += "ink-ws ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\n";
+    return g;
+}
+
+std::string inkling_tool_grammar_trigger_pattern() {
+    return regex_escaped(markers::kInkMessageModel) + "([^<])";
+}
 
 }  // namespace lgc

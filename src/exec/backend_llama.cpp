@@ -908,9 +908,11 @@ public:
             throw std::runtime_error("--tool-grammar: the 'runs' tier parses no tool calls (the template's call form "
                                      "is not known); start without --tool-grammar");
         // Gemma 4 speaks its own reasoning channel and tool-call form. --tool-grammar
-        // constrains the Qwen call form, so on this model it would constrain the
-        // output to a syntax the model does not use: refused at start.
-        if ((dialect_.gemma4() || dialect_.inkling()) && cfg.tool_grammar)
+        // constrains the Qwen call form (and Inkling's, below), so on this model it
+        // would constrain the output to a syntax the model does not use: refused at
+        // start. Inkling 2 Mini has its own call grammar (core/toolgrammar.h
+        // generate_inkling_tool_grammar, after mainline's common/parsers/inkling.cpp).
+        if (dialect_.gemma4() && cfg.tool_grammar)
             throw std::runtime_error("--tool-grammar constrains the Qwen tool-call form; this model calls tools in its "
                                      "own form (parsed into tool_calls without it): start without --tool-grammar");
         tokenizer_ = std::make_unique<LlamaTokenizer>(vocab_);
@@ -3210,14 +3212,25 @@ private:
         // including a Qwen-dialect runs model whose template carries the form
         if (!runs_may_use_tool_grammar(tier_))
             throw InputError("tool_grammar: the 'runs' tier refuses the tool-call grammar; the call form is not promised");
-        // the grammar is the Qwen call form (core/toolgrammar.cpp): on a Gemma 4 model
-        // a request that asks for it is refused, not run against the wrong syntax
+        // the grammar is the Qwen call form (core/toolgrammar.cpp) or Inkling's: on a
+        // Gemma 4 model a request that asks for it is refused, not run against the
+        // wrong syntax
         if (dialect_.neutral())
             throw InputError("tool_grammar: the neutral dialect parses no tool calls");
-        if (dialect_.gemma4() || dialect_.inkling())
+        if (dialect_.gemma4())
             throw InputError("tool_grammar constrains the Qwen tool-call form; this model calls tools in its own form");
+        // Inkling: the grammar stays dormant while the model thinks (operator,
+        // 2026-11-26: the trigger fires outside the thinking block only), which
+        // rests on the think-block tracker seeing the block's opener, the header
+        // and <|content_thinking|>. A prompt that already ends with the header (an
+        // Inkling 1 template's generation prompt; Inkling 2 Mini's template has
+        // none) would hide the header from the tracker, so the thinking text would
+        // reach the trigger: refused, not run half-constrained.
+        if (dialect_.inkling() && std::string_view(in.prompt).ends_with(markers::kInkMessageModel))
+            throw InputError("tool_grammar: the prompt ends with the assistant header (an Inkling 1 template's "
+                             "generation prompt); the Inkling call grammar needs the model to write the header");
         const auto t0 = clock_type::now();
-        auto       g  = std::make_unique<LlamaToolGrammar>(vocab_, in.tools, in.parallel_tool_calls);
+        auto       g  = std::make_unique<LlamaToolGrammar>(vocab_, in.tools, in.parallel_tool_calls, dialect_);
         log::verbose("grammar", "tool-call grammar: %zu tools, %zu bytes of GBNF, triggered by %s, built in %.1f ms",
                      in.tools.size(), g->gbnf().size(), g->trigger_is_token() ? "a token" : "a pattern",
                      seconds_since(t0) * 1e3);
