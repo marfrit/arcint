@@ -91,8 +91,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   the CPU, not 1e-5. The bound was set by the operator after the card run, on a basis independent of the split
   result: the unsplit f16 port's own error against the CPU is 3.88e-5 (`measured-here`, B60), so 1e-5 sat below that
   floor and the three f16 split cases failed on the card. The q8_0 split cases (1e-5) and the older cases are
-  unchanged. The sharper evidence is the split against the unsplit port, 1.6e-9 to 5.9e-8 per case (bound 1e-5);
-  a lost seam block still exceeds the new bound (`contrib/llama.cpp/README.md`, 0223c).
+  unchanged. The sharper evidence is the split against the unsplit port, 1.6e-9 to 5.9e-8 per case (`measured-here`,
+  bound 1e-5); a lost seam block still exceeds the new bound, at 1.76x. The red of record for the split is the split-vs-unsplit comparison (bound 1e-5, RED=13 at 17x or more), a window procedure (`GGML_TEST_FA_PORT_DUMP` plus an external compare), not a verdict the binary prints; the f16 CPU-referenced bound detects only a whole lost seam block (1.76x). (`contrib/llama.cpp/README.md`,
+  0223c).
 - llama.cpp patch 0221 (opt-in, `GGML_OPENCL_LOOP_CONTROL=1|bf16`, default off): Inkling 2 Mini's loop controller as
   one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
   its 12-launch chain, for prompt batches. Unset, the graph is today's line for line. Card rows (`measured-here`, B60

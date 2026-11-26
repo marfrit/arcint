@@ -10020,9 +10020,11 @@ unit's settings).
   split with the knob on. That last check is 0045's blind KL run, made a test.
 - **The counts:** `GGML_TEST_FA_PORT_DECISIONS` counts the split cases apart, and checks that the rule
   splits them at both cards' waves.
-- **The bound:** the split cases are bounded at 1e-5, f16 as well. A lost seam block moves their f16
-  answer by NMSE 1.8e-4 .. 3.5e-4, which 5e-4 would hide. `GGML_TEST_FA_PORT_SEAM=1` checks on the CPU
-  that the red stands at least 10x above the bound.
+- **The bound:** 0223b bounded the split cases at 1e-5, f16 as well: a lost seam block moves their f16 answer
+  by NMSE 1.76e-4 .. 3.55e-4 (`inference`, a numpy model), which the older cases' 5e-4 would hide, and
+  `GGML_TEST_FA_PORT_SEAM=1` asked the red at least 10x above the bound. The card ran at that bound first; since
+  0223c (below) the f16 split cases are bounded at 1e-4 and the seam check asks the red above the bound (the f16
+  cells at 1.76x .. 3.55x, the q8_0 cells at 17x or more of their unchanged 1e-5).
 - **Perf:** a perf row whose launch record is wrong prints `FAILED [launch record]`. Two perf cells
   price the 128-block floor.
 - **The split against the unsplit port:** `GGML_TEST_FA_PORT_DUMP=<dir>` writes each port case's output on the
@@ -10032,9 +10034,10 @@ unit's settings).
   RED=13 above it.
 - **The bound on the CPU reference, revised after the first card run:** the unsplit f16 port's own error against the
   CPU was 3.88e-5 on the card, so the split f16 cases' 1e-5 sat below the kernel's floor by construction (`measured-here`:
-  the split f16 cases 4.3e-5, q8_0 1.9e-6). The window judges the split f16 cases at 1e-4 from the logged NMSE (RED=13:
-  1.75e-4 .. 3.82e-4) and records the binary's 1e-5 verdict beside it; the split-against-unsplit bound above is the
-  check of the split itself.
+  the split f16 cases 4.3e-5, q8_0 1.9e-6). The operator set the split f16 bound to 1e-4 on that basis. Before 0223c the
+  window judged the split f16 cases at 1e-4 from the logged NMSE and recorded the binary's 1e-5 verdict beside it;
+  with 0223c the binary's own bound is 1e-4 and the two verdicts agree. RED=13 against the CPU: 1.75e-4 .. 3.82e-4
+  (`measured-here`). The red of record for the split is the split-vs-unsplit comparison (bound 1e-5, RED=13 at 17x or more), a window procedure (`GGML_TEST_FA_PORT_DUMP` plus an external compare), not a verdict the binary prints; the f16 CPU-referenced bound detects only a whole lost seam block (1.76x).
 
 **Without a device** (`measured-here`, the recipe host):
 - `contrib/refkernels/trellis-fa/port_split_test.cpp` on the six exports: green rc 0, red
@@ -10054,13 +10057,18 @@ unit's settings).
   sat below the kernel's floor by construction. The split f16 cases measured 4.3e-5 there and failed by that floor,
   not by the split.
 - **The sharper evidence** is the split against the unsplit port on the same seeded inputs
-  (`GGML_TEST_FA_PORT_DUMP`): 1.6e-9 to 5.9e-8 per case, bound 1e-5, FORCE=3 over all 22 port cases. RED=13 (a lost
-  seam block) exceeds that bound by 17x or more.
+  (`GGML_TEST_FA_PORT_DUMP`): 1.6e-9 to 5.9e-8 per case (`measured-here`, B60), bound 1e-5, FORCE=3 over all 22
+  port cases. RED=13 (a lost seam block) exceeds that bound by 17x or more (`measured-here`: 1.74e-4 .. 3.54e-4).
+- **The red of record:** The red of record for the split is the split-vs-unsplit comparison (bound 1e-5, RED=13 at 17x or more), a window procedure (`GGML_TEST_FA_PORT_DUMP` plus an external compare), not a verdict the binary prints; the f16 CPU-referenced bound detects only a whole lost seam block (1.76x).
 - **The red still fails at the new bound, with a smaller margin:** a lost seam block moves the f16 split cases by
-  1.76e-4 to 3.5e-4 (`inference`: a numpy model of the cases' fill; `GGML_TEST_FA_PORT_SEAM=1` gives the same on the
-  CPU backend) and 1.75e-4 to 3.82e-4 on the card. That is 1.76 to 3.5 times 1e-4: the closest cell is kv 16384 x
-  nb 64 with 8,000 empty cells at the B60's split (1.76e-4). `GGML_TEST_FA_PORT_SEAM=1` now asks the red to be above
-  the bound (it asked 10x of 1e-5) and prints the factor.
+  1.76e-4 to 3.55e-4 (`inference`: a numpy model of the cases' fill; `GGML_TEST_FA_PORT_SEAM=1` gives the same on the
+  CPU backend) and by 1.75e-4 to 3.82e-4 on the card (`measured-here`, B60). That is 1.76x to 3.55x 1e-4: the
+  closest cell is kv 16384 x nb 64 with 8,000 empty cells at the B60's split (1.76e-4). It detects a whole lost seam
+  block only; one lost seam of a call's two would sit near half of that, under the bound (`inference`).
+  `GGML_TEST_FA_PORT_SEAM=1` now asks the red to be above the bound (it asked 10x of 1e-5) and prints the factor.
+- **Open, proposed as 0223d (not built):** the seam check's relaxation reaches the q8_0 cells too, whose bound did not
+  move (they still stand at 17x or more of 1e-5): keep 10x there and a margin above 1x for f16, e.g. `nmse > (bound <=
+  1e-5 ? 10.0 : 1.5) * bound`; and the case comment's rounding ("3.5e-4", "about 1.8") to 3.55e-4 and 1.76x.
 
 ## 0208-test-backend-ops-inkling-expert-projection-perf.patch
 
