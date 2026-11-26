@@ -88,9 +88,15 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   16 in f32 and bf16, five reds 0 of 16; mean KL against the CPU base 0.004683 nats (f32) against 0.004705 (off), same
   top 98.03 % both; the capital, the 44k needle and the acceptance task right with it on. f32 is the arm (bf16 is not
   faster). The knob stays off by default until the operator changes it (`contrib/llama.cpp/README.md`, 0221).
-  Served reach open: on the patch's own tree the served process takes the controller (its TAKEN line, 1,536 calls a
-  4,096-token pass); with every 1.8.3 knob on over the stacked series, the served process printed no TAKEN line in
-  its first check. Under investigation; until explained, the stacked tree's reach of 0221 is not shown.
+  Served reach: the card window ran its served processes with arcint's `-v` and saw the TAKEN line (1,536 calls a
+  4,096-token pass); the stacked series' first check ran a unit without `-v`, and the line was INFO, which arcint
+  keeps for its verbose level, so it could not show. Since 0224 it is WARN (below). The stacked tree's reach of 0221
+  is still owed to the combined relaunch.
+
+- llama.cpp patch 0224: the 1.8.3 items' TAKEN lines at WARN, once a process. 0221's `loop_control: TAKEN` was INFO
+  (shown only at arcint `-v`) and is WARN under `std::call_once`; 0220's line (already WARN) is guarded by a
+  `std::once_flag` a mode instead of a static bool array. No default changes; the lines' text is unchanged
+  (`contrib/llama.cpp/README.md`, 0224).
 
 ## 1.8.2 — 2026-11-25
 

@@ -1,0 +1,43 @@
+0224: the TAKEN lines of the 1.8.3 items at a level a served unit shows, once a process. 0221's "loop_control: TAKEN opencl <f32|bf16> one-launch ..." moves from GGML_LOG_INFO under a static bool to GGML_LOG_WARN under std::call_once (arcint's route_llama_log keeps INFO for its verbose level, so a unit without -v could not show the controller's reach; 0211 did the same for the depth mix). 0220's "TAKEN src=opencl op=MUL_MAT type=q8_0 path=2d-<i8|f16>" (already WARN) moves from a static bool array to a static std::once_flag array, one a mode (the bool array was a data race when two backends launch at once). The text of both lines is unchanged. 0211, 0212 and 0222's lines were already WARN under std::call_once.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 79b65ce..3de0ce5 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -22372,12 +22372,13 @@ static void ggml_cl_loop_control(ggml_backend_t backend, const ggml_tensor * cur
+     size_t global_work_size[] = { (size_t) plan.n_wg*plan.lsz, 1, 1 };
+     size_t local_work_size[]  = { (size_t) plan.lsz, 1, 1 };
+ 
+-    static bool taken_told = false;
+-    if (!taken_told) {
+-        taken_told = true;
+-        GGML_LOG_INFO("loop_control: TAKEN opencl %s one-launch rows_wg=%d n_wg=%d\n",
++    // 0224: WARN, once a process (std::call_once, 0211's form): at INFO arcint's log routing keeps the line for
++    // its verbose level, and a served unit without -v could not show that the loop controller ran
++    static std::once_flag taken_told;
++    std::call_once(taken_told, [&] {
++        GGML_LOG_WARN("loop_control: TAKEN opencl %s one-launch rows_wg=%d n_wg=%d\n",
+                       ggml_cl_loop_control_mode() == 2 ? "bf16" : "f32", plan.rows_wg, plan.n_wg);
+-    }
++    });
+     backend_ctx->loop_control_calls_graph++;
+ 
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+@@ -35647,12 +35648,13 @@ static bool ggml_cl_mul_mat_q8_2d(ggml_backend_opencl_context * backend_ctx, con
+     ggml_tensor_extra_cl_q8_0 * e0 = (ggml_tensor_extra_cl_q8_0 *) src0->extra;
+     ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
+     const cl_ulong offd = extrad->offset + dst->view_offs, nb1 = dst->nb[1];
+-    static bool taken[3] = { false, false, false };
+-    if (!taken[mode]) {
+-        taken[mode] = true;
++    // 0224: once a mode a process under std::call_once (the static bool array it replaces was a data race when two
++    // backends launch at once); the level was already WARN
++    static std::once_flag taken[3];
++    std::call_once(taken[mode], [&] {
+         GGML_LOG_WARN("TAKEN src=opencl op=MUL_MAT type=q8_0 path=2d-%s k=%d m=%d n=%d wg=%dx%d\n",
+                       mode == 2 ? "i8" : "f16", ne00, ne01, ncols, sg, nwg);
+-    }
++    });
+     backend_ctx->q8_2d_calls++;
+     // what a launch reaches: the planes (the block reads clamp to their surfaces, the scales
+     // are vector loads), the activations and the destination's furthest row

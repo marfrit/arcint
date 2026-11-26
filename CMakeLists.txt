@@ -954,6 +954,13 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_depth_mix_taken_line.py")
     set_tests_properties(depth-mix-taken-line PROPERTIES LABELS unit)
+    # patch 0224: the 1.8.3 items' TAKEN lines at a level route_llama_log shows outside -v, once a process (read
+    # out of the patched tree and src/exec)
+    add_test(NAME taken-lines-183
+             COMMAND "${CMAKE_COMMAND}" -E env "LLAMA_SRC=${ARCINT_LLAMA_DIR}" "PYTHONDONTWRITEBYTECODE=1"
+                     "${Python3_EXECUTABLE}"
+                     "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_taken_lines_183.py")
+    set_tests_properties(taken-lines-183 PROPERTIES LABELS unit)
     # patch 0221's device-free cell: the loop controller's rule on the exported graph's
     # LOOP_CONTROL lines (red first), the launch plan, the CPU op against the unfused chain, and
     # loop_control.cl itself replayed on host threads (f32 and bf16 builds, and the five reds)

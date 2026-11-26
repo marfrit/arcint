@@ -11435,6 +11435,11 @@ bf16 0.004707 / 98.046 %. Row 5: the capital right, the 44,000-token needle righ
 with the knob on (the off arm's single sampled run reached the 4,000-token cap in its thinking and wrote no code,
 0 of 10: one run an arm at temperature 1.0 does not rank the arms).
 
+The served rows' reach was read from the TAKEN line at arcint's `-v`: the line was GGML_LOG_INFO, which arcint's
+`route_llama_log` keeps for its verbose level, so a unit started without `-v` could not show it (the stacked series'
+first served check). It is WARN, once a process, since 0224; the stacked tree's served reach is owed to the combined
+relaunch.
+
 **What it replaces.** Inkling 2 Mini's loop controller (`src/models/inkling2.cpp` `control()`, the loop model's
 message merge) is, per control and a row at a time, `g = down . concat(rms_norm(cur), rms_norm(msg))` [4608 -> 64],
 `out = (cur - tanh(forget . g)*cur) + tanh(gain . g)*msg` [64 -> 2304]. On the card it is 12 launches, each with its
@@ -11477,7 +11482,8 @@ the dispatch and the host replay.
 **Knob and lines.** `GGML_OPENCL_LOOP_CONTROL`: unset, `0`, `off` = off; `1` or `f32` = the f32 kernel; `bf16` = the
 bf16-DPAS build of the same text; `all-layers` = `1` and the guard lifted. Any other value is not a value: the model
 and the backend keep the arm off and each says so in one WARN line (a mistyped `BF16` must not run the f32 kernel;
-review F1). One line when taken: `loop_control: TAKEN opencl <f32|bf16> one-launch rows_wg=<r> n_wg=<n>`. Refusals:
+review F1). One line when taken: `loop_control: TAKEN opencl <f32|bf16> one-launch rows_wg=<r> n_wg=<n>` (INFO
+in 0221, so a served unit showed it only at arcint's `-v`; WARN, once a process, since 0224). Refusals:
 `DOWNGRADE src=opencl op=LOOP_CONTROL path=cpu reason=<rule reason|switch-off|not-intel|dst-layout|not-built|wg-size|
 local-mem>` (a refused node goes to the CPU reference; the answers stay right, the speed does not).
 `GGML_OPENCL_LOOP_CONTROL_STATS=1`: `loop_control: graph nodes=<n> calls=<c> of <nodes>` a graph (one line a split
@@ -11737,3 +11743,46 @@ unchanged. Write-up line: `row 5: capital right|wrong, needle at 44k right|wrong
 acceptance task with the knob off as well, its comparison), setup 5: **~70 min** (B60). The window body is
 operator-local (not in this repository); it follows these rows and assertions in this order, and on a failed check
 it still requests that step's kernel-fault check, prints the rows not reached and a FAIL verdict.
+
+## 0224-opencl-taken-lines-warn.patch
+
+**The 1.8.3 items' TAKEN lines at a level a served unit shows, once a process.** arcint routes libllama's and ggml's
+log through `route_llama_log` (`src/exec/backend_llama.cpp`): ERROR and WARN to its error and warn lines, everything
+else to its verbose level, which a unit started without `-v` does not print. 0211 raised the depth mix's TAKEN line
+for that reason. The lines of the 1.8.3 items, read from the applied tree (`code`):
+
+| item | line | before 0224 | since 0224 |
+|---|---|---|---|
+| 0211 depth mix | `depth_mix: TAKEN opencl f32 token-a-group` | WARN, `std::call_once` | unchanged |
+| 0212 FA GQA bias | `TAKEN src=opencl op=FLASH_ATTN indexed-bias form=gqa` | WARN, `std::call_once` | unchanged |
+| 0220 Q8_0 2D GEMM | `TAKEN src=opencl op=MUL_MAT type=q8_0 path=2d-<i8\|f16> ...` | WARN, a static bool a mode | WARN, a static `std::once_flag` a mode |
+| 0221 loop control | `loop_control: TAKEN opencl <f32\|bf16> one-launch ...` | **INFO**, a static bool | **WARN**, `std::call_once` |
+| 0222 64-pair tile | `TAKEN src=opencl op=MUL_MAT_ID type=<t> path=xt64 tile=64 skip=1` (two sites) | WARN, `std::call_once` each | unchanged |
+| 0209 view writes | no TAKEN line (its WARN is a refusal: a view write into a split tensor not performed) | - | - |
+
+So 0221's line moves to WARN, and 0220's guard becomes a `std::once_flag` (the static bool array was a data race
+when two backends launch at once; its level was already WARN). The lines' text is unchanged (the window bodies grep
+it). No default changes.
+
+Kept as they are (they are not TAKEN lines, and they print only behind an opt-in stats switch, one a graph): 0220's
+`q8_2d: graph calls=... hits=...` (`GGML_OPENCL_Q8_2D_STATS=1`) and 0221's `loop_control: graph nodes=... calls=...`
+(`GGML_OPENCL_LOOP_CONTROL_STATS=1`) stay INFO, so a served unit shows them only at `-v`. The programs' "built"
+lines stay INFO.
+
+Earlier reach lines on the Inkling path that are INFO only (out of this patch's scope, reported): 0187's
+`0187 cpy-transpose taken ne=[...]` (`GGML_OPENCL_CPY_TRANSPOSE=1`, a static bool once a process); the int8 expert
+tile's "int8 DPAS expert GEMM (MUL_MAT_ID ...) built" lines and `ggml_opencl: int8 DPAS formats: ...` (build and
+format lines, not a launch). The FA port's TAKEN lines are WARN.
+
+**Test** (`tests/python/test_taken_lines_183.py`, a `unit` ctest, device-free, `measured-here` on the recipe host's
+applied trees): every listed line's macro is one `route_llama_log` shows outside `-v`, and every call site is inside
+a `std::call_once` on a static `std::once_flag` (an array element for a line a mode). Red on the series without 0224
+(int-183, applied tree `78b098f2` on the pin tarball): three failures, 0221's level and guard and 0220's guard. Green
+with 0224 (applied tree `e26e82f8927847c0b016484dae24857888a77765` on the pin tarball, 166 patches); 0211's own test
+still passes.
+
+**0223** (the FA port's key split, on its own branch, not in this series yet): its new TAKEN lines (the port's two
+lines with the split's state, and `TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=<q8_0|f16> split=...` a K/V type)
+are WARN under `std::call_once`; its split-scratch growth line is WARN once a growth; its trace line is WARN a call,
+behind `GGML_OPENCL_FA_PORT_TRACE=1`. It needs nothing from 0224; when it lands, `test_taken_lines_183.py` can take its
+split line into its list.
