@@ -63,6 +63,7 @@ initializer order, `qtiles`/`qgroups`/`n`/`wg` arithmetic and
 | `port_gate_test.cpp` | the gate's CPU unit test, fed the model's graph export lines; red with `-DFA_PORT_GATE_RED` |
 | `port_split_test.cpp` | the key split's rule (patch 0223, §split) on the same export lines widened to depth; red with `-DFA_PORT_SPLIT_RED_NO_FLOOR`; by hand, not a ctest |
 | `port_seam_model.py` | a numpy model of the six split cases: what a lost seam block (`RED=13`) does to the answer, against the cases' bounds |
+| `v4scale.c` | 0225's scale in P for a q4_0 V, one expression on the host: the first form (`fmin(128 d, 65504)`) against `clamp(128 d)` and the fix (`clamp(8 d)`, 8 off at the end); exit 0 when the first form gives non-finite outputs and the fix none |
 | `fixtures/` | the model's graph exports the gate test reads: `inkling-ub*.txt` (f16 KV) and `inkling-q8kv-ub*.txt` (q8_0 KV, §q8) |
 | `port_abi_check.py` | the kernel's parameter list against the launch's `clSetKernelArg` sequence, no device |
 | `isa_phases.py` | the key-block loop of a kernel's IGC `.asm` dump cut into phases, with instruction counts a phase (`--pre-dpas 8 --loop-dpas 40` for the q8_0 build) |
@@ -2203,7 +2204,8 @@ Lines the device prints, once a process:
     TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=256 …        (the f16 build's, unchanged)
 
 Refusals: `DOWNGRADE src=opencl op=FLASH_ATTN port=declined reason=<why>`, with
-`not-built-q8` / `compile-q8` for the q8_0 build.
+`not-built-q8` / `compile-q8` for the q8_0 build (`not-built-q4v` / `compile-q4v` for 0225's q4_0 V build, whose
+rebuilt V reads `kv-rebuilt reason=q4_0-planes`).
 
 ## Without a device (`measured-here`, the recipe host)
 

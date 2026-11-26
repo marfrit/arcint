@@ -1,8 +1,44 @@
 diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
-index c5c8bdc94..126149a6d 100644
+index c5c8bdc94..bb95361e7 100644
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
-@@ -10261,8 +10261,8 @@ struct test_flash_attn_ext : public test_case {
+@@ -10008,6 +10008,9 @@ struct test_flash_attn_ext : public test_case {
+     // 0223: a key split case (port 1): with GGML_OPENCL_FA_PORT_SPLIT=1 its launch must split
+     // (p > 1, the rule's p). Named in vars() only when set, so the other cases keep their names
+     const int32_t split_case;
++    // 0225: V's values times this (0: times 1), named in vars() only when set: the large-V case, block maxima past
++    // what p d 128 keeps in f16 (4,094), signed both ways
++    const float v_amp;
+     // 0223 (GGML_TEST_FA_PORT_SEAM only): cells [lo, hi) taken as empty, so that a CPU run shows what a
+     // kernel that loses those keys (a split's lost seam block, RED=13) does to the answer
+     std::vector<std::array<int64_t, 2>> hide_cells;
+@@ -10017,6 +10020,11 @@ struct test_flash_attn_ext : public test_case {
+         if (split_case != 0) {
+             s += ",split_case=" + std::to_string(split_case);
+         }
++        if (v_amp != 0.0f) {
++            char b[32];
++            snprintf(b, sizeof(b), "%g", (double) v_amp);
++            s += ",v_amp=" + std::string(b);
++        }
+         return s;
+     }
+ 
+@@ -10101,11 +10109,11 @@ struct test_flash_attn_ext : public test_case {
+                         bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
+                         bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false,
+                         int32_t port = 0, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0, float pad_bias = 0.0f,
+-                        int32_t split_case = 0)
++                        int32_t split_case = 0, float v_amp = 0.0f)
+         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
+           bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros), port(port), wrap(wrap), window(window), n_empty(n_empty), pad_bias(pad_bias),
+-          split_case(split_case) {}
++          split_case(split_case), v_amp(v_amp) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
+@@ -10261,8 +10269,8 @@ struct test_flash_attn_ext : public test_case {
              ggml_tensor * base = tv->view_src ? tv->view_src : tv;
              const size_t off = tv->view_src ? tv->view_offs : 0;
              std::vector<uint8_t> buf(ggml_nbytes(base), 0);
@@ -13,15 +49,17 @@ index c5c8bdc94..126149a6d 100644
                  // that depends on (head, key, q8_0 block) - 0.25 .. 2, so that neighbouring
                  // blocks have different scales and a scale taken from the wrong block, or
                  // applied twice, moves the answer - then ggml's own quantizer, a (key, head) a
-@@ -10272,13 +10272,13 @@ struct test_flash_attn_ext : public test_case {
+@@ -10272,13 +10280,14 @@ struct test_flash_attn_ext : public test_case {
                  static const bool flat = getenv("GGML_TEST_FA_PORT_FLAT_AMP") != nullptr;
                  GGML_ASSERT(tv->ne[3] == 1 && tv->ne[0] % 32 == 0);
                  std::vector<float> row(tv->ne[0]);
 -                const size_t rb = ggml_row_size(GGML_TYPE_Q8_0, tv->ne[0]);
 +                const size_t rb = ggml_row_size(tv->type, tv->ne[0]);
++                const float vamp = salt == 2 && v_amp != 0.0f ? v_amp : 1.0f;   // 0225: the large-V case
                  for (int64_t i2 = 0; i2 < tv->ne[2]; ++i2) for (int64_t i1 = 0; i1 < tv->ne[1]; ++i1) {
                      for (int64_t i0 = 0; i0 < tv->ne[0]; ++i0) {
-                         const float amp = flat ? 1.0f : 0.25f * powf(2.0f, 3.0f * det01(salt + 16, (uint64_t) ((i2*tv->ne[1] + i1)*(tv->ne[0]/32) + i0/32)));
+-                        const float amp = flat ? 1.0f : 0.25f * powf(2.0f, 3.0f * det01(salt + 16, (uint64_t) ((i2*tv->ne[1] + i1)*(tv->ne[0]/32) + i0/32)));
++                        const float amp = vamp * (flat ? 1.0f : 0.25f * powf(2.0f, 3.0f * det01(salt + 16, (uint64_t) ((i2*tv->ne[1] + i1)*(tv->ne[0]/32) + i0/32))));
                          row[i0] = amp * (-1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0)));
                      }
 -                    ggml_quantize_chunk(GGML_TYPE_Q8_0, row.data(), buf.data() + off + i1*tv->nb[1] + i2*tv->nb[2], 0, 1, tv->ne[0], nullptr);
@@ -29,7 +67,7 @@ index c5c8bdc94..126149a6d 100644
                      GGML_ASSERT(off + i1*tv->nb[1] + i2*tv->nb[2] + rb <= buf.size());
                  }
                  // the base's only write, and all of it: offset 0, its full byte size (zero where
-@@ -14860,6 +14860,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+@@ -14860,6 +14869,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                  1, 0, 0, c[2], 0.0f, 1));
          }
      }
@@ -51,10 +89,17 @@ index c5c8bdc94..126149a6d 100644
 +            GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
 +            1, 0, 0, c[2], 0.0f, 1));
 +    }
++    // 0225: the large-V case: V's values x 4,000 (block maxima 1,000 .. 8,000, about half of the blocks with a
++    // positive maximum, so a negative q4_0 d, |d| up to 1,000). The scale in P is p d 8 (the kernel's PORT_V4
++    // header), in f16's range for all of them; RED=16 (q8_0's p d 128, clamped above only) must FAIL it with
++    // non-finite rows (-inf in P where d < -511.75 and p is near 1). Bound: 1e-5, as the other q8_0:q4_0 cases
++    test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1040, 20, true, true, 0, 0,
++        GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++        1, 0, 0, 17, 0.0f, 0, 4000.0f));
      // 0199: a table whose pad bin is not zero, with keys far past the extent (2,200 keys, no
      // window): the port must read the bin (GGML_OPENCL_FA_PORT_RED=4 assumes zero and must
      // FAIL this case), and its twin gives today's kernels the same table
-@@ -15282,6 +15300,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+@@ -15282,6 +15316,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                  1, 0, 0, c[2], 0.0f, 1));
          }
      }
@@ -67,17 +112,18 @@ index c5c8bdc94..126149a6d 100644
      // 0223: the price of the 128-block floor (a scoping choice against 0045 / CUDA, which have none):
      // the 4k global call the floor keeps unsplit (kv 4096 x nb 1024) and the short turn it limits
      // (kv 8192 x nb 32: p 2 with the floor, p 6 on the B60 without it). Not split cases: the window runs
-@@ -16183,6 +16207,9 @@ static const int FA_PORT_EVAL_PORT2_Q8  = 2;
+@@ -16183,6 +16223,10 @@ static const int FA_PORT_EVAL_PORT2_Q8  = 2;
  // at the B60's wave (200) and the B70's (320) once GGML_OPENCL_FA_PORT_SPLIT=1
  static const int FA_PORT_EVAL_SPLIT     = 3;
  static const int FA_PORT_EVAL_SPLIT_Q8  = 3;
-+// 0225: a q8_0 K with a q4_0 V, counted apart: 5 port cases and 3 split cases, port=1, run by GGML_OPENCL_FA_PORT=1
-+static const int FA_PORT_EVAL_PORT1_Q84 = 5;
++// 0225: a q8_0 K with a q4_0 V, counted apart: 5 port cases (+ the large-V case) and 3 split cases, port=1, run by
++// GGML_OPENCL_FA_PORT=1
++static const int FA_PORT_EVAL_PORT1_Q84 = 6;
 +static const int FA_PORT_EVAL_SPLIT_Q84 = 3;
  
  static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
  
-@@ -16195,13 +16222,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+@@ -16195,13 +16239,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
  static bool test_fa_port_decisions() {
      const bool red = getenv("GGML_TEST_FA_PORT_ROUTE_RED") != nullptr;
      auto cases = make_test_cases_eval();
@@ -94,7 +140,7 @@ index c5c8bdc94..126149a6d 100644
          if (fa->port == 2) {
              if (q8) { n2_q8++; continue; }
              n2++; n2_pad += fa->pad_bias != 0.0f;
-@@ -16216,8 +16244,8 @@ static bool test_fa_port_decisions() {
+@@ -16216,8 +16261,8 @@ static bool test_fa_port_decisions() {
                     (long long) fa->kv, (long long) fa->nb, (long long) fa->n_empty, p60, p70,
                     fa_port_split_blocks(fa->kv, p60), fa_port_split_blocks(fa->kv, p70), sok ? "OK" : "FAIL, a split case the rule does not split");
              n_fail += !sok;
@@ -105,7 +151,7 @@ index c5c8bdc94..126149a6d 100644
          ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
          ggml_context * ctx = ggml_init(params);
          ggml_tensor * op = fa->build_graph(ctx);
-@@ -16229,8 +16257,10 @@ static bool test_fa_port_decisions() {
+@@ -16229,8 +16274,10 @@ static bool test_fa_port_decisions() {
              lau[gqa_wide] = fa_port_gate_at_launch(op, red ? 0 : 1, gqa_wide, 1, 4096, 256, 1, &wl[gqa_wide]);
              ok = ok && sup != 0 && lau[gqa_wide] == sup;
          }
@@ -118,7 +164,7 @@ index c5c8bdc94..126149a6d 100644
                 sup ? "ACCEPT" : "refuse ", sup ? "" : ws, lau[0] ? "ACCEPT" : "refuse ", lau[0] ? "" : wl[0],
                 lau[1] ? "ACCEPT" : "refuse ", lau[1] ? "" : wl[1], ok ? "OK" : "FAIL");
          n_fail += !ok;
-@@ -16239,9 +16269,10 @@ static bool test_fa_port_decisions() {
+@@ -16239,9 +16286,10 @@ static bool test_fa_port_decisions() {
      const bool counts = n1 == FA_PORT_EVAL_PORT1 && n1_pad == FA_PORT_EVAL_PORT1_PAD &&
                          n2 == FA_PORT_EVAL_PORT2 && n2_pad == FA_PORT_EVAL_PORT2_PAD &&
                          n1_q8 == FA_PORT_EVAL_PORT1_Q8 && n2_q8 == FA_PORT_EVAL_PORT2_Q8 &&
@@ -132,7 +178,7 @@ index c5c8bdc94..126149a6d 100644
             counts ? "as the table says" : "FAIL, the table above is stale");
      printf("  port decisions%s: %s\n", red ? " (the old dispatch order)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
      return n_fail == 0 && counts;
-@@ -16517,14 +16548,14 @@ static bool test_fa_port_seam(ggml_backend_t backend) {
+@@ -16517,14 +16565,14 @@ static bool test_fa_port_seam(ggml_backend_t backend) {
              const double nmse = den > 0.0 ? num/den : 0.0, bound = base.max_nmse_err();
              const double margin = fa->type_K == GGML_TYPE_Q8_0 ? 10.0 : 1.5;   // 0223d: per type, see above
              const bool ok = nmse > margin * bound;

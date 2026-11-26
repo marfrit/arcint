@@ -10092,19 +10092,32 @@ every 1.8.3 switch). Before it the gate took f16:f16 and q8_0:q8_0 only. An 8:4 
     bytes off it; they are read 2 bytes on, and the two missing bytes are spliced in from a read at the block's first
     byte, as the q8_0 build does for its codes.
   - The nibbles become f16 by integer operations on whole dwords (`0x6400 | n` = 1024 + n = 1032 + (n − 8)), in the
-    q8_0 build's key order, so P's lane shuffle and the scale in P (`pe = f16(p d 128)`) are unchanged. The
-    accumulator starts 1032 Σ pe lower.
+    q8_0 build's key order, so P's lane shuffle is unchanged. The accumulator starts 1032 Σ pe lower.
+  - **The scale in P is `pe = f16(p d 8)`**, not q8_0's `p d 128`. q4_0's d is the block's largest-magnitude value
+    over −8: signed, and 16 times q8_0's d for the same values. `p d 8` is p times that value, as q8_0's `p d 128`
+    is, so it stays in f16's range for every block an f16 cache could hold (|value| ≤ 65,504, |d| ≤ 8,188). `8 d` is
+    clamped to ±65,504 on both sides; only blocks past an f16 cache's range reach the clamp. The final division
+    takes the 8 off (`PV_PSCALE`, the merge too). The first form, q8_0's line `fmin(128 d, 65504)`, left f16 above
+    a block maximum of 4,094 at p = 1, and for a negative d it gave −inf in P and NaN rows, with no log line (the
+    review of 0225).
+  - A kernel guard: an even block's V read takes the first 2 bytes of the next block, so the q8_0 builds refuse to
+    compile unless `DKQ % 64 == 0` (the gate's `ne[0] == 128` held it before, the kernel did not say so).
   - The key split works the same: the split build and the merge store with the q4_0 lane-to-dim map.
 - **The logs:** a TAKEN line of its own, once a process, WARN (0224's rule):
   `TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0:q4_0 …`, the pair written K:V as the repository's DOWNGRADE
-  lines write it. The split's TAKEN line names `kv=q8_0:q4_0`.
+  lines write it. The split's TAKEN line and the per-call trace (`GGML_OPENCL_FA_PORT_TRACE`) name `kv=q8_0:q4_0`.
+  A compile failure of the q4_0 V build reads `reason=compile-q4v`; a rebuilt V reads `kv-rebuilt
+  reason=q4_0-planes` (`q8_0:q4_0-planes` when K's planes were rebuilt too).
 - **The reds** (`GGML_OPENCL_FA_PORT_RED`, the q4_0 V build only): 14 swaps the nibbles, 15 takes V's scale from the
-  next block.
+  next block, 16 restores q8_0's scale line (`p d 128`, clamped above only; ocloc: the same ISA as the first form of
+  0225, on both cards).
 
 **0225b** (`test-backend-ops.cpp`):
 - **The cases:** the five q8_0 port shapes and the three key-split shapes with a q8_0 K and a q4_0 V, the model's
   layout, filled the same way as the q8_0 cases (per-block amplitudes, so a wrong block's scale moves the answer)
   and quantized by ggml's q4_0. The three split shapes are in the perf list too.
+- **The large-V case** (`v_amp=4000`, kv 1,040 x nb 20): V's values times 4,000, block maxima 1,000 .. 8,000, about
+  half of them positive (a negative d). RED=16 must FAIL it (non-finite rows); the fix must pass it at 1e-5.
 - **The bound:** the q8_0 port cases' 1e-5 against the CPU, stated before any card run.
 - **The counts:** the decisions table counts the new cases apart and asserts that each reaches the q4_0 V build. The
   device-free seam check covers the new split cases, 18 cells.
@@ -10125,9 +10138,19 @@ every 1.8.3 switch). Before it the gate took f16:f16 and q8_0:q8_0 only. An 8:4 
   - the f16, q8_0 and q8_0 split programs give the same ISA as before on both devices;
   - the reds change the q4_0 V kernel's ISA.
 
-**Not run on a card.** The card rows: the port cases and the reds; split against unsplit by the dump hook (≤ 1e-5);
-KL at 4k and 40k against the CPU base for the 8:4 port-on arm beside 8:8 and 8:4 port-off; the served TAKEN line;
-the "row-blocks" key gone from the journal.
+**The scale fix, without a device** (`measured-here`, the recipe host):
+- **The one expression on the host** (`contrib/refkernels/trellis-fa/v4scale.c`, a C model of ggml's q4_0 quantizer and the kernel's
+  `pe (1024 + n) − 1032 pe` in f32, block maxima 100 .. 65,504 of both signs, p 1 / 0.9 / 0.5 / 0.01): the first
+  form gives non-finite outputs in 8 of the 36 cells (positive maxima 4,200 .. 65,504 at p ≥ 0.9; 65,504 at p 0.5);
+  `clamp(128 d)` alone is finite but 2.5 % .. 94 % off past 4,094; `clamp(8 d)` with the 8 off stays within the f16
+  rounding of pe (≤ 1.6e-4 relative) in every cell.
+- **ocloc** (bmg-g21 and bmg-g31): the f16, q8_0 and q8_0 split programs give the same ISA before and after the
+  fix; the q4_0 V build, unsplit and split, at 256 GRF, scratch 0, no retry dump; RED=16 gives the first form's
+  ISA exactly. The guard: `DKQ=96` with `PORT_KV8` stops at the new `#error`; the first form compiled it.
+
+**Not run on a card.** The card rows: the port cases and the reds (RED=16 on the large-V case); split against
+unsplit by the dump hook (≤ 1e-5); KL at 4k and 40k against the CPU base for the 8:4 port-on arm beside 8:8 and
+8:4 port-off; the served TAKEN line; the "row-blocks" key gone from the journal.
 
 ## 0208-test-backend-ops-inkling-expert-projection-perf.patch
 
