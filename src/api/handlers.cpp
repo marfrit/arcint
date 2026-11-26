@@ -104,6 +104,11 @@ std::string decode_suffix_for(const GenerationStats& stats) {
         decode_suffix +=
             log::format(" | grammar desync %d (turn unconstrained after desync)", stats.grammar_desyncs);
     }
+    // Inkling: the call grammar triggered after a later thinking block opened
+    // (core/toolgrammar.h, the known limit's audit). Only when it happened.
+    if (stats.grammar_late_think > 0) {
+        decode_suffix += log::format(" | grammar after a later think block %d", stats.grammar_late_think);
+    }
     // What the other lane cost this one. Printed only when it happened, so a
     // single-stream run's line is the line it always was, and a p95 rather than
     // a mean because one long stall inside many short steps is exactly what a

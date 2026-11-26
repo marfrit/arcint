@@ -27,6 +27,8 @@ std::string regex_escape(const std::string& s) {
 LlamaToolGrammar::LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel,
                                    ChatDialect dialect) {
     const bool inkling = dialect.inkling();
+    vocab_             = vocab;
+    inkling_           = inkling;
     try {
         gbnf_ = inkling ? generate_inkling_tool_grammar(tools, parallel) : generate_tool_grammar(tools, parallel);
     } catch (const std::invalid_argument& e) {
@@ -110,6 +112,11 @@ void LlamaToolGrammar::mask(float* logits, size_t vocab) {
 }
 
 void LlamaToolGrammar::accept(int token) {
+    if (inkling_) {
+        char      buf[256];
+        const int n = llama_token_to_piece(vocab_, token, buf, sizeof buf, 0, /*special*/ true);
+        if (n > 0) watch_.feed(std::string_view(buf, static_cast<size_t>(n)));
+    }
     if (broken_) return;
     // Never feed a token the grammar rejects: llama.cpp aborts the process on
     // an end-of-generation token outside a complete stack and throws on any

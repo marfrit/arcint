@@ -2070,7 +2070,7 @@ public:
         prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
-        const auto tool_grammar = prepare_tool_grammar(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, prompt, sampler);
 
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -2286,11 +2286,12 @@ public:
             seed = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
         }
         Sampler sampler(in.sampler, seed);
-        sampler.set_prompt(prompt_ids_raw(in, *tokenizer_));
+        const std::vector<int> prompt_text_ids = prompt_ids_raw(in, *tokenizer_);
+        sampler.set_prompt(prompt_text_ids);
         prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
-        const auto tool_grammar = prepare_tool_grammar(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, prompt_text_ids, sampler);
 
         std::vector<int>&  have   = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> logits(n_vocab_);
@@ -2686,7 +2687,7 @@ private:
         prepare_think_ctx(in.sampler, cap, stats.prompt_tokens, sampler);
         prepare_think_mask(in, sampler);
         prepare_loop_guard(in, sampler);
-        const auto tool_grammar = prepare_tool_grammar(in, sampler);
+        const auto tool_grammar = prepare_tool_grammar(in, prompt, sampler);
         std::vector<int>&  have = slot_tokens_[static_cast<size_t>(seq)];
         std::vector<float> rows;   // the verified rows' logits
 
@@ -3206,7 +3207,8 @@ private:
     // masks, observe() accepts -- in the verify walk only the tokens it keeps,
     // so a rejected draft never reaches the grammar). Off (the default), or no
     // tools whose calls are parsed: nothing, today's path exactly.
-    std::unique_ptr<LlamaToolGrammar> prepare_tool_grammar(const GenerationInput& in, Sampler& sampler) const {
+    std::unique_ptr<LlamaToolGrammar> prepare_tool_grammar(const GenerationInput& in, const std::vector<int>& prompt,
+                                                           Sampler& sampler) const {
         if (!in.sampler.tool_grammar || in.tools.empty()) return nullptr;
         // the "runs" tier has no promise for the call form: refused by tier for a request too,
         // including a Qwen-dialect runs model whose template carries the form
@@ -3225,8 +3227,11 @@ private:
         // and <|content_thinking|>. A prompt that already ends with the header (an
         // Inkling 1 template's generation prompt; Inkling 2 Mini's template has
         // none) would hide the header from the tracker, so the thinking text would
-        // reach the trigger: refused, not run half-constrained.
-        if (dialect_.inkling() && std::string_view(in.prompt).ends_with(markers::kInkMessageModel))
+        // reach the trigger: refused, not run half-constrained. Read from the
+        // prompt's token ids (a request given as ids has no text), layout after
+        // the header ignored; called before the prefill, so a refusal costs none.
+        if (dialect_.inkling() &&
+            prompt_ends_with_inkling_header(prompt, [&](int id) { return tokenizer_->decode_one(id); }))
             throw InputError("tool_grammar: the prompt ends with the assistant header (an Inkling 1 template's "
                              "generation prompt); the Inkling call grammar needs the model to write the header");
         const auto t0 = clock_type::now();
@@ -3249,6 +3254,13 @@ private:
         sampler.set_constraint(nullptr);
         if (g == nullptr) return;
         stats.grammar_desyncs = g->desync();
+        if (g->late_trigger()) {
+            stats.grammar_late_think = 1;
+            // one line, no model text: the audit of the known limit
+            // (core/toolgrammar.h): the dormancy covers the first thinking block only
+            log::warn("grammar", "lane %d: the tool-call grammar triggered after a later thinking block opened in "
+                      "this turn (dormant only inside the first)", seq);
+        }
         log::info("grammar", "lane %d: tool-call grammar: %d draws masked%s", seq, g->rejections(),
                   g->broken() ? "; it gave up on a token outside it (error line above)" : "");
     }

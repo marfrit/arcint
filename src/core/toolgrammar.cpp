@@ -1,5 +1,7 @@
 #include "core/toolgrammar.h"
 
+#include <cctype>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -411,14 +413,18 @@ std::string generate_inkling_tool_grammar(const std::vector<ToolSpec>& tools, bo
         if (name.find('\0') != std::string::npos) throw std::invalid_argument("a tool name holds a NUL");
         if (name.find(marker) != std::string::npos)
             throw std::invalid_argument("tool '" + name + "': the name holds the call marker");
-        const auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+        const auto ws = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
         if (ws(name.front()) || ws(name.back()))
             throw std::invalid_argument("tool '" + name + "': whitespace at the ends of the name (the parser trims it)");
         const std::string rule = "ink-tool-" + std::to_string(i);
         // the reference's `open`: the name, the call marker, the compact prefix
         // {"name":<the name as JSON>,"args": ; then the args, `}` and the closer
-        const std::string open = name + marker + "{\"name\":" + nlohmann::json(name).dump() + ",\"args\":";
-        tool_rules += rule + " ::= " + gbnf_literal(open) + " ink-object " + gbnf_literal("}" + closer) + "\n";
+        // the parser trims the header's name (text::trim, isspace): the
+        // whitespace before the name is outside the grammar (the trigger
+        // skips it, core/toolgrammar.h), the whitespace after it is here
+        const std::string open = marker + "{\"name\":" + nlohmann::json(name).dump() + ",\"args\":";
+        tool_rules += rule + " ::= " + gbnf_literal(name) + " ink-name-ws " + gbnf_literal(open) + " ink-object " +
+                      gbnf_literal("}" + closer) + "\n";
         calls += (i == 0 ? "" : " | ") + rule;
     }
 
@@ -429,9 +435,10 @@ std::string generate_inkling_tool_grammar(const std::vector<ToolSpec>& tools, bo
                                 // the reference's GBNF for a "-delimited string's content, verbatim
                                 // (common/peg-parser.cpp, common_peg_string_parser)
                                 ? R"(( [^"\\] | "\\" ( ["\\/ bfnrt] | "u" [0-9a-fA-F]{4} ) ))"
-                                : R"(( [^"\\\x00-\x1F] | "\\" ( ["\\/bfnrt] | "u" [0-9a-fA-F]{4} ) ))";
+                                : R"(( [^"\\\x00-\x1F] | "\\" ( ["\\/bfnrt] | ink-u-escape ) ))";
     std::string g;
-    g += "root ::= ink-call" + std::string(parallel ? " ( " + gbnf_literal(header) + " ink-call )*" : "") + "\n";
+    g += "root ::= ink-call" + std::string(parallel ? " ( " + gbnf_literal(header) + " ink-name-ws ink-call )*" : "") +
+         "\n";
     g += "ink-call ::= " + calls + "\n";
     g += tool_rules;
     g += "ink-value ::= ink-object | ink-array | ink-string | ink-number | \"true\" | \"false\" | \"null\"\n";
@@ -440,13 +447,58 @@ std::string generate_inkling_tool_grammar(const std::vector<ToolSpec>& tools, bo
     g += "ink-array ::= \"[\" ink-ws ( ink-value ( ink-ws \",\" ink-ws ink-value )* ink-ws )? \"]\"\n";
     g += "ink-string ::= \"\\\"\" ink-char* \"\\\"\"\n";
     g += "ink-char ::= " + chr + "\n";
+    // \uXXXX without a lone surrogate (nlohmann refuses one, as JSON's RFC 8259
+    // parsers may): a high surrogate only with a low one after it
+    g += "ink-u-escape ::= \"u\" ( [0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2} | "
+         "[dD] [89abAB] [0-9a-fA-F]{2} \"\\\\u\" [dD] [c-fC-F] [0-9a-fA-F]{2} )\n";
+    g += "ink-name-ws ::= [ \\t\\n\\x0B\\x0C\\r]*\n";
     g += "ink-number ::= \"-\"? ( \"0\" | [1-9] [0-9]* ) ( \".\" [0-9]+ )? ( [eE] [-+]? [0-9]+ )?\n";
     g += "ink-ws ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\n";
     return g;
 }
 
+bool prompt_ends_with_inkling_header(const std::vector<int>& ids, const std::function<std::string(int)>& piece) {
+    const std::string_view header = markers::kInkMessageModel;
+    std::string            tail;
+    // walk back until the text without its trailing layout is as long as the
+    // header (a bounded walk: layout tokens and a header spelled as text)
+    for (size_t k = 0; k < ids.size() && k < 64; ++k) {
+        tail.insert(0, piece(ids[ids.size() - 1 - k]));
+        size_t n = tail.size();
+        while (n > 0 && std::isspace(static_cast<unsigned char>(tail[n - 1]))) --n;
+        if (n >= header.size()) return std::string_view(tail).substr(0, n).ends_with(header);
+    }
+    return false;
+}
+
+void InklingTriggerWatch::feed(std::string_view piece) {
+    static const std::string_view header = markers::kInkMessageModel;
+    static const std::string_view think  = markers::kInkContentThink;
+    static const std::string_view end    = markers::kInkEndMessage;
+    for (const char c : piece) {
+        if (triggered_) return;   // the grammar is active: nothing left to watch
+        tail_ += c;
+        if (tail_.size() > 64) tail_.erase(0, tail_.size() - 32);
+        const std::string_view t = tail_;
+        if (t.ends_with(header)) {
+            after_header_ = true;
+            continue;
+        }
+        if (t.ends_with(end)) content_begun_ = true;
+        if (t.ends_with(think) && content_begun_) late_think_ = true;
+        if (!after_header_) continue;
+        // the trigger's rule: whitespace waits, `<` is a content marker, any
+        // other byte starts the grammar
+        if (std::isspace(static_cast<unsigned char>(c))) continue;
+        after_header_ = false;
+        if (c == '<') continue;
+        triggered_    = true;
+        late_trigger_ = late_think_;
+    }
+}
+
 std::string inkling_tool_grammar_trigger_pattern() {
-    return regex_escaped(markers::kInkMessageModel) + "([^<])";
+    return regex_escaped(markers::kInkMessageModel) + "\\s*([^<\\s])";
 }
 
 }  // namespace lgc

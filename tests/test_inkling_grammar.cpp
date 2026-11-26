@@ -27,12 +27,14 @@
 //     grammar dormant and the turn ends by itself, with the think mask on and
 //     off, while the same run with the tracker unarmed triggers inside the
 //     block (the interaction's red arm).
+#include "api/handlers.h"
 #include "core/chat.h"
 #include "core/markers.h"
 #include "core/reasoning.h"
 #include "core/sampler.h"
 #include "core/toolcall.h"
 #include "core/toolgrammar.h"
+#include "exec/backend.h"
 #include "harness.h"
 
 #include <nlohmann/json.hpp>
@@ -179,13 +181,27 @@ TEST(inkling_each_reject_logs_its_own_reason) {
         CHECK(line.find("unterminated") == std::string::npos);
     }
     CHECK_EQ(distinct.size(), 5u);   // the five reasons, each its own words
-    // the header-name mismatch: the header says "other", the object "bash"
+    // the header-name mismatch: no model text reaches the line -- the header's
+    // "name" is whatever the model wrote before the marker (here a line break
+    // and a long run of text), so the reason does not quote it
     {
-        const std::string   t = kHeader + "other" + kMarker + pre + "{}}" + kEnd;
+        const std::string junk = "other\nrm -rf / " + std::string(200, 'x');
+        const std::string   t = kHeader + junk + kMarker + pre + "{}}" + kEnd;
         const ToolCallParse p = parse_tool_calls(t, ChatDialect::Inkling);
         CHECK(p.reject_reason.rfind("name / args mismatch", 0) == 0);
-        CHECK(p.reject_reason.find("\"other\"") != std::string::npos);
-        CHECK_EQ(p.reject_offset, (kHeader + "other" + kMarker).size());
+        CHECK(p.reject_reason.find("other") == std::string::npos);
+        CHECK(p.reject_reason.find("rm -rf") == std::string::npos);
+        CHECK(p.reject_reason.size() < 120);
+        for (const char c : tool_call_reject_message(p, ChatDialect::Inkling))
+            CHECK(static_cast<unsigned char>(c) >= 0x20);
+        CHECK_EQ(p.reject_offset, (kHeader + junk + kMarker).size());
+    }
+    // a reject keeps the text before the block: "no '{'" kept only the block
+    {
+        const std::string   t = "Running it now. " + kHeader + "bash" + kMarker + "[1]" + kEnd;
+        const ToolCallParse p = parse_tool_calls(t, ChatDialect::Inkling);
+        CHECK(p.truncated);
+        CHECK_EQ(p.content, t);
     }
     // the Qwen form: its one reject keeps the old line, word for word
     const ToolCallParse q = parse_tool_calls("<tool_call>\n{\"name\":\"x\"", ChatDialect::Qwen);
@@ -203,8 +219,9 @@ TEST(inkling_grammar_names_the_declared_tools_and_the_reference_trigger) {
     CHECK(g.find("\"read_file<|content_invoke_tool_json|>") != std::string::npos);
     CHECK(g.find("\\x00-\\x1F") != std::string::npos);   // the strict string rule
     CHECK(generate_inkling_tool_grammar({}).empty());
-    // mainline's trigger, character for character (inkling.cpp, grammar_triggers)
-    CHECK_EQ(inkling_tool_grammar_trigger_pattern(), std::string("<\\|message_model\\|>([^<])"));
+    // mainline's trigger (inkling.cpp, grammar_triggers: <\|message_model\|>([^<])),
+    // with the whitespace the parser trims skipped before the capture
+    CHECK_EQ(inkling_tool_grammar_trigger_pattern(), std::string("<\\|message_model\\|>\\s*([^<\\s])"));
     // a name the form cannot carry is the client's error
     for (const std::string& bad : { std::string(""), std::string("<x"), std::string(" x"), std::string("x "),
                                     std::string("a") + kMarker }) {
@@ -219,6 +236,76 @@ TEST(inkling_grammar_names_the_declared_tools_and_the_reference_trigger) {
         }
         CHECK(threw);
     }
+}
+
+// ------------------------------------------------ the Inkling 1 refusal (5)
+
+// The refusal reads the prompt's last token ids, not its text: a request
+// given as ids has no text, and layout after the header must not hide it.
+TEST(inkling_prompt_ending_with_the_header_is_found_by_ids) {
+    const std::vector<std::string> piece = { kHeader, "\n", kEnd, "<", "|message", "_model", "|>", "hello", " " };
+    const auto r = [&](const std::vector<int>& ids) {
+        return prompt_ends_with_inkling_header(ids, [&](int id) { return piece[static_cast<size_t>(id)]; });
+    };
+    CHECK(r({ 7, 0 }));                // the header as one special token
+    CHECK(r({ 7, 0, 1 }));             // layout after it
+    CHECK(r({ 7, 0, 1, 8, 1, 1 }));
+    CHECK(r({ 7, 3, 4, 5, 6 }));       // spelled as text tokens
+    CHECK(r({ 3, 4, 5, 6, 1 }));
+    CHECK(!r({ 7, 2 }));               // Inkling 2 Mini's prompts end with a closer
+    CHECK(!r({ 0, 7 }));
+    CHECK(!r({}));
+    CHECK(!r({ 1, 1 }));
+}
+
+// ------------------------------------- the known limit's audit (operator)
+
+// The watch follows the trigger's rule on what the grammar is fed and says
+// whether the trigger fired after a thinking block that opened once content
+// had begun (the dormancy covers the first thinking block only).
+TEST(inkling_trigger_watch_flags_a_trigger_after_a_later_thinking_block) {
+    struct Case {
+        std::string fed;
+        bool        triggered, late_think, late_trigger;
+    };
+    const std::vector<Case> cases = {
+        // the first thinking block (only its header and closer are fed), then a call
+        { kHeader + kEnd + kHeader + "bash" + kMarker, true, false, false },
+        // a text block, then a second thinking block that spells a call
+        { kHeader + kEnd + kHeader + kText + "x" + kEnd + kHeader + kThink + "I could " + kHeader + "bash", true, true,
+          true },
+        // no first thinking block: a text block, then a thinking block that spells a call
+        { kHeader + kText + "x" + kEnd + kHeader + kThink + "run " + kHeader + "bash", true, true, true },
+        // a later thinking block with no call in it
+        { kHeader + kEnd + kHeader + kThink + "more thought", false, true, false },
+        // a header, layout, a content marker: not a call
+        { kHeader + "\n" + kText + "x", false, false, false },
+        // a header, layout, a name: a call
+        { kHeader + "  bash", true, false, false },
+        // a call in the first text block
+        { kHeader + kText + "x" + kEnd + kHeader + "bash", true, false, false },
+    };
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const Case& c = cases[i];
+        for (const bool bytewise : { false, true }) {
+            InklingTriggerWatch w;
+            if (bytewise)
+                for (const char ch : c.fed) w.feed(std::string_view(&ch, 1));
+            else
+                w.feed(c.fed);
+            if (w.triggered() != c.triggered || w.late_think() != c.late_think || w.late_trigger() != c.late_trigger)
+                t::fail(__FILE__, __LINE__, "watch case " + std::to_string(i) + (bytewise ? " (bytewise)" : ""));
+        }
+    }
+}
+
+// The count reaches the request's decode line, where the audit greps it; a
+// turn without it keeps the line it had.
+TEST(decode_suffix_carries_the_grammar_late_think_count) {
+    GenerationStats s;
+    s.grammar_late_think = 1;
+    CHECK(lgc::api::decode_suffix_for(s).find("grammar after a later think block 1") != std::string::npos);
+    CHECK(lgc::api::decode_suffix_for(GenerationStats{}).find("grammar after a later think block") == std::string::npos);
 }
 
 // ------------------------------------------- the think block, token-id layout
@@ -439,6 +526,52 @@ TEST(inkling_gbnf_refuses_the_malformed_calls) {
               .complete);
 }
 
+// The watch and llama.cpp's matcher agree on when the trigger fires.
+TEST(inkling_trigger_watch_agrees_with_the_pattern) {
+    llama_grammar_trigger_pattern pat;
+    pat.pattern = inkling_tool_grammar_trigger_pattern();
+    pat.regex   = std::regex(pat.pattern);
+    for (const std::string& fed : { kHeader + "bash", kHeader + " \n\tbash", kHeader + "\n" + kText + "x",
+                                    kHeader + kThink + "x", kHeader + kEnd + kHeader + "read_file", kHeader + "   ",
+                                    std::string("plain text") }) {
+        InklingTriggerWatch w;
+        w.feed(fed);
+        CHECK_EQ(w.triggered(), pat.find(fed) != std::string::npos);
+    }
+    // the capture starts at the name, past the layout
+    const std::string fed = kHeader + " \n bash";
+    CHECK_EQ(pat.find(fed), fed.find('b'));
+}
+
+TEST(inkling_gbnf_admits_the_whitespace_the_parser_trims) {
+    const std::string g = generate_inkling_tool_grammar(ink_tools());
+    const std::string body = "{\"name\":\"bash\",\"args\":{\"command\":\"ls\"}}" + kEnd;
+    CHECK(run_grammar(g, "bash" + kMarker + body).complete);
+    CHECK(run_grammar(g, "bash \t\n" + kMarker + body).complete);   // after the name
+    // a second call's header may carry layout too
+    CHECK(run_grammar(g, "bash" + kMarker + body + kHeader + "\n read_file" + kMarker +
+                             "{\"name\":\"read_file\",\"args\":{}}" + kEnd)
+              .complete);
+    // and the parser reads these as calls
+    const ToolCallParse p = parse_tool_calls(kHeader + "  bash \n" + kMarker + body, ChatDialect::Inkling);
+    CHECK_EQ(p.calls.size(), 1u);
+}
+
+// A \uXXXX escape may not be a lone surrogate: nlohmann refuses one, so a
+// call holding it would be lost exactly as the raw TAB was.
+TEST(inkling_gbnf_refuses_lone_surrogates_as_the_parser_does) {
+    const std::string g = generate_inkling_tool_grammar(ink_tools());
+    const auto args = [](const std::string& esc) { return "{\"command\":\"a" + esc + "b\"}"; };
+    for (const std::string& ok : { "\\u0041", "\\uD83D\\uDE00", "\\ud83d\\ude00", "\\uFFFF", "\\uE000", "\\uD7FF" }) {
+        CHECK(run_grammar(g, from_name(call_block("bash", args(ok)))).complete);
+        CHECK_EQ(parse_tool_calls(call_block("bash", args(ok)), ChatDialect::Inkling).calls.size(), 1u);
+    }
+    for (const std::string& bad : { "\\uD800", "\\uDBFF", "\\uDC00", "\\uDFFF", "\\uD800\\u0041", "\\uDE00\\uD83D" }) {
+        CHECK(!run_grammar(g, from_name(call_block("bash", args(bad)))).accepted);
+        CHECK(parse_tool_calls(call_block("bash", args(bad)), ChatDialect::Inkling).truncated);
+    }
+}
+
 TEST(inkling_gbnf_parallel_calls_follow_the_request) {
     const std::string two = from_name(call_block("bash", "{\"command\":\"ls\"}")) + call_block("read_file", "{}");
     CHECK(run_grammar(generate_inkling_tool_grammar(ink_tools(), true), two).complete);
@@ -516,6 +649,7 @@ struct Arm {
     bool        ended  = false;   // by the end-of-generation token, not the cap
     int         masked = 0;
     bool        broken = false;
+    bool        late   = false;   // the grammar's late-think audit
 };
 
 // The backend's plain decode loop in miniature: sample, stop on EOG, emit,
@@ -571,6 +705,7 @@ Arm run_arm(const std::string& bad, const std::string& good, bool grammar, bool 
     if (g) {
         a.masked = g->rejections();
         a.broken = g->broken();
+        a.late   = g->late_trigger();
     }
     return a;
 }
@@ -633,6 +768,7 @@ TEST(inkling_sampler_grammar_stays_dormant_while_thinking) {
         CHECK(a.ended);
         CHECK_EQ(a.masked, 0);
         CHECK(!a.broken);
+        CHECK(!a.late);
         const ReasoningSplit sp = split_reasoning(a.text, ThinkStart::Undecided, ChatDialect::Inkling);
         CHECK(sp.reasoning.find(kHeader + "bash" + kMarker) != std::string::npos);
         const ToolCallParse p = parse_tool_calls(sp.content, ChatDialect::Inkling);
@@ -664,5 +800,39 @@ TEST(inkling_sampler_call_after_a_thinking_mention_is_constrained) {
         if (p.calls.size() == 1)
             CHECK_EQ(nlohmann::json::parse(p.calls[0].arguments).at("command").get<std::string>(), kCommand);
     }
+}
+// Finding 3: whitespace after the header (the parser trims it) no longer
+// lets the call run unconstrained: the trigger skips it, the grammar starts at
+// the name, and the raw TAB is still refused.
+TEST(inkling_sampler_space_after_the_header_is_still_constrained) {
+    if (world().v == nullptr) return;
+    const auto blk = [](const std::string& args) {
+        return kHeader + " bash" + kMarker + "{\"name\":\"bash\",\"args\":" + args + "}" + kEnd;
+    };
+    const std::string bad = blk(args_raw_tab()), good = blk(args_escaped());
+    CHECK_EQ(run_arm(bad, good, false, true, false).text, bad);
+    const Arm on = run_arm(bad, good, true, true, false);
+    CHECK_EQ(on.text, good);
+    CHECK(on.ended);
+    CHECK(!on.broken);
+    CHECK(on.masked > 0);
+    const ToolCallParse p = parse_tool_calls(on.text, ChatDialect::Inkling);
+    CHECK_EQ(p.calls.size(), 1u);
+}
+
+// The known limit, driven: a first thinking block, a text block, then a
+// second thinking block that spells a call. The tracker covers the first
+// block only, so the grammar wakes inside the second -- and the audit says
+// so (the decode line's count, decode_suffix_carries_the_grammar_late_think_count).
+// The limit is the operator's to change; this case pins today's behaviour
+// and the audit together.
+TEST(inkling_sampler_late_thinking_block_is_audited) {
+    if (world().v == nullptr) return;
+    const std::string answer = think_block("plan") + kHeader + kText + "Let me check." + kEnd + kThinkMention +
+                               kHeader + kText + "Done." + kEnd;
+    const Arm a = run_arm(answer, answer, true, /*armed*/ true, false);
+    CHECK(a.late);
+    CHECK(a.text != answer);   // today: the second block's call syntax woke the grammar
+    // the first block alone never trips it (inkling_sampler_grammar_stays_dormant_while_thinking)
 }
 #endif

@@ -14,6 +14,7 @@
 #include "core/chat.h"
 #include "core/dialect.h"
 #include "core/sampler.h"
+#include "core/toolgrammar.h"
 
 namespace lgc {
 
@@ -49,9 +50,15 @@ public:
     bool               trigger_is_token() const { return trigger_is_token_; }
     int                rejections() const { return rejections_; }
     bool               broken() const { return broken_; }
+    // Inkling only: the grammar triggered after a thinking block that opened
+    // once content had begun (core/toolgrammar.h, the known limit's audit).
+    bool               late_trigger() const { return watch_.late_trigger(); }
 
 private:
     llama_sampler*                smpl_ = nullptr;
+    const llama_vocab*            vocab_ = nullptr;
+    bool                          inkling_ = false;
+    InklingTriggerWatch           watch_;
     std::string                   gbnf_;
     bool                          trigger_is_token_ = false;
     bool                          broken_           = false;

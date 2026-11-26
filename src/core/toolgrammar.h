@@ -1,6 +1,8 @@
 #pragma once
 
+#include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "core/chat.h"
@@ -86,7 +88,7 @@ std::string tool_grammar_trigger();
 // the turn then ends (a complete grammar admits only the end-of-generation
 // token).
 //
-// Two deviations from the reference, both stricter:
+// Deviations from the reference:
 //   - a JSON string admits no raw control byte 0x00-0x1F (`\t`, `\n` and the
 //     other escapes stay legal). The reference builds args from its PEG
 //     builder's p.json(), whose string rule in GBNF is `[^"\\]` plus the
@@ -96,17 +98,35 @@ std::string tool_grammar_trigger();
 //     call whose "command" held tab-indented C copied raw into a heredoc was
 //     correctly framed but returned as raw content ("Invalid control
 //     character"). json-schema-to-grammar's own `char` rule excludes the
-//     control bytes as here.
+//     control bytes as here. A \uXXXX escape may not be a lone surrogate
+//     (nlohmann refuses one); the reference admits any four hex digits.
 //   - `args` is a JSON object, not any JSON value: the template writes an
 //     object (it refuses anything else) and the parser (core/toolcall.cpp)
 //     takes only an object.
+//   - whitespace around the header's name: the parser trims it (text::trim),
+//     so the trigger skips whitespace after the header and the grammar admits
+//     it between the name and the call marker. The reference's trigger fires
+//     on the first byte after the header, so a leading space starts its
+//     grammar on a byte the grammar refuses, and the call runs unconstrained
+//     (a desync here); a header followed by whitespace and then a content
+//     marker is still no call.
 // The reference also adds an anchored "[^<]+" trigger for Inkling 1, whose
 // generation prompt ends with the header; Inkling 2 Mini's template has no
 // generation prompt (the model writes the header), and the backend refuses
-// the grammar for a prompt that ends with the header (backend_llama.cpp,
-// prepare_tool_grammar), since the think-block tracker that keeps the
-// grammar dormant while the model thinks (operator, 2026-11-26) does not see
-// a header the prompt wrote.
+// the grammar for a prompt whose last tokens are the header
+// (prompt_ends_with_inkling_header below), since the think-block tracker that
+// keeps the grammar dormant while the model thinks (operator, 2026-11-26)
+// does not see a header the prompt wrote.
+//
+// Known limit: the grammar is dormant inside the FIRST thinking block of a
+// turn only. The think-block tracker (core/sampler.h) settles to content
+// when that block closes and does not re-open, so a later thinking block's
+// text reaches the trigger: a call the model spells there starts the
+// grammar inside reasoning. Still stricter than the reference, which feeds
+// every block. Counted, not changed (operator, 2026-11-26): the backend logs
+// one line and counts it on the request's decode line when the grammar
+// triggers in a turn that opened a thinking block after its content began
+// (InklingTriggerWatch below).
 //
 // `reference_strings`: the reference's string rule instead of the strict one,
 // for the red arm of the tests only.
@@ -119,10 +139,38 @@ std::string tool_grammar_trigger();
 std::string generate_inkling_tool_grammar(const std::vector<ToolSpec>& tools, bool parallel = true,
                                           bool reference_strings = false);
 
-// The lazy trigger, as the reference's COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN:
-// the header followed by a character that is not `<` (a content marker after
-// the header is a reasoning or text block, not a call). The capture group
-// marks where the grammar starts.
+// The lazy trigger, after the reference's COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN
+// `<\|message_model\|>([^<])`: the header, optional whitespace, then a byte
+// that is neither `<` (a content marker after the header is a reasoning or
+// text block, not a call) nor whitespace. The capture group marks where the
+// grammar starts: the name.
 std::string inkling_tool_grammar_trigger_pattern();
+
+// Whether a prompt's last tokens spell the assistant header, layout after it
+// ignored: `piece` renders one token with its special text (the header is one
+// special token in Inkling's vocabulary, several text tokens elsewhere). Read
+// from the token ids, so a prompt given as ids (no text) is judged too.
+bool prompt_ends_with_inkling_header(const std::vector<int>& ids, const std::function<std::string(int)>& piece);
+
+// The audit for the known limit above: fed the pieces the grammar is fed (the
+// tokens outside the first thinking block), it follows the trigger's rule
+// and remembers whether a thinking block opened after content began (an
+// <|end_message|> already fed). late_trigger(): the trigger fired after such
+// a block opened -- the case the dormancy does not cover.
+class InklingTriggerWatch {
+public:
+    void feed(std::string_view piece);
+    bool triggered() const { return triggered_; }
+    bool late_think() const { return late_think_; }
+    bool late_trigger() const { return late_trigger_; }
+
+private:
+    std::string tail_;
+    bool        content_begun_ = false;
+    bool        late_think_    = false;
+    bool        after_header_  = false;
+    bool        triggered_     = false;
+    bool        late_trigger_  = false;
+};
 
 }  // namespace lgc

@@ -370,7 +370,7 @@ ToolCallParse parse_inkling_tool_calls(std::string_view text) {
             result.truncated     = true;
             result.reject_reason = "no '{' after the call marker";
             result.reject_offset = json_start - h;
-            result.content.append(text.substr(h));
+            result.content.append(text.substr(cursor));
             break;
         }
         int  depth = 0;
@@ -426,8 +426,10 @@ ToolCallParse parse_inkling_tool_calls(std::string_view text) {
                                : std::string_view::npos;
         if (!named) {
             result.truncated     = true;
-            result.reject_reason = "name / args mismatch: the object must be {\"name\": \"" + name +
-                                   "\" (the header's name), \"args\": <object>}";
+            // no model text in the line: the header's name is whatever the
+            // model wrote between the header and the marker
+            result.reject_reason = "name / args mismatch: the object's \"name\" must be the header's name and "
+                                   "\"args\" an object";
             result.reject_offset = json_start - h;
             result.content.append(text.substr(cursor));
             break;
