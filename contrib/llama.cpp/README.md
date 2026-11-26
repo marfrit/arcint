@@ -10046,6 +10046,22 @@ unit's settings).
 **Not run on a card.** The card rows and their EXPECT lines are in `contrib/refkernels/trellis-fa/README.md`
 §split. A served unit does not use the knob until those rows have passed.
 
+**0223c-flash-attn-port-split-f16-bound.patch** (`test-backend-ops.cpp`, tests only)
+- **The change:** the f16 key-split cases are bounded at NMSE 1e-4 against the CPU reference, not 1e-5. The q8_0
+  split cases (1e-5) and every older case are unchanged.
+- **The basis:** set by the operator after the card run, on a basis independent of the split result. The UNSPLIT
+  f16 port's own error against the CPU is 3.88e-5 (`measured-here`, B60, the older f16 port cases), so 0223b's 1e-5
+  sat below the kernel's floor by construction. The split f16 cases measured 4.3e-5 there and failed by that floor,
+  not by the split.
+- **The sharper evidence** is the split against the unsplit port on the same seeded inputs
+  (`GGML_TEST_FA_PORT_DUMP`): 1.6e-9 to 5.9e-8 per case, bound 1e-5, FORCE=3 over all 22 port cases. RED=13 (a lost
+  seam block) exceeds that bound by 17x or more.
+- **The red still fails at the new bound, with a smaller margin:** a lost seam block moves the f16 split cases by
+  1.76e-4 to 3.5e-4 (`inference`: a numpy model of the cases' fill; `GGML_TEST_FA_PORT_SEAM=1` gives the same on the
+  CPU backend) and 1.75e-4 to 3.82e-4 on the card. That is 1.76 to 3.5 times 1e-4: the closest cell is kv 16384 x
+  nb 64 with 8,000 empty cells at the B60's split (1.76e-4). `GGML_TEST_FA_PORT_SEAM=1` now asks the red to be above
+  the bound (it asked 10x of 1e-5) and prints the factor.
+
 ## 0208-test-backend-ops-inkling-expert-projection-perf.patch
 
 The expert DOWN projection next to the fused GATE_UP as perf cases, so one card run compares them, plus
