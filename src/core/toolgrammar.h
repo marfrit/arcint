@@ -125,7 +125,7 @@ std::string tool_grammar_trigger();
 // grammar inside reasoning. Still stricter than the reference, which feeds
 // every block. Counted, not changed (operator, 2026-11-26): the backend logs
 // one line and counts it on the request's decode line when the grammar
-// triggers in a turn that opened a thinking block after its content began
+// triggers after a thinking block the tracker did not cover
 // (InklingTriggerWatch below).
 //
 // `reference_strings`: the reference's string rule instead of the strict one,
@@ -154,9 +154,11 @@ bool prompt_ends_with_inkling_header(const std::vector<int>& ids, const std::fun
 
 // The audit for the known limit above: fed the pieces the grammar is fed (the
 // tokens outside the first thinking block), it follows the trigger's rule
-// and remembers whether a thinking block opened after content began (an
-// <|end_message|> already fed). late_trigger(): the trigger fired after such
-// a block opened -- the case the dormancy does not cover.
+// and remembers whether a thinking marker reached it -- a thinking block the
+// tracker did not cover (a later block, or one it did not see open, such as a
+// header and layout before the marker). The first block's opener never
+// reaches it: the tracker opens the block before the constraint's gate.
+// late_trigger(): the trigger fired after such a marker.
 class InklingTriggerWatch {
 public:
     void feed(std::string_view piece);
@@ -166,7 +168,6 @@ public:
 
 private:
     std::string tail_;
-    bool        content_begun_ = false;
     bool        late_think_    = false;
     bool        after_header_  = false;
     bool        triggered_     = false;

@@ -285,6 +285,10 @@ TEST(inkling_trigger_watch_flags_a_trigger_after_a_later_thinking_block) {
         { kHeader + "  bash", true, false, false },
         // a call in the first text block
         { kHeader + kText + "x" + kEnd + kHeader + "bash", true, false, false },
+        // a turn that opens with header + layout + the thinking marker: the
+        // tracker reads it as content (its opener is the header and the marker
+        // together), so the block is fed, and a call spelled there is audited
+        { kHeader + " " + kThink + "I could " + kHeader + "bash", true, true, true },
     };
     for (size_t i = 0; i < cases.size(); ++i) {
         const Case& c = cases[i];
@@ -549,6 +553,10 @@ TEST(inkling_gbnf_admits_the_whitespace_the_parser_trims) {
     const std::string body = "{\"name\":\"bash\",\"args\":{\"command\":\"ls\"}}" + kEnd;
     CHECK(run_grammar(g, "bash" + kMarker + body).complete);
     CHECK(run_grammar(g, "bash \t\n" + kMarker + body).complete);   // after the name
+    // bounded at 8, as ink-ws: a constrained model cannot spend its tokens on layout
+    CHECK(run_grammar(g, "bash" + std::string(8, ' ') + kMarker + body).complete);
+    CHECK(!run_grammar(g, "bash" + std::string(9, ' ') + kMarker + body).accepted);
+    CHECK(!run_grammar(g, "bash" + kMarker + body + kHeader + std::string(9, '\n') + "read_file").accepted);
     // a second call's header may carry layout too
     CHECK(run_grammar(g, "bash" + kMarker + body + kHeader + "\n read_file" + kMarker +
                              "{\"name\":\"read_file\",\"args\":{}}" + kEnd)

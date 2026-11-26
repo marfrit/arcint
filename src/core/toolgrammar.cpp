@@ -451,7 +451,8 @@ std::string generate_inkling_tool_grammar(const std::vector<ToolSpec>& tools, bo
     // parsers may): a high surrogate only with a low one after it
     g += "ink-u-escape ::= \"u\" ( [0-9a-cA-Ce-fE-F] [0-9a-fA-F]{3} | [dD] [0-7] [0-9a-fA-F]{2} | "
          "[dD] [89abAB] [0-9a-fA-F]{2} \"\\\\u\" [dD] [c-fC-F] [0-9a-fA-F]{2} )\n";
-    g += "ink-name-ws ::= [ \\t\\n\\x0B\\x0C\\r]*\n";
+    // bounded, as ink-ws: a constrained model cannot spend its tokens on layout here
+    g += "ink-name-ws ::= [ \\t\\n\\x0B\\x0C\\r]{0,8}\n";
     g += "ink-number ::= \"-\"? ( \"0\" | [1-9] [0-9]* ) ( \".\" [0-9]+ )? ( [eE] [-+]? [0-9]+ )?\n";
     g += "ink-ws ::= | \" \" | \"\\n\"{1,2} [ \\t]{0,20}\n";
     return g;
@@ -474,7 +475,6 @@ bool prompt_ends_with_inkling_header(const std::vector<int>& ids, const std::fun
 void InklingTriggerWatch::feed(std::string_view piece) {
     static const std::string_view header = markers::kInkMessageModel;
     static const std::string_view think  = markers::kInkContentThink;
-    static const std::string_view end    = markers::kInkEndMessage;
     for (const char c : piece) {
         if (triggered_) return;   // the grammar is active: nothing left to watch
         tail_ += c;
@@ -484,8 +484,10 @@ void InklingTriggerWatch::feed(std::string_view piece) {
             after_header_ = true;
             continue;
         }
-        if (t.ends_with(end)) content_begun_ = true;
-        if (t.ends_with(think) && content_begun_) late_think_ = true;
+        // any thinking marker the grammar is fed is a block the tracker did not
+        // cover: the first block's opener is never fed (the tracker opens it
+        // before the constraint's gate, core/sampler.cpp observe)
+        if (t.ends_with(think)) late_think_ = true;
         if (!after_header_) continue;
         // the trigger's rule: whitespace waits, `<` is a content marker, any
         // other byte starts the grammar
