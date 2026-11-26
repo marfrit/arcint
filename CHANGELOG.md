@@ -80,6 +80,15 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   97.96 % against 98.16 %; the battery 8 of 8 right. The knob stays off by default until the operator changes it
   (`contrib/llama.cpp/README.md`, 0220).
 
+- llama.cpp patch 0221 (opt-in, `GGML_OPENCL_LOOP_CONTROL=1|bf16`, default off): Inkling 2 Mini's loop controller as
+  one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
+  its 12-launch chain, for prompt batches. Unset, the graph is today's line for line. Card rows (`measured-here`, B60
+  at 165 W, the Inkling unit's settings): the served 4,096-token pass 1,121 -> 1,170 t/s (+4.4 %, the slowest on-run
+  above the fastest off-run); one 4,096-token chunk 888.6 -> 850.6 ms with 1,152 fewer launches; the op cases 16 of
+  16 in f32 and bf16, five reds 0 of 16; mean KL against the CPU base 0.004683 nats (f32) against 0.004705 (off), same
+  top 98.03 % both; the capital, the 44k needle and the acceptance task right with it on. f32 is the arm (bf16 is not
+  faster). The knob stays off by default until the operator changes it (`contrib/llama.cpp/README.md`, 0221).
+
 ## 1.8.2 — 2026-11-25
 
 A fix release on 1.8.1 for Inkling 2 Mini's prompt cache: a served conversation re-read its whole prompt when a turn

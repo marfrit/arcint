@@ -954,6 +954,17 @@ if(ARCINT_TESTS)
                      "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_depth_mix_taken_line.py")
     set_tests_properties(depth-mix-taken-line PROPERTIES LABELS unit)
+    # patch 0221's device-free cell: the loop controller's rule on the exported graph's
+    # LOOP_CONTROL lines (red first), the launch plan, the CPU op against the unfused chain, and
+    # loop_control.cl itself replayed on host threads (f32 and bf16 builds, and the five reds)
+    add_executable(arcint-loop-control tests/test_loop_control.cpp)
+    target_link_libraries(arcint-loop-control PRIVATE arcint_core)
+    target_include_directories(arcint-loop-control PRIVATE
+        "${ARCINT_LLAMA_DIR}/ggml/include"
+        "${ARCINT_LLAMA_DIR}/ggml/src/ggml-opencl/kernels")
+    target_compile_options(arcint-loop-control PRIVATE -Wall -Wextra -Wpedantic)
+    add_test(NAME loop-control COMMAND arcint-loop-control)
+    set_tests_properties(loop-control PROPERTIES LABELS unit)
   endif()
 endif()
 
