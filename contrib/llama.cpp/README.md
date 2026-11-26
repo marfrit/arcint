@@ -11776,9 +11776,11 @@ format lines, not a launch). The FA port's TAKEN lines are WARN.
 
 **Test** (`tests/python/test_taken_lines_183.py`, a `unit` ctest, device-free, `measured-here` on the recipe host's
 applied trees): every listed line's macro is one `route_llama_log` shows outside `-v`, and every call site is inside
-a `std::call_once` on a static `std::once_flag` (an array element for a line a mode). Red on the series without 0224
-(int-183, applied tree `78b098f2` on the pin tarball): three failures, 0221's level and guard and 0220's guard. Green
-with 0224 (applied tree `e26e82f8927847c0b016484dae24857888a77765` on the pin tarball, 166 patches); 0211's own test
+a `std::call_once` on a static `std::once_flag` (for 0220's line a mode, the flag array indexed by `mode`: a flag
+shared across the modes fails). Each line is matched by its full format string, so a change to its tail fails too.
+Red on the series without 0224 (aa0744b9, applied tree `78b098f2` on the pin tarball): three failures, 0221's level
+and guard and 0220's guard; two mutants of the green tree fail as well (0220 on `taken[0]`; 0221's line without its
+`n_wg`). Green with 0224 (applied tree `e26e82f8927847c0b016484dae24857888a77765` on the pin tarball, 166 patches); 0211's own test
 still passes.
 
 **0223** (the FA port's key split, on its own branch, not in this series yet): its new TAKEN lines (the port's two

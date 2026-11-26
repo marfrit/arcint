@@ -15,7 +15,7 @@ depth mix's TAKEN line to WARN for that reason. The 1.8.3 items' lines, read fro
 The cell asserts for each: its GGML_LOG_* macro is one route_llama_log shows outside -v, and every call site is
 inside a std::call_once on a static std::once_flag (an element of a static once_flag array for a line a mode). It
 reads LLAMA_SRC (the applied tree) and arcint's routing; source text, not a run (the paths need the card).
-Red on the series without 0224 (int-183 aa0744b9): 0221's level and guard and 0220's guard fail.
+Red on the series without 0224 (aa0744b9): 0221's level and guard and 0220's guard fail.
 """
 import os
 import re
@@ -26,12 +26,14 @@ ROOT = Path(__file__).resolve().parents[2]
 ROUTING = ROOT / "src" / "exec" / "backend_llama.cpp"
 OPENCL = "ggml/src/ggml-opencl/ggml-opencl.cpp"
 
+# (patch, the FULL format string as the source writes it (a tail change fails the cell), call sites, the guard's index:
+# None for one flag, else the expression the flag array must be indexed with)
 LINES = [
-    ("0211", "depth_mix: TAKEN opencl f32 token-a-group", 1),
-    ("0212", "TAKEN src=opencl op=FLASH_ATTN indexed-bias form=gqa", 1),
-    ("0220", "TAKEN src=opencl op=MUL_MAT type=q8_0 path=2d-", 1),
-    ("0221", "loop_control: TAKEN opencl ", 1),
-    ("0222", "TAKEN src=opencl op=MUL_MAT_ID type=%s path=xt64", 2),
+    ("0211", r"depth_mix: TAKEN opencl f32 token-a-group\n", 1, None),
+    ("0212", r"TAKEN src=opencl op=FLASH_ATTN indexed-bias form=gqa\n", 1, None),
+    ("0220", r"TAKEN src=opencl op=MUL_MAT type=q8_0 path=2d-%s k=%d m=%d n=%d wg=%dx%d\n", 1, "mode"),
+    ("0221", r"loop_control: TAKEN opencl %s one-launch rows_wg=%d n_wg=%d\n", 1, None),
+    ("0222", r"TAKEN src=opencl op=MUL_MAT_ID type=%s path=xt64 tile=64 skip=1\n", 2, None),
 ]
 
 
@@ -56,10 +58,15 @@ def _routed_levels(src):
 
 def _sites(text, needle):
     """(position, macro) of every GGML_LOG_* call whose format string starts with needle."""
-    return [(m.start(), m.group(1)) for m in re.finditer(r"(GGML_LOG_[A-Z]+)\(\s*\"" + re.escape(needle), text)]
+    return [(m.start(), m.group(1)) for m in re.finditer(r"(GGML_LOG_[A-Z]+)\(\s*\"" + re.escape(needle) + "\"", text)]
 
 
-GUARD = re.compile(r"static std::once_flag (\w+)(?:\[\d+\])?;\s*std::call_once\(\1(?:\[[^\]]+\])?,[^{]*\{\s*$")
+def _guard(index):
+    """std::call_once on a static once_flag right before the call; with an index, a static flag ARRAY indexed by it
+    (one flag a mode: a flag shared across the modes would print one mode's line only)."""
+    if index is None:
+        return re.compile(r"static std::once_flag (\w+);\s*std::call_once\(\1,[^{]*\{\s*$")
+    return re.compile(r"static std::once_flag (\w+)\[\d+\];\s*std::call_once\(\1\[" + re.escape(index) + r"\],[^{]*\{\s*$")
 
 
 class TakenLines183(unittest.TestCase):
@@ -69,23 +76,23 @@ class TakenLines183(unittest.TestCase):
         self.shown = _routed_levels(ROUTING.read_text())
 
     def test_each_line_present(self):
-        for patch, needle, n in LINES:
+        for patch, needle, n, _ in LINES:
             with self.subTest(patch=patch):
                 self.assertEqual(len(_sites(self.cl, needle)), n, "%s: %d call site(s) of %r expected" % (patch, n, needle))
 
     def test_each_line_reaches_the_served_log(self):
-        for patch, needle, _ in LINES:
+        for patch, needle, _, _ in LINES:
             for pos, macro in _sites(self.cl, needle):
                 with self.subTest(patch=patch, at=pos):
                     self.assertIn(macro[len("GGML_LOG_"):], self.shown,
                                   "%s: %r is %s, which route_llama_log keeps for -v" % (patch, needle, macro))
 
     def test_each_line_once_a_process(self):
-        for patch, needle, _ in LINES:
+        for patch, needle, _, index in LINES:
             for pos, macro in _sites(self.cl, needle):
                 with self.subTest(patch=patch, at=pos):
                     head = self.cl[max(0, pos - 500):pos]
-                    self.assertIsNotNone(GUARD.search(head),
+                    self.assertIsNotNone(_guard(index).search(head),
                                          "%s: %r is not printed inside a std::call_once on a static once_flag" % (patch, needle))
 
 
