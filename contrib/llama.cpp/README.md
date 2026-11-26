@@ -11963,8 +11963,9 @@ the source of the keys `DOWNGRADE src=opencl op=MUL_MAT type=f32 k=64 cols=1-4 p
 rows) and `cols=5-15` at 5 to 8 rows (`measured-here`; at one row the two products are a GEMV and print no key).
 
 **What the chain costs at these row counts** (`measured-here`, 2026-11-26, the B60 at 165 W, the profiling build,
-llama-batched-bench at depth 4,096, ubatch 1,024, the unit's switches with the 1.8.3 ones and `=f32`, K/V q8_0:q4_0;
-device time a graph, medians over 16 to 32 graphs; 96 controls a graph):
+llama-batched-bench at depth 4,096, ubatch 1,024, the unit's switches with the 1.8.3 ones and `=f32`, a q8_0 K with a
+q4_0 V; device time a graph, medians over 16 to 32 graphs; 96 controls a graph; the controller reads no cache, so its
+cost is the same under the card rows' cache):
 
 | rows | graph, ms | the chain, ms | share | a control, us | its two k=64 products, ms |
 |---|---|---|---|---|---|
@@ -12003,6 +12004,29 @@ Served decode on that unit: 35.7 t/s after a 3,000-token prompt, 29.3 t/s at 32,
   the about 1 us of this card's smallest launches) is 0.2 ms; the 0.3 to 0.5 ms a graph named above needs the pair at
   3 to 5 us a control, under this estimate. Whether two launches beat twelve at one row is the card's question; the
   switch has a value for either answer.
+
+**How this build differs from the reference's path at these row counts** (`code`: `loop_control.sycl` at 6b71b90,
+`control_many` and `control_input` / `control_output`). The pair takes the reference's spread of the work, not its
+whole path, so a row c that misses its target is not a verdict on the reference's technique:
+- **Weights.** The reference reads int8 weights with f16 scales, one scale a 32 (`down` [4, 64, 4608] as chars):
+  0.59 MB a control. 0226 reads the model's F32 weights, 2.36 MB a control, and the gate reads `down` once a row (T x
+  1.18 MB). This deviation rests on a rule: the operator's "no lossy speed tricks" (2026-11-26: int8 or other lossy
+  copies of weights are out). If row c misses the target, the int8 path is the operator's question, with the measured
+  price of each side; it is not dropped here as a finding against it.
+- **Controls a launch set.** The reference serves q, k and v in one launch set (C = 3, four launches) and ffn in
+  another; 0226 is one control a pair of launches (the same average, two a control, but each launch a third of the
+  work).
+- **The trailing norm.** The reference folds the layer's rms_norm and its weight into the last launch
+  (`control_output`, and `control_many`'s fourth launch); here the norm stays a node (one more launch a control, 2.3
+  us in the one-row profile).
+- **The down product's layout.** The reference: one group of 32 lanes a (row, output) over the concatenated K = 4,608
+  normed copy, which an earlier launch wrote. 0226: the halves split (128 T groups of 64 lanes), no normed copy, the
+  half's sum of squares recomputed in each of its 64 groups.
+- **The combine.** The reference computes `(1 - tanh f)*a + tanh g*b`; 0226 keeps the chain's node order `(c - tf*c) +
+  tg*m`, which is what the bound against the chain needs.
+- Lossless follow-ups the card's numbers may motivate, none of them built: q / k / v in one launch set (a three-output
+  op, or three nodes one dispatch serves together), the folded norm, the reference's down layout (one pass a row
+  instead of 64 sums of squares), a separate kernel a row template.
 
 **The switch** (no new knob; `ggml_loop_control_mode`, `_min_rows`, `_small_on` in ggml.c, one table in the unit test):
 
@@ -12120,9 +12144,19 @@ the BASE tree's switch-unset logits as the base; `-b` = `-ub` = 1, every token a
   layer-backend DOWNGRADE lines: the guard.
 - The all-layers arms move the logits by 0.0006 nats, under what one ulp at the depth mix's sites costs on this host's
   CPU (0.0015 to 0.0027 nats, 0204-0207's noise control). The one-row arm changes the top token at 8 of 381 positions
-  (2.1 ± 0.7 points) at that KL: near-ties on a small sample, and above the 1-point bar if it were read as a card
-  result. It is the CPU reference op (0221's, unchanged) against the chain on a CPU, not the pair; the comparative
-  reading on the card, 6,144 scored tokens a one-row arm, is row b, and its bar decides.
+  (2.1 ± 0.7 points) at that KL.
+- **The one-row arm again on 16 chunks** (the review's check: is 97.9 % sampling?), 2,032 scored positions, the same
+  settings: mean KL **0.000713 ± 0.000035**, max 0.0376, same top p **98.868 ± 0.235 %**, PPL 9.0886 against the
+  base's 9.0612. So the 3-chunk figure was partly sampling, and the settled rate is about 1.1 points of changed top
+  tokens at a KL of 0.0007: the size of 0221's own all-layers row (99.08 % at 0.00076 nats, 256-row batches). These
+  are near-ties moved by a rounding-order change, which the model amplifies; the op agrees with the chain at 3e-13 a
+  call.
+- What that means for the card: this is the CPU reference op (0221's, unchanged) against the chain on a CPU, not the
+  pair, and it is read against the chain itself, where every change counts. Row b reads both arms against the CPU
+  base, where pre is itself about 2 points from it, so only the net of changes towards and away from the base shows;
+  0221's card row moved by 0.000 to 0.016 points that way. A one-row arm that still lands near the 1-point bar on
+  6,144 scored tokens is possible from rounding order alone and would be this effect, not a kernel defect: the op
+  cases and the twins (row a) are what separate the two.
 
 *test-backend-ops* (compiled and linked in a llama build of the applied tree on the recipe host, OpenCL on; no
 device here, so the cases ran nowhere): **41 LOOP_CONTROL cases** (0221: 16) - the op at 1, 2, 3, 4, 5, 6, 7 and 8
@@ -12142,7 +12176,8 @@ nothing about a device); the last change to `loop_control_small.cl` after that b
 its row dropped) was checked by ocloc and the host replay, not by another llama build.
 
 **Card rows (written, not run), in this order** (the B60, the unit's own Environment lines with any
-`GGML_OPENCL_LOOP_CONTROL` replaced by the arm's; q8_0 K/V, ub 1,024; `G` the published Inkling 2 Mini IQ4_NL).
+`GGML_OPENCL_LOOP_CONTROL` replaced by the arm's; the unit's cache, q8_0 K and q8_0 V - the cost table above was
+taken with a q4_0 V, so its graph totals are not these arms' -, ub 1,024; `G` the published Inkling 2 Mini IQ4_NL).
 Three arms: **pre** = the series without 0226, `=f32` (the op above 8 rows only); **new** = this tree, `=f32`;
 **t2** = this tree, `=f32-t2`. About 60 minutes; about 85 if llama-bench cannot restore its depth state.
 
