@@ -9966,6 +9966,86 @@ control by 0.002031 .. 0.002161 over four seeds: inside the noise (§q8-paired).
 Red / green without a device: `contrib/refkernels/trellis-fa/port_gate_test.cpp` on `fixtures/inkling-ub*.txt`
 (`-DFA_PORT_GATE_RED`, `-DFA_PORT_GATE_RED_PAGED`), and the three `GGML_TEST_FA_PORT_*` checks above.
 
+## 0223-opencl-flash-attn-port-key-split.patch / 0223b-flash-attn-port-key-split-tests.patch
+
+The key split of the port's global calls, after 0045's rule (llama.cpp CUDA's `parallel_blocks`):
+`GGML_OPENCL_FA_PORT_SPLIT=1`, which acts only with `GGML_OPENCL_FA_PORT=1`. When it is unset, every call
+is today's unsplit kernel, and the unsplit program is byte-identical: the same SPIR-V and the same ISA
+hash on bmg-g21 and bmg-g31, f16 and q8_0 (`measured-here`, ocloc 26.27.1).
+
+**Card result** (`measured-here`, 2026-11-26, B60 at 165 W, the Inkling unit's settings). Row 1, `llama-bench -p 1024`
+at depth, 3 interleaved rounds, a fresh process an arm: at 40,960 the slowest on-run 730.4 t/s against the fastest
+off-run 715.8 (+2.0 %); at 4,096, where no call splits, equal (1,102.9-1,103.4 both). Row 3: the 22 port cases
+against the CPU, the split f16 cases inside 1e-4 (the unsplit f16 port's own error in the same run is 3.88e-5, so
+1e-5 was below the kernel's floor; the bound was raised to 1e-4 by the operator on that basis), q8_0 inside 1e-5;
+the split output against the unsplit output of the same tree, case by case, 1.6e-9 to 5.9e-8 on all 22 (bound 1e-5,
+set before the run), and the lost-seam red (`RED=13`) at 1.74e-4 to 3.54e-4 against it on all six split cases. Row
+4, `llama-perplexity` at 16,384 tokens, 4 chunks: split on against off KL 0.003425 nats, same top 98.572 % (bounds
+0.004 / 98 %), 288 split calls; red 10 0.195. Row 5, the served unit at its own environment plus the knob: the
+capital and the 44,000-token needle right, 288 split calls in the served process. The acceptance task did not
+discriminate: at its 4,000-token cap both arms' thinking used the whole cap and wrote no code (0 of 10 each).
+
+**Why.** At ub 1,024 a call is 1,024 work-groups, 5.12 waves of the B60's 200, so the last wave is 12 % full.
+At depth 40,960 the 8 global calls take 455.7 ms of a 1,290-ms ubatch (`measured-here`, the B60, the
+unit's settings).
+
+**0223** (`fa_port_gate.h`, `ggml-opencl.cpp`, `kernels/flash_attn_port.cl`):
+- **The rule, as pure functions:**
+  - the wave is n_cu / 8 × floor(32 / (G · qtw)) at 256 GRF;
+  - p is the fewest p ≤ min(16, blocks / 128) whose waves are ≥ 95 % full, else the fullest;
+  - every split walks ≥ 128 32-key blocks, so nothing below 8,192 keys splits;
+  - a windowed call never splits.
+- **The kernel:** a lazily built `-DPORT_SPLIT=1` program, with the unsplit build's options.
+  - The grid is kv-head-major, then the split, then the row group.
+  - Split 0 carries the sink. Each split writes its (O, m, l) state, 4,160 B a (split, head, 8-row tile),
+    to the scratch `fa_port_split`: 38.3 MB at ub 1,024 and p = 3. Its growth is logged, because the
+    load-time spill guard does not see it.
+  - The merge kernel `kernel_flash_attn_port_merge` then writes O / l.
+- **The logs:** the TAKEN line gains `split=`; the first split call has a TAKEN line of its own;
+  `GGML_OPENCL_FA_PORT_TRACE=1` adds a line a call.
+- **The other knobs:**
+  - `_SPLIT_MAX=N` caps p;
+  - `_SPLIT_MINBLK=N` sets the floor of blocks a split walks (unset 128, 1 none: for pricing the floor);
+  - `_SPLIT_FORCE=N` forces p (tests);
+  - `_WAVE=W` overrides the wave;
+  - `_RED=10|11|12|13` are the split build's reds: the states without their maxima, split 1 dropped, the
+    sink in every split, and a lost seam block.
+
+**0223b** (`test-backend-ops.cpp`):
+- **The new cases:** six split cases, f16 and q8_0: kv 16384 × nb 1024, kv 12288 × nb 36, and kv 16384 × nb
+  64 with 8,000 empty cells, so that one split is all empty. They run in eval and perf.
+- **What each port case reads:** the backend's record of its launch, through
+  `ggml_backend_opencl_fa_port_split_stats`. It prints `[FA_PORT] split=p`, and fails in three ways: when p
+  is not the rule's, when the work-groups are not n_head_kv × ceil(nb / 8), or when a split case does not
+  split with the knob on. That last check is 0045's blind KL run, made a test.
+- **The counts:** `GGML_TEST_FA_PORT_DECISIONS` counts the split cases apart, and checks that the rule
+  splits them at both cards' waves.
+- **The bound:** the split cases are bounded at 1e-5, f16 as well. A lost seam block moves their f16
+  answer by NMSE 1.8e-4 .. 3.5e-4, which 5e-4 would hide. `GGML_TEST_FA_PORT_SEAM=1` checks on the CPU
+  that the red stands at least 10x above the bound.
+- **Perf:** a perf row whose launch record is wrong prints `FAILED [launch record]`. Two perf cells
+  price the 128-block floor.
+- **The split against the unsplit port:** `GGML_TEST_FA_PORT_DUMP=<dir>` writes each port case's output on the
+  backend (raw f32, under the FNV-1a 64 hash of the case's vars, with an `index.txt`). Two runs of the same seeded case,
+  the key split on and off, can then be compared with each other instead of with the CPU, which is what the split
+  changes, apart from the CPU reference's own floor. The window's bound: NMSE ≤ 1e-5 per case, f16 and q8_0, and
+  RED=13 above it.
+- **The bound on the CPU reference, revised after the first card run:** the unsplit f16 port's own error against the
+  CPU was 3.88e-5 on the card, so the split f16 cases' 1e-5 sat below the kernel's floor by construction (`measured-here`:
+  the split f16 cases 4.3e-5, q8_0 1.9e-6). The window judges the split f16 cases at 1e-4 from the logged NMSE (RED=13:
+  1.75e-4 .. 3.82e-4) and records the binary's 1e-5 verdict beside it; the split-against-unsplit bound above is the
+  check of the split itself.
+
+**Without a device** (`measured-here`, the recipe host):
+- `contrib/refkernels/trellis-fa/port_split_test.cpp` on the six exports: green rc 0, red
+  (`-DFA_PORT_SPLIT_RED_NO_FLOOR`) rc 1;
+- the four `GGML_TEST_FA_PORT_*` gate checks: rc 0;
+- the split builds: 256 GRF, scratch 0;
+- the reds are visible in the ISA.
+
+**Not run on a card.** The card rows and their EXPECT lines are in `contrib/refkernels/trellis-fa/README.md`
+§split. A served unit does not use the knob until those rows have passed.
+
 ## 0208-test-backend-ops-inkling-expert-projection-perf.patch
 
 The expert DOWN projection next to the fused GATE_UP as perf cases, so one card run compares them, plus

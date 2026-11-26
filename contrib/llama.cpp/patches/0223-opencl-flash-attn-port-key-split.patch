@@ -1,0 +1,533 @@
+diff --git a/ggml/src/ggml-opencl/fa_port_gate.h b/ggml/src/ggml-opencl/fa_port_gate.h
+index c7df2945f..b84e8035d 100644
+--- a/ggml/src/ggml-opencl/fa_port_gate.h
++++ b/ggml/src/ggml-opencl/fa_port_gate.h
+@@ -262,6 +262,72 @@ static inline int fa_port_gate_at_launch(const struct ggml_tensor * op, int port
+     return fa_port_gate_op(&dv, buf_align, wg_max, is_intel, why_out);
+ }
+ 
++// ---- 0223: the key split of a global call (0045's rule, on the port's wave) ----
++//
++// A call's work-groups are n_head_kv x ngroups (ngroups = ceil(n_q / 8 / qtw)); at ub1024 that is
++// 1,024, 5.12 waves on the B60 with the last 12 % full. A split gives each work-group 1/p of the key
++// blocks, with its own online-softmax state, and a merge kernel joins the p states. The rule is
++// llama.cpp CUDA's parallel_blocks as 0045 has it: the fewest p whose waves are at least 95 % full,
++// else the fullest. Two port-specific limits: every split walks at least FA_PORT_SPLIT_MIN_BLOCKS
++// 32-key blocks (4,096 keys: a split repeats the tile's setup, and the merge costs a launch), which
++// also means no call below 2 x 128 blocks (8,192 keys) splits; and a windowed call (the SWA ring)
++// never splits (its visited keys lie in one part of the ring, and the seam moves).
++
++// The port's wave: the work-groups the device holds at once. A work-group is G x qtw SIMD16
++// threads, one an (head, 8-row tile); a Xe core holds 32 threads at 256 GRF and 64 at 128 (8
++// vector engines x 4 or 8), and CL_DEVICE_MAX_COMPUTE_UNITS counts the engines. B60 (160) at 256
++// GRF, G 3, qtw 1: 20 x 10 = 200; B70 (256): 320.
++static inline int fa_port_split_wave(int n_cu, int grf, int threads_per_wg) {
++    if (n_cu < 8 || threads_per_wg < 1) return 0;
++    const int per_core = (grf == 256 ? 32 : 64) / threads_per_wg;
++    return per_core < 1 ? 0 : (n_cu / 8) * per_core;
++}
++
++#define FA_PORT_SPLIT_MAX        16
++#define FA_PORT_SPLIT_MIN_BLOCKS 128
++
++// p for one call: nwg work-groups, the wave, the call's keys and window. cap (GGML_OPENCL_FA_PORT_SPLIT_MAX,
++// 0 = none) bounds p; force (GGML_OPENCL_FA_PORT_SPLIT_FORCE, the tests only) sets it, windowed calls too,
++// bounded by 16 and the call's blocks. min_blocks (GGML_OPENCL_FA_PORT_SPLIT_MINBLK, 0 = the default
++// FA_PORT_SPLIT_MIN_BLOCKS) is the floor of blocks a split walks: a knob so that a window can price it
++// (1 = no floor, 0045's and CUDA's form). FA_PORT_SPLIT_RED_NO_FLOOR: the rule without the floor whatever
++// min_blocks says (the unit test's red: it splits a 4k call).
++static inline int fa_port_splits(int64_t nwg, int64_t wave, int64_t n_kv, int32_t window, int cap, int force, int min_blocks) {
++    const int64_t blocks = (n_kv + 31) / 32;
++    if (force > 0) {
++        int64_t p = force < FA_PORT_SPLIT_MAX ? force : FA_PORT_SPLIT_MAX;
++        if (p > blocks) p = blocks;
++        return p < 1 ? 1 : (int) p;
++    }
++    if (window != 0 || wave <= 0 || nwg <= 0) return 1;
++#ifdef FA_PORT_SPLIT_RED_NO_FLOOR
++    int64_t smax = blocks;
++#else
++    int64_t smax = blocks / (min_blocks > 0 ? min_blocks : FA_PORT_SPLIT_MIN_BLOCKS);
++#endif
++    if (smax > FA_PORT_SPLIT_MAX) smax = FA_PORT_SPLIT_MAX;
++    if (cap > 0 && smax > cap) smax = cap;
++    if (smax <= 1) return 1;
++    int best = 1;
++    int64_t eff_best = 0, nw_best = 0;
++    for (int p = 1; p <= smax; ++p) {
++        const int64_t nb = nwg * p, nw = (nb + wave - 1) / wave, eff = 100 * nb / (nw * wave);
++        if (eff_best >= 95 && nw > nw_best) break;
++        if (eff > eff_best) { eff_best = eff; nw_best = nw; best = p; }
++    }
++    return best;
++}
++
++// the 32-key blocks a split walks: split s takes [s * b, min(B, (s + 1) * b)) of the call's B blocks.
++// A split past B (p does not divide B evenly) walks none: its state is (M_INIT, 0) and weighs 0.
++static inline int fa_port_split_blocks(int64_t n_kv, int p) {
++    const int64_t blocks = (n_kv + 31) / 32;
++    return (int) ((blocks + p - 1) / (p < 1 ? 1 : p));
++}
++
++// a split state's floats: O as a sub-group holds it (8 chunks x 8 rows x 16 lanes), then m (8) and l (8)
++#define FA_PORT_SPLIT_STATE_FLOATS (8 * 128 + 16)
++
+ #if defined(__cplusplus)
+ }
+ #endif
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7b04b8664..e9e343d3d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1526,6 +1526,14 @@ struct ggml_backend_opencl_context {
+     cl_program program_fa_port_kv8 = nullptr;
+     bool fa_port_kv8_tried = false;
+     size_t fa_port_kv8_wg = 0;
++    // 0223: the key split's build of each (the same options + -DPORT_SPLIT=1, so the unsplit
++    // programs above stay what they were), [0] f16, [1] q8_0, made at the first call that splits
++    std::string fa_port_opts[2];
++    cl_kernel kernel_fa_port_split[2] = {}, kernel_fa_port_merge[2] = {};
++    cl_program program_fa_port_split[2] = {};
++    bool fa_port_split_tried[2] = {};
++    size_t fa_port_split_wg[2] = {};
++    int fa_port_n_cu = -1;   // CL_DEVICE_MAX_COMPUTE_UNITS, asked once (-1: not yet)
+     int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
+     // 0106: the build options of the head-256 prompt kernels, so that the
+     // head-512 builds made on first use match them (sub-group, sub-groups a
+@@ -13297,7 +13305,10 @@ static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx,
+         // FAIL the q8_0 cases (the f16 build has neither and passes)
+         if (r == 6) opts += " -DGB_KV8_K_SCALE2";
+         if (r == 7) opts += " -DGB_KV8_V_BLOCK";
++        // 0223's reds (10 .. 13) are the split build's own: ggml_cl_port_split_kernels adds them
+     }
++    // 0223: the split build takes these same options (and the source again) plus its own
++    backend_ctx->fa_port_opts[kv8 ? 1 : 0] = opts;
+     cl_program p = build_program_from_source_optional(backend_ctx, src.c_str(), opts);
+     if (p == nullptr) {
+         ggml_cl_downgrade("op=FLASH_ATTN port=not-built reason=%s", kv8 ? "compile-q8" : "compile");
+@@ -13338,6 +13349,78 @@ static cl_kernel ggml_cl_port_kernel(ggml_backend_opencl_context * backend_ctx,
+     return k;
+ }
+ 
++// 0223: the key split of the port's global calls (fa_port_gate.h: fa_port_splits, 0045's rule on the
++// port's wave). GGML_OPENCL_FA_PORT_SPLIT=1 turns it on (unset or 0: off, every call is the unsplit
++// kernel, the program 0198 / 0199q1 built); it acts only where the port does (GGML_OPENCL_FA_PORT=1).
++// GGML_OPENCL_FA_PORT_SPLIT_MAX=N caps p (1: no call splits), GGML_OPENCL_FA_PORT_SPLIT_MINBLK=N sets the
++// floor of 32-key blocks a split walks (unset: 128; 1: none, the reference's form; for pricing the floor),
++// GGML_OPENCL_FA_PORT_SPLIT_FORCE=N sets p
++// for every port call, windowed ones too (the tests only: the merge's coverage on the seam, pad and
++// mixed-group cases), GGML_OPENCL_FA_PORT_WAVE=W overrides the wave, GGML_OPENCL_FA_PORT_TRACE=1 logs
++// one line a port call (its rows, keys, window, work-groups, wave and p).
++static int ggml_cl_port_env_int(const char * name, int dflt) {
++    const char * e = getenv(name);
++    return e != nullptr ? atoi(e) : dflt;
++}
++static bool ggml_cl_port_split_on() {
++    static const bool on = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT", 0) != 0 ||
++                           ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_FORCE", 0) > 0;
++    return on;
++}
++
++// what the launches did, for the tests (get_proc_address "ggml_backend_opencl_fa_port_split_stats"):
++// port launches, of them split, and the last launch's p, wave and work-groups
++static int64_t g_fa_port_launches = 0, g_fa_port_split_launches = 0;
++static int     g_fa_port_last_p = 0, g_fa_port_last_wave = 0, g_fa_port_last_nwg = 0;
++static void ggml_backend_opencl_fa_port_split_stats(int64_t out[5]) {
++    out[0] = g_fa_port_launches; out[1] = g_fa_port_split_launches;
++    out[2] = g_fa_port_last_p; out[3] = g_fa_port_last_wave; out[4] = g_fa_port_last_nwg;
++}
++
++// the split build of the port kernel and its merge, once a device and K/V type, after the unsplit
++// build (whose options it takes). A failure is said once and the calls stay unsplit.
++static bool ggml_cl_port_split_kernels(ggml_backend_opencl_context * backend_ctx, bool kv8) {
++    const int i = kv8 ? 1 : 0;
++    if (backend_ctx->kernel_fa_port_split[i] != nullptr) return true;
++    if (backend_ctx->fa_port_split_tried[i]) return false;
++    backend_ctx->fa_port_split_tried[i] = true;
++    if (backend_ctx->fa_port_opts[i].empty()) return false;     // the unsplit build has not run
++#ifdef GGML_OPENCL_EMBED_KERNELS
++    const std::string src {
++        #include "flash_attn_port.cl.h"
++    };
++#else
++    const std::string src = read_file("flash_attn_port.cl");
++#endif
++    std::string opts = backend_ctx->fa_port_opts[i] + " -DPORT_SPLIT=1";
++    const int r = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_RED", 0);
++    if (r == 10) opts += " -DGB_SPLIT_RED_NOMAX";    // the states added without their maxima
++    if (r == 11) opts += " -DGB_SPLIT_RED_DROP1";    // split 1's state dropped
++    if (r == 12) opts += " -DGB_SPLIT_RED_SINKS";    // every split starts from the sink
++    if (r == 13) opts += " -DGB_SPLIT_RED_SEAM";     // the first block of every split >= 1 skipped (a lost seam block)
++    cl_program p = src.empty() ? nullptr : build_program_from_source_optional(backend_ctx, src.c_str(), opts);
++    if (p == nullptr) {
++        ggml_cl_downgrade("op=FLASH_ATTN port=split-not-built reason=%s", kv8 ? "compile-q8" : "compile");
++        return false;
++    }
++    cl_int err = CL_SUCCESS;
++    cl_kernel k = clCreateKernel(p, "kernel_flash_attn_port", &err);
++    cl_kernel km = err == CL_SUCCESS ? clCreateKernel(p, "kernel_flash_attn_port_merge", &err) : nullptr;
++    if (err != CL_SUCCESS) {
++        if (k != nullptr) CL_CHECK(clReleaseKernel(k));
++        CL_CHECK(clReleaseProgram(p));
++        ggml_cl_downgrade("op=FLASH_ATTN port=split-not-built reason=%s", "kernel");
++        return false;
++    }
++    size_t wg = 0;
++    CL_CHECK(clGetKernelWorkGroupInfo(k, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
++    backend_ctx->program_fa_port_split[i] = p;
++    backend_ctx->kernel_fa_port_split[i] = k;
++    backend_ctx->kernel_fa_port_merge[i] = km;
++    backend_ctx->fa_port_split_wg[i] = wg;
++    return true;
++}
++
+ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+     ggml_backend_opencl_device_context * dev_ctx     = (ggml_backend_opencl_device_context *)dev->context;
+     ggml_backend_opencl_context *        backend_ctx = dev_ctx->backend_ctx;
+@@ -19077,6 +19160,10 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+     if (strcmp(name, "ggml_backend_opencl_topk_moe_sigmoid_fused_count") == 0) {
+         return (void *) ggml_backend_opencl_topk_moe_sigmoid_fused_count;
+     }
++    if (strcmp(name, "ggml_backend_opencl_fa_port_split_stats") == 0) {
++        // 0223: the port's launches and the last one's split, for test-backend-ops' split cases
++        return (void *) ggml_backend_opencl_fa_port_split_stats;
++    }
+     if (strcmp(name, "ggml_backend_opencl_set_tensor_slices") == 0) {
+         return (void *) ggml_backend_opencl_set_tensor_slices;
+     }
+@@ -26516,6 +26603,43 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+         const int kv_lo = 0, kv_hi = n_kv;
+         const int rows = (int) q->ne[1];
+ 
++        // 0223: the key split (GGML_OPENCL_FA_PORT_SPLIT=1). p from the pure rule (fa_port_gate.h);
++        // p > 1 runs the split build, its states go to a scratch, and the merge writes the output
++        const int nwg = n_head_kv * ngroups;
++        int n_split = 1, wave = 0;
++        if (ggml_cl_port_split_on()) {
++            if (backend_ctx->fa_port_n_cu < 0) {
++                cl_uint n_cu = 0;
++                CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(n_cu), &n_cu, NULL));
++                backend_ctx->fa_port_n_cu = (int) n_cu;
++            }
++            static const int wave_env = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_WAVE", 0);
++            static const int cap      = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_MAX", 0);
++            static const int force    = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_FORCE", 0);
++            static const int minblk   = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_MINBLK", 0);
++            wave = wave_env > 0 ? wave_env : fa_port_split_wave(backend_ctx->fa_port_n_cu, kv8 ? 256 : backend_ctx->fa_port_grf, G * qtw);
++            n_split = fa_port_splits(nwg, wave, n_kv, window, cap, force, minblk);
++            if (n_split > 1 && !ggml_cl_port_split_kernels(backend_ctx, kv8)) {
++                ggml_cl_downgrade("op=FLASH_ATTN port=split-declined reason=%s", "not-built");   // a call the rule splits, run unsplit
++                n_split = 1;
++            }
++            if (n_split > 1 && (size_t) 16 * G * qtw > backend_ctx->fa_port_split_wg[kv8 ? 1 : 0]) {
++                ggml_cl_downgrade("op=FLASH_ATTN port=split-declined reason=%s", "work-group");
++                n_split = 1;
++            }
++        }
++        const int split_blocks = fa_port_split_blocks(n_kv, n_split);
++        g_fa_port_launches++;
++        g_fa_port_split_launches += n_split > 1;
++        g_fa_port_last_p = n_split; g_fa_port_last_wave = wave; g_fa_port_last_nwg = nwg;
++        {
++            static const bool trace = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_TRACE", 0) != 0;
++            if (trace) {
++                GGML_LOG_WARN("FA_PORT call kv=%s n_q=%d n_kv=%d window=%d nwg=%d wave=%d split=%d\n",
++                              kv8 ? "q8_0" : "f16", n_q, n_kv, window, nwg, wave, n_split);
++            }
++        }
++
+         auto argbuf = [](const ggml_tensor * t, cl_mem * m, cl_ulong * off) {
+             ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) t->extra;
+             *m = e->data_device;
+@@ -26598,23 +26722,56 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+ 
+         GGML_ASSERT((size_t) 16 * G <= wg_limit && "op=FLASH_ATTN port: supports_op accepted a tile the kernel cannot hold");
+ 
++        // 0223: the split states, p x n_head x ntiles x FA_PORT_SPLIT_STATE_FLOATS floats (ub1024, p 3:
++        // 38.3 MB), a scratch grown to the largest call and kept. The load-time spill guard does not
++        // see it, so its growth is said
++        ggml_cl_buffer * partbuf = nullptr;
++        if (n_split > 1) {
++            const size_t part_size = (size_t) n_split * n_head * ntiles * FA_PORT_SPLIT_STATE_FLOATS * sizeof(float);
++            partbuf = &backend_ctx->scratch_buffer("fa_port_split");
++            if (part_size > partbuf->size) {
++                GGML_LOG_WARN("op=FLASH_ATTN port: the split scratch grows to %zu bytes (split=%d n_head=%d tiles=%d)\n",
++                              part_size, n_split, n_head, ntiles);
++            }
++            partbuf->allocate(backend_ctx->context, part_size);
++            ggml_cl_bounds("op=FLASH_ATTN port", "split", partbuf->buffer, part_size);
++        }
++
++        // the split's state, named on the TAKEN line: off, or on with its limits
++        char split_desc[96];
++        if (ggml_cl_port_split_on()) {
++            snprintf(split_desc, sizeof split_desc, " split=on max=%d force=%d minblk=%d wave=%d",
++                     ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_MAX", 0), ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_FORCE", 0),
++                     ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_SPLIT_MINBLK", 0), wave);
++        } else {
++            snprintf(split_desc, sizeof split_desc, " split=off");
++        }
+         if (kv8) {
+             // a line of its own, once a process: the f16 line below keeps its text
+             static std::once_flag taken8;
+             std::call_once(taken8, [&] {
+-                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0 grf=256 qhoist=1 qf32=1 skip=%d uniform=1 qtw=%d%s\n",
++                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=q8_0 grf=256 qhoist=1 qf32=1 skip=%d uniform=1 qtw=%d%s%s\n",
+                               backend_ctx->fa_port_skip, qtw,
+-                              backend_ctx->fa_port_nobias ? " probe=nobias-WRONG-ANSWERS" : "");
++                              backend_ctx->fa_port_nobias ? " probe=nobias-WRONG-ANSWERS" : "", split_desc);
+             });
+         } else {
+             static std::once_flag taken;
+             std::call_once(taken, [&] {
+-                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=%d qhoist=%d qf32=%d skip=%d uniform=%d qtw=%d%s\n",
++                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern grf=%d qhoist=%d qf32=%d skip=%d uniform=%d qtw=%d%s%s\n",
+                               backend_ctx->fa_port_grf, backend_ctx->fa_port_qhoist, backend_ctx->fa_port_qf32,
+                               backend_ctx->fa_port_skip, backend_ctx->fa_port_uniform, qtw,
+-                              backend_ctx->fa_port_nobias ? " probe=nobias-WRONG-ANSWERS" : "");
++                              backend_ctx->fa_port_nobias ? " probe=nobias-WRONG-ANSWERS" : "", split_desc);
+             });
+         }
++        if (n_split > 1) {
++            // the first call that splits, a line of its own a K/V type
++            static std::once_flag taken_split[2];
++            std::call_once(taken_split[kv8 ? 1 : 0], [&] {
++                GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=%s split=%d n_q=%d n_kv=%d nwg=%d wave=%d blocks=%d\n",
++                              kv8 ? "q8_0" : "f16", n_split, n_q, n_kv, nwg, wave, split_blocks);
++            });
++            kp = backend_ctx->kernel_fa_port_split[kv8 ? 1 : 0];
++        }
+ 
+         if (!qf32) {
+             int a = 0;
+@@ -26674,9 +26831,29 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+         CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &kv_hi));
+         CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),      &window));
+         CL_CHECK(clSetKernelArg(kp, a++, sizeof(float),    &scale_log2));
++        if (n_split > 1) {
++            CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),    &n_split));
++            CL_CHECK(clSetKernelArg(kp, a++, sizeof(int),    &split_blocks));
++            CL_CHECK(clSetKernelArg(kp, a++, sizeof(cl_mem), &partbuf->buffer));
++        }
+         size_t lws[3] = { 16, (size_t) G, (size_t) qtw };
+-        size_t gws[3] = { 16, (size_t) G, (size_t) n_head_kv * ngroups * qtw };
++        size_t gws[3] = { 16, (size_t) G, (size_t) n_head_kv * n_split * ngroups * qtw };
+         backend_ctx->enqueue_ndrange_kernel(kp, 3, gws, lws, dst);
++        if (n_split > 1) {
++            cl_kernel km = backend_ctx->kernel_fa_port_merge[kv8 ? 1 : 0];
++            int b = 0;
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &partbuf->buffer));
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_mem),   &bo));
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_ulong), &oo));
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_ulong), &dst->nb[1]));
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(cl_ulong), &o_nb2p));
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(int),      &n_q));
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(int),      &n_head));
++            CL_CHECK(clSetKernelArg(km, b++, sizeof(int),      &n_split));
++            size_t mlws[3] = { 16, 1, 1 };
++            size_t mgws[3] = { 16, (size_t) n_head, (size_t) ntiles };
++            backend_ctx->enqueue_ndrange_kernel(km, 3, mgws, mlws, dst);
++        }
+     }
+ }
+ 
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+index da4580b1e..0a165caf0 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+@@ -98,6 +98,26 @@
+ // Red: GB_KV8_K_SCALE2 (RED=6) applies K's scale twice, GB_KV8_V_BLOCK (RED=7) takes V's
+ // scale from the next block of the row; both must FAIL the q8_0 cases.
+ 
++// PORT_SPLIT (0223, a build of its own: the unsplit program is not changed by it): the key split
++// of a global call, 0045's form. The grid's z is kv-head-major, then the split s, then the row
++// group: z = ((kvh * n_split + s) * ngroups + grp) * qtw + qti, so work-groups that read the same
++// keys are dispatched together. Split s walks the 32-key blocks [s * split_blocks, (s + 1) *
++// split_blocks) of [kv_lo, kv_hi); split 0 starts from the sink, as the unsplit kernel does, every
++// other split from (M_INIT, 0). At the end a split writes its state, not the output: O as the
++// sub-group holds it (8 chunks of float8 a lane, one block write a chunk), the rows' m and their
++// reduced l, FA_PORT_SPLIT_STATE_FLOATS (fa_port_gate.h) floats a (split, head, tile). For q8_0, O
++// still holds the x128 of KV8_PSCALE. kernel_flash_attn_port_merge then takes M = max m_s,
++// w_s = exp2(m_s - M), O = sum w_s O_s, l = sum w_s l_s, and writes O / l. An empty split's state
++// (M_INIT, 0) weighs exp2(M_INIT - M) = 0: split 0 carries the sink, so M is at least the sink's.
++// Red (GGML_OPENCL_FA_PORT_RED, the split build only): 10 (GB_SPLIT_RED_NOMAX) adds the states
++// without their maxima (w = 1), 11 (GB_SPLIT_RED_DROP1) drops split 1's state, 12
++// (GB_SPLIT_RED_SINKS) starts every split from the sink, 13 (GB_SPLIT_RED_SEAM) skips the first block
++// of every split >= 1 (a lost seam block). Each must FAIL every split case.
++#ifndef PORT_SPLIT
++#define PORT_SPLIT 0
++#endif
++#define SPLIT_STATE (NC * QR * 16 + 2 * QR)   // = FA_PORT_SPLIT_STATE_FLOATS at DKQ 128
++
+ #ifndef QR
+ #define QR 8
+ #endif
+@@ -213,7 +233,11 @@ kernel void kernel_flash_attn_port(
+         global const char * cflag, ulong cflag_offset,
+         global const char * rflag, ulong rflag_offset,
+         int n_q, int n_kv, int n_head, int hkv, int qtw, int ngroups,
+-        int kv_lo, int kv_hi, int window, float scale_log2)
++        int kv_lo, int kv_hi, int window, float scale_log2
++#if PORT_SPLIT
++        , int n_split, int split_blocks, global float * part
++#endif
++        )
+ {
+     const int lane = get_sub_group_local_id();
+     // z and g are the same in all 16 lanes of a sub-group, but an id read from the lane
+@@ -228,7 +252,12 @@ kernel void kernel_flash_attn_port(
+     const int g    = get_local_id(1);
+ #endif
+     const int qti  = z % qtw, unit = z / qtw;
++#if PORT_SPLIT
++    const int grp  = unit % ngroups, ksp = unit / ngroups;
++    const int kvh  = ksp / n_split, sidx = ksp % n_split;
++#else
+     const int kvh  = unit / ngroups, grp = unit % ngroups;
++#endif
+     const int qt   = grp * qtw + qti;
+     const int q0   = qt * QR;
+     if (q0 >= n_q) return;
+@@ -278,8 +307,19 @@ kernel void kernel_flash_attn_port(
+         padv[r] = tb[trow[r] + n_bins - 1];                      // the row's pad bin: the bias of a key at or past the extent
+ #endif
+         const float s2 = LOG2E * sk[(size_t) row * n_head + head];
++#if PORT_SPLIT
++        // split 0 carries the sink; the others start empty (the merge weighs them by their own m)
++#ifdef GB_SPLIT_RED_SINKS
++        const bool sinkhere = true;                              // the red case: the sink in every split
++#else
++        const bool sinkhere = sidx == 0;
++#endif
++        m[r] = live && sinkhere ? s2 : M_INIT;
++        l[r] = (live && sinkhere && lane == 0) ? SINK_L : 0.f;
++#else
+         m[r] = live ? s2 : M_INIT;
+         l[r] = (live && lane == 0) ? SINK_L : 0.f;
++#endif
+     }
+     const int qmin = qpr[0], qmax = qpr[0] + nrow - 1;   // the tile's span when rg_lin
+ 
+@@ -341,7 +381,18 @@ kernel void kernel_flash_attn_port(
+ #define QA(c) QREAD(c, q0)
+ #endif
+ 
++#if PORT_SPLIT
++    // this split's blocks of [kv_lo, kv_hi); a split past the call's blocks walks none
++#ifdef GB_SPLIT_RED_SEAM
++    const int s_lo = kv_lo + sidx * split_blocks * BK + (sidx > 0 ? BK : 0);   // the red case: a seam block lost
++#else
++    const int s_lo = kv_lo + sidx * split_blocks * BK;
++#endif
++    const int s_hi = min(kv_hi, kv_lo + (sidx + 1) * split_blocks * BK);
++    for (int t0 = s_lo; t0 < s_hi; t0 += BK) {
++#else
+     for (int t0 = kv_lo; t0 < kv_hi; t0 += BK) {
++#endif
+         // ---- the block's two key groups: class, first position, dead or not ----
+         bool glin[NKB], gdead[NKB];
+         int  gk0[NKB];
+@@ -568,6 +619,98 @@ kernel void kernel_flash_attn_port(
+ #endif
+     }
+ 
++#if PORT_SPLIT
++    // ---- the split's state, not the output: O as the sub-group holds it, then the rows' m (lanes
++    // 0..7) and their reduced l (lanes 8..15); the merge kernel below divides ----
++    global float * st = part + ((size_t) (sidx * n_head + head) * (size_t) ((n_q + QR - 1) / QR) + (size_t) qt) * SPLIT_STATE;
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) intel_sub_group_block_write8((global uint *) (st + c * QR * 16), as_uint8(o[c]));
++    float mlv = 0.f;
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++        const float lv = sub_group_reduce_add(l[r]);
++        mlv = lane == r ? m[r] : (lane == QR + r ? lv : mlv);
++    }
++    st[NC * QR * 16 + lane] = mlv;
++}
++
++// 0223: the merge of a split call's states, one sub-group a (head, 8-row tile): M = max m_s,
++// w_s = exp2(m_s - M), O = sum w_s O_s, l = sum w_s l_s, out = O / l (x 1/128 for q8_0) into the
++// op's dst [D, n_head, n_q] at head * o_nb1 + row * o_nb2. The sink is in split 0's state already.
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_flash_attn_port_merge(global const float * part, global char * dst, ulong o_offset, ulong o_nb1, ulong o_nb2,
++                                         int n_q, int n_head, int n_split)
++{
++    const int lane = get_sub_group_local_id();
++    const int head = sub_group_broadcast((int) get_global_id(1), 0u);
++    const int qt   = sub_group_broadcast((int) get_global_id(2), 0u);
++    const int ntiles = (n_q + QR - 1) / QR;
++    if (head >= n_head || qt >= ntiles) return;
++    const int q0 = qt * QR, nrow = min(QR, n_q - q0);
++    const size_t sstride = (size_t) n_head * (size_t) ntiles * SPLIT_STATE;    // one split's states
++    global const float * st0 = part + ((size_t) head * (size_t) ntiles + (size_t) qt) * SPLIT_STATE;
++
++    float mx[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) mx[r] = M_INIT;
++    for (int s = 0; s < n_split; ++s) {
++        const float ml = st0[(size_t) s * sstride + NC * QR * 16 + lane];
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) mx[r] = fmax(mx[r], sub_group_broadcast(ml, (uint) r));
++    }
++
++    float  ls[QR];
++    float8 o[NC];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) ls[r] = 0.f;
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) o[c] = (float8)(0.f);
++    for (int s = 0; s < n_split; ++s) {
++#ifdef GB_SPLIT_RED_DROP1
++        if (s == 1) continue;                    // the red case: split 1's state dropped
++#endif
++        global const float * st = st0 + (size_t) s * sstride;
++        const float ml = st[NC * QR * 16 + lane];
++        float w[QR];
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            const float ms = sub_group_broadcast(ml, (uint) r), lv = sub_group_broadcast(ml, (uint) (QR + r));
++#ifdef GB_SPLIT_RED_NOMAX
++            w[r] = 1.f;                          // the red case: the states added without their maxima
++#else
++            w[r] = ms > 0.5f * M_INIT ? native_exp2(ms - mx[r]) : 0.f;
++#endif
++            ls[r] += w[r] * lv;
++        }
++        const float8 wv = (float8)(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++        _Pragma("unroll")
++        for (int c = 0; c < NC; ++c) o[c] += wv * as_float8(intel_sub_group_block_read8((global const uint *) (st + c * QR * 16)));
++    }
++    float inv[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++#if PORT_KV8
++        inv[r] = ls[r] > 0.f ? (1.f / KV8_PSCALE) / ls[r] : 0.f;
++#else
++        inv[r] = ls[r] > 0.f ? 1.f / ls[r] : 0.f;
++#endif
++    }
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) {
++        const float ov[QR] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            if (r >= nrow) continue;
++            global float * orow = (global float *)(dst + o_offset + (size_t) head * o_nb1 + (size_t) (q0 + r) * o_nb2);
++#if PORT_KV8
++            orow[32 * (c / 2) + KV8_ODIM(c, lane)] = ov[r] * inv[r];
++#else
++            orow[c * 16 + lane] = ov[r] * inv[r];
++#endif
++        }
++    }
++}
++#else
+     // ---- the reduction once, the store ----
+     float inv[QR];
+     _Pragma("unroll")
+@@ -595,3 +738,4 @@ kernel void kernel_flash_attn_port(
+         }
+     }
+ }
++#endif

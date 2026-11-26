@@ -80,6 +80,13 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   97.96 % against 98.16 %; the battery 8 of 8 right. The knob stays off by default until the operator changes it
   (`contrib/llama.cpp/README.md`, 0220).
 
+- llama.cpp patches 0223 / 0223b (opt-in, `GGML_OPENCL_FA_PORT_SPLIT=1` with the FA port, default off): the port's
+  global attention calls split their keys over the card's waves (0045's rule), merged in f32. Card rows
+  (`measured-here`, B60 at 165 W, the Inkling unit's settings): +2.0 % at a depth of 40,960 tokens (the slowest
+  on-run above the fastest off-run), equal at 4,096 where no call splits; the split output against the unsplit one
+  1.6e-9 to 5.9e-8 per case, a lost seam block 1.7e-4 or more; KL against the unsplit run 0.003425 nats, same top
+  98.57 %; the capital and the 44k needle right in the served process. The knob stays off by default until the
+  operator changes it (`contrib/llama.cpp/README.md`, 0223).
 - llama.cpp patch 0221 (opt-in, `GGML_OPENCL_LOOP_CONTROL=1|bf16`, default off): Inkling 2 Mini's loop controller as
   one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
   its 12-launch chain, for prompt batches. Unset, the graph is today's line for line. Card rows (`measured-here`, B60

@@ -1,0 +1,376 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index c3ff1b11a..4c349fd1f 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1011,6 +1011,10 @@ struct console_printer : public printer {
+         }
+         printf("%*s", last - len, "");
+ 
++        if (!result.passed) {
++            // 0223: a perf row whose launch record is not the case's (a split case that did not split)
++            printf("FAILED [%s] ", result.error_message.c_str());
++        }
+         printf("    %8d runs - %8.2f us/run - ", result.n_runs, result.time_us);
+ 
+         if (result.flops > 0) {
+@@ -1251,6 +1255,13 @@ struct test_case {
+         return nullptr;
+     }
+ 
++    // 0223: a case may read the backend's own record of what its launch did (before: a snapshot;
++    // after: print it and say whether it is what the case requires). false fails the case
++    virtual void note_before_eval(ggml_backend_t backend) { GGML_UNUSED(backend); }
++    // 0223: a key under which GGML_TEST_FA_PORT_DUMP=<dir> writes the backend's output of the case's op ("" = none)
++    virtual std::string dump_key() { return ""; }
++    virtual bool check_after_eval(ggml_backend_t backend) { GGML_UNUSED(backend); return true; }
++
+     virtual double err(const float * a, const float * b, size_t n) {
+         return nmse(a, b, n);
+     }
+@@ -1568,6 +1579,26 @@ struct test_case {
+             }
+ 
+             double err = ud->tc->err(f1.data(), f2.data(), f1.size());
++            // 0223: GGML_TEST_FA_PORT_DUMP=<dir>: the backend's output of a port case's op, raw f32, under the FNV-1a 64
++            // hash of the case's vars (<dir>/<hash>.f32, and "<hash> <floats> <vars>" in <dir>/index.txt), so that two
++            // runs of the same case (the key split on and off, the same seeded inputs) can be compared with each
++            // other instead of with the CPU: the split's own error, apart from the CPU reference's floor
++            static const char * dump_dir = getenv("GGML_TEST_FA_PORT_DUMP");
++            const std::string dkey = dump_dir != nullptr && t1->op == GGML_OP_FLASH_ATTN_EXT ? ud->tc->dump_key() : std::string();
++            if (!dkey.empty()) {
++                uint64_t h = 1469598103934665603ull;
++                for (unsigned char c : dkey) { h ^= c; h *= 1099511628211ull; }
++                char hex[17];
++                snprintf(hex, sizeof hex, "%016llx", (unsigned long long) h);
++                const std::string path = std::string(dump_dir) + "/" + hex + ".f32";
++                FILE * fo = fopen(path.c_str(), "wb");
++                bool dumped = fo != nullptr && fwrite(f1.data(), sizeof(float), f1.size(), fo) == f1.size();
++                if (fo != nullptr) dumped = fclose(fo) == 0 && dumped;
++                FILE * fi = dumped ? fopen((std::string(dump_dir) + "/index.txt").c_str(), "a") : nullptr;
++                if (fi != nullptr) { fprintf(fi, "%s %zu %s\n", hex, f1.size(), dkey.c_str()); fclose(fi); }
++                printf("[FA_PORT] dump %s %s ", hex, dumped && fi != nullptr ? "written" : "FAILED");
++                if (!dumped || fi == nullptr) ud->ok = false;
++            }
+             if (ud->tc->err_tag() != nullptr) {
+                 printf("[%s] nmse = %.3g (bound %.3g) ", ud->tc->err_tag(), err, ud->tc->max_err(ud->backend1));
+             }
+@@ -1607,9 +1638,13 @@ struct test_case {
+             }
+         }
+ 
++        note_before_eval(backend1);
+         const bool cmp_ok = ggml_backend_compare_graph_backend(backend1, backend2, gf, callback, &ud,
+                                                                run_whole_graph() ? fused_nodes_to_verify.data() : nullptr,
+                                                                fused_nodes_to_verify.size());
++        if (!check_after_eval(backend1)) {
++            ud.ok = false;
++        }
+ 
+         bool reached_fused = false;
+         if (fused_count) {
+@@ -1699,12 +1734,17 @@ struct test_case {
+         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
+         ggml_build_forward_expand(gf, out);
+ 
+-        // warmup run
++        // warmup run (0223: a case's launch record is printed from it)
++        note_before_eval(backend);
+         ggml_status status = ggml_backend_graph_compute(backend, gf);
+         if (status != GGML_STATUS_SUCCESS) {
+             fprintf(stderr, "%s: ggml_backend_graph_compute failed. status=%s \n", __func__, ggml_status_to_string(status));
+             return false;
+         }
++        const bool record_ok = check_after_eval(backend);
++        if (!record_ok) {
++            printf("[%s] the launch record is not what the case requires ", current_op_name.c_str());
++        }
+ 
+         // determine number of runs
+         int n_runs;
+@@ -1777,7 +1817,10 @@ struct test_case {
+             (op_flops(out) == 0) ? total_mem / (total_time_us / 1e6) / 1024.0 / 1024.0 / 1024.0 : 0.0;
+         size_t calculated_memory_kb = op_size(out) / 1024;
+ 
+-        test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, true, "", avg_time_us,
++        // 0223: a perf row whose launch did not do what the case requires (a split case that did not
++        // split) is a failed row, not a time
++        test_result result(ggml_backend_name(backend), current_op_name, vars(), "perf", true, record_ok,
++                           record_ok ? "" : "launch record", avg_time_us,
+                            calculated_flops, calculated_bandwidth, calculated_memory_kb, total_runs);
+ 
+         if (output_printer) {
+@@ -9699,9 +9742,60 @@ struct test_flash_attn_ext : public test_case {
+     // the value of the table's pad bin (the bias of a key at or past the extent). 0 in the
+     // model's unfolded table; a case with another value proves the kernel reads the bin
+     const float pad_bias;
++    // 0223: a key split case (port 1): with GGML_OPENCL_FA_PORT_SPLIT=1 its launch must split
++    // (p > 1, the rule's p). Named in vars() only when set, so the other cases keep their names
++    const int32_t split_case;
++    // 0223 (GGML_TEST_FA_PORT_SEAM only): cells [lo, hi) taken as empty, so that a CPU run shows what a
++    // kernel that loses those keys (a split's lost seam block, RED=13) does to the answer
++    std::vector<std::array<int64_t, 2>> hide_cells;
+ 
+     std::string vars() override {
+-        return VARS_TO_STR25(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, bias, n_bins, sinks_zeros, port, wrap, window, n_empty, pad_bias);
++        std::string s = VARS_TO_STR25(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, kv_view, v_is_view_of_k, n_kv_max, bias, n_bins, sinks_zeros, port, wrap, window, n_empty, pad_bias);
++        if (split_case != 0) {
++            s += ",split_case=" + std::to_string(split_case);
++        }
++        return s;
++    }
++
++    // 0223: every port case reads the OpenCL backend's record of its launch (get_proc_address
++    // "ggml_backend_opencl_fa_port_split_stats": launches, split launches, the last p, wave and
++    // work-groups) and prints "[FA_PORT] split=p". Red when p is not the rule's p for the case's
++    // keys, window and the knobs (fa_port_gate.h: fa_port_splits, on the launch's own wave and
++    // work-groups), when the work-groups are not n_head_kv x ceil(nb / 8) (qtw 1), or when a split
++    // case does not split with the knob on: the blind run of 0045's first KL arm, as a test.
++    void (*split_stats)(int64_t *) = nullptr;
++    int64_t split_before[5] = { 0, 0, 0, 0, 0 };
++    std::string dump_key() override { return port == 1 ? vars() : std::string(); }
++    void note_before_eval(ggml_backend_t backend) override {
++        split_stats = nullptr;
++        if (port != 1) return;
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        split_stats = reg ? (void (*)(int64_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_fa_port_split_stats") : nullptr;
++        if (split_stats) split_stats(split_before);
++    }
++    bool check_after_eval(ggml_backend_t backend) override {
++        GGML_UNUSED(backend);
++        if (port != 1 || split_stats == nullptr) return true;
++        int64_t now[5];
++        split_stats(now);
++        if (now[0] - split_before[0] <= 0) {
++            printf("[FA_PORT] split: no port launch ");
++            return false;      // a port case the backend accepted and did not launch is no pass
++        }
++        auto env = [](const char * n) { const char * e = getenv(n); return e ? atoi(e) : 0; };
++        const int force = env("GGML_OPENCL_FA_PORT_SPLIT_FORCE"), cap = env("GGML_OPENCL_FA_PORT_SPLIT_MAX");
++        const int minblk = env("GGML_OPENCL_FA_PORT_SPLIT_MINBLK");
++        const bool on = env("GGML_OPENCL_FA_PORT_SPLIT") != 0 || force > 0;
++        const int p = (int) now[2], wave = (int) now[3], nwg = (int) now[4];
++        const int want = on ? fa_port_splits(nwg, wave, kv, window, cap, force, minblk) : 1;
++        const bool qtw1 = getenv("GGML_OPENCL_FA_PORT_QTW") == nullptr;
++        const bool nwg_ok = !qtw1 || nwg == (int) (nh * ((nb + 7) / 8));
++        const bool blind = on && split_case != 0 && force == 0 && cap != 1 && p <= 1;
++        const bool ok = p == want && nwg_ok && !blind;
++        printf("[FA_PORT] split=%d (rule %d, wave %d, nwg %d)%s ", p, want, wave, nwg,
++               ok ? "" : (blind ? " SPLIT CASE DID NOT SPLIT" : (nwg_ok ? " SPLIT MISMATCH" : " NWG MISMATCH")));
++        return ok;
+     }
+ 
+     double max_nmse_err() override {
+@@ -9712,6 +9806,13 @@ struct test_flash_attn_ext : public test_case {
+         if (port == 1 && type_K == GGML_TYPE_Q8_0) {
+             return 1e-5;
+         }
++        // 0223: the split cases, f16 as well, at 1e-5 (stated before their card run; the q8_0 port cases ran
++        // at 1.9e-6 .. 2.2e-6 on the card, the CPU twins agree to 1.5e-6). 5e-4 would hide the red it needs:
++        // a lost seam block moves these cases' f16 answer by NMSE 1.8e-4 .. 3.5e-4 only (a numpy model of the
++        // cases; GGML_TEST_FA_PORT_SEAM=1 is the same check on the CPU backend)
++        if (port == 1 && split_case != 0) {
++            return 1e-5;
++        }
+         return 5e-4;
+     }
+ 
+@@ -9732,10 +9833,12 @@ struct test_flash_attn_ext : public test_case {
+                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
+                         bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
+                         bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false,
+-                        int32_t port = 0, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0, float pad_bias = 0.0f)
++                        int32_t port = 0, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0, float pad_bias = 0.0f,
++                        int32_t split_case = 0)
+         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
+-          bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros), port(port), wrap(wrap), window(window), n_empty(n_empty), pad_bias(pad_bias) {}
++          bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros), port(port), wrap(wrap), window(window), n_empty(n_empty), pad_bias(pad_bias),
++          split_case(split_case) {}
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
+@@ -9872,6 +9975,9 @@ struct test_flash_attn_ext : public test_case {
+         // n_used-nq .. n_used-1 (the chunk at the end of its keys)
+         const int64_t shift = wrap == 0 ? 0 : n_used/2 + (wrap == 1 ? 24 : 8);
+         auto kpos = [&](int64_t j) -> int32_t {
++            for (const auto & h : hide_cells) {
++                if (j >= h[0] && j < h[1]) return -1;
++            }
+             return (int32_t) (j >= n_used ? -1 : (j + shift) % n_used);
+         };
+         auto qpos = [&](int64_t i) -> int32_t { return (int32_t) (n_used - n_q + i); };
+@@ -14410,6 +14516,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
+             2, (int32_t) c[2], (int32_t) c[3], c[4]));
+     }
++    // 0223: the key split (GGML_OPENCL_FA_PORT=1 GGML_OPENCL_FA_PORT_SPLIT=1), global calls of the
++    // model's layout, f16 and q8_0. Each prints "[FA_PORT] split=p" from its launch and fails when it
++    // does not split (split_case): kv 16384 x nb 1024 is the rule's p 3 at ub1024 (B60 wave 200 and
++    // B70 wave 320 alike); kv 12288 x nb 36 is p 3 by the 128-block floor, with a last tile of 4 rows;
++    // kv 16384 x nb 64 with 8,000 empty cells at the end (p 3 on the B60, 4 on the B70: either way the
++    // last split is class-2 cells only, its state (M_INIT, 0) must weigh 0). Red of the check itself:
++    // GGML_OPENCL_FA_PORT_WAVE=8 makes p 1 the rule's (one full wave), and each split case must FAIL
++    // "SPLIT CASE DID NOT SPLIT". Red on the card, the split build's own: RED=10 (the states
++    // added without their maxima), 11 (split 1 dropped), 12 (the sink in every split) must FAIL each;
++    // RED=1 and 2 reach the split build too. GGML_OPENCL_FA_PORT_SPLIT_FORCE=2 / 3 runs the eleven f16
++    // and five q8_0 port cases above split as well (windowed ones too: the merge on the seams).
++    for (ggml_type kvt : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++        for (auto c : std::vector<std::array<int64_t, 3>>{ { 16384, 1024, 0 }, { 12288, 36, 0 }, { 16384, 64, 8000 } }) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++                GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++                1, 0, 0, c[2], 0.0f, 1));
++        }
++    }
+     // 0199: a table whose pad bin is not zero, with keys far past the extent (2,200 keys, no
+     // window): the port must read the bin (GGML_OPENCL_FA_PORT_RED=4 assumes zero and must
+     // FAIL this case), and its twin gives today's kernels the same table
+@@ -14817,6 +14941,26 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+                 port, 0, 1024, 0));
+         }
+     }
++    // 0223: the key split's three eval shapes, f16 and q8_0, for the split on / off A/B
++    // (GGML_OPENCL_FA_PORT_SPLIT=1 against unset); each prints its launch's split=p
++    for (ggml_type kvt : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++        for (auto c : std::vector<std::array<int64_t, 3>>{ { 16384, 1024, 0 }, { 12288, 36, 0 }, { 16384, 64, 8000 } }) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++                GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++                1, 0, 0, c[2], 0.0f, 1));
++        }
++    }
++    // 0223: the price of the 128-block floor (a scoping choice against 0045 / CUDA, which have none):
++    // the 4k global call the floor keeps unsplit (kv 4096 x nb 1024) and the short turn it limits
++    // (kv 8192 x nb 32: p 2 with the floor, p 6 on the B60 without it). Not split cases: the window runs
++    // them unsplit, then with GGML_OPENCL_FA_PORT_SPLIT_FORCE=2 / 3 / 6 (or _SPLIT_MINBLK=1), and compares
++    for (ggml_type kvt : { GGML_TYPE_F16, GGML_TYPE_Q8_0 }) {
++        for (auto c : std::vector<std::array<int64_t, 2>>{ { 4096, 1024 }, { 8192, 32 } }) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++                GGML_PREC_F32, kvt, kvt, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++                1, 0, 0, 0));
++        }
++    }
+ 
+     // decode (1 row) and MTP verify (6 rows) attention at depth, a dense
+     // 27B's geometry (head size 256, 24 query heads on 4)
+@@ -15680,6 +15824,11 @@ static const int FA_PORT_EVAL_PORT2_PAD = 1;
+ // support` on the card, not from here.
+ static const int FA_PORT_EVAL_PORT1_Q8  = 5;
+ static const int FA_PORT_EVAL_PORT2_Q8  = 2;
++// 0223: the key split's cases (split_case), counted apart from the rows above: 3 f16 and 3 q8_0,
++// port=1, run by GGML_OPENCL_FA_PORT=1 (unset: not supported), each splitting (p > 1) by the rule
++// at the B60's wave (200) and the B70's (320) once GGML_OPENCL_FA_PORT_SPLIT=1
++static const int FA_PORT_EVAL_SPLIT     = 3;
++static const int FA_PORT_EVAL_SPLIT_Q8  = 3;
+ 
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+ 
+@@ -15692,7 +15841,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+ static bool test_fa_port_decisions() {
+     const bool red = getenv("GGML_TEST_FA_PORT_ROUTE_RED") != nullptr;
+     auto cases = make_test_cases_eval();
+-    int n1 = 0, n1_pad = 0, n2 = 0, n2_pad = 0, n1_q8 = 0, n2_q8 = 0, n_fail = 0;
++    int n1 = 0, n1_pad = 0, n2 = 0, n2_pad = 0, n1_q8 = 0, n2_q8 = 0, n_fail = 0, ns = 0, ns_q8 = 0;
+     for (auto & tc : cases) {
+         auto * fa = dynamic_cast<test_flash_attn_ext *>(tc.get());
+         if (fa == nullptr || fa->port == 0) {
+@@ -15704,7 +15853,17 @@ static bool test_fa_port_decisions() {
+             n2++; n2_pad += fa->pad_bias != 0.0f;
+             continue;
+         }
+-        if (q8) { n1_q8++; } else { n1++; n1_pad += fa->pad_bias != 0.0f; }
++        if (fa->split_case != 0) {
++            // 0223: the rule splits it at both cards' waves (qtw 1: n_head_kv x ceil(nb / 8) work-groups)
++            const int64_t nwg = fa->nh * ((fa->nb + 7) / 8);
++            const int p60 = fa_port_splits(nwg, 200, fa->kv, fa->window, 0, 0, 0), p70 = fa_port_splits(nwg, 320, fa->kv, fa->window, 0, 0, 0);
++            const bool sok = p60 > 1 && p70 > 1;
++            printf("  %s kv=%lld nb=%lld n_empty=%lld: split B60 %d, B70 %d (blocks a split %d / %d): %s\n", ggml_type_name(fa->type_K),
++                   (long long) fa->kv, (long long) fa->nb, (long long) fa->n_empty, p60, p70,
++                   fa_port_split_blocks(fa->kv, p60), fa_port_split_blocks(fa->kv, p70), sok ? "OK" : "FAIL, a split case the rule does not split");
++            n_fail += !sok;
++            if (q8) { ns_q8++; } else { ns++; }
++        } else if (q8) { n1_q8++; } else { n1++; n1_pad += fa->pad_bias != 0.0f; }
+         ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
+         ggml_context * ctx = ggml_init(params);
+         ggml_tensor * op = fa->build_graph(ctx);
+@@ -15725,8 +15884,10 @@ static bool test_fa_port_decisions() {
+     }
+     const bool counts = n1 == FA_PORT_EVAL_PORT1 && n1_pad == FA_PORT_EVAL_PORT1_PAD &&
+                         n2 == FA_PORT_EVAL_PORT2 && n2_pad == FA_PORT_EVAL_PORT2_PAD &&
+-                        n1_q8 == FA_PORT_EVAL_PORT1_Q8 && n2_q8 == FA_PORT_EVAL_PORT2_Q8;
+-    printf("  eval cases: f16 port=1 %d (pad %d), port=2 %d (pad %d); q8_0 port=1 %d, port=2 %d: %s\n", n1, n1_pad, n2, n2_pad, n1_q8, n2_q8,
++                        n1_q8 == FA_PORT_EVAL_PORT1_Q8 && n2_q8 == FA_PORT_EVAL_PORT2_Q8 &&
++                        ns == FA_PORT_EVAL_SPLIT && ns_q8 == FA_PORT_EVAL_SPLIT_Q8;
++    printf("  eval cases: f16 port=1 %d (pad %d), port=2 %d (pad %d); q8_0 port=1 %d, port=2 %d; split f16 %d, q8_0 %d: %s\n",
++           n1, n1_pad, n2, n2_pad, n1_q8, n2_q8, ns, ns_q8,
+            counts ? "as the table says" : "FAIL, the table above is stale");
+     printf("  port decisions%s: %s\n", red ? " (the old dispatch order)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
+     return n_fail == 0 && counts;
+@@ -15956,6 +16117,58 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+ }
+ 
+ 
++// 0223: GGML_TEST_FA_PORT_SEAM=1 (the CPU backend; no device): what a lost seam block does to each split
++// case. The kernel's RED=13 skips the first 32-key block of every split >= 1; here those cells are taken as
++// empty (the same keys missing) and the CPU's answer is compared with the case's own, at the split the
++// rule gives on the B60 (200) and the B70 (320). The red is visible only if that NMSE is above the case's
++// bound: each must be, by a factor of at least 10, or the check fails (the case is too blunt for the red).
++static bool test_fa_port_seam(ggml_backend_t backend) {
++    auto run = [&](test_flash_attn_ext & tc, std::vector<float> & out) {
++        ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++        ggml_context * ctx = ggml_init(params);
++        ggml_tensor * o = tc.build_graph(ctx);
++        ggml_cgraph * gf = ggml_new_graph(ctx);
++        ggml_build_forward_expand(gf, o);
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++        GGML_ASSERT(buf != nullptr);
++        tc.initialize_tensors(ctx);
++        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++        out.resize(ggml_nelements(o));
++        ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
++        ggml_backend_buffer_free(buf);
++        ggml_free(ctx);
++    };
++    int n_fail = 0, n_run = 0;
++    auto cases = make_test_cases_eval();
++    for (auto & c : cases) {
++        auto * fa = dynamic_cast<test_flash_attn_ext *>(c.get());
++        if (fa == nullptr || fa->split_case == 0) continue;
++        std::vector<float> ref;
++        test_flash_attn_ext base(128, 128, fa->nh, fa->nr23, fa->kv, fa->nb, true, true, 0, 0, GGML_PREC_F32, fa->type_K, fa->type_V,
++                                 fa->permute, false, false, 0, true, fa->n_bins, false, 1, fa->wrap, fa->window, fa->n_empty, fa->pad_bias, 1);
++        run(base, ref);
++        for (int wave : { 200, 320 }) {
++            const int p = fa_port_splits(fa->nh * ((fa->nb + 7) / 8), wave, fa->kv, fa->window, 0, 0, 0);
++            const int64_t sb = fa_port_split_blocks(fa->kv, p);
++            test_flash_attn_ext red(128, 128, fa->nh, fa->nr23, fa->kv, fa->nb, true, true, 0, 0, GGML_PREC_F32, fa->type_K, fa->type_V,
++                                    fa->permute, false, false, 0, true, fa->n_bins, false, 1, fa->wrap, fa->window, fa->n_empty, fa->pad_bias, 1);
++            for (int sp = 1; sp < p; ++sp) red.hide_cells.push_back({ sp * sb * 32, sp * sb * 32 + 32 });
++            std::vector<float> out;
++            run(red, out);
++            double num = 0.0, den = 0.0;
++            for (size_t e = 0; e < ref.size(); ++e) { const double d = (double) out[e] - ref[e]; num += d*d; den += (double) ref[e]*ref[e]; }
++            const double nmse = den > 0.0 ? num/den : 0.0, bound = base.max_nmse_err();
++            const bool ok = nmse >= 10.0 * bound;
++            printf("  seam %s kv=%lld nb=%lld n_empty=%lld wave %d p %d: a lost seam block moves the answer by nmse %.3g, bound %.3g: %s\n",
++                   ggml_type_name(fa->type_K), (long long) fa->kv, (long long) fa->nb, (long long) fa->n_empty, wave, p, nmse, bound,
++                   ok ? "visible" : "FAIL, under 10x the bound");
++            n_fail += !ok; n_run++;
++        }
++    }
++    printf("  port seam: %d cells, %s\n", n_run, n_fail ? "FAIL" : "OK");
++    return n_fail == 0 && n_run == 12;
++}
++
+ // 0199q2: GGML_TEST_FA_PORT_KV8=1 (the CPU backend; no device): flash_attn_port.cl's q8_0
+ // read path (-DPORT_KV8=1), transcribed statement for statement and run on the bytes of the
+ // port's q8_0 cases - the tensors test-backend-ops builds from the export's strides (K/V
+@@ -16258,6 +16471,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
+     if (getenv("GGML_TEST_FA_PORT_TWINS") != nullptr) {
+         return test_fa_port_twins(backend);
+     }
++    if (getenv("GGML_TEST_FA_PORT_SEAM") != nullptr) {
++        return test_fa_port_seam(backend);
++    }
+     if (getenv("GGML_TEST_FA_PORT_KV8") != nullptr) {
+         return test_fa_port_kv8(backend);
+     }
