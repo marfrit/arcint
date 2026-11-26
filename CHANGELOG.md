@@ -20,6 +20,43 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
 ## Unreleased
 
+- **`--tool-grammar` for Inkling 2 Mini, and the reject reason in the tool-call log line.** A served Inkling unit
+  returned a correctly framed bash call as raw content, twice (`measured-here`): the "command" string held
+  tab-indented C copied raw into a heredoc, the JSON inside the block held a raw TAB, and the parser's `json::parse`
+  refused it. arcint applied no call grammar to Inkling (`--tool-grammar` was refused at start and per request,
+  because the grammar knew only the Qwen form); mainline llama.cpp applies a lazy one. The new grammar follows
+  mainline's `common/parsers/inkling.cpp` (commit 690b87d8): triggered by `<\|message_model\|>([^<])`, the grammar
+  starting at the tool name; one of the request's tools, the template's compact `{"name":<name>,"args":` prefix, a
+  JSON object, `}` and `<|end_message|>`; parallel calls as the request says. Two deviations, both stricter: a JSON
+  string admits no raw control byte 0x00-0x1F (mainline's `p.json()` string rule in GBNF is `[^"\\]` plus the
+  escapes and admits the TAB), and `args` must be an object. A prompt ending with the header (an Inkling 1 template)
+  is refused for the grammar. The grammar is dormant inside the thinking block, with `--think-eog-mask` on or off:
+  the operator's constraint, since on the coder the mask with a dormant grammar inside the think block gave endless
+  turns and the mask stays off there. The Qwen path is unchanged. The Inkling parser's log line named five different
+  rejects "unterminated"; it now says which one (no `{` after the call marker; the object never closes, by braces
+  or an open string; the JSON parse error with its message, on one line; a name / args mismatch; no closer right
+  after the object) and the failing byte counted from the block's header, and still returns the block as raw
+  content; `tools/turn_defect_audit.py` matches both forms. Evidence, device-free (`code`, `tests/test_inkling_grammar.cpp`):
+  the GBNF on llama.cpp's grammar engine refuses every raw control byte in a string and accepts the escapes, the
+  reference's string rule admits the raw TAB (the red arm, with a tripwire on the vendored builder's rule); arcint's
+  Sampler driving the production grammar on the pinned tree's gpt-2 vocabulary (vocab-only, no device) emits the raw
+  TAB without the grammar (the call lost) and `\t` with it (the call parsed, the decoded command holding the tabs); a
+  thinking block that spells the call syntax with a raw TAB inside leaves the grammar dormant and the turn ends by
+  itself, mask on and off, while the same turn with the tracker unarmed wakes the grammar inside the block; in the
+  token-id layout no thinking token reaches the constraint. Not yet served on a card.
+  After review: the trigger skips whitespace after the header (`<\|message_model\|>\s*([^<\s])`) and the grammar
+  admits up to 8 bytes of it before the call marker, since the parser trims the name: with mainline's trigger a space after the header
+  desynced the grammar and the call ran unconstrained; a header, layout and a content marker is still no call. A
+  `\u` escape may not be a lone surrogate (nlohmann refuses one). The Inkling 1 refusal reads the prompt's last token
+  ids, layout after the header ignored, so a request given as ids is judged too; it happens before the prefill. The
+  name / args reason no longer quotes the header's name (model text), and the "no `{`" reject keeps the text before
+  the block. Known limit, counted: the grammar is dormant in the first thinking block of a turn only; a trigger after
+  a thinking block the tracker did not cover (a later one, or one opened after layout) logs one line and adds
+  `grammar after a later think block 1` to the decode line. The dormant
+  trigger's search of the turn's text costs 67 us a token after 2,000 tokens and 530 us after 16,000
+  (`tools/inkling_trigger_cost.cpp`, `measured-here` on the recipe host's CPU; mainline's trigger the same; bounded to
+  the tail from the last header start, 0.3 us). `<|content_model_end_sampling|>` is the GGUF's eos and eot id
+  (`measured-here`, metadata of ggml-org's IQ4_NL file), so a completed call can end the turn.
 - **Context checkpoints again at q8_0 / q4_0 K/V for a sliding-window cache on OpenCL** (Inkling 2 Mini at its unit's
   q8_0, Dory1.0-4B with `--llama-swa-window`). 1.8.1 and 1.8.2 kept none there, because the restore's writes through
   views of the K / V tensors were dropped (positions restored, bytes not); patch 0209 performs them. The refusal now

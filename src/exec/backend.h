@@ -466,6 +466,13 @@ struct GenerationStats {
     // operator looks for the request's own numbers.
     int grammar_desyncs = 0;
 
+    // Inkling's call grammar triggered after a thinking block the think-block
+    // tracker did not cover (0 or 1): the grammar is dormant only in the
+    // first thinking block of a turn (core/toolgrammar.h, the known limit), so
+    // such a trigger may have started inside reasoning. Printed on the decode
+    // line when non-zero.
+    int grammar_late_think = 0;
+
     // An aborted request never finished its prefill: the tokens actually
     // prefilled (the `have` growth) in prompt_tokens_prefilled, so the slot
     // line reports what happened instead of the whole prompt. Negative: the

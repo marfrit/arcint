@@ -406,6 +406,39 @@ medium; the capital of France comes back as Paris; tool calls work. The
 model's reasoning depth is set with `reasoning_effort`; its chat template
 ignores `enable_thinking`.
 
+### Tool calls under `--tool-grammar` (1.8.3, unreleased)
+
+`--tool-grammar` (or the request field `tool_grammar`) constrains Inkling 2 Mini's call form; 1.8.0-1.8.2 refused it
+for this model. The grammar follows mainline llama.cpp's `common/parsers/inkling.cpp` (commit 690b87d8): it is lazy,
+triggered by the assistant header followed by a character other than `<` (mainline's `<\|message_model\|>([^<])`;
+arcint skips whitespace first, `<\|message_model\|>\s*([^<\s])`, since the parser trims it from the name), so a
+thinking or text block is not a call; from the tool name on, the block is one of the request's tools,
+`{"name":<that name>,"args":<a JSON object>}` and `<|end_message|>`, with more calls after it when
+`parallel_tool_calls` allows. It is stricter than mainline: a JSON string admits no raw control byte (0x00-0x1F;
+`\t`, `\n` and the other escapes are legal) and no lone surrogate escape, where mainline's string rule admits a raw
+TAB, which is the failure behind this change (a correctly framed bash call whose heredoc held tab-indented C,
+returned as raw content, twice on a served unit, `measured-here`); and `args` must be an object. The arguments are
+not checked against the tools' schemas, as in mainline. The grammar stays dormant while the model thinks: arcint
+hands it no token while the thinking block is open, so a call the model spells while thinking cannot trigger it,
+with `--think-eog-mask` on or off. That is the operator's constraint: on the coder `--think-eog-mask` stays off,
+because the mask together with a dormant grammar inside the think block gave endless turns there. A prompt whose
+last tokens are the header (an Inkling 1 template) is refused for the grammar, before the prefill, since the
+think-block tracker would not see that header. The model's end-of-generation token `<|content_model_end_sampling|>`
+is the GGUF's eos and eot id (ggml-org's IQ4_NL file), so a completed call can end the turn. A block the parser
+rejects is still returned as raw content, and the log line names the reason and the failing byte, without the
+model's text: `tools: <|message_model|> block rejected: JSON parse error: ... (at byte N of the block); returned as
+raw content`. Evidence so far is device-free (`code`, the unit tests on a real vocabulary); a served card test is
+owed.
+
+Known limits: the grammar is dormant in the **first** thinking block of a turn only. A later thinking block (after a
+text block, or right after the first) reaches the trigger, so a call the model spells there starts the grammar
+inside the reasoning (mainline feeds every block). This is counted rather than changed: such a trigger logs one line
+(`the tool-call grammar triggered after a later thinking block opened in this turn`) and adds `grammar after a later
+think block 1` to the request's decode line. While no call has started, the trigger searches everything the turn has
+written outside its first thinking block on every token (libllama's lazy grammar; mainline the same): a device-free
+timing of that loop (`tools/inkling_trigger_cost.cpp`, `measured-here` on the recipe host's CPU, g++ -O3) gives 67 us a token after 2,000 tokens of answer and 530 us
+after 16,000, against about 30 ms a token of decode.
+
 ## Numbers by release
 
 The A770 and coder figures below are historical (card retired, last measured with 1.7.0 or earlier); the B60 figures were measured on the B60.

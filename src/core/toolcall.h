@@ -55,7 +55,24 @@ struct ToolCallParse {
     // An opening <tool_call> was never closed. The unterminated remainder is
     // left in `content` verbatim rather than dropped.
     bool truncated = false;
+
+    // Why a block was returned as raw content, for the log line
+    // (tool_call_reject_message). Set by the Inkling parser, whose `truncated`
+    // covers five different rejects of a block that may well be terminated:
+    // no `{` after the call marker, an object that never closes (unbalanced
+    // braces or an unclosed string), a JSON parse error (its message), a name /
+    // args mismatch, no block closer right after the object. `reject_offset`
+    // is the byte of the failure counted from the block's header. Empty / npos
+    // for the other dialects, whose only reject is a missing closer.
+    std::string reject_reason;
+    size_t      reject_offset = std::string::npos;
 };
+
+// The log line's text for a parse with `truncated` set, without the
+// "returned as raw content" tail the callers add: the Qwen and Gemma forms
+// keep "unterminated <opener> block"; a parse that names its reason says
+// "<opener> block rejected: <reason> (at byte N of the block)".
+std::string tool_call_reject_message(const ToolCallParse& parsed, ChatDialect dialect);
 
 // `schemas` is optional. When present, the XML form's string parameter values
 // are coerced to the declared JSON types; without it every value stays a

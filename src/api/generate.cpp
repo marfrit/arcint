@@ -255,8 +255,8 @@ void finish_chat_generation(const PreparedChat& prep,
         // ids unique across turns (core/toolcall.h): after the history's call_N
         number_calls(parsed.calls, next_call_index(prep.req));
         if (parsed.truncated) {
-            log::warn("tools", "unterminated %s block; returned as raw content",
-                      std::string(tool_call_open(prep.dialect)).c_str());
+            log::warn("tools", "%s; returned as raw content",
+                      tool_call_reject_message(parsed, prep.dialect).c_str());
         }
         out.content = std::move(parsed.content);
         out.calls   = std::move(parsed.calls);

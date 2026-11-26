@@ -207,7 +207,10 @@ TEST(the_llama_backend_reads_the_api_tokens_and_tokenises_once) {
     const std::string src((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     CHECK(src.find("return tokenize_once(") != std::string::npos);
     CHECK(src.find("prompt_ids_raw(in, *tokenizer_)") != std::string::npos);
-    CHECK(src.find("sampler.set_prompt(prompt_ids_raw(in, *tokenizer_))") != std::string::npos);
+    // the multimodal path keeps the one result for the sampler and the Inkling
+    // grammar's prompt check (prepare_tool_grammar): still one call
+    CHECK(src.find("const std::vector<int> prompt_text_ids = prompt_ids_raw(in, *tokenizer_);\n"
+                   "        sampler.set_prompt(prompt_text_ids);") != std::string::npos);
     CHECK(src.find("llama_tokenize(v_, text.data(), static_cast<int32_t>(text.size()), nullptr, 0") ==
           std::string::npos);
 }
