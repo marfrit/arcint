@@ -10090,7 +10090,7 @@ unit's settings).
   - **The reds** (`GGML_OPENCL_FA_PORT_RED`, the split build only): **21** (`GB_SPLIT_RED_SEAM_LOSE1`) drops the first
     key of every split >= 1; **22** (`GB_SPLIT_RED_SEAM_DUP1`) starts every split >= 1 one block early with only the
     key before its seam live, so that key is walked by both splits; **23** (`GB_SPLIT_RED_TAIL_CLIP1`) ends the last
-    split one block short. Each must FAIL all six needle cases, at the CPU model's figure (the A5 rows' bands). ocloc
+    split one block short. Each must FAIL all six needle cases, at the CPU model's figure (the card rows' bands). ocloc
     (bmg-g21 and bmg-g31, 256 GRF): every program's ISA (f16 / q8_0 / q8_0:q4_0, unsplit and split) is identical to
     the tree's own; the reds compile and change the split programs.
   - **The seams come from the launch** (the review's FIX-1): the split stats export the launch's `split_blocks` and
@@ -10102,7 +10102,7 @@ unit's settings).
   - **The CPU model of the reds** (`GGML_TEST_FA_PORT_NEEDLE=1`, the CPU backend): LOSE hides the seam's first key,
     TWICE gives the key before the seam a mask of ln 2 (exp(s + ln 2) = 2 exp(s), the exact effect of counting it
     twice), CLIP hides the call's last block. Every cell must move the answer past 100x its bound: 30 cells (6 cases x
-    (2 waves x 2 models + CLIP)), the figures in the A5 rows. The launch-side check, fed launch records: the modelled
+    (2 waves x 2 models + CLIP)), the figures in the card rows. The launch-side check, fed launch records: the modelled
     one passes; `split_blocks + 1`, `n_kv + 32` and the rule at wave 420 where it moves the seams (kv 16384: p 2) fail
     `NEEDLE OFF THE SEAM` (24 cells). Red of the models: `GGML_TEST_FA_PORT_NEEDLE_RED=1` puts the seam needles 40 keys
     off the seams, and every LOSE / TWICE cell FAILS.
@@ -10111,7 +10111,7 @@ unit's settings).
     seams elsewhere. Not with the operator's own `GGML_OPENCL_FA_PORT_WAVE` (0223's red of the check); the needle cases
     are then still held to the launch's own seams.
   - **Counts:** the decisions table counts the six apart (`needle 6`); `GGML_TEST_FA_PORT_SEAM` leaves them to the needle
-    check (its 18 cells unchanged). **Not run on a card**; the card rows are the A5 window's.
+    check (its 18 cells unchanged). **Not run on a card**; the card rows are owed.
 
 ## 0225-opencl-flash-attn-port-q4_0-v.patch / 0225b-flash-attn-port-q4_0-v-tests.patch
 
@@ -11398,7 +11398,7 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
 
 **The series it applies to (note).** 0222 was written on development, before 0209 / 0211 / 0212, which also touch
 `ggml-opencl.cpp`. Its context was refreshed onto the 1.8.3 series (the added and removed lines unchanged); the 1.8.3
-series applies whole (173 patches, LC_ALL=C) and passes the recipe. The card result below ran on the development
+series applies whole (174 patches, LC_ALL=C) and passes the recipe. The card result below ran on the development
 tree (pin + 160 patches). 0208b sorts after 0208 under LC_ALL=C. The four new eval cases change the
 op suite's case total.
 
@@ -11668,7 +11668,7 @@ the answer-level bar, arm 1 becomes the candidate and rows 4, 6 and 7 are re-run
 row only if a B70 unit gets the knob (Inkling does not run there): the offline check covers `bmg-g31`.
 
 **Integration.** 0220 is diffed against development's series. 0209, 0211 and 0212, from the other 1.8.3
-branches, touch `ggml-opencl.cpp` too; in the 1.8.3 series the whole series applies (173 patches, LC_ALL=C).
+branches, touch `ggml-opencl.cpp` too; in the 1.8.3 series the whole series applies (174 patches, LC_ALL=C).
 The knob-off ISA comparison of the K-quant program on the combined series is not recorded.
 
 **Open.** The card numbers are the card result at the top of this section (B60, 2026-11-26). The fp16 arm's tile-identity (arm 1 = arm 0) is expected

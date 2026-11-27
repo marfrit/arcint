@@ -381,7 +381,7 @@ index f53c695b4..83e9d8121 100644
 +// LOSE (RED=21): the first key of every split >= 1 hidden (its cell empty); TWICE (RED=22): the key before every seam
 +// counted twice (its mask ln 2: exp(s + ln 2) = 2 exp(s)); both at each modelled wave (200 / 320). CLIP (RED=23): the
 +// call's last block hidden. Each model must move the case's answer past JUMP x its bound (JUMP 100: an NMSE of at least
-+// 1e-3 for q8_0 K, 1e-2 for f16; the printed figures are the A5 rows' bands). 6 cases x (2 waves x 2 + 1) = 30 cells.
++// 1e-3 for q8_0 K, 1e-2 for f16; the printed figures are the card rows' bands). 6 cases x (2 waves x 2 + 1) = 30 cells.
 +// And the launch-side check of review FIX-1 (test_flash_attn_ext::needle_seams_ok, what check_after_eval asks of a
 +// card launch): fed the modelled launch (p, split_blocks, n_kv at wave 200) it must pass; fed a wrong split_blocks
 +// (+1), a wrong n_kv (+32), or the launch the rule makes at wave 420 (128 GRF), it must FAIL "NEEDLE OFF THE SEAM":

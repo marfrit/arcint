@@ -31,7 +31,9 @@
 - Version 1.8.3 (2026-11-27): FIX q8_0 / q4_0 KV checkpoints for sliding-window caches on OpenCL (0209, the 1.8.1
   refusal lifted where the tree carries it). NEW --tool-grammar for Inkling 2 Mini (no raw control byte in a JSON
   string); opt-in Xe2 switches for Inkling (0220-0226): at 8:4 KV with all of them, prefill +18-20 %, decode +9 %
-  against the 1.8.2 unit at 8:8 on the B60.
+  against the 1.8.2 unit at 8:8 on the B60. FIX the chat-template engine's memory leak on every render of a template
+  with a macro (all production templates), and on MTP / DFlash2 units with --loop-guard the think tracker's double
+  observation of accepted drafts.
 - Version 1.8.2 (2026-11-25): FIX Inkling 2 Mini's prompt cache: the tokenizer's ignore_merges rule (337 words were
   split, patch 0210) and tool call ids unique across turns; both made a served conversation re-read its prompt.
 - Version 1.8.1 (2026-11-25): FIX the q8_0 / q4_0 KV checkpoint restore on OpenCL (positions restored, bytes not;

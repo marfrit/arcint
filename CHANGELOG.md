@@ -37,6 +37,8 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
 - A tool result without a `name` is given the name of the call it answers before Inkling's template renders it.
 - The relative-bias flash attention falls back to the split kernel (one `DOWNGRADE` line) where the card cannot
   build its GQA decode variant, instead of aborting.
+- The chat-template engine no longer leaks memory on every render of a template that defines a macro (every
+  production template: ~15-25 KB a render).
 - With `--loop-guard` on a speculative unit (MTP, DFlash2), the door's budget advances once per emitted token, not twice.
 
 - **Inkling 2 Mini at 8:4 K/V with every 1.8.3 switch, measured as one configuration** (the operator's target,

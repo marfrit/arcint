@@ -14,9 +14,17 @@ arcint (1.8.3-1) trixie; urgency=medium
   * NEW (opt-in, defaults unchanged): Xe2 switches for Inkling 2 Mini,
     patches 0220-0226 (dense Q8_0 2D-block GEMM, the fused loop controller,
     the 64-pair int8 expert tile, the FA port's key split, the FA port at
-    q8_0:q4_0); GGML_OPENCL_LOOP_CONTROL=f32 now fuses from one row.
+    q8_0:q4_0); GGML_OPENCL_LOOP_CONTROL=f32 fuses from one row, decode
+    steps included.
+  * FIX: on speculative units (MTP, DFlash2) with --loop-guard the think
+    tracker saw every accepted draft token twice once the loop guard's
+    door was open (its budget advanced at twice the rate); the verify walk
+    now makes one observation per emitted token.
+  * FIX: the chat-template engine leaked memory on every render of a
+    template that defines a macro (every production template): a
+    reference cycle in the macro scope and in tojson's key sorter.
 
- -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 27 Nov 2026 12:00:00 +0100
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 27 Nov 2026 16:00:00 +0100
 
 arcint (1.8.2-1) trixie; urgency=medium
 
