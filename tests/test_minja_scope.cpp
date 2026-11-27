@@ -17,7 +17,9 @@
 #endif
 #endif
 #if defined(ARCINT_TEST_ASAN)
-#include <sanitizer/allocator_interface.h>
+// The sanitizer runtime's own count (sanitizer/allocator_interface.h, which not
+// every toolchain installs; the runtime always exports the symbol).
+extern "C" size_t __sanitizer_get_current_allocated_bytes(void);
 #else
 #include <malloc.h>
 #endif
