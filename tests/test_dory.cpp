@@ -455,11 +455,16 @@ TEST(dory_effort_map_is_capped_at_the_units_maximum) {
 
 // "unset" on a unit with a default effort is that effort's count, not --llama-dory-loops
 TEST(dory_effort_map_unset_follows_the_units_default_effort) {
-    CHECK_EQ(dory_effort_map(2, 4)[0].second, 2);
-    CHECK_EQ(dory_effort_map(2, 4, "high")[0].second, 4);
-    CHECK_EQ(dory_effort_map(2, 4, "low")[0].second, 1);
-    CHECK_EQ(dory_effort_map(1, 3, "xhigh")[0].second, 3);   // capped
-    CHECK_EQ(dory_effort_map(2, 4, "high")[2].second, 1);    // the other rows do not move
+    // each map bound to a local first: [0] of a temporary vector is a reference into it
+    const auto unset = dory_effort_map(2, 4);
+    const auto high  = dory_effort_map(2, 4, "high");
+    const auto low   = dory_effort_map(2, 4, "low");
+    const auto xhigh = dory_effort_map(1, 3, "xhigh");
+    CHECK_EQ(unset[0].second, 2);
+    CHECK_EQ(high[0].second, 4);
+    CHECK_EQ(low[0].second, 1);
+    CHECK_EQ(xhigh[0].second, 3);   // capped
+    CHECK_EQ(high[2].second, 1);    // the other rows do not move
 }
 
 // The per-request decision: one count or an error text, never a fallback.

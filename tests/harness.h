@@ -74,8 +74,10 @@ std::string show(const T& v) {
 
 #define CHECK_EQ(a, b)                                                    \
     do {                                                                  \
-        const auto& lhs_ = (a);                                           \
-        const auto& rhs_ = (b);                                           \
+        /* copies: a reference to (a) dangles when (a) reads into a */    \
+        /* temporary, e.g. f()[0].second (no lifetime extension) */      \
+        const auto lhs_ = (a);                                            \
+        const auto rhs_ = (b);                                            \
         if (!(lhs_ == rhs_)) {                                            \
             t::fail(__FILE__, __LINE__,                                   \
                     std::string(#a " == " #b "\n           left:  ") +    \
