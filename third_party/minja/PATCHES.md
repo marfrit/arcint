@@ -57,3 +57,46 @@ Inkling 2 Mini passes `tojson(sort_keys=true, separators=(",", ":"))` and
 separators are `dump`'s behaviour at indent -1, and `sort_keys` sorts object
 keys recursively, like Python. `dictsort` no longer rejects extra keywords and
 accepts `case_sensitive` (keys sort as strings either way).
+
+## Macro and call-block scope (2026-11-27)
+
+`minja.hpp`, `MacroNode::do_render` and `CallNode::do_render`: the macro's
+callable captured the defining context (`macro_context`, a
+`std::shared_ptr<Context>`) by value and was then stored into that same
+context; a call block's `caller` did the same with its context. That is a
+reference cycle (Context -> Value -> std::function -> lambda -> Context), so
+every render that executed a `{% macro %}` definition or a `{% call %}` block
+leaked its scope chain: ~15-25 KB a render (LeakSanitizer), linear in the
+render count. Every admitted production template defines a macro.
+
+The callables now capture a `std::weak_ptr<Context>` and lock it at call
+time. Jinja macros close over their defining scope lexically, and that scope
+must stay reachable for the whole render (a macro defined in a loop body and
+kept in a `namespace` is called after the loop's context is gone), so
+`render_scope` keeps each defining context alive until the outermost
+`TemplateNode::render` on the thread returns. The bound: one render keeps
+every defining context it creates until it returns (a loop defining a macro
+10^5 times holds 10^5 contexts until then; the old engine held them forever).
+The keeper is a thread-local static that no context or value refers to, so it
+closes no cycle. A macro called after that render, with no other owner of its
+context (reachable only through the C++ API), throws
+`Macro <name> called after the render that defined it ended`.
+Within a render the scopes resolve as before; the production templates render
+byte-identically. Tests: `tests/test_minja_scope.cpp`.
+
+Upstream: google/minja `include/minja/minja.hpp` at `main` (last changed by
+3e4c61c6, 2025-09-09) has the same strong capture in both nodes; no upstream
+fix or issue was found. llama.cpp at the recipe's pin (3e4dfa8) no longer
+carries minja: its own `common/jinja` engine runs a macro body in a scope
+copied from the *caller's* context at call time (dynamic scoping), so it
+holds no defining context and has no cycle, but resolves names differently
+from Jinja and from minja; not followed here, since the templates must render
+as before. Worth a PR against google/minja.
+
+## `tojson` key sorter (2026-11-27)
+
+`minja.hpp`, the global `tojson` (this file's 2026-11-22 entry): the
+recursive key sorter was a `std::function` held by a `shared_ptr` that the
+function captured by value, a self-cycle created on every `tojson` call,
+sorting or not (~100 B a call). It is now a local `std::function` captured by
+reference, which lives for the call. Local code; nothing upstream.

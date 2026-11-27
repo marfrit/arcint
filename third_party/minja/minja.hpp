@@ -865,6 +865,51 @@ struct EndCallTemplateToken : public TemplateToken {
         : TemplateToken(Type::EndCall, loc, pre, post) {}
 };
 
+// arcint local patch (third_party/minja/PATCHES.md, "Macro and call-block scope"):
+// a macro's callable, and a call block's `caller`, used to hold a shared_ptr to
+// the context that defined it and were then stored into that same context: a
+// cycle (Context -> Value -> std::function -> lambda -> Context) that leaked the
+// whole scope chain on every render that executed a {% macro %}. The callables
+// now hold the defining context weakly. So that a macro stays callable for the
+// whole render wherever its value went (a namespace attribute set inside a loop,
+// say), each defining context is also kept here, by the outermost
+// TemplateNode::render on this thread, and released when that render returns.
+// The bound: one render keeps every defining context it creates until it returns
+// (a loop that defines a macro 10^5 times, or 10^5 calls of a macro that defines
+// a nested macro or runs a call block, holds 10^5 contexts until then; the old
+// engine held them forever). The keeper is a thread-local static, not part of
+// the context graph (no context or value refers to it), so it closes no cycle.
+namespace render_scope {
+struct Keeper {
+    std::vector<std::shared_ptr<Context>> contexts;
+    size_t depth = 0;
+};
+inline Keeper & keeper() {
+    static thread_local Keeper k;
+    return k;
+}
+// Keep `context` alive until the outermost render on this thread returns.
+// Outside any render (depth 0) the caller owns the context; nothing to keep.
+inline void keep(const std::shared_ptr<Context> & context) {
+    auto & k = keeper();
+    if (k.depth == 0) return;
+    if (!k.contexts.empty() && k.contexts.back() == context) return;  // a definition re-run in one scope
+    k.contexts.push_back(context);
+}
+struct Guard {
+    Guard() { ++keeper().depth; }
+    ~Guard() {
+        auto & k = keeper();
+        if (--k.depth == 0) {
+            auto released = std::move(k.contexts);
+            k.contexts.clear();
+        }
+    }
+    Guard(const Guard &) = delete;
+    Guard & operator=(const Guard &) = delete;
+};
+}  // namespace render_scope
+
 class TemplateNode {
     Location location_;
 protected:
@@ -873,6 +918,7 @@ protected:
 public:
     TemplateNode(const Location & location) : location_(location) {}
     void render(std::ostringstream & out, const std::shared_ptr<Context> & context) const {
+        render_scope::Guard scope;
         try {
             do_render(out, context);
         } catch (const LoopControlException & e) {
@@ -1069,7 +1115,15 @@ public:
     void do_render(std::ostringstream &, const std::shared_ptr<Context> & macro_context) const override {
         if (!name) throw std::runtime_error("MacroNode.name is null");
         if (!body) throw std::runtime_error("MacroNode.body is null");
-        auto callable = Value::callable([this, macro_context](const std::shared_ptr<Context> & call_context, ArgumentsValue & args) {
+        // Weak: the callable is stored into macro_context itself (below); a strong
+        // capture is a reference cycle. render_scope keeps it alive for the render.
+        std::weak_ptr<Context> weak_macro_context = macro_context;
+        render_scope::keep(macro_context);
+        auto callable = Value::callable([this, weak_macro_context](const std::shared_ptr<Context> & call_context, ArgumentsValue & args) {
+            auto macro_context = weak_macro_context.lock();
+            if (!macro_context) {
+                throw std::runtime_error("Macro " + name->get_name() + " called after the render that defined it ended");
+            }
             auto execution_context = Context::make(Value::object(), macro_context);
 
             if (call_context->contains("caller")) {
@@ -1654,7 +1708,15 @@ public:
         if (!expr) throw std::runtime_error("CallNode.expr is null");
         if (!body) throw std::runtime_error("CallNode.body is null");
         
-        auto caller = Value::callable([this, context](const std::shared_ptr<Context> &, ArgumentsValue &) -> Value {
+        // Weak for the same reason as MacroNode's callable: `caller` is stored
+        // into this same context; render_scope keeps it alive for the render.
+        std::weak_ptr<Context> weak_context = context;
+        render_scope::keep(context);
+        auto caller = Value::callable([this, weak_context](const std::shared_ptr<Context> &, ArgumentsValue &) -> Value {
+            auto context = weak_context.lock();
+            if (!context) {
+                throw std::runtime_error("caller() called after the render that defined it ended");
+            }
             return Value(body->render(context));
         });
         
@@ -2748,8 +2810,10 @@ inline std::shared_ptr<Context> Context::builtins() {
   // `sort_keys` / `separators`: Inkling 2 Mini passes both. Compact separators are already `dump`'s
   // behaviour at indent -1; sort_keys is honoured recursively, as Python's json.dumps does.
   globals.set("tojson", simple_function("tojson", { "value", "indent", "ensure_ascii", "sort_keys", "separators" }, [](const std::shared_ptr<Context> &, Value & args) {
-    auto sort_recursive = std::make_shared<std::function<Value(const Value &)>>();
-    *sort_recursive = [sort_recursive](const Value & value) -> Value {
+    // A local function the lambda refers to by reference: a shared_ptr to it
+    // captured by value in itself was a cycle that leaked on every tojson call.
+    std::function<Value(const Value &)> sort_recursive;
+    sort_recursive = [&sort_recursive](const Value & value) -> Value {
       if (value.is_object()) {
         auto copy = value;
         auto keys = copy.keys();
@@ -2757,18 +2821,18 @@ inline std::shared_ptr<Context> Context::builtins() {
           return a.to_str() < b.to_str();
         });
         auto sorted = Value::object();
-        for (const auto & key : keys) sorted.set(key, (*sort_recursive)(value.at(key)));
+        for (const auto & key : keys) sorted.set(key, sort_recursive(value.at(key)));
         return sorted;
       }
       if (value.is_array()) {
         auto sorted = Value::array();
-        for (size_t i = 0, n = value.size(); i < n; ++i) sorted.push_back((*sort_recursive)(value.at(i)));
+        for (size_t i = 0, n = value.size(); i < n; ++i) sorted.push_back(sort_recursive(value.at(i)));
         return sorted;
       }
       return value;
     };
     auto value = args.at("value");
-    if (args.get<bool>("sort_keys", false)) value = (*sort_recursive)(value);
+    if (args.get<bool>("sort_keys", false)) value = sort_recursive(value);
     const int64_t indent = args.get<int64_t>("indent", -1);
     // `separators=(item, key)` as Python's json.dumps: both are strings, the
     // first between items, the second between a key and its value. Absent, the

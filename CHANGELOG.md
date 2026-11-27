@@ -196,6 +196,28 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   (thinking T)`: C == E on each of them, C == 2E on the old walk. Speech synthesis, whose loop runs its own sampler,
   prints none. Before a detection the double feed changed nothing (the
   second feed's piece was empty, and the only id feed sits behind the open door). No card run is recorded yet.
+- **Fixed: the chat-template engine leaked memory on every render of a template that defines a macro** (a reference
+  cycle in minja's macro scope: the macro's callable owned the context it was stored in; a `{% call %}` block's
+  `caller` did the same). ~15-25 KB a render (LeakSanitizer, CPU: 15.2 KB for a one-macro template, ~24.6 KB for
+  the production templates; unsanitized ~28 KB of RssAnon a render, linear in the render count), measured as ~52 KB
+  a request on a served Inkling 2 Mini at reasoning effort high (`measured-here`; the served unit measured flat at
+  effort none, which the CPU render does not reproduce, and the served RSS leg on the fixed build is owed). Every
+  current production template defines a macro (Inkling 2 Mini, the Qwen3.8 family), so every chat request leaked.
+  Present since minja was vendored (77872e9d, 2026-08-29, 0.1.0). The callables now hold their defining context
+  weakly, and the outermost render keeps each such context alive until it returns, so a macro stays callable for
+  the whole render wherever its value went; a macro value carried out of that render by API (no template can)
+  errors cleanly instead of running. Evidence (`code`, `measured-here` on CPU): device-free cases red on the old
+  engine (the defining contexts never expire; +17 KB after 1 render and +883 KB after 50 of a one-macro template)
+  and flat after, a template that raises after defining a macro included; the production templates (two distinct
+  files: the Qwen3.8 27B and Flash-Next share one) render byte-identical old against new over 90 request shapes
+  each, 180 distinct renders: 30 base shapes (system, user, a tool, an assistant tool call, its result; reasoning
+  effort unset / none / low / medium / high; thinking unset / on / off; with and without the tool round), the
+  same 30 with the user turn as list content with an image part (Qwen's `render_content` list branch, which
+  writes outer namespaces), and the same 30 with add_generation_prompt off. Also fixed: `tojson` leaked ~100 B a
+  call, sorting or not, through a key sorter that held itself (arcint's own `tojson` options patch, 1.8.0); red
+  +0.4 KB after 1 render and +19 KB after 50 of four calls, flat after. With both fixes, RssAnon over 100 / 2,000 /
+  20,000 renders of the production Inkling template: 492 / 488 / 492 kB (before: 3,496 kB at 100, 57,472 kB at
+  2,000).
 
 - Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
   ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are
