@@ -10073,8 +10073,8 @@ unit's settings).
   unchanged 1e-5, as 0223b did (they stand at 17.3x to 3,046x), the f16 cells 1.5x of 1e-4 (1.76x to 307x; the
   smallest is case kv 16384 x nb 64 on the B60's split). 0223c had relaxed both to 1x. The case comment's rounding is
   3.55e-4 and 1.76x.
-- **Since 0226b** (`0226b-flash-attn-port-seam-needles.patch`, tests and two red builds; it applies after 0226, the
-  last of the series): **a key lost or doubled at a split seam is now caught.** The review of 0223 found that no check
+- **Since 0226b** (`0226b-flash-attn-port-seam-needles.patch`: tests, three red builds and two more fields of the
+  split's stats record; it applies after 0226, the last of the series): **a key lost or doubled at a split seam is now caught.** The review of 0223 found that no check
   saw a single key off at a seam: about 0.017x the q8_0 bound, 0.002x the f16 bound, 1.7e-7 against the
   split-vs-unsplit compare's 1e-5. The partition reads right (`flash_attn_port.cl`, the split's `s_lo` / `s_hi`), but
   nothing proved it.
@@ -10093,7 +10093,9 @@ unit's settings).
     (bmg-g21 and bmg-g31, 256 GRF): every program's ISA (f16 / q8_0 / q8_0:q4_0, unsplit and split) is identical to
     the tree's own; the reds compile and change the split programs.
   - **The seams come from the launch** (the review's FIX-1): the split stats export the launch's `split_blocks` and
-    `n_kv`, and a needle case with the knob on fails `NEEDLE OFF THE SEAM` unless the launch split, its n_kv is the
+    `n_kv`. The one change outside the tests and the reds: two more fields of the stats record the test reads, stored
+    only once a reader asked for the record (its proc address handed out, as test-backend-ops does before a port case);
+    a serving process never asks, so its launches gain a load of a static flag and no store. And a needle case with the knob on fails `NEEDLE OFF THE SEAM` unless the launch split, its n_kv is the
     case's kv, no needle was dropped, and the keys either side of every `s * split_blocks * 32` and the tail keys are
     needles. So a needle off the device's seam fails the case whatever the override (`_WAVE`, `_QTW`).
   - **The CPU model of the reds** (`GGML_TEST_FA_PORT_NEEDLE=1`, the CPU backend): LOSE hides the seam's first key,

@@ -198,7 +198,8 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   to stand 10x above the bound for the q8_0 split cases (their bound unchanged at 1e-5, as before 0223c) and 1.5x for
   the f16 ones (bound 1e-4): every cell clears it, the smallest at 1.76x (f16) and 17.3x (q8_0) (`inference`, a
   numpy-checked CPU model). The case comment's figures read 3.55e-4 and 1.76x (`contrib/llama.cpp/README.md`, 0223c).
-- llama.cpp patch 0226b (tests and two red builds): needle-at-seam cases for the FA port's key split, f16, q8_0 and the
+- llama.cpp patch 0226b (tests, three red builds and two fields of the split's stats record, stored only when a test
+  reads the record: a serving launch gains a flag load and no store): needle-at-seam cases for the FA port's key split, f16, q8_0 and the
   served 8:4 (q8_0 K / q4_0 V). A key lost or doubled at a seam, or a clipped tail, was invisible to every check
   (1.7e-7 against a 1e-5 compare); with a dominant key either side of every seam and in the call's tail it moves the
   answer 100x and more over the bound on the CPU model. The needles are held to the launch's own seams (its

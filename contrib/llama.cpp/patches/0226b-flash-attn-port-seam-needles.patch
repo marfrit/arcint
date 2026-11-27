@@ -1,8 +1,8 @@
 diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
-index 3901fa0a4..28fda796b 100644
+index 3901fa0a4..dd63687dc 100644
 --- a/ggml/src/ggml-opencl/ggml-opencl.cpp
 +++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
-@@ -13595,12 +13595,16 @@ static bool ggml_cl_port_split_on() {
+@@ -13595,12 +13595,19 @@ static bool ggml_cl_port_split_on() {
  }
  
  // what the launches did, for the tests (get_proc_address "ggml_backend_opencl_fa_port_split_stats"):
@@ -14,6 +14,9 @@ index 3901fa0a4..28fda796b 100644
  static int     g_fa_port_last_p = 0, g_fa_port_last_wave = 0, g_fa_port_last_nwg = 0;
 -static void ggml_backend_opencl_fa_port_split_stats(int64_t out[5]) {
 +static int64_t g_fa_port_last_split_blocks = 0, g_fa_port_last_n_kv = 0;
++// 0226b: those two are stored only once a reader asked for the record (its proc address handed out, as the test does
++// before it evaluates a port case): no new store on a serving process, which never asks
++static bool    g_fa_port_stats_wanted = false;
 +static void ggml_backend_opencl_fa_port_split_stats(int64_t out[7]) {
      out[0] = g_fa_port_launches; out[1] = g_fa_port_split_launches;
      out[2] = g_fa_port_last_p; out[3] = g_fa_port_last_wave; out[4] = g_fa_port_last_nwg;
@@ -21,7 +24,7 @@ index 3901fa0a4..28fda796b 100644
  }
  
  // the split build of the port kernel and its merge, once a device and K/V type, after the unsplit
-@@ -13624,6 +13628,11 @@ static bool ggml_cl_port_split_kernels(ggml_backend_opencl_context * backend_ctx
+@@ -13624,6 +13631,11 @@ static bool ggml_cl_port_split_kernels(ggml_backend_opencl_context * backend_ctx
      if (r == 11) opts += " -DGB_SPLIT_RED_DROP1";    // split 1's state dropped
      if (r == 12) opts += " -DGB_SPLIT_RED_SINKS";    // every split starts from the sink
      if (r == 13) opts += " -DGB_SPLIT_RED_SEAM";     // the first block of every split >= 1 skipped (a lost seam block)
@@ -33,11 +36,19 @@ index 3901fa0a4..28fda796b 100644
      cl_program p = src.empty() ? nullptr : build_program_from_source_optional(backend_ctx, src.c_str(), opts);
      if (p == nullptr) {
          ggml_cl_downgrade("op=FLASH_ATTN port=split-not-built reason=%s", v4 ? "compile-q4v" : kv8 ? "compile-q8" : "compile");
-@@ -27234,6 +27243,7 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+@@ -19463,6 +19475,7 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+         return (void *) ggml_backend_opencl_topk_moe_sigmoid_fused_count;
+     }
+     if (strcmp(name, "ggml_backend_opencl_fa_port_split_stats") == 0) {
++        g_fa_port_stats_wanted = true;   // 0226b: the launches record split_blocks / n_kv from now on
+         // 0223: the port's launches and the last one's split, for test-backend-ops' split cases
+         return (void *) ggml_backend_opencl_fa_port_split_stats;
+     }
+@@ -27234,6 +27247,7 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
          g_fa_port_launches++;
          g_fa_port_split_launches += n_split > 1;
          g_fa_port_last_p = n_split; g_fa_port_last_wave = wave; g_fa_port_last_nwg = nwg;
-+        g_fa_port_last_split_blocks = split_blocks; g_fa_port_last_n_kv = n_kv;
++        if (g_fa_port_stats_wanted) { g_fa_port_last_split_blocks = split_blocks; g_fa_port_last_n_kv = n_kv; }
          {
              static const bool trace = ggml_cl_port_env_int("GGML_OPENCL_FA_PORT_TRACE", 0) != 0;
              if (trace) {
