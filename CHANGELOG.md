@@ -191,8 +191,10 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   old one only on the tracker's call count (120 for 60 tokens). The `-vv` line
   `the door's budget advances by a 64-token stretch` now names `emitted`, the door's recorded ids and the budget points
   `spent`, so a served log shows the stretch's step in emitted tokens (64; 32 under the defect); that line needs a
-  detection. Every request now ends with a `-vv` line, `think-tracker: lane N: observe calls C, emitted E (thinking
-  T)`: C == E on every decode path, C == 2E on the old walk. Before a detection the double feed changed nothing (the
+  detection. A request on the three decode paths that report the loop guard (plain decode, multimodal input and
+  the speculative lane, MTP or DFlash2) now ends with a `-vv` line, `think-tracker: lane N: observe calls C, emitted E
+  (thinking T)`: C == E on each of them, C == 2E on the old walk. Speech synthesis, whose loop runs its own sampler,
+  prints none. Before a detection the double feed changed nothing (the
   second feed's piece was empty, and the only id feed sits behind the open door). No card run is recorded yet.
 
 - Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
