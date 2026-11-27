@@ -110,6 +110,49 @@ std::string render(const char* source, const std::shared_ptr<minja::Context>& ct
     return root->render(ctx ? ctx : minja::Context::make(minja::Value::object()));
 }
 
+// Renders `root` against a fresh context holding `items`; returns the error
+// text, empty when it rendered. `watch` observes that context after the call.
+std::string render_error(const std::shared_ptr<minja::TemplateNode>& root, std::weak_ptr<minja::Context>* watch = nullptr) {
+    auto ctx = minja::Context::make(minja::Value::object());
+    ctx->set("items", minja::Value(nlohmann::ordered_json::array({1, 2})));
+    if (watch != nullptr) *watch = ctx;
+    try {
+        (void) root->render(ctx);
+    } catch (const std::exception& e) {
+        return e.what();
+    }
+    return "";
+}
+
+// A template that defines a macro (or runs a call block in a loop) and then
+// raises: the render unwinds through every TemplateNode::render, and the
+// keeper must still release what it kept.
+constexpr const char* kRaisesAfterMacro =
+    "{% macro m(x) %}[{{ x }}]{% endmacro %}{{ m(1) }}{{ raise_exception('stop') }}";
+constexpr const char* kRaisesInCallLoop =
+    "{% macro w() %}<{{ caller() }}>{% endmacro %}"
+    "{% for i in items %}{% call w() %}{{ i }}{% if i == 2 %}{{ raise_exception('stop') }}{% endif %}{% endcall %}{% endfor %}";
+
+void check_raising_template_releases(const char* source) {
+    auto root = minja::Parser::parse(source, {true, true, false});
+    std::weak_ptr<minja::Context> watch;
+    CHECK(render_error(root, &watch).find("stop") != std::string::npos);   // it does raise
+    CHECK(watch.expired());                                                 // its scope is gone after the unwind
+    auto growth = [&](int n) {
+        (void) render_error(root);
+        const size_t before = live_heap_bytes();
+        for (int i = 0; i < n; ++i) (void) render_error(root);
+        const size_t after = live_heap_bytes();
+        return after > before ? after - before : size_t(0);
+    };
+    const size_t g1 = growth(1), g50 = growth(50);
+    if (!(g50 <= g1 + 2048)) {
+        t::fail(__FILE__, __LINE__,
+                "live heap grows with raising renders: +" + std::to_string(g1) + " B after 1, +" +
+                    std::to_string(g50) + " B after 50 (" + source + ")");
+    }
+}
+
 }  // namespace
 
 TEST(minja_macro_defining_context_is_released_after_render) {
@@ -133,6 +176,17 @@ TEST(minja_tojson_live_heap_is_flat_in_render_count) {
                                       "{\"content\": \"hi\", \"role\": \"user\"}"
                                       "{\"role\":\"user\",\"content\":\"hi\"}"
                                       "{\"content\":\"hi\",\"role\":\"user\"}"));
+}
+
+// The exception path: the keeper is released by the guard's destructor, on
+// return and on unwind alike. Mutation: clear the list only on render's normal
+// return (not in ~Guard) and these cases fail.
+TEST(minja_macro_scope_is_released_when_the_render_raises) {
+    check_raising_template_releases(kRaisesAfterMacro);
+    check_raising_template_releases(kRaisesInCallLoop);
+    // the next good render is right, and its scope released (the depth is back at 0)
+    CHECK_EQ(render("{% macro m(x) %}[{{ x }}]{% endmacro %}{{ m(1) }}"), std::string("[1]"));
+    CHECK(root_context_released("{% macro m(x) %}[{{ x }}]{% endmacro %}{{ m(1) }}"));
 }
 
 // Semantics the fix must keep (each output is what the pre-fix engine renders).
@@ -160,6 +214,23 @@ TEST(minja_macro_semantics_unchanged) {
     CHECK_EQ(render("{% set ns = namespace(c=none) %}{% macro w() %}{% set ns.c = caller %}{% endmacro %}"
                     "{% call w() %}late{% endcall %}{{ ns.c() }}"),
              std::string("late"));
+    // the same with the call block in a loop body: caller's context is the loop's,
+    // gone after the loop but for the keeper. Mutation: drop CallNode's
+    // render_scope::keep(context) and this case fails.
+    {
+        auto root = minja::Parser::parse("{% set ns = namespace(c=none) %}{% macro w() %}{% set ns.c = caller %}{% endmacro %}"
+                                         "{% for i in items %}{% call w() %}late{{ i }}{% endcall %}{% endfor %}{{ ns.c() }}",
+                                         {true, true, false});
+        auto ctx = minja::Context::make(minja::Value::object());
+        ctx->set("items", minja::Value(nlohmann::ordered_json::array({1, 2})));
+        std::string out;
+        try {
+            out = root->render(ctx);
+        } catch (const std::exception& e) {
+            out = std::string("threw: ") + e.what();
+        }
+        CHECK_EQ(out, std::string("late2"));
+    }
 }
 
 // After the render that defined it, a macro whose defining context has no other

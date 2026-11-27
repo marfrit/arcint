@@ -874,7 +874,11 @@ struct EndCallTemplateToken : public TemplateToken {
 // whole render wherever its value went (a namespace attribute set inside a loop,
 // say), each defining context is also kept here, by the outermost
 // TemplateNode::render on this thread, and released when that render returns.
-// This keeper is a stack object outside the context graph, so it closes no cycle.
+// The bound: one render keeps every defining context it creates until it returns
+// (a loop that defines a macro 10^5 times, or 10^5 calls of a macro that defines
+// a nested macro or runs a call block, holds 10^5 contexts until then; the old
+// engine held them forever). The keeper is a thread-local static, not part of
+// the context graph (no context or value refers to it), so it closes no cycle.
 namespace render_scope {
 struct Keeper {
     std::vector<std::shared_ptr<Context>> contexts;

@@ -74,8 +74,11 @@ time. Jinja macros close over their defining scope lexically, and that scope
 must stay reachable for the whole render (a macro defined in a loop body and
 kept in a `namespace` is called after the loop's context is gone), so
 `render_scope` keeps each defining context alive until the outermost
-`TemplateNode::render` on the thread returns. The keeper is a thread-local
-stack outside the context graph, so it closes no cycle. A macro called after
+`TemplateNode::render` on the thread returns. The bound: one render keeps
+every defining context it creates until it returns (a loop defining a macro
+10^5 times holds 10^5 contexts until then; the old engine held them forever).
+The keeper is a thread-local static that no context or value refers to, so it
+closes no cycle. A macro called after
 that render, with no other owner of its context (reachable only through the
 C++ API), throws `Macro <name> called after the render that defined it ended`.
 Within a render the scopes resolve as before; the production templates render
