@@ -461,6 +461,7 @@ typedef void (*kernel_fn)(char *, uint64_t, uint64_t, uint64_t, char *, uint64_t
 struct launch {
     kernel_fn fn;
     char *    base;        // the one buffer every source tensor lives in
+    char *    nwbuf = nullptr;   // red only: the norm weight argument's base, instead of base (a defined sentinel)
     uint64_t  offb, offc, offq, offn;
     char *    out;         // the replay's own dst, at offset 0
     ggml_depth_mix_plan plan;
@@ -479,7 +480,7 @@ void run_groups(const launch & L, const std::vector<int> & tokens) {
                 host_cl::g_group = t;
                 host_cl::g_lane  = lane;
                 L.fn(L.base, L.offb, L.plan.nb1, L.plan.nb2, L.base, L.offc, L.plan.nbc1, L.base, L.offq, L.plan.nbq1,
-                     L.base, L.offn, L.plan.nbn1, L.plan.has_nw, L.out, 0, L.plan.nbd1, L.plan.nbd2,
+                     L.nwbuf ? L.nwbuf : L.base, L.offn, L.plan.nbn1, L.plan.has_nw, L.out, 0, L.plan.nbd1, L.plan.nbd2,
                      L.plan.ne0, L.plan.k, L.plan.nq, L.eps_states, L.eps_out, L.scale, L.red);
                 pthread_barrier_wait(&host_cl::g_bar);   // the group ends for every lane before the next starts
             }
@@ -618,10 +619,18 @@ void check_plan_and_replay(const call_shape & c, bool replay, bool kernel = true
         if (r.nw) {
             // red: the same text with the weight's offset dropped must not match
             std::fill(out.begin(), out.end(), 0.0f);
+            // With the offset dropped the kernel reads the norm weight from the argument's byte 0.
+            // In the real buffer that is the first ggml object header (pointers: ASLR- and
+            // heap-dependent, finite garbage or NaN), so the red reads a sentinel of the weight's
+            // size, filled with a constant outside the weight's 0.5..1.5: defined, finite, wrong.
+            std::vector<float> sentinel(ggml_nbytes(r.nw)/sizeof(float) + 256, 7.0f);
+            L.nwbuf = (char *) sentinel.data();
             L.fn = k_red_nw::kernel_depth_mix_f32;
             run_groups(L, tokens);
+            L.nwbuf = nullptr;
             const double er = nmse_tokens(out.data(), dst, tokens);
-            if (!(er > 1e-2)) {
+            // NaN or inf is a red that differs, never a match
+            if (!(std::isnan(er) || std::isinf(er) || er > 1e-2)) {
                 printf("FAIL: the red kernel (norm weight offset dropped) still matches, %s: nmse %.3g\n", what, er);
                 ++g_failures;
             }
