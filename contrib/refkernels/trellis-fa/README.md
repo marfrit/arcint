@@ -2702,7 +2702,8 @@ The rows:
    - EXPECT with the knob unset: the 6 split cases pass at `split=1`.
    - EXPECT `_SPLIT_FORCE=2` and `=3`: all 22 port cases pass at `split=2` / `3`.
    - EXPECT `GGML_OPENCL_FA_PORT_WAVE=8` with the split on: the 6 split cases FAIL with "SPLIT CASE DID
-     NOT SPLIT" (the check's own red).
+     NOT SPLIT" (the check's own red). Since 0226b the 6 needle cases (`needle=1`) are split cases too and FAIL as
+     well, with "NEEDLE OFF THE SEAM" (the launch did not split); filtering `split_case=1$` keeps the 6 of 0223.
    - EXPECT `RED=10`, `11`, `12` and `13`, each with the split on: the 6 split cases FAIL, at NMSE about
      0.1-1, 0.05-0.3, 1e-2 .. 5e-2 and 1.76e-4 .. 3e-2 (the seam red at 1.76x the f16 bound of 1e-4 or more since
      0223c, 17x or more of the q8_0 bound; the red of record is the split-vs-unsplit comparison, 17x or more of 1e-5).

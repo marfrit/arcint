@@ -199,12 +199,14 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   the f16 ones (bound 1e-4): every cell clears it, the smallest at 1.76x (f16) and 17.3x (q8_0) (`inference`, a
   numpy-checked CPU model). The case comment's figures read 3.55e-4 and 1.76x (`contrib/llama.cpp/README.md`, 0223c).
 - llama.cpp patch 0226b (tests and two red builds): needle-at-seam cases for the FA port's key split, f16, q8_0 and the
-  served 8:4 (q8_0 K / q4_0 V). A key lost or doubled at a seam was invisible to every check (1.7e-7 against a 1e-5
-  compare); with a dominant key either side of every seam it moves the answer by NMSE 1.0 / 0.11 on the CPU model,
-  100x and more over the bound. Reds 21 (the first key of every split >= 1 lost) and 22 (the key before every seam
-  walked twice); a split launch at a wave other than the modelled 200 / 320 now fails its case. Checked without a card
-  (the CPU model red / green, ocloc on both cards' targets: every program's ISA unchanged); the card rows are owed
-  (`contrib/llama.cpp/README.md`, 0223).
+  served 8:4 (q8_0 K / q4_0 V). A key lost or doubled at a seam, or a clipped tail, was invisible to every check
+  (1.7e-7 against a 1e-5 compare); with a dominant key either side of every seam and in the call's tail it moves the
+  answer 100x and more over the bound on the CPU model. The needles are held to the launch's own seams (its
+  split_blocks and n_kv, exported with the split stats): a needle off them fails the case ("NEEDLE OFF THE SEAM").
+  Reds 21 (the first key of every split >= 1 lost), 22 (the key before every seam walked twice) and 23 (the last
+  split one block short); a split launch at a wave other than the modelled 200 / 320 fails its case. Checked without
+  a card (the CPU model red / green, ocloc on both cards' targets: every program's ISA unchanged); the card rows are
+  owed (`contrib/llama.cpp/README.md`, 0223).
 - llama.cpp patch 0221 (opt-in, `GGML_OPENCL_LOOP_CONTROL=1|bf16`, default off): Inkling 2 Mini's loop controller as
   one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
   its 12-launch chain, for prompt batches. Unset, the graph is today's line for line. Card rows (`measured-here`, B60
