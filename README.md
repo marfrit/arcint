@@ -755,6 +755,9 @@ service's production flags, Flash-Next's expert cache included
 - **A build against a llama.cpp tree without patch 0209 keeps no context checkpoints for a sliding-window cache at
   q8_0 / q4_0 K/V on OpenCL** (1.8.1's refusal; a release applies the whole series and is not affected): a follow-up
   that changes earlier text re-reads its prompt there. The load log and `/props` `checkpoints` say so.
+- The q8_0 / q4_0 split conversion has no weights-only rule yet (open since 1.8.1): a whole-tensor write into a
+  non-weights q8_0 / q4_0 tensor converts it to the split layout, after which a checkpoint restore into it is dropped
+  with a WARN. No served path makes such a write (code reading).
 - **Inkling 2 Mini needs every layer on the card.** A partial offload (`-ngl` below the layer count) faulted in a
   test at `-ngl 12`: the depth-mix state store is written from every layer, and a CPU layer's copy into the card's
   buffer fails (measured on the development tree; by code also in 1.8.0). arcint's units load every layer.

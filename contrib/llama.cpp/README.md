@@ -11104,12 +11104,12 @@ the probe's red arms once each, the three q8_0 / q4_0 arms three times on green,
 runs). About 30 minutes by the same estimate.
 
 **The 1.8.3 checkpoint gate** (`measured-here`, 2026-11-25, B60; every criterion met, the checkpoint refusal lifted):
-- the exact arms at `GGML_OPENCL_FA_DPAS2_SPLIT=1`: without 0209 E1 / E2 read back 65,107,885 / 79,139,135 differing
+- the exact arms (q8_0 K / q4_0 V) at `GGML_OPENCL_FA_DPAS2_SPLIT=1`: without 0209 E1 / E2 read back 65,107,885 / 79,139,135 differing
   bytes and 129 / 129 differing logit rows; with 0209 0 bytes and 1 of 129 rows (the decode row, max |d| 0.0043); the
   matched raw K/V read 0 differing bytes;
 - at the default split the restored logits differ by rounding: the restored window sits in other cells (positions
   128..1151 in cells 0..1023), so the dpas2 key split's boundaries move (at one split only the decode row differs);
-- served at about 40k tokens at the Inkling unit's settings: the read-back equal (92,977,268 bytes); KL against a full
+- served at about 40k tokens at the Inkling unit's settings of the day (q8_0:q8_0 K/V): the read-back equal (92,977,268 bytes); KL against a full
   re-read 0.0010-0.0033 nats against a bar of 0.0317 (two arms in other splits + 0.03), 33 / 33 rows, argmax 100 %,
   the answers right, restored at the expected positions including a late edit at 38,790; the restore 23-29 ms
   against a 45.5 s re-read, the checkpoint 88.7 MiB in host RAM;
@@ -11209,9 +11209,11 @@ result below):
    bar (0.03 nats mean KL, 1 point argmax), after asserting that the forced arm printed the DOWNGRADE line and the
    unforced one the TAKEN line.
 
-**Card result, item 3** (`measured-here`, 2026-11-25, B60, `llama-perplexity` over 1,024 scored rows at batch 8): the
-forced fallback equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against
+**Card result, item 3** (`measured-here`, 2026-11-25, B60, f16 K/V, `llama-perplexity` over 1,024 scored rows at batch
+8): the forced fallback equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against
 the unforced kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route.
+"Same top" here is one arm against the other, not against a reference; the paired run against the CPU at the 8:4
+target is not on record.
 
 ## 0208b-test-backend-ops-p5-routing-replay.patch
 
@@ -11641,7 +11643,8 @@ slot logic's coverage is rows 5 and 6. 0201 (the attention bundle) is not part o
 **Status: card-proven on the B60, opt-in.** The card rows below were written, each with its expected result,
 before any of them ran.
 
-**Card result** (`measured-here`, 2026-11-26, B60 at 165 W, the Inkling unit's settings). Row 0: 13 cases
+**Card result** (`measured-here`, 2026-11-26, B60 at 165 W, the Inkling unit's settings of the day: q8_0:q8_0 K/V; the
+KL at the 8:4 target, q8_0:q4_0, is owed). Row 0: 13 cases
 SUPPORTED in f32 and bf16; the one case at `GGML_OPENCL_BOUNDS=1` OK (f32 NMSE 1.55e-13, bf16 5.96e-6). Row 1, the
 served 4,096-token fixture, a fresh process an arm, interleaved: off 1,120.9-1,121.6, f32 1,170.0-1,170.6 t/s
 (+4.4 %, the slowest on-run above the fastest off-run, in two runs), bf16 1,165.9-1,166.0 (not ahead of f32, so f32
@@ -11973,8 +11976,20 @@ it still requests that step's kernel-fault check, prints the rows not reached an
 
 ## 0226-loop-control-small-rows.patch
 
-**Status: built and checked without a card; not run on a card.** Opt-in through 0221's switch. The card rows are
-written below, each with its expected result, before any of them ran.
+**Status: card-proven on the B60 at q8_0:q8_0 K/V, opt-in** through 0221's switch. The card rows below were written,
+each with its expected result, before any of them ran.
+
+**Card result** (`measured-here`, 2026-11-26, the B60 at 165 W, q8_0:q8_0 K/V, the 1.8.2 Inkling unit's switches with
+`GGML_OPENCL_LOOP_CONTROL=f32`; every gated check held). The device cases 41 / 41 (worst NMSE 2.11e-13; 1 to 8 rows
+1.74e-13) and the one-work-group arm 27 / 27; RED=1 to 4 each fail all 27 cases of 1 to 8 rows (least NMSE 0.0997);
+RED=6 and RED=7 fail the 23 cases of 2 to 8 rows and pass the four one-row cases, as they must (a one-row tile has
+no row step and no tail). A control: the pair 6.13 / 6.84 / 9.98 / 15.03 / 16.62 us at 1 / 2 / 4 / 6 / 8 rows,
+one work-group 49.2-85.3 us. KL against the CPU, paired on the same base: one-row decode (6 chunks x 2,048 tokens)
+0.002581 / 98.289 % without 0226 and 0.002560 / 98.208 % with it (-0.000021 nats, -0.081 pt), at 2k identical, at
+32k equal; on against off directly at one row 0.000630 nats, same top 99.120 %. Plain decode, 3 rotated rounds:
+depth 0 39.242 -> 42.910 t/s (+9.35 %), 32k 29.450 -> 31.391 (+6.59 %), `f32-t2` at the old figure. The served
+process at the unit's command: the capital right, the `k=64 cols=1-4` key gone. The KL at the 8:4 target
+(q8_0:q4_0) is owed.
 
 **What it adds.** `GGML_OP_LOOP_CONTROL` (0221) for **1 to 8 rows**: a decode step (one row), a draft's verify rows
 (a 5-token draft verifies in 6), a prompt's last ubatch of 2 to 8 rows. That is the range the reference fuses (the

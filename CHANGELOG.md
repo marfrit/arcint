@@ -128,19 +128,24 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   build names it in `/props` `build.red_case` (empty otherwise) and the packaging refuses it. The configure re-runs
   when the tree's `ggml-opencl.cpp` changes, so an existing build directory cannot keep the lift after 0209 left.
   Evidence: the decision's unit cases, red on the 1.8.1 rule, and a check that the build finds 0209 when the series
-  has it (`code`); 0209's op test and the probe's exact arms, and the card gate at the Inkling unit's settings (B60,
-  `measured-here`: served at about 40k tokens, KL against a full re-read 0.0010-0.0033 nats against a bar of 0.0317,
-  the answers right, the restore 23-29 ms against a 45.5 s re-read; contrib/llama.cpp/README.md, 0209's section).
-  0209 also fixes the f16 / f32 and bf16 writes, for every model with no switch set: a write through a view at a
-  non-zero offset landed at the start of its base. That is a checkpoint restore into a KV stream other than the
-  first, i.e. a start with `--parallel 2` or more (unnamed lanes, a stream each) at f16 / f32 / bf16 K/V on OpenCL,
-  for a model that restores checkpoints (hybrid and sliding-window models): lane 2's restored rows overwrote lane
-  1's (1.8.1's known limit). One lane (the default) and named lanes (one shared pool) were not affected. And a write
-  into a view of a q8_0 / q4_0 tensor already split into scales and quants (a weight, or a tensor set whole) is
-  still dropped, as before, and now logs one WARN a process and type naming the tensor and its base; no served path
-  is known to do that. Evidence: 0209's op test on the B60 (`measured-here`, 2026-11-25), whose cases write views
-  at non-zero offsets for q8_0, q4_0, f16 and bf16 and check the warning: 64 of 64 pass with 0209, 34 of 64 fail
-  without it. No served run with more than one lane was made.
+  has it (`code`). On the B60 (`measured-here`, 2026-11-25): 0209's op test, 34 of 64 cases failing without 0209 and
+  64 of 64 passing with it, over q8_0, q4_0, f16 and bf16 views; the probe's exact arms with the state read back, at
+  q8_0 K / q4_0 V: without 0209 65.1 M / 79.1 M differing bytes and 129 of 129 differing logit rows, with it 0 bytes
+  and 1 of 129 rows (the decode row); and a served arcint at the Inkling unit's settings of the day (q8_0:q8_0) at
+  about 40k tokens: the read-back equal, KL against a full re-read 0.0010-0.0033 nats against a bar of 0.0317, the
+  answers right, the restore 23-29 ms against a 45.5 s re-read. The probe's answer-level arm did not separate the
+  trees and is not evidence (contrib/llama.cpp/README.md, 0209's section).
+  0209 also fixes what 1.8.1's known limits promised for 1.8.3: an f16 restore into a KV stream other than the first
+  landed in the first stream's rows (the generic write omitted the view offset the read adds; the same for a q8_0 /
+  q4_0 view there). In arcint that is a start with `--parallel` 2 or more (unnamed lanes, a stream each) of a
+  sliding-window model (Inkling 2 Mini, Dory with `--llama-swa-window`): one lane and named lanes keep one stream,
+  and a model without a sliding window restores no attention cells. The evidence for this part is 0209's op test
+  only (its cases write views at non-zero offsets); no served run with more than one lane was made. A write into a
+  view of a q8_0 / q4_0 tensor already split into scales and quants (a weight, or a tensor set whole) is still
+  dropped, as before, and now logs one WARN a process and type naming the tensor and its base.
+  **Not delivered, still open:** the weights-only rule for the split conversion that the same 1.8.1 note promised.
+  `set_tensor` still converts a non-weights q8_0 / q4_0 tensor to the split layout on a whole-tensor write, after
+  which every restore into it would be dropped with that WARN. No served path makes such a write today (`code`).
 - **The depth mix's TAKEN line shows in a served unit's log** (patch 0211). `depth_mix: TAKEN opencl f32
   token-a-group` was printed at ggml's INFO level, which arcint logs only under `-v`, so a unit with
   `GGML_OPENCL_DEPTH_MIX=1` showed the FA port's TAKEN line and not the mix's. It is now at the port's level (WARN),
@@ -165,7 +170,9 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   the route function's unit cell, its red twin (the old rule) and a gate over the patched tree (`code`, the recipe's
   suite); on the card (`measured-here`, B60, `llama-perplexity` 1,024 scored rows at batch 8) the forced fallback
   equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against the unforced
-  kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route.
+  kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route. Both rows are at
+  f16 K/V, and "same top" is one arm against the other, not against a reference. The card's test-backend-ops runs of
+  the fallback (the patch README's items 1 and 2: the unforced and the forced suite) are owed.
   With no switch set, on Xe2: where the GQA decode variant is taken, the log now shows `TAKEN src=opencl
   op=FLASH_ATTN indexed-bias form=gqa` once a process (WARN), and the fit check above applies on that default path:
   a variant that does not fit is no longer launched. Evidence for the line and the fit check: the device-free route
@@ -217,12 +224,13 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   to the previous series' at 1 to 1,024 rows). Removes the keys `op=MUL_MAT type=f32 k=64 cols=1-4` (2 to 4-row
   batches) and `cols=5-15` at 5 to 8 rows. 25 more test cases, red builds 6 and 7. Built and checked without a card (the pair replayed on host
   threads against the CPU op and the chain, ocloc on both cards' targets, the device-free emission and model
-  checks). On the card (B60, 8:4 K/V and the 1.8.3 switches, `measured-here`): the device cases 41 / 41 (worst NMSE
+  checks). On the card (B60, q8_0:q8_0 K/V, the 1.8.2 Inkling unit's switches with `=f32`, `measured-here`): the device cases 41 / 41 (worst NMSE
   2.1e-13), the red builds caught; a control 6.1 us at one row against the chain's 25.8 us in the served profile;
   KL paired on the same chunks at one-row decode -0.00002 nats and -0.08 pt top-1 against the series without 0226,
   2k and 32k identical, the direct on-vs-off KL 0.00063; plain decode in 3 rotated rounds +9.3 % at depth 0 (39.24 ->
   42.90 t/s) and +6.6 % at 32k (29.45 -> 31.39), every round of the new arm above every round of the old; 6 rows a
-  step +13.2 %; served decode +8.9 % (37.70 -> 41.04 t/s); the k=64 cols=1-4 key gone. The reference's int8 weights
+  step +13.2 %; served decode +8.9 % (37.70 -> 41.04 t/s); the k=64 cols=1-4 key gone. The paired KL at the 8:4
+  target (q8_0:q4_0) is owed. The reference's int8 weights
   are not taken (`docs/decisions/2026-11-26-no-int8-requantised-q6k-q5k.md`'s scope) (`contrib/llama.cpp/README.md`,
   0226).
 - llama.cpp patches 0225 / 0225b (with `GGML_OPENCL_FA_PORT=1`): the FA port reads a q8_0 K with a q4_0 V in place, the
@@ -244,11 +252,12 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
   its 12-launch chain, for prompt batches (that was `=1`'s range in 0221 alone; with 0226, `1` and `f32` fuse from one
   row and `f32-prompt` keeps this range). Unset, the graph is today's line for line. Card rows (`measured-here`, B60
-  at 165 W, the Inkling unit's settings): the served 4,096-token pass 1,121 -> 1,170 t/s (+4.4 %, the slowest on-run
+  at 165 W, the Inkling unit's settings of the day, q8_0:q8_0 K/V): the served 4,096-token pass 1,121 -> 1,170 t/s (+4.4 %, the slowest on-run
   above the fastest off-run); one 4,096-token chunk 888.6 -> 850.6 ms with 1,152 fewer launches; the op cases 16 of
   16 in f32 and bf16, five reds 0 of 16; mean KL against the CPU base 0.004683 nats (f32) against 0.004705 (off), same
   top 98.03 % both; the capital, the 44k needle and the acceptance task right with it on. f32 is the arm (bf16 is not
-  faster). The knob stays off by default until the operator changes it (`contrib/llama.cpp/README.md`, 0221).
+  faster); the KL at the 8:4 target (q8_0:q4_0) is owed. The knob stays off by default until the operator changes it
+  (`contrib/llama.cpp/README.md`, 0221).
   Served reach: the card window ran its served processes with arcint's `-v` and saw the TAKEN line (1,536 calls a
   4,096-token pass); the stacked series' first check ran a unit without `-v`, and the line was INFO, which arcint
   keeps for its verbose level, so it could not show. Since 0224 it is WARN (below). On the stacked series with every
