@@ -11272,7 +11272,9 @@ share one 64-pair route, and the Q8_0 layers cut their own.
 **Proof of reach.** The 64-pair kernels carry the 32-pair kernels' names (one source, two programs), so a profile
 cannot tell them apart. Each arm prints one `TAKEN src=opencl op=MUL_MAT_ID type=<iq4_nl|q8_0> path=xt64 tile=64
 skip=1` line a process at its first 64-pair launch. Every card row asserts that line per type, together with the
-absence of `path=xt32` for the Inkling shapes.
+absence of `path=xt32` for the Inkling shapes. The IQ4_NL arm prints its line where the int8 route is chosen (inside
+`if (i8)`), before the kernel is picked: on a card with an 8-wide sub-group and the ids8 arm also on, it would print
+while the ids8 kernel runs. On the cards these rows name (B60, B70: 16-wide) that cannot happen (`code`).
 
 **For the day the default flips (note).** With the knob on, every launch the 64-pair tile does not take is a counted
 DOWNGRADE, by design: not-wide for the narrow-tile formats, shape under 16 tokens, expert-cache. A "0 new downgrades"
@@ -11353,9 +11355,10 @@ energy, so NMSE ≈ the dropped fraction against the 5e-4 line.
 - The default program's ISA is identical to the pre-0222 text's on bmg-g21 and on bmg-g31: IQ4_NL 4,113 instruction
   lines (listing md5 137a6c30), Q8_0 3,681 (206bc764), the same on both devices.
 
-**Applies against development only (note).** This branch is development f81d6175, without rel-183's 0209 / 0211 /
-0212, which also touch `ggml-opencl.cpp`. 0222's hunks depend on their context, so the apply, the write-tree and the
-recipe are owed again on the merged series. 0208b sorts after 0208 under LC_ALL=C. The four new eval cases change the
+**The series it applies to (note).** 0222 was written on development, before 0209 / 0211 / 0212, which also touch
+`ggml-opencl.cpp`. Its context was refreshed onto the 1.8.3 series (the added and removed lines unchanged); the 1.8.3
+series applies whole (173 patches, LC_ALL=C) and passes the recipe. The card result below ran on the development
+tree (pin + 160 patches). 0208b sorts after 0208 under LC_ALL=C. The four new eval cases change the
 op suite's case total.
 
 **Card rows (written before any run; B60 at 165 W; the unit's settings unless named: 262,144 cells,
@@ -11395,6 +11398,24 @@ op suite's case total.
 4. **The answers.** The capital, the 45k needle and the task battery at the unit's settings, knob on. EXPECT: the same
    greedy text as knob off (identical logits), the needle found, the battery's verdicts unchanged. The on server's
    log carries both TAKEN lines.
+
+**Card result** (`measured-here`, 2026-11-25 23:50 to 2026-11-26 00:30, the B60 at 165 W): rows 1-4 as written, in one
+gated run, on the tree of 0222 with the review's follow-up (both TAKEN lines, RED-C, the KL floor arm; pin + 160
+patches, write-tree `2ff556a460149927033caade18f5fc7c502f2fbe`, the reds `0e01ed9e` / `1cf2e667` / `63bb3992`). Every
+gated check held; the kernel log stayed clean after each step.
+1. A/B, 3 rounds: 40,960 tokens 920.71 / 920.99 / 921.01 off against 1,002.07 / 1,002.17 / 1,002.24 t/s on (+8.81 %),
+   4,096 tokens 1,176.42 / 1,176.90 / 1,176.61 against 1,312.99 / 1,313.38 / 1,312.85 (+11.59 %): the slowest on-run
+   above the fastest off-run at both. Both TAKEN lines in every on-run's log, none in an off-run's, no `path=xt32`.
+2. Ops: the routed eval cases OK on and off; perf a call -15.6 to -26.2 %. u1024a down 3,156.4 -> 2,569.6 us and gate/up
+   6,123.1 -> 4,794.4 inside their expected ranges; routed=1 n512 down 1,910.9 -> 1,612.5 and gate/up 3,783.1 ->
+   3,050.6 gained less than expected (ranges 1,440-1,540 and 2,760-2,985: outside, recorded, not gated). RED-A, RED-B
+   and RED-C each fail their routed cases (red proven).
+3. KL (`-c 2048 --chunks 6`): on against off 0.000000 / 100 %, off against off 0.000000 / 100 % (identity, floor 0);
+   off and on against the CPU base both 0.002289 / 98.273 %.
+4. Answers: the battery (capital, arithmetic, JSON, binary search; its arm runs without the FA port) right with the
+   text identical on and off; the 45k needle right on both.
+On the 1.8.3 series the rows were not re-run one by one: there a served unit with every 1.8.3 knob prints both
+`xt64` TAKEN lines (0224's section), and the configuration's rows are the CHANGELOG's.
 
 ## 0220-opencl-q8_0-2d-gemm.patch
 
