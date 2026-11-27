@@ -1244,7 +1244,7 @@ index c7077b4..488323c 100644
 +    plan->rank = (int) down->ne[1];
 +    plan->lsz  = GGML_LOOP_CONTROL_NSG*GGML_LOOP_CONTROL_SG;
 +
-+    // one work-group a core and one wave where the rows allow it (P26's lesson): a work-group
++    // one work-group a core and one wave where the rows allow it (fill the waves): a work-group
 +    // owns ceil(nt / cores) rows rounded up to 8, at most ROWS_MAX (its g store in local memory)
 +    const int cores = n_cores > 0 ? n_cores : 1;
 +    int rows = (plan->nt + cores - 1)/cores;

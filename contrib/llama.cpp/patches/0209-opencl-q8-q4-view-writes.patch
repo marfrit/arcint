@@ -40,7 +40,7 @@ index 7b04b86..f16401c 100644
 +    // 0123zzzzz2: a partial write of a q8_0 / q4_0 tensor that is not a weight and never split takes a
 +    // plain copy. The KV stream moves single pages into its pool and ring slots, which the attention reads
 +    // as blocks; the SoA split below converts a whole tensor (it writes ggml_nbytes from `data` at `offset`,
-+    // so a page move ran past the slot: a B60 page fault, window 255).
++    // so a page move ran past the slot: a B60 page fault in a served run).
 +    // 0209: a VIEW of such a tensor too, at its view_offs. llama_kv_cache::state_read_data writes the K / V
 +    // stream views (ggml_view_2d of k / v); the Q8_0 / Q4_0 branches below return for a view before any
 +    // write, so a checkpoint resume at q8_0 / q4_0 K/V restored the cells' metadata and none of their bytes.

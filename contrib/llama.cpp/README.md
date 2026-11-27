@@ -11197,7 +11197,8 @@ on the created kernel and releases a refused one, the switch reaches the GQA bui
 fails 5 of 7 cells on the series without this patch. The fit rule's card side cannot be forced on the CPU: the cap
 and local memory are the driver's answers for the compiled kernel, so the cell feeds the rule those values.
 
-**Card check** (owed, the B60 or the B70, this tree's tools):
+**Card check** (the B60 or the B70, this tree's tools; items 1 and 2 are owed, not run on a card; item 3 ran, its
+result below):
 1. green: `GGML_OPENCL_FA_DEBUG=1 test-backend-ops test -b <the OpenCL device> -o FLASH_ATTN_EXT`: the summary line
    present, `TAKEN src=opencl op=FLASH_ATTN indexed-bias form=gqa` once, `form=gqa` on the rows=4 / 8 bias calls,
    no `gqa-variant-unbuilt`;
@@ -11235,7 +11236,7 @@ B60 at 165 W, the 2026-11-25 profile):
   - down: a 10.50 us a tile, s 0.563 us a real 8-pair group, c = a − 4s = 8.25 us;
   - gate/up: a 20.11 us, s 0.550 us, c = 17.91 us.
 - The replays sat at routed=1's level (−1.9 % mean), not at the served figure. The wide tile kernel's own time was
-  +11.4 / +13.8 % above another session's served figure. Same-window anchor, ub 1024 chunk: down 2,930 us,
+  +11.4 / +13.8 % above another run's served figure. Same-window anchor, ub 1024 chunk: down 2,930 us,
   gate/up 5,623 us a launch, against the u1024 replays at 3,081-3,147 / 6,079-6,242.
 
 ## 0222-opencl-q8_iq4-mul_mat_id-wide-64-pair-tile.patch
@@ -11283,7 +11284,7 @@ the 2026-11-25 profile and approved by the operator on those rows (2026-11-25).
 
 **The in-tile skip is part of it.** 0222 builds the group skip (`I8W_SKIP=1`) inside the 64-pair tile. That is
 option 1's mechanism, and on its own it stays within the reference's geometry. A 64-pair tile without it would run
-eight DPAS groups for every tile, more than the 32-pair tile runs today. C1b's priced saving (124.4 tiles fewer and
+eight DPAS groups for every tile, more than the 32-pair tile runs today. The routing replay's priced saving (124.4 tiles fewer and
 191.7 groups skipped a launch) needs both. Read every A/B of this knob as **option 2 including the in-tile skip**; the
 skip is not measured apart.
 
@@ -11365,7 +11366,7 @@ op suite's case total.
      CPU) recorded beside each run.
    - The cell: llama-batched-bench of the 0222 tree (plain build), `-c 262144 -b 1024 -ub 1024 -npp 40960,4096 -ntg 0
      -npl 1 -fa on -ctk q8_0 -ctv q8_0 -ngl 99`.
-   - EXPECT: C1b's option-2 range, 221-492 ms saved a 4,096-token pass (inference, d not measured). At the 40,960-token
+   - EXPECT: the routing replay's option-2 range, 221-492 ms saved a 4,096-token pass (inference, d not measured). At the 40,960-token
      depth, from ~915 t/s (the anchor, measured with the profiling build) to ~960-1,030 t/s (+5 to +12 %). At pp4096,
      +5 to +12 % as well. The Q8_0 layers add 4-15 ms (not counted in the range).
    - The gain counts only if the slowest on-run beats the fastest off-run.
@@ -11386,7 +11387,7 @@ op suite's case total.
 3. **The KL arm at the unit's settings.** `llama-perplexity -c 2048 --chunks 6`. The arms: on against off, a second off
    against the first off (the floor), and each against the CPU base. EXPECT: on vs off KLD 0.000000, same top p 100 %
    (inference: per-pair arithmetic unchanged, but the two programs are separate compiles). Off vs off is 0.000000 too
-   (record: this path repeated bit-equal on the B60 in window B).
+   (record: this path repeated bit-equal on the B60 in an earlier card run).
    - Reading: 0 / 0 is identity. A non-zero on vs off with a zero floor is a finding (a compiler contraction or a bug),
      judged by the answer-level bar (+0.03 nats, −1 point against the off arm's KL to the CPU base). Non-zero in both is
      the card's floor.
@@ -11548,7 +11549,7 @@ unit test asserts mode 0 refuses every export line as `off`.
   CPU against itself proves nothing more). With them the filter holds 295 cases (292 distinct parameter
   sets), 67 of which reach the gate and are taken (the card rows' paragraph below says which, and why).
 
-**Card rows (owed).** The B60, by PCI id; the build from the applied series on the pin (development
+**Card rows** (the plan; run 2026-11-26, the card result at the top of this section). The B60, by PCI id; the build from the applied series on the pin (development
 `f81d6175` + 0220: write-tree `a6ed9f554cfeb8ad1daa0f43ae1a690947e36f12`); `-b GPUOpenCL`, every suite
 run's summary line and per-class counts asserted, not an OK count; the B60's board power cap named with
 every number. `UENV` is the Inkling unit's prompt switches (`GGML_OPENCL_KQ_MM_ID_I8=1
@@ -11604,11 +11605,11 @@ About 105 minutes, the reds' 16 first, then the fixture answers on the dev unit 
 the answer-level bar, arm 1 becomes the candidate and rows 4, 6 and 7 are re-run with it (+25 min). A B70
 row only if a B70 unit gets the knob (Inkling does not run there): the offline check covers `bmg-g31`.
 
-**Integration.** 0220 is diffed against development's series. 0209-0213 and 0219 on the other 1.8.3
-branches touch `ggml-opencl.cpp`: when they meet, the series needs an apply check and the knob-off ISA
-comparison of the K-quant program once more.
+**Integration.** 0220 is diffed against development's series. 0209, 0211 and 0212, from the other 1.8.3
+branches, touch `ggml-opencl.cpp` too; in the 1.8.3 series the whole series applies (173 patches, LC_ALL=C).
+The knob-off ISA comparison of the K-quant program on the combined series is not recorded.
 
-**Open.** No card number exists for any of this. The fp16 arm's tile-identity (arm 1 = arm 0) is expected
+**Open.** The card numbers are the card result at the top of this section (B60, 2026-11-26). The fp16 arm's tile-identity (arm 1 = arm 0) is expected
 from the rounding, not proven: DPAS's internal summation order is the hardware's. The vISA decode is
 checked only on fills whose half products never round to subnormals; before it is proposed for a unit it
 needs a small-magnitude fill case and its own KL row. No op case hits a slot (one product a graph): the
@@ -11634,8 +11635,8 @@ with the knob on (the off arm's single sampled run reached the 4,000-token cap i
 
 The served rows' reach was read from the TAKEN line at arcint's `-v`: the line was GGML_LOG_INFO, which arcint's
 `route_llama_log` keeps for its verbose level, so a unit started without `-v` could not show it (the stacked series'
-first served check). It is WARN, once a process, since 0224; the stacked tree's served reach is owed to the combined
-relaunch.
+first served check). It is WARN, once a process, since 0224. On the stacked series with every 1.8.3 knob on (`measured-here`, B60), a
+served unit without `-v` prints 0221's `loop_control: TAKEN` line next to 0220's and 0222's.
 
 **What it replaces.** Inkling 2 Mini's loop controller (`src/models/inkling2.cpp` `control()`, the loop model's
 message merge) is, per control and a row at a time, `g = down . concat(rms_norm(cur), rms_norm(msg))` [4608 -> 64],
@@ -11778,7 +11779,7 @@ without the depth mix, 6 lines):
 
 The replay encodes the documented DPAS layout; whether the card's matches it is op row 3's bf16 cases.
 
-*The knob-off identity, proofs 1 and 2 of the brief* (`measured-here`, `test-export-graph-ops`, CPU, Inkling 2 Mini
+*The knob-off identity, proofs 1 and 2* (`measured-here`, `test-export-graph-ops`, CPU, Inkling 2 Mini
 IQ4_NL, c 4096, fa on):
 - knob unset, this tree against the base tree (development f81d6175 + its series, applied tree 1d3e13b9), ub 512 /
   1024 / 2048: **byte-identical** files (md5 3c249072 / 594e05dc / db4535e6), 9,875 pp nodes each;
@@ -11798,7 +11799,7 @@ IQ4_NL, c 4096, fa on):
 | `=all-layers` (the op on every layer, the CPU reference) | 0.000757 ± 0.000079 | 0.0341 | 99.081 ± 0.346 % | 8.2982 |
 
 The `=1` run's statistics equal the knob-off-again run's **line for line** (34 lines, `cmp`; guard_check.sh's form,
-proof 2 of the brief), with the layer-backend DOWNGRADE line. The all-layers arm moves the logits by 0.00076 nats and
+proof 2), with the layer-backend DOWNGRADE line. The all-layers arm moves the logits by 0.00076 nats and
 0.79 points of top p: inside the answer-level bar, and below what one ulp at the depth mix's sites cost on this host's
 CPU (0.0015-0.0027 nats, 0204-0207's noise control; the op agrees with the chain at nmse 3e-13 a call, the
 quantized expert products amplify it). The card's comparative reading is row 4.
@@ -11868,7 +11869,7 @@ instrument `llama-batched-bench -c 262144 -npp 4096 -ntg 0 -ub 1024 -b 1024` of 
 - Expected: off 1,067.5 t/s (the unit's measurement, 3,837 ms a pass); F f32 **~1,136-1,143 t/s** (+6.4-7.0 %, 232-252
   ms a pass saved); F bf16 a further 0.2-1.0 %.
 - The gain counts only if **min(F f32) > max(off)** (no size threshold). Slower or overlapping: stop before the KL
-  arm and run row 2 instead (the fuse precedent: P10 / P11 predicted a gain and measured 5-6 % slower).
+  arm and run row 2 instead (the fuse precedent: two earlier fusions predicted a gain and measured 5-6 % slower).
 - bf16 becomes the default only if min(F bf16) > max(F f32) and row 4 puts it inside its bound.
 - Write-up line: `row 1: off a / b / c, F f32 d / e / f, F bf16 g / h / i t/s; gain rule met|not met; batched-bench
   off x, f32 y, bf16 z`.
@@ -11884,9 +11885,9 @@ unit's settings, `GGML_OPENCL_LOOP_CONTROL=1` and then `=bf16`, `GGML_OPENCL_LOO
   **bf16 / f32 launch-time ratio**: near 1 = memory-bound (the pipelining and the bytes are the lever, bf16 gains
   little); well under 1 (towards 0.5-0.6) = compute-bound (bf16 is the lever). **t > 0.2 ms = the pipelining or the
   cache reuse failed** -> the stall row next (needs the host owner to set `observation_paranoid` 0).
-- None of the chain's launches remain at the control nodes. Against the knob-off chunk's counts (p28-design §6):
+- None of the chain's launches remain at the control nodes. Against the knob-off chunk's counts (the launch profile of a 4,096-token chunk):
   `kernel_rms_norm` at the controls 168 -> 0, `kernel_concat_b4` 288 -> 192, `kernel_mul_mm_f32_f32_l4_lm` 384 -> 96
-  (P25's table and the router's), `kernel_sum_slices_f32` 96 -> 0 (the down product's),
+  (the relative-position bias table's and the router's), `kernel_sum_slices_f32` 96 -> 0 (the down product's),
   `kernel_tanh_f32_4` 193 -> 1, `kernel_mul` 272 -> 80, `kernel_sub` 96 -> 0, `kernel_add_row` 440 -> 344;
   `kernel_rms_norm_mul` stays 110.
 - Write-up line: `row 2: kernel_loop_control n launches, x ms total, y us a launch (f32) / z us (bf16), ratio r,
@@ -11931,7 +11932,7 @@ ms against the chain's ~0.77 ms a control.
 *Row 4 - the KL arm* (~16 min; `llama-perplexity -m $G -f <gate text> -c 4096 -b 1024 -ub 1024 --chunks 6 -fa on -ctk
 q8_0 -ctv q8_0 -ngl 99 -lv 4` with `$U`).
 - Arms: `<dev>` knob unset (the base logits on the card, `--kl-divergence-base`); `<dev>` again; **`<tree>` knob unset
-  (the brief's third knob-off proof: KL 0 and top p 100 % against `<dev>` if the card's run-to-run floor is 0, else
+  (the third knob-off proof: KL 0 and top p 100 % against `<dev>` if the card's run-to-run floor is 0, else
   inside the dev / dev arm's band: KL at most dev / dev's + 0.001 nats, top p at least dev / dev's - 0.5 points)**; `<tree>` F f32; `<tree>` F bf16; each with its TAKEN line (or, knob off,
   none) and the stats line's 96 a ubatch; then each against the CPU base of the published file.
 - Bounds: paired mean KL (F against off) <= **0.004 nats**; against the CPU base <= 0.03 nats worse than off and top
@@ -12273,8 +12274,8 @@ and guard and 0220's guard; two mutants of the green tree fail as well (0220 on 
 `n_wg`). Green with 0224 (applied tree `e26e82f8927847c0b016484dae24857888a77765` on the pin tarball, 166 patches); 0211's own test
 still passes.
 
-**0223** (the FA port's key split, on its own branch, not in this series yet): its new TAKEN lines (the port's two
+**0223** (the FA port's key split, in this series since 1.8.3): its new TAKEN lines (the port's two
 lines with the split's state, and `TAKEN src=opencl op=FLASH_ATTN port=fa_kern kv=<q8_0|f16> split=...` a K/V type)
 are WARN under `std::call_once`; its split-scratch growth line is WARN once a growth; its trace line is WARN a call,
-behind `GGML_OPENCL_FA_PORT_TRACE=1`. It needs nothing from 0224; when it lands, `test_taken_lines_183.py` can take its
-split line into its list.
+behind `GGML_OPENCL_FA_PORT_TRACE=1`. It needs nothing from 0224. `test_taken_lines_183.py` does not hold its split line
+yet, nor 0225's `kv=q8_0:q4_0` line (owed).

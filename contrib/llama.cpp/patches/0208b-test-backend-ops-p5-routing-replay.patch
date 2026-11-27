@@ -1,4 +1,4 @@
-0208b: P5 window C1b test cases on 0208: a balanced routing (routed=2) at 128 and 512 tokens and nine served launches replayed (routed=3, row B of the fixture 400a7dd1), down and gate/up each; one P5 ROUTE line a case with the tile statistics of its ids; two correctness cases. Test-only.
+0208b: test cases on 0208 for the routing replay's card check: a balanced routing (routed=2) at 128 and 512 tokens and nine served launches replayed (routed=3, row B of the fixture 400a7dd1), down and gate/up each; one P5 ROUTE line a case with the tile statistics of its ids; two correctness cases. Test-only.
 
 --- a/tests/test-backend-ops.cpp
 +++ b/tests/test-backend-ops.cpp
@@ -6,11 +6,11 @@
      void reinit_perf_iter(ggml_context * ctx) override { GGML_UNUSED(ctx); }
  };
  
-+// 0208b (P5, card window C1b): two more routings of the same expert projections, test-only.
++// 0208b (the routing replay's card check): two more routings of the same expert projections, test-only.
 +//   routed=2  balanced: token t's slot i takes expert (8t + i) mod 128, so every expert holds exactly 8n/128 pairs
 +//             (8 at 128 tokens: one 8-pair group in a 32-pair tile; 32 at 512: a full tile), 128 tiles both ways
 +//   routed=3  a served launch's per-expert pair counts, replayed: Inkling 2 Mini on the 4,096-token served fixture
-+//             (sha256 400a7dd1), the CPU routing of one MUL_MAT_ID launch (P5 row B, one run). The counts are laid
++//             (sha256 400a7dd1), the CPU routing of one MUL_MAT_ID launch (one served run). The counts are laid
 +//             out as a run-length list L (expert e repeated cnt[e] times, e ascending) and token t's slot i takes
 +//             L[i*n + t]: a token's eight experts are distinct while no count exceeds n (asserted). The counts, the
 +//             tiles and the experts touched are the served launch's; which token sits in which pair is not.
