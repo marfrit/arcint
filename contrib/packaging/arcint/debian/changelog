@@ -1,3 +1,23 @@
+arcint (1.8.3-1) trixie; urgency=medium
+
+  * FIX: context checkpoints at q8_0 / q4_0 K/V for a sliding-window cache
+    on OpenCL (Inkling 2 Mini, Dory with --llama-swa-window): patch 0209
+    writes the restored cells, so the 1.8.1 refusal is lifted where the
+    llama.cpp tree carries it (every release build).
+  * NEW: --tool-grammar for Inkling 2 Mini (after mainline's lazy grammar,
+    stricter: no raw control byte in a JSON string, args an object); the
+    Inkling parser's log line names the reject reason.
+  * NEW: a nameless tool result is given its call's name for Inkling's
+    template; /props checkpoints names the refusal only where it applies.
+  * FIX: the relative-bias flash attention falls back instead of aborting
+    when the GQA decode variant cannot be built (0212).
+  * NEW (opt-in, defaults unchanged): Xe2 switches for Inkling 2 Mini,
+    patches 0220-0226 (dense Q8_0 2D-block GEMM, the fused loop controller,
+    the 64-pair int8 expert tile, the FA port's key split, the FA port at
+    q8_0:q4_0); GGML_OPENCL_LOOP_CONTROL=f32 now fuses from one row.
+
+ -- Markus Fritsche <mfritsche@reauktion.de>  Fri, 27 Nov 2026 12:00:00 +0100
+
 arcint (1.8.2-1) trixie; urgency=medium
 
   * FIX: Inkling 2 Mini's tokenizer takes a whole-word vocabulary entry

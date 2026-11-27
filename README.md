@@ -406,7 +406,7 @@ medium; the capital of France comes back as Paris; tool calls work. The
 model's reasoning depth is set with `reasoning_effort`; its chat template
 ignores `enable_thinking`.
 
-### Tool calls under `--tool-grammar` (1.8.3, unreleased)
+### Tool calls under `--tool-grammar` (1.8.3)
 
 `--tool-grammar` (or the request field `tool_grammar`) constrains Inkling 2 Mini's call form; 1.8.0-1.8.2 refused it
 for this model. The grammar follows mainline llama.cpp's `common/parsers/inkling.cpp` (commit 690b87d8): it is lazy,

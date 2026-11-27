@@ -18,7 +18,24 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
-## Unreleased
+## 1.8.3 — 2026-11-27
+
+Inkling 2 Mini's release on 1.8.2: context checkpoints come back at q8_0 / q4_0 K/V on OpenCL (patch 0209 performs
+the restore's writes that 1.8.1 and 1.8.2 refused for), `--tool-grammar` constrains Inkling's calls (a JSON string
+admits no raw control byte, the failure behind a tab-indented heredoc returned as raw content), and opt-in Xe2
+switches for Inkling's prefill and decode (patches 0220-0226). With an 8:4 (q8_0:q4_0) cache and every switch, the
+first entry below measures +18 to +20 % prefill and +9 % decode against the 1.8.2 unit at 8:8 on the B60, the
+answers right (`measured-here`). The defaults of the opt-in switches are unchanged; the units are the operator's.
+
+**Read first — what changes with no switch set:**
+- A build with the whole series (every release) restores checkpoints at q8_0 / q4_0 for a sliding-window cache:
+  an Inkling unit at q8_0 resumes a follow-up instead of re-reading its prompt.
+- `--tool-grammar` (and the request field `tool_grammar`) is accepted for Inkling 2 Mini; 1.8.0-1.8.2 refused it.
+- A tool result without a `name` is given the name of the call it answers before Inkling's template renders it.
+- The relative-bias flash attention falls back to the split kernel (one `DOWNGRADE` line) where the card cannot
+  build its GQA decode variant, instead of aborting.
+- `GGML_OPENCL_LOOP_CONTROL=f32` (and `1`) now fuses from one row, decode steps included (0226); `f32-prompt` is
+  0221's range.
 
 - **Inkling 2 Mini at 8:4 K/V with every 1.8.3 switch, measured as one configuration** (the operator's target,
   2026-11-26: q8_0:q4_0, `GGML_OPENCL_Q8_2D=1`, `GGML_OPENCL_KQ_MM_ID_I8_XT=64`, `GGML_OPENCL_LOOP_CONTROL=f32`,
