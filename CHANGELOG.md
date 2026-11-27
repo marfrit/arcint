@@ -32,8 +32,8 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   an Inkling unit at q8_0 resumes a follow-up instead of re-reading its prompt.
 - `--tool-grammar` (and the request field `tool_grammar`) is accepted for Inkling 2 Mini; 1.8.0-1.8.2 refused it. A tool
   name the call form cannot carry is then a 400.
-- A checkpoint restore into a lane other than the first (`--parallel` 2 or more, f16 / f32 / bf16 K/V on OpenCL)
-  writes that lane's rows; it overwrote the first lane's (0209).
+- A checkpoint restore into a lane other than the first (`--parallel` 2 or more, a sliding-window model at f16 K/V
+  on OpenCL) writes that lane's rows; it overwrote the first lane's (0209).
 - A tool result without a `name` is given the name of the call it answers before Inkling's template renders it.
 - The relative-bias flash attention falls back to the split kernel (one `DOWNGRADE` line) where the card cannot
   build its GQA decode variant, instead of aborting.
