@@ -129,18 +129,22 @@ TEST(swa_window_with_0209_q8_q4_sliding_window_checkpoints_are_restored) {
     CHECK(!swa_ckpt_restore_refused(0, true, true, true, true));
 }
 
+// A libllama case: compiled out of a device-free stub build (ARCINT_LLAMA off), as the other
+// libllama cases are; there it could only skip, and the unit target allows no unnamed skip.
+#ifdef ARCINT_LLAMA
 TEST(swa_window_the_build_finds_0209_in_its_llama_tree) {
     // The source's series carries 0209 (ARCINT_SERIES_HAS_0209), so a build against the
     // tree the recipe applies must find it (ARCINT_LLAMA_KV_VIEW_WRITES, CMakeLists.txt's
     // marker): a marker that stopped matching would turn the q8_0 / q4_0 checkpoints off
     // with every other test green. A build against another tree (a red or an older one)
     // fails here by design and says so.
-#if defined(ARCINT_LLAMA) && defined(ARCINT_SERIES_HAS_0209)
+#if defined(ARCINT_SERIES_HAS_0209)
 #if !defined(ARCINT_LLAMA_KV_VIEW_WRITES)
     t::fail(__FILE__, __LINE__, "the series has 0209 but ARCINT_LLAMA_DIR does not: q8_0 / q4_0 sliding-window "
                                 "checkpoints are off in this build");
 #endif
 #else
-    t::skip("not a libllama build against this source's series");
+    t::skip("not a build against this source's series (no 0209 in contrib/llama.cpp/patches)");
 #endif
 }
+#endif
