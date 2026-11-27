@@ -10073,6 +10073,32 @@ unit's settings).
   unchanged 1e-5, as 0223b did (they stand at 17.3x to 3,046x), the f16 cells 1.5x of 1e-4 (1.76x to 307x; the
   smallest is case kv 16384 x nb 64 on the B60's split). 0223c had relaxed both to 1x. The case comment's rounding is
   3.55e-4 and 1.76x.
+- **Since 0226b** (`0226b-flash-attn-port-seam-needles.patch`, tests and two red builds; it applies after 0226, the
+  last of the series): **a key lost or doubled at a split seam is now caught.** The review of 0223 found that no check
+  saw a single key off at a seam: about 0.017x the q8_0 bound, 0.002x the f16 bound, 1.7e-7 against the
+  split-vs-unsplit compare's 1e-5. The partition reads right (`flash_attn_port.cl`, the split's `s_lo` / `s_hi`), but
+  nothing proved it.
+  - **The needle cases** (`needle=1`, six: kv 16384 x nb 1024 and kv 12288 x nb 36, each for f16, q8_0 and the served
+    8:4 = q8_0 K / q4_0 V; split cases, the split cases' bounds, q8_0 K 1e-5, f16 1e-4). At every seam the rule draws
+    for the case (both modelled waves, 200 and 320, and the run's own `_SPLIT_FORCE` / `_MAX` / `_MINBLK`) the key
+    before it and the key at it are dominant (Q all 1, the key's K 1.77 a dim: a logit of 20 against the flat rest's 0
+    and the sink's 6 .. 8), each with its own one-hot V dim; the rest is flat (K, V zero, no bias). Four needles at
+    p 3 (keys 5471 / 5472 / 10943 / 10944 for kv 16384, 4095 / 4096 / 8191 / 8192 for kv 12288).
+  - **The reds** (`GGML_OPENCL_FA_PORT_RED`, the split build only): **21** (`GB_SPLIT_RED_SEAM_LOSE1`) drops the first
+    key of every split >= 1; **22** (`GB_SPLIT_RED_SEAM_DUP1`) starts every split >= 1 one block early with only the
+    key before its seam live, so that key is walked by both splits. Each must FAIL all six needle cases. ocloc (bmg-g21
+    and bmg-g31, 256 GRF): every program's ISA (f16 / q8_0 / q8_0:q4_0, unsplit and split) is identical to the tree's
+    own; the reds compile (16 / 16 variants, scratch 0) and change the split programs.
+  - **The CPU model of the reds** (`GGML_TEST_FA_PORT_NEEDLE=1`, the CPU backend): LOSE hides the seam's first key,
+    TWICE gives the key before the seam a mask of ln 2 (exp(s + ln 2) = 2 exp(s), the exact effect of counting it
+    twice). Every cell must move the answer past 100x its bound: measured NMSE **1.0 (LOSE) and 0.111 (TWICE)** in all
+    24 cells (6 cases x 2 waves x 2 models), that is 1e4 / 1.1e3 x the f16 bound and 1e5 / 1.1e4 x the q8_0 bound.
+    Red of the check: `GGML_TEST_FA_PORT_NEEDLE_RED=1` puts the needles 40 keys off the seams, and every cell FAILS.
+  - **The wave (review F3):** a split launch whose wave is not the modelled 200 / 320 (256 GRF) now FAILS its case
+    (`WAVE NOT MODELLED`): at 128 GRF the B60's wave would be 420, the rule's p and the seams elsewhere. Not with the
+    operator's own `GGML_OPENCL_FA_PORT_WAVE`.
+  - **Counts:** the decisions table counts the six apart (`needle 6`); `GGML_TEST_FA_PORT_SEAM` leaves them to the needle
+    check (its 18 cells unchanged). **Not run on a card**; the card rows are the A5 window's.
 
 ## 0225-opencl-flash-attn-port-q4_0-v.patch / 0225b-flash-attn-port-q4_0-v-tests.patch
 

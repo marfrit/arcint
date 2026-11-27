@@ -1,0 +1,360 @@
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3901fa0a4..250f049d2 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -13624,6 +13624,10 @@ static bool ggml_cl_port_split_kernels(ggml_backend_opencl_context * backend_ctx
+     if (r == 11) opts += " -DGB_SPLIT_RED_DROP1";    // split 1's state dropped
+     if (r == 12) opts += " -DGB_SPLIT_RED_SINKS";    // every split starts from the sink
+     if (r == 13) opts += " -DGB_SPLIT_RED_SEAM";     // the first block of every split >= 1 skipped (a lost seam block)
++    // 0226b: the seam by one key, the needle cases' reds: 21 the first key of every split >= 1 lost, 22 the key before
++    // every seam walked by both splits
++    if (r == 21) opts += " -DGB_SPLIT_RED_SEAM_LOSE1";
++    if (r == 22) opts += " -DGB_SPLIT_RED_SEAM_DUP1";
+     cl_program p = src.empty() ? nullptr : build_program_from_source_optional(backend_ctx, src.c_str(), opts);
+     if (p == nullptr) {
+         ggml_cl_downgrade("op=FLASH_ATTN port=split-not-built reason=%s", v4 ? "compile-q4v" : kv8 ? "compile-q8" : "compile");
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+index 8012e1bc2..6cc08c82e 100644
+--- a/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_port.cl
+@@ -114,6 +114,10 @@
+ // without their maxima (w = 1), 11 (GB_SPLIT_RED_DROP1) drops split 1's state, 12
+ // (GB_SPLIT_RED_SINKS) starts every split from the sink, 13 (GB_SPLIT_RED_SEAM) skips the first block
+ // of every split >= 1 (a lost seam block). Each must FAIL every split case.
++// The seam by one key (0226b; the split build only; the needle cases of test-backend-ops, needle=1, carry a dominant key
++// on each side of every seam): 21 (GB_SPLIT_RED_SEAM_LOSE1) drops the first key of every split >= 1, 22
++// (GB_SPLIT_RED_SEAM_DUP1) starts every split >= 1 one block early with only the key before its seam live, so that key
++// is walked twice. Each must FAIL the needle cases; the off-by-one is invisible to the other cases' bounds.
+ #ifndef PORT_SPLIT
+ #define PORT_SPLIT 0
+ #endif
+@@ -462,7 +466,12 @@ kernel void kernel_flash_attn_port(
+     const int s_lo = kv_lo + sidx * split_blocks * BK;
+ #endif
+     const int s_hi = min(kv_hi, kv_lo + (sidx + 1) * split_blocks * BK);
++#ifdef GB_SPLIT_RED_SEAM_DUP1
++    // the red case: one block before the seam, only its last key live (that key counted by both splits)
++    for (int t0 = s_lo - (sidx > 0 ? BK : 0); t0 < s_hi; t0 += BK) {
++#else
+     for (int t0 = s_lo; t0 < s_hi; t0 += BK) {
++#endif
+ #else
+     for (int t0 = kv_lo; t0 < kv_hi; t0 += BK) {
+ #endif
+@@ -543,7 +552,13 @@ kernel void kernel_flash_attn_port(
+         for (int gb = 0; gb < NKB; ++gb) {
+             const int  kg   = t0 + gb * 16;
+             const int  kk   = min(kg + lane, n_kv - 1);
+-            const bool live = kg + lane < n_kv && !gdead[gb];
++            bool live = kg + lane < n_kv && !gdead[gb];
++#if PORT_SPLIT && defined(GB_SPLIT_RED_SEAM_LOSE1)
++            live = live && !(sidx > 0 && kg + lane == s_lo);          // the red case: the seam's first key lost
++#endif
++#if PORT_SPLIT && defined(GB_SPLIT_RED_SEAM_DUP1)
++            live = live && !(sidx > 0 && t0 < s_lo && kg + lane != s_lo - 1);   // the extra block: its last key only
++#endif
+             const int  kpl  = kps[kk];
+             const float sv8[QR] = { s[gb].s0, s[gb].s1, s[gb].s2, s[gb].s3, s[gb].s4, s[gb].s5, s[gb].s6, s[gb].s7 };
+             _Pragma("unroll")
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f53c695b4..e91e82f52 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10018,6 +10018,14 @@ struct test_flash_attn_ext : public test_case {
+     // 0225: V's values times this (0: times 1), named in vars() only when set: the large-V case, block maxima past
+     // what p d 128 keeps in f16 (4,094), signed both ways
+     const float v_amp;
++    // 0226b: a needle case (split cases only): a dominant key on each side of every seam the split rule draws for the
++    // case (seam - 1, the last key of split s - 1, and seam, the first of split s), each with its own one-hot V dim; the
++    // rest flat (K zero, V zero, no bias). Losing or doubling one key at a seam moves the output by about its weight
++    // (1 / the needles), where the other cases' compare sees 1.7e-7. Named in vars() only when set
++    const int32_t needle;
++    // 0226b (GGML_TEST_FA_PORT_NEEDLE only): cells whose mask takes ln 2 for every row: a key counted twice (exp(s + ln 2)
++    // = 2 exp(s)), the CPU model of a seam key walked by both splits (RED=22)
++    std::vector<std::array<int64_t, 2>> twice_cells;
+     // 0223 (GGML_TEST_FA_PORT_SEAM only): cells [lo, hi) taken as empty, so that a CPU run shows what a
+     // kernel that loses those keys (a split's lost seam block, RED=13) does to the answer
+     std::vector<std::array<int64_t, 2>> hide_cells;
+@@ -10032,6 +10040,9 @@ struct test_flash_attn_ext : public test_case {
+             snprintf(b, sizeof(b), "%g", (double) v_amp);
+             s += ",v_amp=" + std::string(b);
+         }
++        if (needle != 0) {
++            s += ",needle=" + std::to_string(needle);
++        }
+         return s;
+     }
+ 
+@@ -10070,9 +10081,14 @@ struct test_flash_attn_ext : public test_case {
+         const bool qtw1 = getenv("GGML_OPENCL_FA_PORT_QTW") == nullptr;
+         const bool nwg_ok = !qtw1 || nwg == (int) (nh * ((nb + 7) / 8));
+         const bool blind = on && split_case != 0 && force == 0 && cap != 1 && p <= 1;
+-        const bool ok = p == want && nwg_ok && !blind;
+-        printf("[FA_PORT] split=%d (rule %d, wave %d, nwg %d)%s ", p, want, wave, nwg,
+-               ok ? "" : (blind ? " SPLIT CASE DID NOT SPLIT" : (nwg_ok ? " SPLIT MISMATCH" : " NWG MISMATCH")));
++        // 0226b (review F3): the seam cells and the needles are drawn for the 256-GRF waves (the B60 200, the B70 320);
++        // a split launch at another wave (128 GRF: 420 / 672) splits elsewhere, so it FAILS loudly. Not with the
++        // operator's own GGML_OPENCL_FA_PORT_WAVE override (0223's red of the check)
++        const bool wave_ok = !on || getenv("GGML_OPENCL_FA_PORT_WAVE") != nullptr || wave == 200 || wave == 320;
++        const bool ok = p == want && nwg_ok && !blind && wave_ok;
++        printf("[FA_PORT] split=%d (rule %d, wave %d, nwg %d)%s%s ", p, want, wave, nwg,
++               ok || !wave_ok ? "" : (blind ? " SPLIT CASE DID NOT SPLIT" : (nwg_ok ? " SPLIT MISMATCH" : " NWG MISMATCH")),
++               wave_ok ? "" : " WAVE NOT MODELLED (the seams are drawn for 200 / 320, 256 GRF)");
+         return ok;
+     }
+ 
+@@ -10116,11 +10132,44 @@ struct test_flash_attn_ext : public test_case {
+                         bool kv_view = true, bool v_is_view_of_k = false, int64_t n_kv_max = 0,
+                         bool bias = false, int64_t n_bins = 0, bool sinks_zeros = false,
+                         int32_t port = 0, int32_t wrap = 0, int32_t window = 0, int64_t n_empty = 0, float pad_bias = 0.0f,
+-                        int32_t split_case = 0, float v_amp = 0.0f)
++                        int32_t split_case = 0, float v_amp = 0.0f, int32_t needle = 0)
+         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
+           type_K(type_K), type_V(type_V), permute(permute), kv_view(kv_view), v_is_view_of_k(v_is_view_of_k), n_kv_max(n_kv_max),
+           bias(bias), n_bins(n_bins), sinks_zeros(sinks_zeros), port(port), wrap(wrap), window(window), n_empty(n_empty), pad_bias(pad_bias),
+-          split_case(split_case), v_amp(v_amp) {}
++          split_case(split_case), v_amp(v_amp), needle(needle) {}
++
++    // 0226b: the needle keys: for the modelled waves (200: the B60, 320: the B70, at 256 GRF) and the run's own knobs
++    // (_SPLIT_FORCE / _MAX / _MINBLK as the backend reads them), the rule's p and split_blocks; at each seam s * blocks *
++    // 32 (s = 1 .. p - 1) the keys seam - 1 and seam. GGML_TEST_FA_PORT_NEEDLE_RED=1 moves them 40 keys off every seam
++    // (the red of the needle check itself: losing or doubling a seam key must then move nothing)
++    std::vector<int64_t> needle_keys() const {
++        auto env = [](const char * n) { const char * e = getenv(n); return e ? atoi(e) : 0; };
++        const int force = env("GGML_OPENCL_FA_PORT_SPLIT_FORCE"), cap = env("GGML_OPENCL_FA_PORT_SPLIT_MAX"), minblk = env("GGML_OPENCL_FA_PORT_SPLIT_MINBLK");
++        const int64_t off = getenv("GGML_TEST_FA_PORT_NEEDLE_RED") != nullptr ? 40 : 0;
++        std::vector<int64_t> keys;
++        for (int wave : { 200, 320 }) {
++            for (int k = 0; k < 2; ++k) {
++                const int p = k == 0 ? fa_port_splits(nh * ((nb + 7) / 8), wave, kv, window, 0, 0, 0)
++                                     : fa_port_splits(nh * ((nb + 7) / 8), wave, kv, window, cap, force, minblk);
++                const int64_t sb = fa_port_split_blocks(kv, p);
++                for (int sp = 1; sp < p; ++sp) {
++                    for (int64_t j : { sp * sb * 32 - 1 + off, sp * sb * 32 + off }) {
++                        if (j >= 0 && j < kv - n_empty && std::find(keys.begin(), keys.end(), j) == keys.end()) keys.push_back(j);
++                    }
++                }
++            }
++        }
++        std::sort(keys.begin(), keys.end());
++        return keys;
++    }
++    // 0226b: the seams themselves (the first key of every split >= 1) at one wave, for the CPU models of the reds
++    std::vector<int64_t> seams_at(int wave) const {
++        const int p = fa_port_splits(nh * ((nb + 7) / 8), wave, kv, window, 0, 0, 0);
++        const int64_t sb = fa_port_split_blocks(kv, p);
++        std::vector<int64_t> v;
++        for (int sp = 1; sp < p; ++sp) v.push_back(sp * sb * 32);
++        return v;
++    }
+ 
+     ggml_tensor * build_graph(ggml_context * ctx) override {
+         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
+@@ -10269,8 +10318,20 @@ struct test_flash_attn_ext : public test_case {
+         // the bias of (bin, head, row); the last bin is the pad bin: pad_bias, zero as the
+         // model's is (ggml_pad adds it) unless the case is about that bin
+         auto biasv = [&](int64_t b, int64_t h, int64_t r) -> float {
++            if (needle != 0) return 0.0f;    // 0226b: the needle cases' rest is flat
+             return b == n_bins - 1 ? pad_bias : -4.0f + 8.0f * det01(4, (uint64_t) ((r*n_head + h)*n_bins + b));
+         };
++        // 0226b: the needle cases' values by logical index (dim i0, row i1) and tensor (salt 0 q, 1 k, 2 v): Q all 1; K
++        // zero but a needle row, 1.77 a dim (a logit of 1.77 x 128 / sqrt(128) = 20: each needle weighs e^20 against the
++        // flat keys' e^0 and the sink's e^6..8); V zero but a needle row, 1 in its own dim (7 x its index + 3, mod 128)
++        const std::vector<int64_t> nkeys = needle != 0 ? needle_keys() : std::vector<int64_t>();
++        auto needlev = [&](uint64_t salt, int64_t i0, int64_t i1) -> float {
++            if (salt == 0) return 1.0f;
++            const auto it = std::find(nkeys.begin(), nkeys.end(), i1);
++            if (it == nkeys.end()) return 0.0f;
++            if (salt == 1) return 1.77f;
++            return i0 == (7 * (int64_t) (it - nkeys.begin()) + 3) % 128 ? 1.0f : 0.0f;
++        };
+         // q / k / v by logical index (dim, row, head), through whatever view the case built
+         auto fill_view = [&](ggml_tensor * tv, uint64_t salt) {
+             ggml_tensor * base = tv->view_src ? tv->view_src : tv;
+@@ -10292,7 +10353,7 @@ struct test_flash_attn_ext : public test_case {
+                 for (int64_t i2 = 0; i2 < tv->ne[2]; ++i2) for (int64_t i1 = 0; i1 < tv->ne[1]; ++i1) {
+                     for (int64_t i0 = 0; i0 < tv->ne[0]; ++i0) {
+                         const float amp = vamp * (flat ? 1.0f : 0.25f * powf(2.0f, 3.0f * det01(salt + 16, (uint64_t) ((i2*tv->ne[1] + i1)*(tv->ne[0]/32) + i0/32))));
+-                        row[i0] = amp * (-1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0)));
++                        row[i0] = needle != 0 ? needlev(salt, i0, i1) : amp * (-1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0)));
+                     }
+                     ggml_quantize_chunk(tv->type, row.data(), buf.data() + off + i1*tv->nb[1] + i2*tv->nb[2], 0, 1, tv->ne[0], nullptr);
+                     GGML_ASSERT(off + i1*tv->nb[1] + i2*tv->nb[2] + rb <= buf.size());
+@@ -10306,7 +10367,7 @@ struct test_flash_attn_ext : public test_case {
+             }
+             GGML_ASSERT(tv->ne[3] == 1 && (tv->type == GGML_TYPE_F32 || tv->type == GGML_TYPE_F16));
+             for (int64_t i2 = 0; i2 < tv->ne[2]; ++i2) for (int64_t i1 = 0; i1 < tv->ne[1]; ++i1) for (int64_t i0 = 0; i0 < tv->ne[0]; ++i0) {
+-                const float x = -1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0));
++                const float x = needle != 0 ? needlev(salt, i0, i1) : -1.0f + 2.0f * det01(salt, (uint64_t) ((i2*tv->ne[1] + i1)*tv->ne[0] + i0));
+                 uint8_t * dstp = buf.data() + off + i0*tv->nb[0] + i1*tv->nb[1] + i2*tv->nb[2];
+                 if (tv->type == GGML_TYPE_F32) {
+                     memcpy(dstp, &x, sizeof(float));
+@@ -10353,7 +10414,11 @@ struct test_flash_attn_ext : public test_case {
+             for (int64_t i = 0; i < n_q; ++i) for (int64_t j = 0; j < n_kv; ++j) {
+                 const int32_t dist = qpos(i) - kpos(j);
+                 const bool vis = kpos(j) >= 0 && dist >= 0 && (window == 0 || dist < window);
+-                d[i*n_kv + j] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
++                float tw = 0.0f;
++                for (const auto & h : twice_cells) {
++                    if (j >= h[0] && j < h[1]) tw = 0.69314718f;   // 0226b: ln 2, the key counted twice
++                }
++                d[i*n_kv + j] = ggml_fp32_to_fp16(vis ? tw : -INFINITY);
+             }
+             ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(ggml_fp16_t));
+         } else if (strcmp(t->name, "bi") == 0) {
+@@ -14913,6 +14978,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, 1040, 20, true, true, 0, 0,
+         GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, {0, 2, 1, 3}, false, false, 0, true, 1025, false,
+         1, 0, 0, 17, 0.0f, 0, 4000.0f));
++    // 0226b: the needle cases (review of 0223, F2): the key split's seams, one key either side of each, as dominant keys
++    // with their own V dims (needle=1, test_flash_attn_ext::needle_keys), for f16, q8_0 and the served 8:4 (q8_0 K /
++    // q4_0 V), at two split shapes: kv 16384 x nb 1024 (p 3 at wave 200 and 320) and kv 12288 x nb 36 (p 3 by the
++    // 128-block floor). Bound: the split cases' (q8_0 K 1e-5, f16 1e-4), stated before any run. A key lost or doubled at a
++    // seam moves these by NMSE 0.1 .. 0.5 (the CPU models of GGML_TEST_FA_PORT_NEEDLE); the card's reds RED=21 (the
++    // first key of every split >= 1 lost) and RED=22 (the key before every seam walked twice) must FAIL all six
++    for (auto kvt : std::vector<std::array<ggml_type, 2>>{ { GGML_TYPE_F16, GGML_TYPE_F16 }, { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 } }) {
++        for (auto c : std::vector<std::array<int64_t, 2>>{ { 16384, 1024 }, { 12288, 36 } }) {
++            test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {3, 1}, c[0], c[1], true, true, 0, 0,
++                GGML_PREC_F32, kvt[0], kvt[1], {0, 2, 1, 3}, false, false, 0, true, 1025, false,
++                1, 0, 0, 0, 0.0f, 1, 0.0f, 1));
++        }
++    }
+     // 0199: a table whose pad bin is not zero, with keys far past the extent (2,200 keys, no
+     // window): the port must read the bin (GGML_OPENCL_FA_PORT_RED=4 assumes zero and must
+     // FAIL this case), and its twin gives today's kernels the same table
+@@ -16252,6 +16330,8 @@ static const int FA_PORT_EVAL_SPLIT_Q8  = 3;
+ // GGML_OPENCL_FA_PORT=1
+ static const int FA_PORT_EVAL_PORT1_Q84 = 6;
+ static const int FA_PORT_EVAL_SPLIT_Q84 = 3;
++// 0226b: the needle cases, counted apart from the split cases above: 2 shapes x (f16, q8_0, q8_0:q4_0), split_case=1
++static const int FA_PORT_EVAL_NEEDLE = 6;
+ 
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+ 
+@@ -16264,7 +16344,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+ static bool test_fa_port_decisions() {
+     const bool red = getenv("GGML_TEST_FA_PORT_ROUTE_RED") != nullptr;
+     auto cases = make_test_cases_eval();
+-    int n1 = 0, n1_pad = 0, n2 = 0, n2_pad = 0, n1_q8 = 0, n2_q8 = 0, n_fail = 0, ns = 0, ns_q8 = 0, n1_q84 = 0, ns_q84 = 0;
++    int n1 = 0, n1_pad = 0, n2 = 0, n2_pad = 0, n1_q8 = 0, n2_q8 = 0, n_fail = 0, ns = 0, ns_q8 = 0, n1_q84 = 0, ns_q84 = 0, n_needle = 0;
+     for (auto & tc : cases) {
+         auto * fa = dynamic_cast<test_flash_attn_ext *>(tc.get());
+         if (fa == nullptr || fa->port == 0) {
+@@ -16286,7 +16366,7 @@ static bool test_fa_port_decisions() {
+                    (long long) fa->kv, (long long) fa->nb, (long long) fa->n_empty, p60, p70,
+                    fa_port_split_blocks(fa->kv, p60), fa_port_split_blocks(fa->kv, p70), sok ? "OK" : "FAIL, a split case the rule does not split");
+             n_fail += !sok;
+-            if (q84) { ns_q84++; } else if (q8) { ns_q8++; } else { ns++; }
++            if (fa->needle != 0) { n_needle++; } else if (q84) { ns_q84++; } else if (q8) { ns_q8++; } else { ns++; }
+         } else if (q84) { n1_q84++; } else if (q8) { n1_q8++; } else { n1++; n1_pad += fa->pad_bias != 0.0f; }
+         ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
+         ggml_context * ctx = ggml_init(params);
+@@ -16312,9 +16392,9 @@ static bool test_fa_port_decisions() {
+                         n2 == FA_PORT_EVAL_PORT2 && n2_pad == FA_PORT_EVAL_PORT2_PAD &&
+                         n1_q8 == FA_PORT_EVAL_PORT1_Q8 && n2_q8 == FA_PORT_EVAL_PORT2_Q8 &&
+                         ns == FA_PORT_EVAL_SPLIT && ns_q8 == FA_PORT_EVAL_SPLIT_Q8 &&
+-                        n1_q84 == FA_PORT_EVAL_PORT1_Q84 && ns_q84 == FA_PORT_EVAL_SPLIT_Q84;
+-    printf("  eval cases: f16 port=1 %d (pad %d), port=2 %d (pad %d); q8_0 port=1 %d, port=2 %d; split f16 %d, q8_0 %d; q8_0:q4_0 port=1 %d, split %d: %s\n",
+-           n1, n1_pad, n2, n2_pad, n1_q8, n2_q8, ns, ns_q8, n1_q84, ns_q84,
++                        n1_q84 == FA_PORT_EVAL_PORT1_Q84 && ns_q84 == FA_PORT_EVAL_SPLIT_Q84 && n_needle == FA_PORT_EVAL_NEEDLE;
++    printf("  eval cases: f16 port=1 %d (pad %d), port=2 %d (pad %d); q8_0 port=1 %d, port=2 %d; split f16 %d, q8_0 %d; q8_0:q4_0 port=1 %d, split %d; needle %d: %s\n",
++           n1, n1_pad, n2, n2_pad, n1_q8, n2_q8, ns, ns_q8, n1_q84, ns_q84, n_needle,
+            counts ? "as the table says" : "FAIL, the table above is stale");
+     printf("  port decisions%s: %s\n", red ? " (the old dispatch order)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
+     return n_fail == 0 && counts;
+@@ -16552,6 +16632,76 @@ static bool test_fa_port_twins(ggml_backend_t backend) {
+ // type (0223d): the q8_0 cells 10x of their 1e-5 bound, as 0223b asked (they stand at 17.3x .. 3,046x); the f16 cells
+ // 1.5x of their 1e-4 bound since 0223c (they stand at 1.76x .. 307x; the smallest, 1.76x, is case kv 16384 x nb 64 on
+ // the B60's split). 0223c had relaxed both to 1x.
++// 0226b: GGML_TEST_FA_PORT_NEEDLE=1 (the CPU backend; no device): the needle cases against the CPU models of the
++// seam reds, at each modelled wave (200 / 320). LOSE (RED=21): the first key of every split >= 1 hidden (its cell
++// empty); TWICE (RED=22): the key before every seam counted twice (its mask ln 2: exp(s + ln 2) = 2 exp(s)). Each model
++// must move the case's answer past JUMP x its bound (JUMP 100: an NMSE of at least 1e-3 for q8_0 K, 1e-2 for f16;
++// expected about 1.0 for LOSE and 0.11 for TWICE with the four needles of p 3),
++// where the other split cases see a single seam key at 1.7e-7. 6 cases x 2 waves x 2 models = 24 cells, each printed
++// with its NMSE and the jump. Red of the check itself: GGML_TEST_FA_PORT_NEEDLE_RED=1 puts the needles 40 keys off
++// the seams; the models then hit flat keys and every cell must FAIL (rc 1).
++static bool test_fa_port_needle(ggml_backend_t backend) {
++    auto run = [&](test_flash_attn_ext & tc, std::vector<float> & out) {
++        ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++        ggml_context * ctx = ggml_init(params);
++        ggml_tensor * o = tc.build_graph(ctx);
++        ggml_cgraph * gf = ggml_new_graph(ctx);
++        ggml_build_forward_expand(gf, o);
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++        GGML_ASSERT(buf != nullptr);
++        tc.initialize_tensors(ctx);
++        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++        out.resize(ggml_nelements(o));
++        ggml_backend_tensor_get(o, out.data(), 0, ggml_nbytes(o));
++        ggml_backend_buffer_free(buf);
++        ggml_free(ctx);
++    };
++    const bool red = getenv("GGML_TEST_FA_PORT_NEEDLE_RED") != nullptr;
++    const double JUMP = 100.0;
++    int n_fail = 0, n_run = 0, n_case = 0;
++    auto cases = make_test_cases_eval();
++    for (auto & c : cases) {
++        auto * fa = dynamic_cast<test_flash_attn_ext *>(c.get());
++        if (fa == nullptr || fa->needle == 0) continue;
++        n_case++;
++        auto mk = [&]() {
++            return test_flash_attn_ext(128, 128, fa->nh, fa->nr23, fa->kv, fa->nb, true, true, 0, 0, GGML_PREC_F32, fa->type_K, fa->type_V,
++                                       fa->permute, false, false, 0, true, fa->n_bins, false, 1, fa->wrap, fa->window, fa->n_empty, fa->pad_bias, 1, 0.0f, 1);
++        };
++        test_flash_attn_ext base = mk();
++        std::vector<float> ref;
++        run(base, ref);
++        const std::vector<int64_t> nk = base.needle_keys();
++        printf("  needle %s:%s kv=%lld nb=%lld: %zu needles at keys", ggml_type_name(fa->type_K), ggml_type_name(fa->type_V), (long long) fa->kv, (long long) fa->nb, nk.size());
++        for (int64_t j : nk) printf(" %lld", (long long) j);
++        printf("%s\n", red ? " (RED: 40 keys off the seams)" : "");
++        for (int wave : { 200, 320 }) {
++            const std::vector<int64_t> seams = base.seams_at(wave);
++            for (int model = 0; model < 2; ++model) {
++                test_flash_attn_ext m = mk();
++                for (int64_t sj : seams) {
++                    if (model == 0) m.hide_cells.push_back({ sj, sj + 1 });      // LOSE: the seam's first key gone
++                    else            m.twice_cells.push_back({ sj - 1, sj });     // TWICE: the key before the seam doubled
++                }
++                std::vector<float> out;
++                run(m, out);
++                double num = 0.0, den = 0.0;
++                for (size_t e = 0; e < ref.size(); ++e) { const double d = (double) out[e] - ref[e]; num += d*d; den += (double) ref[e]*ref[e]; }
++                const double nmse = den > 0.0 ? num/den : 0.0, bound = base.max_nmse_err();
++                const bool ok = nmse > JUMP * bound;
++                printf("    wave %d p %zu %s (RED=%d's model, seams", wave, seams.size() + 1, model == 0 ? "LOSE " : "TWICE", model == 0 ? 21 : 22);
++                for (int64_t sj : seams) printf(" %lld", (long long) sj);
++                printf("): nmse %.3g against the bound %.3g = x%.3g (needs x%.0f): %s\n", nmse, bound, bound > 0.0 ? nmse / bound : 0.0, JUMP,
++                       ok ? "decisive" : "FAIL, not decisive");
++                n_fail += !ok; n_run++;
++            }
++        }
++    }
++    const bool all = n_fail == 0 && n_run == 24 && n_case == FA_PORT_EVAL_NEEDLE;
++    printf("  port needles%s: %d cases, %d cells, %d not decisive: %s\n", red ? " (RED: off the seams)" : "", n_case, n_run, n_fail, all ? "OK" : "FAIL");
++    return all;
++}
++
+ static bool test_fa_port_seam(ggml_backend_t backend) {
+     auto run = [&](test_flash_attn_ext & tc, std::vector<float> & out) {
+         ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
+@@ -16572,7 +16722,7 @@ static bool test_fa_port_seam(ggml_backend_t backend) {
+     auto cases = make_test_cases_eval();
+     for (auto & c : cases) {
+         auto * fa = dynamic_cast<test_flash_attn_ext *>(c.get());
+-        if (fa == nullptr || fa->split_case == 0) continue;
++        if (fa == nullptr || fa->split_case == 0 || fa->needle != 0) continue;   // 0226b: the needle cases are GGML_TEST_FA_PORT_NEEDLE's
+         std::vector<float> ref;
+         test_flash_attn_ext base(128, 128, fa->nh, fa->nr23, fa->kv, fa->nb, true, true, 0, 0, GGML_PREC_F32, fa->type_K, fa->type_V,
+                                  fa->permute, false, false, 0, true, fa->n_bins, false, 1, fa->wrap, fa->window, fa->n_empty, fa->pad_bias, 1);
+@@ -16902,6 +17052,9 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
+     if (getenv("GGML_TEST_FA_PORT_TWINS") != nullptr) {
+         return test_fa_port_twins(backend);
+     }
++    if (getenv("GGML_TEST_FA_PORT_NEEDLE") != nullptr) {
++        return test_fa_port_needle(backend);
++    }
+     if (getenv("GGML_TEST_FA_PORT_SEAM") != nullptr) {
+         return test_fa_port_seam(backend);
+     }
