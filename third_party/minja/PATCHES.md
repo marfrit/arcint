@@ -78,9 +78,9 @@ kept in a `namespace` is called after the loop's context is gone), so
 every defining context it creates until it returns (a loop defining a macro
 10^5 times holds 10^5 contexts until then; the old engine held them forever).
 The keeper is a thread-local static that no context or value refers to, so it
-closes no cycle. A macro called after
-that render, with no other owner of its context (reachable only through the
-C++ API), throws `Macro <name> called after the render that defined it ended`.
+closes no cycle. A macro called after that render, with no other owner of its
+context (reachable only through the C++ API), throws
+`Macro <name> called after the render that defined it ended`.
 Within a render the scopes resolve as before; the production templates render
 byte-identically. Tests: `tests/test_minja_scope.cpp`.
 
