@@ -177,6 +177,21 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   op=FLASH_ATTN indexed-bias form=gqa` once a process (WARN), and the fit check above applies on that default path:
   a variant that does not fit is no longer launched. Evidence for the line and the fit check: the device-free route
   and fit cells (`code`); no card run records the line.
+- **Fixed: the chat-template engine leaked memory on every render of a template that defines a macro** (a reference
+  cycle in minja's macro scope: the macro's callable owned the context it was stored in; a `{% call %}` block's
+  `caller` did the same). ~15-25 KB a render (LeakSanitizer, CPU: 15.2 KB for a one-macro template, ~24.6 KB for
+  the production templates; unsanitized ~28 KB of RssAnon a render, linear in the render count), measured as ~52 KB
+  a request on a served Inkling 2 Mini at reasoning effort high (`measured-here`; the served unit measured flat at
+  effort none, which the CPU render does not reproduce, and the served RSS leg on the fixed build is owed). Every
+  current production template defines a macro (Inkling 2 Mini, the Qwen3.8 family), so every chat request leaked.
+  Present since minja was vendored (77872e9d, 2026-08-29, 0.1.0). The callables now hold their defining context
+  weakly, and the outermost render keeps each such context alive until it returns, so a macro stays callable for
+  the whole render wherever its value went; a macro value carried out of that render by API (no template can)
+  errors cleanly instead of running. Evidence (`code`, `measured-here` on CPU): device-free cases red on the old
+  engine (the defining contexts never expire; +883 KB over 49 more renders of a one-macro template) and flat after;
+  the three production templates render byte-identical old against new over 30 request shapes each (system, user,
+  a tool, an assistant tool call, its result; reasoning effort unset / none / low / medium / high; thinking unset /
+  on / off).
 
 - Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
   ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are
