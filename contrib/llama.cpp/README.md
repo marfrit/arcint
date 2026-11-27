@@ -10062,6 +10062,7 @@ unit's settings).
   (`GGML_TEST_FA_PORT_DUMP`): 1.6e-9 to 5.9e-8 per case (`measured-here`, B60), bound 1e-5, FORCE=3 over all 22
   port cases. RED=13 (a lost seam block) exceeds that bound by 17x or more (`measured-here`: 1.74e-4 .. 3.54e-4).
 - **The red of record:** The red of record for the split is the split-vs-unsplit comparison (bound 1e-5, RED=13 at 17x or more), a window procedure (`GGML_TEST_FA_PORT_DUMP` plus an external compare), not a verdict the binary prints; the f16 CPU-referenced bound detects only a whole lost seam block (1.76x).
+- **The comparer:** `tools/fa_port_dump_compare.py SPLIT_DIR UNSPLIT_DIR [--bound 1e-5]` is the external compare of that red. It pairs the two dump directories' cases by hash and fails (exit 1, one line a problem) on a case on one side only, unequal float counts, non-finite values, an NMSE over the bound, or a hash listed twice in one `index.txt` with different lines (the dump appends: use a fresh directory a run). Its last line is `FA PORT DUMP COMPARE: PASS|FAIL (n cases, worst nmse ...)`. Unit test: `tests/python/test_fa_port_dump_compare.py`.
 - **The red still fails at the new bound, with a smaller margin:** a lost seam block moves the f16 split cases by
   1.76e-4 to 3.55e-4 (`inference`: a numpy model of the cases' fill; `GGML_TEST_FA_PORT_SEAM=1` gives the same on the
   CPU backend) and by 1.75e-4 to 3.82e-4 on the card (`measured-here`, B60). That is 1.76x to 3.55x 1e-4: the
