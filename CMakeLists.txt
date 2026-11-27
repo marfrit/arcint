@@ -614,6 +614,12 @@ if(ARCINT_TESTS)
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_downgrade_check.py")
   set_tests_properties(downgrade-check PROPERTIES LABELS unit)
 
+  # tools/fa_port_dump_compare.py: the comparer for patch 0223's red of record, on synthetic dumps.
+  add_test(NAME fa-port-dump-compare
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_fa_port_dump_compare.py")
+  set_tests_properties(fa-port-dump-compare PROPERTIES LABELS unit)
+
   # contrib/llama.cpp/apply-series.sh's byte order (GitHub issue #6), device-free; its locale case
   # runs where en_US.UTF-8 is installed and is skipped (not failed) on a C-locale host
   add_test(NAME patch-series-order

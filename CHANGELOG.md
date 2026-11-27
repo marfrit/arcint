@@ -156,7 +156,9 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   on-run above the fastest off-run), equal at 4,096 where no call splits; the split output against the unsplit one
   1.6e-9 to 5.9e-8 per case, a lost seam block 1.7e-4 or more; KL against the unsplit run 0.003425 nats, same top
   98.57 %; the capital and the 44k needle right in the served process. The knob stays off by default until the
-  operator changes it (`contrib/llama.cpp/README.md`, 0223).
+  operator changes it (`contrib/llama.cpp/README.md`, 0223). `tools/fa_port_dump_compare.py` is the comparer for
+  the split-vs-unsplit red of record (two `GGML_TEST_FA_PORT_DUMP` directories, bound 1e-5; unit test
+  `tests/python/test_fa_port_dump_compare.py`).
 - llama.cpp patch 0223c (tests only): the f16 key-split cases of test-backend-ops are bounded at NMSE 1e-4 against
   the CPU, not 1e-5. The bound was set by the operator after the card run, on a basis independent of the split
   result: the unsplit f16 port's own error against the CPU is 3.88e-5 (`measured-here`, B60), so 1e-5 sat below that
