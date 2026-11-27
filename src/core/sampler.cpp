@@ -398,9 +398,10 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             // with no counted line, `emitted` (the turn's observed tokens)
             // moves by the stretch length, on the plain loop and the verify
             // walk alike; a path that fed the tracker twice moved it by half.
+            // `spent` is the budget points spent since the detection.
             log::debug("loop-guard",
                        "the door's budget advances by a %d-token stretch without a counted line "
-                       "(emitted %d, door ids %zu, budget %d)",
+                       "(emitted %d, door ids %zu, spent %d)",
                        kDoorStretchTokens, emitted_, loop_token_pos_, loop_since_detect_);
             // A budget point reached by stretches: the line share stands where
             // the last counted line left it and is stale here by definition --

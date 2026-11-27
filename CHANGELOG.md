@@ -186,9 +186,14 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   the emit only decodes and hands the piece on. Evidence (`code`): a unit case drives the walk and the plain loop
   over the same rows with the ladder, the door open through a nudge and a slap, and the context guard armed, and
   compares everything `observe` feeds at every round's end; it fails on the old walk (the stretch counter one ahead
-  after the detection's token, the nudge at token 114 against 209) and passes on the new one. The `-vv` line
-  `the door's budget advances by a 64-token stretch` now names `emitted`, the door's recorded ids and the budget, so a
-  served log shows the stretch's step in emitted tokens (64; 32 under the defect). No card run is recorded yet.
+  after the detection's token, the nudge at token 114 against 209) and passes on the new one. A second case (a text
+  closer drawn mid-span, an answer presence penalty, no detection) keeps the same state on both walks and fails the
+  old one only on the tracker's call count (120 for 60 tokens). The `-vv` line
+  `the door's budget advances by a 64-token stretch` now names `emitted`, the door's recorded ids and the budget points
+  `spent`, so a served log shows the stretch's step in emitted tokens (64; 32 under the defect); that line needs a
+  detection. Every request now ends with a `-vv` line, `think-tracker: lane N: observe calls C, emitted E (thinking
+  T)`: C == E on every decode path, C == 2E on the old walk. Before a detection the double feed changed nothing (the
+  second feed's piece was empty, and the only id feed sits behind the open door). No card run is recorded yet.
 
 - Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
   ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are

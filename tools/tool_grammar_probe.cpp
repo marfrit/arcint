@@ -161,8 +161,7 @@ Arm run(const World& w, const Case& c, const std::vector<int>& cand, bool gramma
             const int tok = sampler.sample(rows.data(), static_cast<size_t>(w.n));
             if (w.eog[static_cast<size_t>(tok)]) break;
             a.text += w.piece[static_cast<size_t>(tok)];
-            sampler.observe_think_text(w.piece[static_cast<size_t>(tok)]);
-            sampler.observe(tok);
+            sampler.observe(tok, w.piece[static_cast<size_t>(tok)]);   // the backend's one observation
             ++emitted;
             continue;
         }
@@ -170,9 +169,9 @@ Arm run(const World& w, const Case& c, const std::vector<int>& cand, bool gramma
         const VerifyWalk vw = walk_verify(rows.data(), rows.size() / static_cast<size_t>(w.n), static_cast<size_t>(w.n),
                                           draft, sampler, cap - emitted,
                                           [&](int tok) { return static_cast<bool>(w.eog[static_cast<size_t>(tok)]); },
-                                          [&](int tok, std::string&) {
-                                              a.text += w.piece[static_cast<size_t>(tok)];
-                                              sampler.observe_think_text(w.piece[static_cast<size_t>(tok)]);
+                                          [&](int tok, std::string& piece) {
+                                              piece = w.piece[static_cast<size_t>(tok)];   // the walk observes it
+                                              a.text += piece;
                                               return Control::Continue;
                                           });
         emitted += vw.emitted;

@@ -135,8 +135,9 @@ public:
     // clean-turns step 2: the tool-call grammar, or nullptr. Not owned. It is
     // dormant while a think block is open (the reference's lazy grammar is not
     // applied while the reasoning budget sampler counts, common/sampling.cpp
-    // grammar_should_apply), so it needs the block's state: the backend feeds
-    // observe_think_text whenever params.tool_grammar is set, mask or not.
+    // grammar_should_apply), so it needs the block's state: tracks_think()
+    // holds for params.tool_grammar, mask or not, so the decode loop's one
+    // observe(id, piece) per emitted token keeps it.
     void set_constraint(TokenConstraint* c) { constraint_ = c; }
 
     // loop-guard: the fixed sentence's ids, tokenised by the backend (which
