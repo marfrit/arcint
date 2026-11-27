@@ -323,6 +323,8 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   (shown only at arcint `-v`) and is WARN under `std::call_once`; 0220's line (already WARN) is guarded by a
   `std::once_flag` a mode instead of a static bool array. No default changes; the lines' text is unchanged
   (`contrib/llama.cpp/README.md`, 0224).
+- Tests only: the old depth-mix check accepted non-finite and unbounded errors as a valid red; it now requires a fixed band
+  (`tests/test_depth_mix.cpp`, ctest `depth-mix`).
 
 ## 1.8.2 — 2026-11-25
 
