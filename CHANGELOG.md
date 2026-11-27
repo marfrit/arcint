@@ -30,7 +30,10 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
 **Read first — what changes with no switch set:**
 - A build with the whole series (every release) restores checkpoints at q8_0 / q4_0 for a sliding-window cache:
   an Inkling unit at q8_0 resumes a follow-up instead of re-reading its prompt.
-- `--tool-grammar` (and the request field `tool_grammar`) is accepted for Inkling 2 Mini; 1.8.0-1.8.2 refused it.
+- `--tool-grammar` (and the request field `tool_grammar`) is accepted for Inkling 2 Mini; 1.8.0-1.8.2 refused it. A tool
+  name the call form cannot carry is then a 400.
+- A checkpoint restore into a lane other than the first (`--parallel` 2 or more, f16 / f32 / bf16 K/V on OpenCL)
+  writes that lane's rows; it overwrote the first lane's (0209).
 - A tool result without a `name` is given the name of the call it answers before Inkling's template renders it.
 - The relative-bias flash attention falls back to the split kernel (one `DOWNGRADE` line) where the card cannot
   build its GQA decode variant, instead of aborting.
@@ -63,6 +66,11 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   decode (an inferred 3-4 % for the 27B, never measured) are not worth a lossy, likely cumulative error that KL on
   short text can hide. Lossy arms elsewhere stay opt-in and need an agent-level check before any default.
   `docs/decisions/2026-11-26-no-int8-requantised-q6k-q5k.md`.
+- **DESIGN §3.4 rule 6: comparing rows across batch sizes has a floor, and it is the model's** (documents only). A
+  verify pass runs its rows in a batch (n > 1), plain decode one at a time; the two take different kernels and sum in
+  a different order. On Inkling 2 Mini (CPU, `measured-here`) n = 1 against n = 6 moved the logits by mean KL
+  4.0e-4 / 2.3e-3, as much as a one-ulp nudge of one activation does; such a comparison is held to the answer-level
+  bar, never to a tighter bound.
 - **`--tool-grammar` for Inkling 2 Mini, and the reject reason in the tool-call log line.** A served Inkling unit
   returned a correctly framed bash call as raw content, twice (`measured-here`): the "command" string held
   tab-indented C copied raw into a heredoc, the JSON inside the block held a raw TAB, and the parser's `json::parse`
@@ -90,7 +98,7 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   heredoc, the call-syntax reasoning with the thinking mask off and on, two calls in one turn and the forced reject
   with its reason line all pass, and decode with the grammar on equals off (37.19 / 37.14 / 37.18 against 37.12 /
   37.19 / 37.20 t/s). The model escapes every TAB itself at the unit's sampler and at temperature 1.8, so the masking
-  was exercised through a test-only bias (`ARCINT_TEST_TOOL_TAB_BIAS`, not in this release): masking proven on CPU on
+  was exercised through a test-only bias (a test-only hook, not in this release): masking proven on CPU on
   the GPT-2 and the Inkling 2 Mini vocabularies (red-checked), and exercised on the card: under a raw-TAB bias of
   +24 to +48, every call valid with no raw tab in a string (28 / 28), where the unmasked control at the same bias
   leaks raw tabs into the strings (+24: 3 / 3) or destroys the call (+32 / +48: 0 / 6 formed).
@@ -107,6 +115,10 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   (`tools/inkling_trigger_cost.cpp`, `measured-here` on the recipe host's CPU; mainline's trigger the same; bounded to
   the tail from the last header start, 0.3 us). `<|content_model_end_sampling|>` is the GGUF's eos and eot id
   (`measured-here`, metadata of ggml-org's IQ4_NL file), so a completed call can end the turn.
+  New for a client: under `--tool-grammar` an Inkling request is refused with a 400 when one of its tools has a name
+  the call form cannot carry (empty, starting with `<`, whitespace at either end, a NUL, or the call marker in it);
+  without the grammar such a request is served as before (`code`, the grammar function's device-free cell; no
+  handler-level case).
 - **Context checkpoints again at q8_0 / q4_0 K/V for a sliding-window cache on OpenCL** (Inkling 2 Mini at its unit's
   q8_0, Dory1.0-4B with `--llama-swa-window`). 1.8.1 and 1.8.2 kept none there, because the restore's writes through
   views of the K / V tensors were dropped (positions restored, bytes not); patch 0209 performs them. The refusal now
@@ -121,6 +133,16 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   has it (`code`); 0209's op test and the probe's exact arms, and the card gate at the Inkling unit's settings (B60,
   `measured-here`: served at about 40k tokens, KL against a full re-read 0.0010-0.0033 nats against a bar of 0.0317,
   the answers right, the restore 23-29 ms against a 45.5 s re-read; contrib/llama.cpp/README.md, 0209's section).
+  0209 also fixes the f16 / f32 and bf16 writes, for every model with no switch set: a write through a view at a
+  non-zero offset landed at the start of its base. That is a checkpoint restore into a KV stream other than the
+  first, i.e. a start with `--parallel 2` or more (unnamed lanes, a stream each) at f16 / f32 / bf16 K/V on OpenCL,
+  for a model that restores checkpoints (hybrid and sliding-window models): lane 2's restored rows overwrote lane
+  1's (1.8.1's known limit). One lane (the default) and named lanes (one shared pool) were not affected. And a write
+  into a view of a q8_0 / q4_0 tensor already split into scales and quants (a weight, or a tensor set whole) is
+  still dropped, as before, and now logs one WARN a process and type naming the tensor and its base; no served path
+  is known to do that. Evidence: 0209's op test on the B60 (`measured-here`, 2026-11-25), whose cases write views
+  at non-zero offsets for q8_0, q4_0, f16 and bf16 and check the warning: 64 of 64 pass with 0209, 34 of 64 fail
+  without it. No served run with more than one lane was made.
 - **The depth mix's TAKEN line shows in a served unit's log** (patch 0211). `depth_mix: TAKEN opencl f32
   token-a-group` was printed at ggml's INFO level, which arcint logs only under `-v`, so a unit with
   `GGML_OPENCL_DEPTH_MIX=1` showed the FA port's TAKEN line and not the mix's. It is now at the port's level (WARN),
@@ -146,6 +168,10 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   suite); on the card (`measured-here`, B60, `llama-perplexity` 1,024 scored rows at batch 8) the forced fallback
   equals the `GGML_OPENCL_FA_GQA_MIN_ROWS=9` route bit for bit (KL 0.000000, same top 100 %); against the unforced
   kernel it measures 0.001345 nats and same top 98.431 % (-1.57 pt), the same as that existing route.
+  With no switch set, on Xe2: where the GQA decode variant is taken, the log now shows `TAKEN src=opencl
+  op=FLASH_ATTN indexed-bias form=gqa` once a process (WARN), and the fit check above applies on that default path:
+  a variant that does not fit is no longer launched. Evidence for the line and the fit check: the device-free route
+  and fit cells (`code`); no card run records the line.
 
 - Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
   ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are
@@ -188,7 +214,8 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   weights; at most 8 rows take a pair of small kernels in the reference's geometry instead, two launches a control,
   and 0221's kernel is unchanged for more than 8 rows. **`f32` (and `1`) now mean "from one row"**: a unit that sets
   it fuses its decode steps too. `f32-t2` keeps one-row decode on the chain, `f32-prompt` is 0221's range, `f32-onewg`
-  the one-work-group comparison arm; `bf16` and the unset switch are unchanged (the unset graphs are byte-identical
+  the one-work-group comparison arm, `all-layers` a test value (the op on every layer, the backend's guard lifted; not
+  for serving); `bf16` and the unset switch are unchanged (the unset graphs are byte-identical
   to the previous series' at 1 to 1,024 rows). Removes the keys `op=MUL_MAT type=f32 k=64 cols=1-4` (2 to 4-row
   batches) and `cols=5-15` at 5 to 8 rows. 25 more test cases, red builds 6 and 7. Built and checked without a card (the pair replayed on host
   threads against the CPU op and the chain, ocloc on both cards' targets, the device-free emission and model
@@ -217,7 +244,8 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   numpy-checked CPU model). The case comment's figures read 3.55e-4 and 1.76x (`contrib/llama.cpp/README.md`, 0223c).
 - llama.cpp patch 0221 (opt-in, `GGML_OPENCL_LOOP_CONTROL=1|bf16`, default off): Inkling 2 Mini's loop controller as
   one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
-  its 12-launch chain, for prompt batches. Unset, the graph is today's line for line. Card rows (`measured-here`, B60
+  its 12-launch chain, for prompt batches (that was `=1`'s range in 0221 alone; with 0226, `1` and `f32` fuse from one
+  row and `f32-prompt` keeps this range). Unset, the graph is today's line for line. Card rows (`measured-here`, B60
   at 165 W, the Inkling unit's settings): the served 4,096-token pass 1,121 -> 1,170 t/s (+4.4 %, the slowest on-run
   above the fastest off-run); one 4,096-token chunk 888.6 -> 850.6 ms with 1,152 fewer launches; the op cases 16 of
   16 in f32 and bf16, five reds 0 of 16; mean KL against the CPU base 0.004683 nats (f32) against 0.004705 (off), same
