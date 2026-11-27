@@ -136,6 +136,35 @@ void Sampler::observe(int token, std::string_view piece) {
         ++answer_generated_[token];
 }
 
+Sampler::ObservedStateForTest Sampler::observed_state_for_test() const {
+    ObservedStateForTest o;
+    o.emitted               = emitted_;
+    o.seen                  = {seen_.begin(), seen_.end()};
+    o.generated             = {generated_.begin(), generated_.end()};
+    o.answer_generated      = {answer_generated_.begin(), answer_generated_.end()};
+    o.think_state           = static_cast<int>(think_state_);
+    o.think_block_ever_open = think_block_ever_open_;
+    o.ctx_budget            = ctx_budget_;
+    o.ctx_pending           = ctx_pending_;
+    o.ctx_settled           = ctx_settled_;
+    o.door_open             = loop_door_open_;
+    o.door_opened           = loop_door_opened_;
+    o.door_lifted           = loop_door_lifted_;
+    o.door_tokens           = loop_door_tokens_;
+    o.since_detect          = loop_since_detect_;
+    o.since_nudge           = loop_since_nudge_;
+    o.token_ids             = {loop_token_ids_.begin(), loop_token_ids_.end()};
+    o.token_grams           = {loop_token_grams_.begin(), loop_token_grams_.end()};
+    o.token_pos             = loop_token_pos_;
+    o.token_positions       = loop_token_positions_;
+    o.token_repeats         = loop_token_repeats_;
+    o.tokens_seen           = loop_token_seen_;
+    o.open_line             = loop_line_;
+    for (const LoopLine& l : loop_window_) o.window_lines.push_back(l.text);
+    o.counts = loop_guard_counts();
+    return o;
+}
+
 void Sampler::observe_think_text(std::string_view piece) { observe_think_(piece, -1); }
 
 void Sampler::observe_think(int token, std::string_view piece) { observe_think_(piece, token); }
@@ -363,8 +392,14 @@ void Sampler::observe_think_(std::string_view piece, int token) {
             loop_door_tokens_ = 0;
             ++loop_since_detect_;
             if (loop_nudged_ && !loop_slapped_) ++loop_since_nudge_;
-            log::debug("loop-guard", "the door's budget advances by a %d-token stretch without a counted line",
-                       kDoorStretchTokens);
+            // The card's check of the one-feed rule: between two such lines
+            // with no counted line, `emitted` (the turn's observed tokens)
+            // moves by the stretch length, on the plain loop and the verify
+            // walk alike; a path that fed the tracker twice moved it by half.
+            log::debug("loop-guard",
+                       "the door's budget advances by a %d-token stretch without a counted line "
+                       "(emitted %d, door ids %zu, budget %d)",
+                       kDoorStretchTokens, emitted_, loop_token_pos_, loop_since_detect_);
             // A budget point reached by stretches: the line share stands where
             // the last counted line left it and is stale here by definition --
             // the trigger takes 64 tokens since the last counted line. The

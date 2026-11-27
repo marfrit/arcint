@@ -37,6 +37,7 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
 - A tool result without a `name` is given the name of the call it answers before Inkling's template renders it.
 - The relative-bias flash attention falls back to the split kernel (one `DOWNGRADE` line) where the card cannot
   build its GQA decode variant, instead of aborting.
+- With `--loop-guard` on a speculative unit (MTP, DFlash2), the door's budget advances once per emitted token, not twice.
 
 - **Inkling 2 Mini at 8:4 K/V with every 1.8.3 switch, measured as one configuration** (the operator's target,
   2026-11-26: q8_0:q4_0, `GGML_OPENCL_Q8_2D=1`, `GGML_OPENCL_KQ_MM_ID_I8_XT=64`, `GGML_OPENCL_LOOP_CONTROL=f32`,
@@ -177,6 +178,17 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   op=FLASH_ATTN indexed-bias form=gqa` once a process (WARN), and the fit check above applies on that default path:
   a variant that does not fit is no longer launched. Evidence for the line and the fit check: the device-free route
   and fit cells (`code`); no card run records the line.
+- **The speculative verify walk feeds the sampler once per accepted token** (MTP, DFlash2; the defect since
+  2026-10-23's tracker change). On a unit with `--llama-mtp` or `--llama-dflash-gguf` and `--loop-guard`, the backend's
+  emit fed the think tracker and the walk's own `observe` fed it again: once the loop guard's door was open its token
+  budget advanced twice per emitted token (a 64-token stretch every 32 tokens, so the nudge and the slap came early)
+  and the token k-gram window held each id twice. The walk now owns the one observation, the id with its text, and
+  the emit only decodes and hands the piece on. Evidence (`code`): a unit case drives the walk and the plain loop
+  over the same rows with the ladder, the door open through a nudge and a slap, and the context guard armed, and
+  compares everything `observe` feeds at every round's end; it fails on the old walk (the stretch counter one ahead
+  after the detection's token, the nudge at token 114 against 209) and passes on the new one. The `-vv` line
+  `the door's budget advances by a 64-token stretch` now names `emitted`, the door's recorded ids and the budget, so a
+  served log shows the stretch's step in emitted tokens (64; 32 under the defect). No card run is recorded yet.
 
 - Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
   ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are

@@ -170,7 +170,7 @@ Arm run(const World& w, const Case& c, const std::vector<int>& cand, bool gramma
         const VerifyWalk vw = walk_verify(rows.data(), rows.size() / static_cast<size_t>(w.n), static_cast<size_t>(w.n),
                                           draft, sampler, cap - emitted,
                                           [&](int tok) { return static_cast<bool>(w.eog[static_cast<size_t>(tok)]); },
-                                          [&](int tok) {
+                                          [&](int tok, std::string&) {
                                               a.text += w.piece[static_cast<size_t>(tok)];
                                               sampler.observe_think_text(w.piece[static_cast<size_t>(tok)]);
                                               return Control::Continue;

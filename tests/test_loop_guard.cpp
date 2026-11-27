@@ -351,7 +351,7 @@ TEST(loop_guard_answer_phase_unwatched_without_a_slap) {
         std::vector<float> rows = row_with_argmax(3);
         const VerifyWalk   w = walk_verify(
             rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
-            [&](int) { return Control::Continue; });
+            [&](int, std::string&) { return Control::Continue; });
         CHECK(w.reason != FinishReason::Loop);
         CHECK_EQ(std::string(finish_reason_name(w.reason)), std::string("stop"));
     }
@@ -393,7 +393,7 @@ TEST(loop_guard_looping_content_after_a_slap_ends_the_turn) {
     int               emitted = 0;
     const VerifyWalk   w = walk_verify(
         rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
-        [&](int) {
+        [&](int, std::string&) {
             ++emitted;
             return Control::Continue;
         });
@@ -563,7 +563,7 @@ TEST(loop_guard_slap_breaks_the_verify_walk_at_its_row) {
     std::vector<int> out;
     const VerifyWalk w = walk_verify(
         rows.data(), 3, vocab, {2, 2}, s, 100, [](int) { return false; },
-        [&](int t) {
+        [&](int t, std::string&) {
             out.push_back(t);
             return Control::Continue;
         });
@@ -594,7 +594,7 @@ TEST(loop_guard_nudge_inside_the_verify_walk_keeps_only_the_matching_prefix) {
     std::vector<int> out;
     const VerifyWalk w = walk_verify(
         rows.data(), 3, vocab, {kPieceFirst, 7}, s, 100, [](int) { return false; },
-        [&](int t) {
+        [&](int t, std::string&) {
             out.push_back(t);
             return Control::Continue;
         });
@@ -1089,7 +1089,7 @@ TEST(loop_guard_answer_after_a_door_self_close_aborts_on_a_loop) {
     std::vector<float> rows = row_with_argmax(3);
     const VerifyWalk   w = walk_verify(
         rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
-        [&](int) { return Control::Continue; });
+        [&](int, std::string&) { return Control::Continue; });
     CHECK(w.done);
     CHECK(w.reason == FinishReason::Loop);
     CHECK_EQ(std::string(finish_reason_name(w.reason)), std::string("loop"));
@@ -1127,7 +1127,7 @@ TEST(loop_guard_answer_restating_two_reasoning_lines_once_does_not_abort) {
     std::vector<float> rows = row_with_argmax(3);
     const VerifyWalk   w = walk_verify(
         rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
-        [&](int) { return Control::Continue; });
+        [&](int, std::string&) { return Control::Continue; });
     CHECK(w.reason == FinishReason::Stop);
 }
 
@@ -1154,7 +1154,7 @@ TEST(loop_guard_answer_unwatched_when_the_door_never_opened) {
     std::vector<float> rows = row_with_argmax(3);
     const VerifyWalk   w = walk_verify(
         rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
-        [&](int) { return Control::Continue; });
+        [&](int, std::string&) { return Control::Continue; });
     CHECK(w.reason == FinishReason::Stop);
 }
 
@@ -1264,7 +1264,7 @@ TEST(loop_guard_text_closer_answer_starts_from_a_clean_window) {
     std::vector<float> rows = row_with_argmax(3);
     const VerifyWalk   w = walk_verify(
         rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
-        [&](int) { return Control::Continue; });
+        [&](int, std::string&) { return Control::Continue; });
     CHECK(w.reason == FinishReason::Stop);
 }
 
@@ -2171,7 +2171,7 @@ TEST(loop_guard_door_mode_answer_watched_after_a_lift) {
     std::vector<float> rows = row_with_argmax(3);
     const VerifyWalk   w = walk_verify(
         rows.data(), 1, rows.size(), {}, s, 100, [](int) { return false; },
-        [&](int) { return Control::Continue; });
+        [&](int, std::string&) { return Control::Continue; });
     CHECK(w.reason == FinishReason::Loop);
     CHECK_EQ(std::string(finish_reason_name(w.reason)), std::string("loop"));
 }

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -98,9 +99,10 @@ public:
     // known id still governs its role, so ordinary text cannot close or open
     // a block whose tag is one special token.
     void observe_think_text(std::string_view piece);
-    // The tracker alone, without the history counts: a decode loop whose
-    // history is maintained elsewhere (the speculative lane's verify walk)
-    // still needs the emitted token's id and text here.
+    // The tracker alone, without the history counts, for the tests that drive
+    // the think block and the loop guard by (id, text). No decode loop calls
+    // it: every one, the verify walk included, makes one observe(id, piece)
+    // per emitted token, and a second feed here would count the token twice.
     void observe_think(int token, std::string_view piece);
     bool think_block_open() const { return think_state_ == ThinkState::thinking; }
 
@@ -224,6 +226,28 @@ public:
     // stretch's tracker has taken (1.2.5's speed gate measures the door-closed
     // and guard-off paths, where this must never rise). No response key.
     int loop_guard_tokens_seen() const { return loop_token_seen_; }
+
+    // Tests: everything observe() feeds, read at once, so a decode path (the
+    // verify walk) can be held against the plain loop field by field. Ordered
+    // maps, so two states compare and print the same. No response key.
+    struct ObservedStateForTest {
+        int                     emitted = 0;
+        std::map<int, int>      seen, generated, answer_generated;
+        int                     think_state = 0;   // ThinkState as int
+        bool                    think_block_ever_open = false;
+        int                     ctx_budget = -1;
+        bool                    ctx_pending = false, ctx_settled = false;
+        bool                    door_open = false, door_opened = false, door_lifted = false;
+        int                     door_tokens = 0, since_detect = 0, since_nudge = 0;
+        std::vector<int>        token_ids;          // the k-gram window's ids
+        std::map<uint64_t, int> token_grams;
+        size_t                  token_pos = 0;
+        int                     token_positions = 0, token_repeats = 0, tokens_seen = 0;
+        std::string             open_line;
+        std::vector<std::string> window_lines;
+        LoopGuardCounts         counts;
+    };
+    ObservedStateForTest observed_state_for_test() const;
 
     // Exposed for tests: the pure argmax the greedy path must agree with.
     static int argmax(const float* logits, size_t vocab);

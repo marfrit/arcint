@@ -2826,8 +2826,9 @@ private:
 #endif
             double     emit_s = 0.0;
             // llava: the verify walk samples each row with the sampler state as
-            // of that token -- sample(), then emit (which feeds observe_think),
-            // then walk_verify's own observe(token) before the next row. So a
+            // of that token -- sample(), then emit (which decodes and hands on
+            // the piece), then walk_verify's own observe(token, piece), the
+            // token's one observation, before the next row. So a
             // closer inside the verified span switches the following draws to
             // the answer row exactly as it would in the plain loop; observe()
             // counts the closer as the answer history's edge (not into it) and
@@ -2856,13 +2857,12 @@ private:
             const VerifyWalk w = walk_verify(
                 rows.data(), batch.size(), n_vocab_, draft, sampler, budget,
                 [&](int tok) { return is_stop(in.sampler, tok); },
-                [&](int tok) {
-                    const auto    t_emit = clock_type::now();
-                    const std::string piece = tokenizer_->decode_one(tok);
+                [&](int tok, std::string& piece) {
+                    const auto t_emit = clock_type::now();
+                    piece             = tokenizer_->decode_one(tok);
                     const Control ctl = on_piece(piece, tok);
                     emit_s += seconds_since(t_emit);
-                    sampler.observe_think(tok, piece);
-                    return ctl;
+                    return ctl;   // the walk observes (tok, piece) once
                 });
             stats.decode_emit_seconds += emit_s;
             stats.decode_sample_seconds += seconds_since(t_walk) - emit_s;

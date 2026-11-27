@@ -349,6 +349,7 @@ if(ARCINT_TESTS)
     tests/test_config.cpp
     tests/test_swa_window.cpp
     tests/test_verify_walk.cpp
+    tests/test_walk_feed.cpp
     tests/test_mtp_trace.cpp
     tests/test_mtp_capture.cpp
     tests/test_draft_policy.cpp

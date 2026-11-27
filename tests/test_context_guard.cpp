@@ -245,7 +245,7 @@ TEST(context_guard_budget_arithmetic_counts_accepted_drafts_once) {
     }
     const std::vector<int> draft = {2, 2, 2};
     const VerifyWalk w = walk_verify(rows.data(), static_cast<size_t>(rows_n), 8, draft, s, 32,
-                                     [](int) { return false; }, [](int) { return Control::Continue; });
+                                     [](int) { return false; }, [](int, std::string&) { return Control::Continue; });
     CHECK_EQ(w.emitted, 3);
     CHECK_EQ(w.accepted, 3);
     CHECK_EQ(s.think_ctx_remaining(), 44);
@@ -611,7 +611,7 @@ TEST(context_guard_forced_closer_breaks_the_verify_walk_at_its_row) {
     std::vector<int> out;
     const VerifyWalk w = walk_verify(
         rows.data(), 3, vocab, {2, 2}, s, 100, [](int) { return false; },
-        [&](int t) {
+        [&](int t, std::string&) {
             out.push_back(t);
             return Control::Continue;
         });
