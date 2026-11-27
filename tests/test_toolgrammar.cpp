@@ -474,7 +474,7 @@ TEST(verify_walk_constraint_sees_only_kept_tokens) {
     sampler.set_constraint(&c);
     std::vector<int> out;
     const VerifyWalk w = walk_verify(rows.data(), 3, kVocab, { 5, 6 }, sampler, 100, [](int) { return false; },
-                                     [&](int tok) {
+                                     [&](int tok, std::string&) {
                                          out.push_back(tok);
                                          return Control::Continue;
                                      });

@@ -40,7 +40,7 @@ Run walk(std::vector<float> rows, const std::vector<int>& draft, int budget, int
     Run     r;
     r.w = walk_verify(rows.data(), rows.size() / kVocab, kVocab, draft, sampler, budget,
                       [&](int t) { return t == stop_tok; },
-                      [&](int t) {
+                      [&](int t, std::string&) {
                           r.out.push_back(t);
                           return static_cast<int>(r.out.size()) - 1 == cancel_at ? Control::Cancel : Control::Continue;
                       });

@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <string>
 #include <vector>
 
 #include "core/sampler.h"
@@ -27,10 +28,15 @@ struct VerifyWalk {
 // rows: n_rows x vocab logits (sample() may rewrite them); draft: the
 // n_rows - 1 drafted tokens; budget: how many tokens may still be emitted
 // (max_tokens and the context, as the plain loop checks them); emit hands a
-// token on and says whether to go on.
+// token on, writes the text it decoded the token to into `piece` (left empty
+// by a caller without text), and says whether to go on. The walk then makes
+// the token's one observation, observe(token, piece), as the plain loop does
+// after its own emit: emit must not feed the sampler itself, or the history
+// and the think tracker (the loop guard's door budget, its k-gram window, the
+// context guard) count the token twice.
 inline VerifyWalk walk_verify(float* rows, size_t n_rows, size_t vocab, const std::vector<int>& draft,
                               Sampler& sampler, int budget, const std::function<bool(int)>& is_stop,
-                              const std::function<Control(int)>& emit) {
+                              const std::function<Control(int, std::string&)>& emit) {
     VerifyWalk w;
     for (size_t i = 0; i < n_rows; ++i) {
         const int tok = sampler.sample(rows + i * vocab, vocab);
@@ -44,9 +50,10 @@ inline VerifyWalk walk_verify(float* rows, size_t n_rows, size_t vocab, const st
             w.reason = FinishReason::Length;
             break;
         }
-        const Control ctl = emit(tok);
+        std::string   piece;
+        const Control ctl = emit(tok, piece);
         ++w.emitted;
-        sampler.observe(tok);
+        sampler.observe(tok, piece);
         // loop-guard: a forced token (nudge or slap) returns from sample() and
         // is emitted/observed like any drawn token. When it differs from the
         // draft at this position the `tok == draft[i]` check below fails and

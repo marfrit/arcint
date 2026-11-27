@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -98,9 +99,10 @@ public:
     // known id still governs its role, so ordinary text cannot close or open
     // a block whose tag is one special token.
     void observe_think_text(std::string_view piece);
-    // The tracker alone, without the history counts: a decode loop whose
-    // history is maintained elsewhere (the speculative lane's verify walk)
-    // still needs the emitted token's id and text here.
+    // The tracker alone, without the history counts, for the tests that drive
+    // the think block and the loop guard by (id, text). No decode loop calls
+    // it: every one, the verify walk included, makes one observe(id, piece)
+    // per emitted token, and a second feed here would count the token twice.
     void observe_think(int token, std::string_view piece);
     bool think_block_open() const { return think_state_ == ThinkState::thinking; }
 
@@ -133,8 +135,9 @@ public:
     // clean-turns step 2: the tool-call grammar, or nullptr. Not owned. It is
     // dormant while a think block is open (the reference's lazy grammar is not
     // applied while the reasoning budget sampler counts, common/sampling.cpp
-    // grammar_should_apply), so it needs the block's state: the backend feeds
-    // observe_think_text whenever params.tool_grammar is set, mask or not.
+    // grammar_should_apply), so it needs the block's state: tracks_think()
+    // holds for params.tool_grammar, mask or not, so the decode loop's one
+    // observe(id, piece) per emitted token keeps it.
     void set_constraint(TokenConstraint* c) { constraint_ = c; }
 
     // loop-guard: the fixed sentence's ids, tokenised by the backend (which
@@ -180,6 +183,17 @@ public:
                 loop_self_closes_, loop_door_masked_, loop_door_eog_masked_,
                 ctx_closes_, ctx_no_closer_, think_closes_, ctx_forced_index_};
     }
+    // -vv, the served check of the one-feed rule: the think tracker's calls
+    // (observe_think_, every entry) against the observed tokens, and how many
+    // of those landed inside the block (the opener included, the closer not:
+    // the context guard's count). A decode path that feeds the tracker once
+    // per emitted token shows calls == emitted. No response key.
+    struct ThinkFeedCounts {
+        int tracker_calls = 0;
+        int emitted       = 0;
+        int thinking      = 0;
+    };
+    ThinkFeedCounts think_feed_counts() const { return {think_feed_calls_, emitted_, think_emitted_}; }
     // The answer phase kept looping after a slap: the caller ends the turn on
     // FinishReason::Loop instead of emitting another token. Latching: once set
     // the turn is over.
@@ -224,6 +238,28 @@ public:
     // stretch's tracker has taken (1.2.5's speed gate measures the door-closed
     // and guard-off paths, where this must never rise). No response key.
     int loop_guard_tokens_seen() const { return loop_token_seen_; }
+
+    // Tests: everything observe() feeds, read at once, so a decode path (the
+    // verify walk) can be held against the plain loop field by field. Ordered
+    // maps, so two states compare and print the same. No response key.
+    struct ObservedStateForTest {
+        int                     emitted = 0;
+        std::map<int, int>      seen, generated, answer_generated;
+        int                     think_state = 0;   // ThinkState as int
+        bool                    think_block_ever_open = false;
+        int                     ctx_budget = -1;
+        bool                    ctx_pending = false, ctx_settled = false;
+        bool                    door_open = false, door_opened = false, door_lifted = false;
+        int                     door_tokens = 0, since_detect = 0, since_nudge = 0;
+        std::vector<int>        token_ids;          // the k-gram window's ids
+        std::map<uint64_t, int> token_grams;
+        size_t                  token_pos = 0;
+        int                     token_positions = 0, token_repeats = 0, tokens_seen = 0;
+        std::string             open_line;
+        std::vector<std::string> window_lines;
+        LoopGuardCounts         counts;
+    };
+    ObservedStateForTest observed_state_for_test() const;
 
     // Exposed for tests: the pure argmax the greedy path must agree with.
     static int argmax(const float* logits, size_t vocab);
@@ -474,6 +510,8 @@ private:
     bool ctx_by_think_       = false;  // the thinking budget is the limit counted
     int  ctx_forced_index_   = -1;
     int  emitted_            = 0;
+    int  think_feed_calls_   = 0;   // observe_think_ entries (think_feed_counts)
+    int  think_emitted_      = 0;   // observed tokens inside the block (think_feed_counts)
     mutable bool ctx_warned_ = false;
     // The masked ids' logits at mask time, not the whole row: the count reads
     // them against the candidate floor the draw's collection gives.

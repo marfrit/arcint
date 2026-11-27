@@ -85,7 +85,7 @@ Arm run(int depth_max, size_t prompt_len, int gen, int n_draft, int budget) {
         std::vector<float> rows = rows_at(emitted, static_cast<size_t>(n_max) + 1);
         w = walk_verify(rows.data(), static_cast<size_t>(n_max) + 1, kVocab, draft, sampler, room,
                         [](int) { return false; },
-                        [&](int tok) {
+                        [&](int tok, std::string&) {
                             a.out.push_back(tok);
                             return Control::Continue;
                         });
