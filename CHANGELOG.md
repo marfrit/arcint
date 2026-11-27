@@ -190,9 +190,10 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   errors cleanly instead of running. Evidence (`code`, `measured-here` on CPU): device-free cases red on the old
   engine (the defining contexts never expire; +17 KB after 1 render and +883 KB after 50 of a one-macro template)
   and flat after, a template that raises after defining a macro included; the production templates (two distinct
-  files: the Qwen3.8 27B and Flash-Next share one) render byte-identical old against new over 30 request shapes
+  files: the Qwen3.8 27B and Flash-Next share one) render byte-identical old against new over 90 request shapes
   each (system, user, a tool, an assistant tool call, its result; reasoning effort unset / none / low / medium /
-  high; thinking unset / on / off), 60 distinct renders. Also fixed: `tojson` leaked ~100 B a call, sorting or
+  high; thinking unset / on / off; the user turn as a string or as list content with an image part, which Qwen's
+  `render_content` writes outer namespaces for; add_generation_prompt on and off), 180 distinct renders. Also fixed: `tojson` leaked ~100 B a call, sorting or
   not, through a key sorter that held itself (arcint's own `tojson` options patch, 1.8.0); red +0.4 KB after 1
   render and +19 KB after 50 of four calls, flat after. With both fixes, RssAnon over 100 / 2,000 / 20,000 renders
   of the production Inkling template: 492 / 488 / 492 kB (before: 3,496 kB at 100, 57,472 kB at 2,000).
