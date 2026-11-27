@@ -116,6 +116,7 @@ void Sampler::observe(int token, std::string_view piece) {
         --ctx_budget_;
         think_ctx_arm_();
     }
+    if (think_state_ == ThinkState::thinking) ++think_emitted_;
     // A token inside an open think block is reasoning, not a call: arcint
     // parses calls from the content only (split_reasoning), so the grammar is
     // not fed it -- a call opener the model mentions while thinking does not
@@ -338,6 +339,7 @@ void Sampler::start_in_think_block(bool open, bool after_close) {
 // the block is. Once content the state is final for the turn: nothing
 // re-opens the block.
 void Sampler::observe_think_(std::string_view piece, int token) {
+    ++think_feed_calls_;   // the -vv think-tracker line's count, every entry
     if (!tracks_think()) return;
 
     // loop-guard door: a closer that sample() forced for a slap is not the

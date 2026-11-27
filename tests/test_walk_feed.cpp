@@ -215,6 +215,11 @@ TEST(verify_walk_feeds_the_sampler_once_per_token_like_the_plain_loop) {
     }
     CHECK_EQ(out, plain.out);
     CHECK_EQ(first_diff, std::string());
+    // the served -vv think-tracker line's numbers: one tracker call a token
+    const Sampler::ThinkFeedCounts f = s.think_feed_counts();
+    CHECK_EQ(f.tracker_calls, static_cast<int>(out.size()));
+    CHECK_EQ(f.emitted, static_cast<int>(out.size()));
+    CHECK(f.thinking > 300 && f.thinking < f.emitted);   // the block closed at the slap
     CHECK(compared > 100);
     CHECK(door_compared > 50);
 }

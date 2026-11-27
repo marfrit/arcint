@@ -182,6 +182,17 @@ public:
                 loop_self_closes_, loop_door_masked_, loop_door_eog_masked_,
                 ctx_closes_, ctx_no_closer_, think_closes_, ctx_forced_index_};
     }
+    // -vv, the served check of the one-feed rule: the think tracker's calls
+    // (observe_think_, every entry) against the observed tokens, and how many
+    // of those landed inside the block (the opener included, the closer not:
+    // the context guard's count). A decode path that feeds the tracker once
+    // per emitted token shows calls == emitted. No response key.
+    struct ThinkFeedCounts {
+        int tracker_calls = 0;
+        int emitted       = 0;
+        int thinking      = 0;
+    };
+    ThinkFeedCounts think_feed_counts() const { return {think_feed_calls_, emitted_, think_emitted_}; }
     // The answer phase kept looping after a slap: the caller ends the turn on
     // FinishReason::Loop instead of emitting another token. Latching: once set
     // the turn is over.
@@ -498,6 +509,8 @@ private:
     bool ctx_by_think_       = false;  // the thinking budget is the limit counted
     int  ctx_forced_index_   = -1;
     int  emitted_            = 0;
+    int  think_feed_calls_   = 0;   // observe_think_ entries (think_feed_counts)
+    int  think_emitted_      = 0;   // observed tokens inside the block (think_feed_counts)
     mutable bool ctx_warned_ = false;
     // The masked ids' logits at mask time, not the whole row: the count reads
     // them against the candidate floor the draw's collection gives.

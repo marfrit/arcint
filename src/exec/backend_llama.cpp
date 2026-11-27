@@ -3289,6 +3289,15 @@ private:
         if (c.ctx_closes || c.ctx_no_closer)
             log::info("context-guard", "lane %d: closed %d, no closer %d, forced at token %d", seq,
                       c.ctx_closes, c.ctx_no_closer, c.ctx_forced_index);
+        // -vv, one line a request, on every request (no detection needed): a
+        // decode path that feeds the think tracker once per emitted token
+        // shows observe calls == emitted, the plain loop and the verify walk
+        // alike.
+        if (log::enabled(log::Level::Debug)) {
+            const Sampler::ThinkFeedCounts f = sampler.think_feed_counts();
+            log::debug("think-tracker", "lane %d: observe calls %d, emitted %d (thinking %d)", seq,
+                       f.tracker_calls, f.emitted, f.thinking);
+        }
     }
 
     // One llama_decode of n tokens of `seq` at positions [pos, pos + n), with
