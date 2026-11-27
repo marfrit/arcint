@@ -250,6 +250,16 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   to stand 10x above the bound for the q8_0 split cases (their bound unchanged at 1e-5, as before 0223c) and 1.5x for
   the f16 ones (bound 1e-4): every cell clears it, the smallest at 1.76x (f16) and 17.3x (q8_0) (`inference`, a
   numpy-checked CPU model). The case comment's figures read 3.55e-4 and 1.76x (`contrib/llama.cpp/README.md`, 0223c).
+- llama.cpp patch 0226b (tests, three red builds and two fields of the split's stats record, stored only when a test
+  reads the record: a serving launch gains a flag load and no store): needle-at-seam cases for the FA port's key split, f16, q8_0 and the
+  served 8:4 (q8_0 K / q4_0 V). A key lost or doubled at a seam, or a clipped tail, was invisible to every check
+  (1.7e-7 against a 1e-5 compare); with a dominant key either side of every seam and in the call's tail it moves the
+  answer 100x and more over the bound on the CPU model. The needles are held to the launch's own seams (its
+  split_blocks and n_kv, exported with the split stats): a needle off them fails the case ("NEEDLE OFF THE SEAM").
+  Reds 21 (the first key of every split >= 1 lost), 22 (the key before every seam walked twice) and 23 (the last
+  split one block short); a split launch at a wave other than the modelled 200 / 320 fails its case. Checked without
+  a card (the CPU model red / green, ocloc on both cards' targets: every program's ISA unchanged); the card rows are
+  owed (`contrib/llama.cpp/README.md`, 0223).
 - llama.cpp patch 0221 (opt-in, `GGML_OPENCL_LOOP_CONTROL=1|bf16`, default off): Inkling 2 Mini's loop controller as
   one op and one OpenCL launch on Intel Xe2 (`kernel_loop_control`, nothing intermediate in global memory) in place of
   its 12-launch chain, for prompt batches (that was `=1`'s range in 0221 alone; with 0226, `1` and `f32` fuse from one
