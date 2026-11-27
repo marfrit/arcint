@@ -629,9 +629,13 @@ void check_plan_and_replay(const call_shape & c, bool replay, bool kernel = true
             run_groups(L, tokens);
             L.nwbuf = nullptr;
             const double er = nmse_tokens(out.data(), dst, tokens);
-            // NaN or inf is a red that differs, never a match
-            if (!(std::isnan(er) || std::isinf(er) || er > 1e-2)) {
-                printf("FAIL: the red kernel (norm weight offset dropped) still matches, %s: nmse %.3g\n", what, er);
+            // The red output is x*7 against the op's x*w, w in [0.5, 1.5) (the fill above), so per
+            // element ((7-w)/w)^2 lies in (13.44, 169] and the nmse, a weighted mean of those,
+            // lies in the same range: the band (13, 170). A NaN, an inf or a value outside the band
+            // is a mutant that did not take effect as defined (e.g. the green text reading the
+            // sentinel out of bounds), never a detection.
+            if (!(std::isfinite(er) && er > 13.0 && er < 170.0)) {
+                printf("FAIL: the red kernel (norm weight offset dropped) is not the expected finite nmse in (13, 170), %s: nmse %.3g\n", what, er);
                 ++g_failures;
             }
             printf("replay %s: nmse %.2g, red (offset dropped) %.3g\n", what, e, er);
