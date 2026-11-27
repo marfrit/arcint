@@ -90,3 +90,10 @@ holds no defining context and has no cycle, but resolves names differently
 from Jinja and from minja; not followed here, since the templates must render
 as before. Worth a PR against google/minja.
 
+## `tojson` key sorter (2026-11-27)
+
+`minja.hpp`, the global `tojson` (this file's 2026-11-22 entry): the
+recursive key sorter was a `std::function` held by a `shared_ptr` that the
+function captured by value, a self-cycle created on every `tojson` call,
+sorting or not (~100 B a call). It is now a local `std::function` captured by
+reference, which lives for the call. Local code; nothing upstream.

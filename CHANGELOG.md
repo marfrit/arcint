@@ -191,7 +191,10 @@ answers right (`measured-here`). The defaults of the opt-in switches are unchang
   engine (the defining contexts never expire; +883 KB over 49 more renders of a one-macro template) and flat after;
   the three production templates render byte-identical old against new over 30 request shapes each (system, user,
   a tool, an assistant tool call, its result; reasoning effort unset / none / low / medium / high; thinking unset /
-  on / off).
+  on / off). Also fixed: `tojson` leaked ~100 B a call, sorting or not, through a key sorter that held itself
+  (arcint's own `tojson` options patch, 1.8.0); red +19 KB over 49 more renders of four calls, flat after. With both
+  fixes, RssAnon over 100 / 2,000 / 20,000 renders of the production Inkling template: 492 / 488 / 492 kB (before:
+  3,496 kB at 100, 57,472 kB at 2,000).
 
 - Patch 0222: the wide int8 expert tile at 64 pairs, opt-in (`GGML_OPENCL_KQ_MM_ID_I8_XT=64`; unset is the 32-pair tile,
   ISA unchanged). The route cuts an expert into ceil(c/64) tiles, and the 8-pair groups past a tile's real count are

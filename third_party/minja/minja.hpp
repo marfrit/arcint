@@ -2806,8 +2806,10 @@ inline std::shared_ptr<Context> Context::builtins() {
   // `sort_keys` / `separators`: Inkling 2 Mini passes both. Compact separators are already `dump`'s
   // behaviour at indent -1; sort_keys is honoured recursively, as Python's json.dumps does.
   globals.set("tojson", simple_function("tojson", { "value", "indent", "ensure_ascii", "sort_keys", "separators" }, [](const std::shared_ptr<Context> &, Value & args) {
-    auto sort_recursive = std::make_shared<std::function<Value(const Value &)>>();
-    *sort_recursive = [sort_recursive](const Value & value) -> Value {
+    // A local function the lambda refers to by reference: a shared_ptr to it
+    // captured by value in itself was a cycle that leaked on every tojson call.
+    std::function<Value(const Value &)> sort_recursive;
+    sort_recursive = [&sort_recursive](const Value & value) -> Value {
       if (value.is_object()) {
         auto copy = value;
         auto keys = copy.keys();
@@ -2815,18 +2817,18 @@ inline std::shared_ptr<Context> Context::builtins() {
           return a.to_str() < b.to_str();
         });
         auto sorted = Value::object();
-        for (const auto & key : keys) sorted.set(key, (*sort_recursive)(value.at(key)));
+        for (const auto & key : keys) sorted.set(key, sort_recursive(value.at(key)));
         return sorted;
       }
       if (value.is_array()) {
         auto sorted = Value::array();
-        for (size_t i = 0, n = value.size(); i < n; ++i) sorted.push_back((*sort_recursive)(value.at(i)));
+        for (size_t i = 0, n = value.size(); i < n; ++i) sorted.push_back(sort_recursive(value.at(i)));
         return sorted;
       }
       return value;
     };
     auto value = args.at("value");
-    if (args.get<bool>("sort_keys", false)) value = (*sort_recursive)(value);
+    if (args.get<bool>("sort_keys", false)) value = sort_recursive(value);
     const int64_t indent = args.get<int64_t>("indent", -1);
     // `separators=(item, key)` as Python's json.dumps: both are strings, the
     // first between items, the second between a key and its value. Absent, the

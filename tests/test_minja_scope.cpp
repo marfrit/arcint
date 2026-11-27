@@ -29,7 +29,8 @@
 // macro leaked its whole scope chain (every production template defines one).
 // Mutation: put back the strong capture in MacroNode::do_render (capture
 // macro_context, drop the lock) and the *_released / *_flat cases fail; put it
-// back in CallNode::do_render and the call-block arms fail.
+// back in CallNode::do_render and the call-block arms fail; make tojson's
+// sort_recursive a shared_ptr captured in itself again and the tojson case fails.
 
 namespace {
 
@@ -51,6 +52,12 @@ constexpr const char* kOneMacro =
 constexpr const char* kCallBlock =
     "{%- macro wrap(tag) -%}<{{ tag }}>{{ caller() }}</{{ tag }}>{%- endmacro -%}"
     "{%- for m in messages -%}{%- call wrap('b') -%}{{ m.content }}{%- endcall -%}{%- endfor -%}";
+
+// The local `tojson` patch (PATCHES.md, 2026-11-22): its key sorter held itself
+// through a shared_ptr, a cycle made on every call, sorting or not (~100 B a call).
+constexpr const char* kToJson =
+    "{%- for m in messages -%}{{ m | tojson }}{{ m | tojson(sort_keys=true) }}"
+    "{{ m | tojson(separators=(',', ':')) }}{{ m | tojson(sort_keys=true, separators=(',', ':')) }}{%- endfor -%}";
 
 std::string apply(const minja::chat_template& tmpl) {
     minja::chat_template_inputs in;
@@ -115,6 +122,15 @@ TEST(minja_macro_defining_context_is_released_after_render) {
 TEST(minja_macro_render_live_heap_is_flat_in_render_count) {
     check_flat(kOneMacro);
     check_flat(kCallBlock);
+}
+
+TEST(minja_tojson_live_heap_is_flat_in_render_count) {
+    check_flat(kToJson);
+    minja::chat_template tmpl(kToJson, "", "");
+    CHECK_EQ(apply(tmpl), std::string("{\"role\": \"user\", \"content\": \"hi\"}"
+                                      "{\"content\": \"hi\", \"role\": \"user\"}"
+                                      "{\"role\":\"user\",\"content\":\"hi\"}"
+                                      "{\"content\":\"hi\",\"role\":\"user\"}"));
 }
 
 // Semantics the fix must keep (each output is what the pre-fix engine renders).
