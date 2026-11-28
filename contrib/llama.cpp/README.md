@@ -13445,3 +13445,35 @@ Checks (`measured-here`, the same host and tree as above, red first):
 
 The CPU modes are untouched: `test-dspark-shortlist` without `gpu` still runs its cases and ends `SHORTLIST PASS`,
 exit 0.
+
+## 0231-opencl-soa-range-write-planes.patch
+
+A q8_0 / q4_0 tensor on OpenCL that was written whole is split into scales and quants, two sub-buffers of its own
+allocation holding the blocks in order. A later write of a byte range of it, or through a view of it, was refused
+(0209's WARN for a view, 0230's for a partial write). In a non-weights buffer it is now performed:
+`ggml_cl_soa_range_write` splits the caller's blocks on the host and writes the scales at 2 bytes a block and the
+quants at 32 / 16 bytes a block into the BASE's planes, at the block that `view_offs + offset` names, with two
+blocking writes on the backend's in-order queue. The route is `ggml_cl_soa_write_route2` (ggml-opencl-soa-route.h,
+pure): a tensor that is not split keeps 0230's route (its first whole write converts); a range that is not whole
+blocks or runs past the tensor is refused with a WARN, once per process and type; in a build with
+`GGML_OPENCL_USE_ADRENO_KERNELS` (transposed and no-shuffle layouts, images, a scale copy) every write into a split
+tensor is refused with the same WARN. A view that covers its whole base is written into the planes, not converted.
+A second defect is closed with it: a WHOLE write into a base that was already split went to the conversion again,
+which read the tensor's extra as the plain one although it was the split one by then. Such a write now goes into the
+existing planes too, in a weights buffer as well; a split base is never converted a second time. A tensor
+re-initialised in the same buffer without a reset gets a fresh plain extra from init_tensor and is erased there from
+the split set, so its next whole write converts again instead of routing into planes the tensor no longer has.
+In a weights buffer that is the only change: a view of a split base keeps 0209's refusal, a partial write 0230's.
+Who is split is unchanged; no kernel changes. This replaces 0230's "writing it into the split planes is owed" for
+non-weights buffers.
+Not changed, known: get_tensor of a view of a split base ignores `view_offs` (read such a tensor through its base).
+Tests (`contrib/refkernels/soa-route/soa_route_test.cpp`, CPU): green rc 0, table 1 `SOA ROUTE: 8 of 8 cases right`,
+table 2 `SOA ROUTE2: 27 of 27 cases right`, no compiler warning; the red build `-DGGML_CL_SOA_ROUTE2_RED` (0230's
+routing) rc 1, `SOA ROUTE2: 13 of 27 cases right`, its fourteen failures the PLANES rows 1, 6, 7, 8, 9, 10, 17, 18,
+19, 21, 22, 23, 24 and 25 (the four whole re-writes read CONVERT, rows 9 and 19 REFUSE_PARTIAL, the other eight
+REFUSE_VIEW); step 1's red build `-DGGML_CL_SOA_ROUTE_RED` stays red, rc 1, table 1 `4 of 8` (cases 4, 5, 6, 8),
+table 2 `26 of 27` (row 3). Not run on a card here.
+`tests/test-opencl-kv-view-write.cpp` (the card): the split cases now expect the view write performed and no warning,
+and a KV-shaped case is added (a split base [4096, 64], rows 8..15 written through a view in two ranges, read back
+through the base) and cases that set a base whole twice (in a non-weights and in a weights buffer) and that
+re-initialise a split base in the same buffer and set it whole again; 88 cases. Not built and not run here (it needs a card).

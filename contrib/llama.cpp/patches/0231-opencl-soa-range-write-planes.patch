@@ -1,0 +1,386 @@
+0231: set_tensor writes into an already split q8_0 / q4_0 tensor's scales and quants (ggml_cl_soa_range_write): a range or a view in a non-weights buffer instead of refusing it, and a whole write in any buffer instead of converting a second time; a weights buffer's view and partial write, unaligned ranges and Adreno layouts stay refused.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-soa-route.h b/ggml/src/ggml-opencl/ggml-opencl-soa-route.h
+index b72557c..97ef28d 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl-soa-route.h
++++ b/ggml/src/ggml-opencl/ggml-opencl-soa-route.h
+@@ -11,6 +11,9 @@ enum ggml_cl_soa_route {
+     GGML_CL_SOA_CONVERT        = 0,   // a whole write of a whole, contiguous base: convert (today's path)
+     GGML_CL_SOA_REFUSE_VIEW    = 1,   // a view or a non-contiguous tensor: 0209's WARN, not performed
+     GGML_CL_SOA_REFUSE_PARTIAL = 2,   // 0230: a partial write: WARN, not performed
++    GGML_CL_SOA_PLANES         = 3,   // 0231: a range of a split base: written into its scales and quants
++    GGML_CL_SOA_REFUSE_ALIGN   = 4,   // 0231: not whole blocks, or past the tensor: WARN, not performed
++    GGML_CL_SOA_REFUSE_LAYOUT  = 5,   // 0231: the planes are not in block order (an Adreno layout): WARN, not performed
+ };
+ 
+ static inline ggml_cl_soa_route ggml_cl_soa_write_route(bool view_or_noncontiguous, size_t offset, size_t size,
+@@ -23,3 +26,30 @@ static inline ggml_cl_soa_route ggml_cl_soa_write_route(bool view_or_noncontiguo
+ #endif
+     return GGML_CL_SOA_CONVERT;
+ }
++
++// 0231: the route of a write that reaches the q8_0 / q4_0 branch of set_tensor, with the tensor's state. A tensor
++// whose base is not split keeps 0230's route unchanged (its first whole write converts). A split base is never
++// converted again (the conversion reads the tensor's extra as the plain one, which it no longer is): a write of whole
++// blocks inside the tensor is written into the base's scales and quants (PLANES). In a weights buffer only a whole
++// write of the base is: a view keeps 0209's refusal, a partial write 0230's. In a non-weights buffer a partial write
++// and a view are too, and a view that covers its whole base. blk = the type's block bytes (34 / 18), nbytes = the
++// written tensor's bytes, base_nbytes = its base's, view_offs = the tensor's byte offset in its base. layout_plain =
++// the planes hold the blocks in order (no Adreno transposed / no-shuffle layout in the build).
++static inline ggml_cl_soa_route ggml_cl_soa_write_route2(bool weights, bool is_view, bool contiguous, bool base_split,
++                                                         bool layout_plain, size_t view_offs, size_t offset, size_t size,
++                                                         size_t nbytes, size_t base_nbytes, size_t blk) {
++    const ggml_cl_soa_route r0230 = ggml_cl_soa_write_route(is_view || !contiguous, offset, size, nbytes);
++    if (!base_split) return r0230;
++    if (!contiguous) return GGML_CL_SOA_REFUSE_VIEW;
++    if (weights && (is_view || offset != 0 || size != nbytes)) return r0230;   // REFUSE_VIEW / REFUSE_PARTIAL
++    if (!layout_plain) return GGML_CL_SOA_REFUSE_LAYOUT;
++    if (blk == 0 || (view_offs + offset) % blk != 0 || size % blk != 0 || offset + size > nbytes ||
++        view_offs + offset + size > base_nbytes) {
++        return GGML_CL_SOA_REFUSE_ALIGN;
++    }
++#ifndef GGML_CL_SOA_ROUTE2_RED
++    return GGML_CL_SOA_PLANES;
++#else
++    return r0230;   // the red build: 0230's routing (REFUSE_VIEW / REFUSE_PARTIAL, a whole write CONVERT)
++#endif
++}
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index b20b345..8b660d7 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -15296,6 +15296,10 @@ static enum ggml_status ggml_backend_opencl_buffer_init_tensor(ggml_backend_buff
+             extra->actual_size = ggml_nbytes(tensor);
+ 
+             tensor->extra = extra;
++            // 0231: a fresh plain extra: the tensor is not split (a stale set entry would route its next write into
++            // planes it does not have).
++            ctx->q8_0_soa_tensors.erase(tensor);
++            ctx->q4_0_soa_tensors.erase(tensor);
+         }
+     }
+     return GGML_STATUS_SUCCESS;
+@@ -15680,6 +15684,78 @@ static void ggml_cl_warn_partial_write_refused(const ggml_tensor * tensor, ggml_
+                   ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? "weights" : "non-weights");
+ }
+ 
++// 0231: a range write into a split q8_0 / q4_0 tensor that cannot go into its planes (not whole blocks, past the
++// tensor, or an Adreno layout) is refused; once per process and type, so a path that lands here shows in the log.
++static void ggml_cl_warn_range_write_refused(const ggml_tensor * tensor, size_t offset, size_t size, ggml_cl_soa_route route) {
++    static std::atomic<bool> warned_q8_0{false};
++    static std::atomic<bool> warned_q4_0{false};
++    std::atomic<bool> & warned = tensor->type == GGML_TYPE_Q8_0 ? warned_q8_0 : warned_q4_0;
++    if (warned.exchange(true)) {
++        return;
++    }
++    const ggml_tensor * base = tensor->view_src != nullptr ? tensor->view_src : tensor;
++    GGML_LOG_WARN("ggml_opencl: set_tensor: a range write into a split q8_0/q4_0 tensor was refused, not written "
++                  "(tensor '%s', type %s, base '%s', view_offs %zu, offset %zu, size %zu of %zu, reason: %s); "
++                  "logged once per process and type\n",
++                  tensor->name, ggml_type_name(tensor->type), base->name, tensor->view_offs, offset, size, ggml_nbytes(tensor),
++                  route == GGML_CL_SOA_REFUSE_LAYOUT ? "the planes are not in block order" : "not whole blocks inside the tensor");
++}
++
++// 0231: the write route of a q8_0 / q4_0 tensor in set_tensor, from the tensor's state (ggml_cl_soa_write_route2,
++// ggml-opencl-soa-route.h, pure). The split test follows view_src.
++static ggml_cl_soa_route ggml_cl_soa_route2_of(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, size_t offset,
++                                               size_t size) {
++    const ggml_tensor * base = tensor->view_src != nullptr ? tensor->view_src : tensor;
++    const bool base_split = tensor->type == GGML_TYPE_Q8_0 ? ggml_cl_is_q8_0_soa(tensor) : ggml_cl_is_q4_0_soa(tensor);
++#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
++    // the build may hold a split tensor transposed, without the nibble shuffle, or with an image / a scale copy
++    const bool layout_plain = false;
++#else
++    const bool layout_plain = true;   // only d and q exist, blocks in order
++#endif
++    return ggml_cl_soa_write_route2(ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
++                                    tensor->view_src != nullptr, ggml_is_contiguous(tensor), base_split, layout_plain,
++                                    tensor->view_offs, offset, size, ggml_nbytes(tensor), ggml_nbytes(base),
++                                    ggml_type_size(tensor->type));
++}
++
++// 0231: writes the bytes [offset, offset + size) of `tensor` (GGUF block layout in `data`) into the scales and
++// quants of its split base: block b of the base has its scale at d[2 * b] and its quants at q[(blk - 2) * b]
++// (kernel_convert_block_q8_0 / _q4_0 keep the block order). The route has checked: a split base, whole blocks
++// inside the tensor, no Adreno layout (a weights buffer: only a whole write of the base; then the host copies are as
++// large as the tensor). The split extra is the BASE's: a view's own extra pointer
++// was copied at init and is the stale plain one. Two blocking writes on the backend's in-order queue: ordered after
++// every earlier kernel and write, done on return (the host copies are locals, the caller may free `data`).
++static void ggml_cl_soa_range_write(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * tensor, const void * data,
++                                    size_t offset, size_t size) {
++    if (size == 0) {
++        return;
++    }
++    const ggml_tensor * base = tensor->view_src != nullptr ? tensor->view_src : tensor;
++    const size_t blk = ggml_type_size(tensor->type);        // d (half) + quants: 34 / 18
++    const size_t qb  = blk - sizeof(ggml_fp16_t);
++    const size_t b0  = (tensor->view_offs + offset) / blk;  // the first block, in the base
++    const size_t nbk = size / blk;
++    std::vector<uint8_t> dh(nbk * sizeof(ggml_fp16_t)), qh(nbk * qb);
++    const uint8_t * src = (const uint8_t *) data;
++    for (size_t b = 0; b < nbk; ++b) {
++        memcpy(dh.data() + b * sizeof(ggml_fp16_t), src + b * blk, sizeof(ggml_fp16_t));
++        memcpy(qh.data() + b * qb, src + b * blk + sizeof(ggml_fp16_t), qb);
++    }
++    cl_mem d = nullptr, q = nullptr;
++    if (tensor->type == GGML_TYPE_Q8_0) {
++        auto * e = (ggml_tensor_extra_cl_q8_0 *) base->extra;
++        d = e->d; q = e->q;
++    } else {
++        auto * e = (ggml_tensor_extra_cl_q4_0 *) base->extra;
++        d = e->d; q = e->q;
++    }
++    GGML_ASSERT(d != nullptr && q != nullptr);
++    cl_command_queue queue = backend_ctx->queue;
++    CL_CHECK(clEnqueueWriteBuffer(queue, d, CL_TRUE, b0 * sizeof(ggml_fp16_t), dh.size(), dh.data(), 0, NULL, NULL));
++    CL_CHECK(clEnqueueWriteBuffer(queue, q, CL_TRUE, b0 * qb, qh.size(), qh.data(), 0, NULL, NULL));
++}
++
+ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     if (((ggml_backend_opencl_buffer_context *) buffer->context)->usm) {
+         ggml_cl_usm_set_tensor((ggml_backend_opencl_buffer_context *) buffer->context, tensor, data, offset, size);
+@@ -15816,8 +15892,15 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     // conversion kernel.
+     if (tensor->type == GGML_TYPE_Q4_0) {
+         // Views can't SoA-ify here — parent owns the layout (see q8_0 guard). 0230: nor can a partial write.
+-        const ggml_cl_soa_route route = ggml_cl_soa_write_route(tensor->view_src != nullptr || !ggml_is_contiguous(tensor),
+-                                                                offset, size, ggml_nbytes(tensor));
++        const ggml_cl_soa_route route = ggml_cl_soa_route2_of(buffer, tensor, offset, size);   // 0231 (0230's route inside)
++        if (route == GGML_CL_SOA_PLANES) {
++            ggml_cl_soa_range_write(backend_ctx, tensor, data, offset, size);   // 0231: into the base's scales and quants
++            return;
++        }
++        if (route == GGML_CL_SOA_REFUSE_ALIGN || route == GGML_CL_SOA_REFUSE_LAYOUT) {
++            ggml_cl_warn_range_write_refused(tensor, offset, size, route);   // 0231
++            return;
++        }
+         if (route == GGML_CL_SOA_REFUSE_VIEW) {
+             ggml_cl_warn_view_write_dropped(tensor, buffer);   // 0209: never silent
+             return;
+@@ -16559,8 +16642,15 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     }
+     if (tensor->type == GGML_TYPE_Q8_0) {
+         // Views share the parent's buffer; parent owns SoA conversion. 0230: a partial write is refused.
+-        const ggml_cl_soa_route route = ggml_cl_soa_write_route(tensor->view_src != nullptr || !ggml_is_contiguous(tensor),
+-                                                                offset, size, ggml_nbytes(tensor));
++        const ggml_cl_soa_route route = ggml_cl_soa_route2_of(buffer, tensor, offset, size);   // 0231 (0230's route inside)
++        if (route == GGML_CL_SOA_PLANES) {
++            ggml_cl_soa_range_write(backend_ctx, tensor, data, offset, size);   // 0231: into the base's scales and quants
++            return;
++        }
++        if (route == GGML_CL_SOA_REFUSE_ALIGN || route == GGML_CL_SOA_REFUSE_LAYOUT) {
++            ggml_cl_warn_range_write_refused(tensor, offset, size, route);   // 0231
++            return;
++        }
+         if (route == GGML_CL_SOA_REFUSE_VIEW) {
+             ggml_cl_warn_view_write_dropped(tensor, buffer);   // 0209: never silent
+             return;
+diff --git a/tests/test-opencl-kv-view-write.cpp b/tests/test-opencl-kv-view-write.cpp
+index 24acbc2..ae871d4 100644
+--- a/tests/test-opencl-kv-view-write.cpp
++++ b/tests/test-opencl-kv-view-write.cpp
+@@ -14,10 +14,24 @@
+ //      once with views below the 4 MiB staging bound (the USM ring) and once with a view above it (the
+ //      blocking clEnqueueWriteBuffer);
+ //   2. per type q8_0 / q4_0, a tensor set whole first (split, as test-backend-ops' sources are), then a
+-//      view written twice: the write is not performed (the base still reads back the whole write) and
+-//      the warning is logged exactly once for that type.
++//      view written twice: since 0231 the write is performed, into the base's scales and quants (the base
++//      read whole holds the view's rows and, elsewhere, the whole write) and no warning is logged;
++//   3. (0231) per type q8_0 / q4_0, the KV shape: a base [4096, 64] set whole (split), then rows 8..15
++//      written through a ggml_view_2d in two ranges, the second at an offset inside the view (as a
++//      restore writes a stream view's cell ranges): the base read whole holds the second write in rows
++//      8..15 and the first write in every other row, and no warning is logged.
++//   4. (0231) per type q8_0 / q4_0, once in a non-weights and once in a weights buffer: a base set whole
++//      twice. The second whole write goes into the planes (a split base is not converted again) and the
++//      base reads back the second write. Run after 3: before 0231 the second write went to the conversion
++//      with the split extra read as the plain one (an abort or wrong bytes).
++//   5. (0231) per type q8_0 / q4_0, a base set whole (split), then re-initialised in the same buffer
++//      without a reset (a fresh plain extra) and set whole again: the second write converts it, not into
++//      planes it no longer has. Run last: without 0231's init_tensor erase this FAILs (or aborts).
++// 88 cases.
++// Every read in 2 and 3 goes through the BASE: get_tensor of a view of a split base ignores view_offs.
+ // The red: before 0209, every q8_0 / q4_0 view read in 1 shows the fill byte, the f16 / bf16 base read
+-// shows view a's data at row 0, and 2 logs nothing.
++// shows view a's data at row 0, and 2 logs nothing. Before 0231 (0209 to 0230), 2 and 3 read the first
++// write back in every row and 2 logs the warning once a type.
+ //
+ // Needs an OpenCL device; not a ctest case (the recipe host has no card). Run by name:
+ //   test-opencl-kv-view-write [device name, default GPUOpenCL]
+@@ -164,7 +178,7 @@ static void case_plain(ggml_backend_t backend, ggml_type type, bool big) {
+     ggml_free(ctx);
+ }
+ 
+-// 2: the split tensor (set whole first): the view write keeps today's return, and says so once
++// 2: the split tensor (set whole first): 0231 writes the view into the base's scales and quants
+ static void case_split(ggml_backend_t backend, ggml_type type) {
+     const std::string tn = ggml_type_name(type);
+     const int64_t NE0 = 256, ROWS = 16;
+@@ -199,11 +213,14 @@ static void case_split(ggml_backend_t backend, ggml_type type) {
+     ggml_backend_tensor_set(v, d4.data(), 0, d4.size());
+     ggml_backend_tensor_set(v, d4.data(), 0, d4.size());
+ 
++    // read back through the BASE (get_tensor of a view of a split base ignores view_offs)
++    std::vector<uint8_t> expect = d0;
++    std::memcpy(expect.data() + 4 * row, d4.data(), d4.size());
+     all.assign(ggml_nbytes(base), 0);
+     ggml_backend_tensor_get(base, all.data(), 0, all.size());
+-    report(all == d0, tn + " split: the view write is not performed (the base still holds the whole write; "
+-                           "if not, the base was not split and the case does not test the return)");
+-    report(warned - before == 1, tn + " split: the not-performed warning logged exactly once for two writes (" +
++    report(all == expect, tn + " split: the view write is performed (the base read whole: rows 4 and 5 hold the "
++                               "view's data, every other row the whole write)");
++    report(warned - before == 0, tn + " split: no not-performed warning for two writes (" +
+                                      std::to_string(warned - before) + ")");
+ 
+     ggml_free(vctx);
+@@ -211,6 +228,132 @@ static void case_split(ggml_backend_t backend, ggml_type type) {
+     ggml_free(ctx);
+ }
+ 
++// 3 (0231): the KV shape. A split base [4096, 64]; rows 8..15 written through a view in two ranges.
++static void case_kv_split(ggml_backend_t backend, ggml_type type) {
++    const std::string tn = ggml_type_name(type);
++    const int64_t NE0 = 4096, ROWS = 64, R0 = 8, NR = 8;
++
++    ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx  = ggml_init(ip);
++    ggml_tensor * base  = ggml_new_tensor_2d(ctx, type, NE0, ROWS);
++    ggml_set_name(base, ("kvs_" + tn).c_str());
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (buf == nullptr) {
++        report(false, tn + " kv split: buffer allocation");
++        ggml_free(ctx);
++        return;
++    }
++    report(ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS, tn + " kv split: the buffer is not a weights buffer");
++    const std::vector<uint8_t> d0 = pattern(type, ggml_nbytes(base), 30 + type);
++    ggml_backend_tensor_set(base, d0.data(), 0, d0.size());   // whole, once: the base is split
++
++    std::vector<uint8_t> all(ggml_nbytes(base));
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    report(all == d0, tn + " kv split: the whole write reads back byte-exact");
++
++    ggml_init_params vp = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * vctx = ggml_init(vp);
++    const size_t row = base->nb[1];
++    ggml_tensor * v = ggml_view_2d(vctx, base, NE0, NR, row, R0 * row);
++    ggml_set_name(v, ("kvs_" + tn + "_view").c_str());
++    report(ggml_backend_view_init(v) == GGML_STATUS_SUCCESS, tn + " kv split: view init");
++
++    int & warned = type == GGML_TYPE_Q8_0 ? g_warn_q8_0 : g_warn_q4_0;
++    const int before = warned;
++    const std::vector<uint8_t> d5 = pattern(type, ggml_nbytes(v), 40 + type);
++    const size_t half = (size_t) (NR / 2) * row;
++    ggml_backend_tensor_set(v, d5.data(), 0, half);              // rows 8..11
++    ggml_backend_tensor_set(v, d5.data() + half, half, half);    // rows 12..15: an offset inside the view
++
++    // read back through the BASE (get_tensor of a view of a split base ignores view_offs)
++    all.assign(ggml_nbytes(base), 0);
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    int64_t bad_written = 0, bad_rest = 0;
++    for (int64_t r = 0; r < ROWS; ++r) {
++        const bool written = r >= R0 && r < R0 + NR;
++        const uint8_t * want = written ? d5.data() + (size_t) (r - R0) * row : d0.data() + (size_t) r * row;
++        if (std::memcmp(all.data() + (size_t) r * row, want, row) != 0) {
++            ++(written ? bad_written : bad_rest);
++        }
++    }
++    report(bad_written == 0, tn + " kv split: rows 8..15 hold the second write (" + std::to_string(bad_written) +
++                                 " of " + std::to_string(NR) + " rows differ)");
++    report(bad_rest == 0, tn + " kv split: every other row holds the first write (" + std::to_string(bad_rest) +
++                              " of " + std::to_string(ROWS - NR) + " rows differ)");
++    report(warned - before == 0, tn + " kv split: no not-performed warning (" + std::to_string(warned - before) + ")");
++
++    ggml_free(vctx);
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
++// 4 (0231): a split base set whole a second time: into the planes, never a second conversion
++static void case_rewhole(ggml_backend_t backend, ggml_type type, bool weights) {
++    const std::string tn = std::string(ggml_type_name(type)) + (weights ? " weights" : " non-weights");
++    const int64_t NE0 = 256, ROWS = 16;
++
++    ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx  = ggml_init(ip);
++    ggml_tensor * base  = ggml_new_tensor_2d(ctx, type, NE0, ROWS);
++    ggml_set_name(base, "rewhole");
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (buf == nullptr) {
++        report(false, tn + " rewhole: buffer allocation");
++        ggml_free(ctx);
++        return;
++    }
++    if (weights) {
++        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    }
++    const std::vector<uint8_t> d0 = pattern(type, ggml_nbytes(base), 50 + type);
++    const std::vector<uint8_t> d6 = pattern(type, ggml_nbytes(base), 60 + type);
++    ggml_backend_tensor_set(base, d0.data(), 0, d0.size());   // whole: the base is split
++    ggml_backend_tensor_set(base, d6.data(), 0, d6.size());   // whole again: into the planes
++
++    std::vector<uint8_t> all(ggml_nbytes(base));
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    report(all == d6 && d6 != d0, tn + " rewhole: the base set whole twice reads back the second write");
++
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
++// 5 (0231): a tensor set whole, re-initialised in the same buffer (a fresh plain extra, no reset), set whole again
++static void case_reinit(ggml_backend_t backend, ggml_type type) {
++    const std::string tn = ggml_type_name(type);
++    const int64_t NE0 = 4096, ROWS = 64;
++
++    ggml_init_params ip = { 4 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * ctx  = ggml_init(ip);
++    ggml_tensor * base  = ggml_new_tensor_2d(ctx, type, NE0, ROWS);
++    ggml_set_name(base, ("reinit_" + tn).c_str());
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++    if (buf == nullptr) {
++        report(false, tn + " reinit: buffer allocation");
++        ggml_free(ctx);
++        return;
++    }
++    report(ggml_backend_buffer_get_usage(buf) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS, tn + " reinit: the buffer is not a weights buffer");
++    const std::vector<uint8_t> dA = pattern(type, ggml_nbytes(base), 70 + type);
++    const std::vector<uint8_t> dB = pattern(type, ggml_nbytes(base), 80 + type);
++    ggml_backend_tensor_set(base, dA.data(), 0, dA.size());   // whole: the base is split
++
++    std::vector<uint8_t> all(ggml_nbytes(base));
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    report(all == dA, tn + " reinit: the first whole write reads back byte-exact");
++
++    // the same buffer, the same address, no reset: init_tensor installs a fresh plain extra
++    report(ggml_backend_buffer_init_tensor(buf, base) == GGML_STATUS_SUCCESS, tn + " reinit: the tensor is re-initialised");
++
++    ggml_backend_tensor_set(base, dB.data(), 0, dB.size());   // whole again: it must convert
++    all.assign(ggml_nbytes(base), 0);
++    ggml_backend_tensor_get(base, all.data(), 0, all.size());
++    report(all == dB && dB != dA, tn + " reinit: after the re-init the base set whole reads back the second write");
++
++    ggml_backend_buffer_free(buf);
++    ggml_free(ctx);
++}
++
+ int main(int argc, char ** argv) {
+     ggml_log_set(log_cb, nullptr);
+     const char * name = argc > 1 ? argv[1] : "GPUOpenCL";
+@@ -234,6 +377,16 @@ int main(int argc, char ** argv) {
+     for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
+         case_split(backend, type);
+     }
++    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {
++        case_kv_split(backend, type);
++    }
++    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {   // last: its red may abort
++        case_rewhole(backend, type, false);
++        case_rewhole(backend, type, true);
++    }
++    for (ggml_type type : { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 }) {   // last: without the erase it FAILs or aborts
++        case_reinit(backend, type);
++    }
+     ggml_backend_free(backend);
+ 
+     if (g_cases == 0) {
