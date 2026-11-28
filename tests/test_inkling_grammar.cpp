@@ -46,6 +46,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #ifdef ARCINT_LLAMA
@@ -420,6 +421,13 @@ TEST(inkling_think_block_tokens_never_reach_the_grammar) {
 }
 
 #ifdef ARCINT_LLAMA
+// 1.8.4: the grammar's dialect has no default (a forgotten argument would build Qwen's grammar for any model).
+static_assert(!std::is_constructible_v<LlamaToolGrammar, const llama_vocab*, const std::vector<ToolSpec>&, bool>,
+              "LlamaToolGrammar must not be constructible without a dialect");
+static_assert(std::is_constructible_v<LlamaToolGrammar, const llama_vocab*, const std::vector<ToolSpec>&, bool,
+                                      ChatDialect>,
+              "LlamaToolGrammar takes (vocab, tools, parallel, dialect)");
+
 // ... and on llama.cpp's own matcher (the code the lazy sampler runs on its
 // trigger buffer): the text the armed tracker lets through cannot trigger,
 // the text the unarmed one lets through does, and a real call after the

@@ -147,7 +147,7 @@ Arm run(const World& w, const Case& c, const std::vector<int>& cand, bool gramma
     Sampler                           sampler(p, seed);
     std::unique_ptr<LlamaToolGrammar> g;
     if (grammar_on) {
-        g = std::make_unique<LlamaToolGrammar>(w.v, tools(), true);
+        g = std::make_unique<LlamaToolGrammar>(w.v, tools(), true, ChatDialect::Qwen);   // the probe's cases are Qwen's call form
         sampler.set_constraint(g.get());
     }
     Arm                a;
@@ -251,7 +251,7 @@ int main(int argc, char** argv) {
         w.eog[static_cast<size_t>(t)] = llama_vocab_is_eog(w.v, t);
     }
     {
-        LlamaToolGrammar probe(w.v, tools(), true);
+        LlamaToolGrammar probe(w.v, tools(), true, ChatDialect::Qwen);   // the probe's cases are Qwen's call form
         std::printf("vocabulary %d tokens; grammar %zu bytes; the opener is %s\n", w.n, probe.gbnf().size(),
                     probe.trigger_is_token() ? "one token (trigger token)" : "several tokens (trigger pattern)");
     }

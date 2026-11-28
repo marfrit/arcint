@@ -32,8 +32,11 @@ public:
     // (core/toolgrammar.h generate_inkling_tool_grammar), triggered by the
     // reference's pattern (the header followed by a character other than
     // `<`), never by a token. Every other dialect takes the Qwen form.
+    // The dialect has no default: a caller names the loaded model's (the
+    // backend's dialect_), so a missing argument cannot build the Qwen grammar
+    // for another model.
     LlamaToolGrammar(const llama_vocab* vocab, const std::vector<ToolSpec>& tools, bool parallel,
-                     ChatDialect dialect = ChatDialect{});
+                     ChatDialect dialect);
     ~LlamaToolGrammar() override;
     LlamaToolGrammar(const LlamaToolGrammar&)            = delete;
     LlamaToolGrammar& operator=(const LlamaToolGrammar&) = delete;
