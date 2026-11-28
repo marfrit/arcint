@@ -582,6 +582,9 @@ service's production flags, Flash-Next's expert cache included
   and at every measured depth (-8 % at 4k to -36 % at 200k), it costs VRAM, and at 212,992 tokens its
   acceptance task scored 0/10 (MTP 10/10, not attributed), so the agent's
   unit keeps MTP.
+  Inkling 2 Mini's own DSpark drafter is opt-in the same way (`--llama-dflash-gguf`
+  with its converted drafter, `--llama-dflash-shortlist K`): on the Arc Pro B60 at
+  165 W it decodes 13.6-21.4 % faster than DSpark off from depth 0 to 77k.
 - One process holds its card's VRAM for its whole lifetime: whatever else
   was serving that card has to stop first.
 - **One card per model on a host with several GPUs.** arcint never splits a

@@ -12695,3 +12695,672 @@ How the rows were taken:
 
 Not measured: micro-batch 1 (a 1-row call is not the arm's: it takes 4 to 8 rows, so that path is today's kernels
 by the gate; the gate unit asserts the exported 1-row decode line refused "rows"), any card but the Arc Pro B60, and any model but the dense 27B hybrid at these cache types.
+
+## 0214-inkling2-dspark-target-taps.patch / 0215-dflash-inkling2-dspark-drafter.patch / 0216-speculative-dspark-markov-context.patch
+
+**Renumbered and rebased** (2026-11-25): written as 0210-0213 on `c2d1fc70`, now 0214-0217 on development
+`f81d6175`, where 0210 is the tokenizer's `ignore_merges` patch and the 1.8.3 branches hold 0211-0213. 0215, 0216
+and 0217 are byte-identical to the old 0211-0213. 0214 (the old 0210) was re-cut: 0206 rewrote
+`llama_model_inkling2::graph::build_output` (the depth mix can fold the output norm), and the old hunk no longer
+applied. The last feature is taken after that norm, whichever form it has: with the folded depth mix
+(`GGML_OPENCL_DEPTH_MIX` on) it is the op's own output `om`, not the reshape view of it the lm head reads,
+because ggml-alloc frees a view's source when the view's consumers are done even if the view is marked as an
+output (`ggml_gallocr_free_node` checks the flag of the node it frees, the source; `code`). Without the fold it
+is the norm node, as before. Write-trees and figures below were taken on the old numbering and base, without the
+depth mix; the renumbered series is checked by its own recipe run, and the CPU acceptance check is owed again
+on it with the depth mix on and off. The applied series (`git apply` of 0001-0217 on the extracted pin, then
+`git init` + `git add -A`): write-tree `60cb0c007defebe736429bcd6ccb640f990398d4`.
+
+Inkling 2's own speculative drafter (DSpark, the `mtp.safetensors` of the publisher's checkpoint) on the
+pin's stock `--spec-type draft-dspark`. Written and first checked on the CPU; arcint's own driver and the card runs
+are in 0218's and 0241's sections.
+
+**Reference followed** (`code`): llama.cpp PR #32218 "feat: Inkling 2 DSpark support" (open; head
+`9f57b445`, by Xuan Son Nguyen, Piotr Wilkin and ruixiang63), 974 commits ahead of the pin. Its hunks
+are ported into the pin's layout: the pin keeps DFlash and DSpark in one `src/models/dflash.cpp` and
+one driver struct in `common/speculative.cpp`, upstream has since split both. Licence of the ported
+code: MIT, as llama.cpp (the PR is a contribution to that project; head
+`9f57b4453570c6a5fef01fec8e65a44d783a63e0`); `THIRD_PARTY.md` lists it, and the converter carries the
+notice.
+
+**Opt-in.** Nothing changes unless a DSpark drafter with `dflash.has_markov_context` is loaded:
+the taps are pointer assignments that become graph outputs only when a drafter enables
+`llama_set_embeddings_layer_inp`; the mask flag defaults to off; the new tensors are optional.
+
+What each patch carries:
+
+- **0214, the target taps** (`src/models/inkling2.cpp`, `inkling2-loop.cpp`). `res->t_layer_inp[v]` is the
+  residual stream at the input of layer visit `v`, and `t_layer_inp[n_layer]` the final norm output of
+  every token, taken before `inp_out_ids` selects rows. In the looped model a visit is not a cache slot:
+  visits count in execution order (prelude, then each pass over the core, then the coda), 48 for
+  Inkling 2 Mini, and the drafter's `target_layers` are `[5, 23, 41, 48]`. An assert checks that the
+  visits add up to `n_layer`.
+- **0215, the drafter graph** (`src/models/dflash.cpp`, the arch tables, `llama-batch.cpp`, the attention mask).
+  - Loader: `dflash.has_markov_context`; per layer `ctx_mix` `[4]`, `ctx_norm`, `attn_k_ctx`, `attn_v_ctx`,
+    `attn_k_ctx_norm`; at the root `joint_proj` `{2*n_embd + 2*R, 3*R}` with its bias, `markov_ctx_mix`,
+    `markov_ctx_norm`, `mask_embd` `{n_embd, block_size - 1}`, `markov_w2.bias`, `token_embd_norm`. `fc`
+    and `enc.output_norm` are optional for such a drafter.
+  - Injection: no shared encoder. Each layer mixes the four raw target features itself,
+    `rms_norm(sum_i ctx_mix[i] * target_i) * ctx_norm`, and writes `k_ctx` / `v_ctx` of it into its cache.
+    The same mix with the head's weights (`f_rnn`) goes out as `h_nextn`.
+  - Block input: the anchor's token embedding through `token_embd_norm`, then one mask embedding per
+    draft slot (the mask token id is not used).
+  - The recurrent Markov head. The pin had only the first-order head (`bias = W2 * W1[prev]`). Now, per
+    block position, `joint_proj([state, W1[prev], hidden_i, f_rnn])` gives a gate, a candidate and the
+    Markov vector; `state = gate*state + (1 - gate)*cand`; the logits are
+    `softcap(lm_head(hidden_i) + W2*markov + b2)`, and the argmax is the next `prev`.
+  - A padded lm head borrowed from the target is cut to the vocabulary.
+  - Mask: `swa_block_uniform`. Every query of a block uses the sliding window of the block's first token,
+    so the block sees the trained window before the anchor.
+  - `f_rnn` reaches the head as the per-token state (`embd_state`) of the anchor row.
+- **0216, the driver** (`common/speculative.cpp`). It keeps `f_rnn` of the last `block_size + 1` injected
+  positions per sequence, hands the one of the token before the block to the anchor row, and drafts
+  nothing when that row was not injected.
+
+**Deviations from #32218**, each `code`:
+
+1. **Greedy drafting only.** #32218 also draws each block token in the graph at the request temperature
+   (`--spec-draft-sampling probabilistic`: top-64 candidates, an in-graph draw, the packed `q` rows for
+   rejection sampling). That part is not ported. Reason: the approved step is the greedy CPU check, and
+   the draw needs the verifier's dense-`q` lookup, which the pin does not have (upstream added it
+   during #32218's review after a 4e10-comparison stall). With this port a positive temperature drafts
+   the argmax chain. **Open, the operator's call** before any sampled serving.
+2. **Host features only.** Upstream can read the target's layer inputs from a device buffer
+   (`embd_row`); the pin has only the host copy, as its other DFlash drafters use.
+3. **The mask flag** is `p1 := the sequence's lowest position in the ubatch` in the sliding-window
+   test, not upstream's "reuse the first token's row". For a contiguous non-causal block the two are
+   the same mask (`inferred`).
+4. **The converter** is `tools/inkling2_dspark_to_gguf.py`, numpy only (the recipe host has no torch).
+   It writes #32218's tensor names, shapes and metadata; the tokenizer metadata is copied from a
+   target GGUF. `markov_w2` is stored as f32 (a float64 product has no bfloat16 source).
+
+**The drafter's origin.** `thinkingmachines/Inkling-2-Mini` (Hugging Face, revision `7a67ae23`):
+`mtp.safetensors`, 635,801,416 bytes, sha256
+`7c3b651317f01f73bcf4e1dceba66ef8b7e1a1eac6bc171e882e690a4b10a1d2`, 54 bfloat16 tensors, safetensors
+format; Apache-2.0 with the publisher's Model Acceptable Use Policy. The lm head and the embedding norm
+come from the same checkpoint's `model-00001-of-00001.safetensors` (sha256 `65e60f51...`), where both
+are plain bfloat16.
+
+### The CPU check: prediction and criteria, written before the run
+
+Run: the pin's stock `llama-speculative-simple`, CPU, `--spec-type draft-dspark --spec-draft-n-max 5`,
+greedy (`--temp 0`), target Inkling 2 Mini IQ4_NL, the converted drafter, the 4,096-token fixture prompt
+(prompt-id digest `400a7dd1...`), 256 tokens. The pin's tokenizer reproduces the fixture's ids from the
+prompt text (`measured-here`, 4,096 of 4,096).
+
+The reference on this prompt (vLLM on the 24 GB card, `measured-here`): mean acceptance length 4.52 /
+5.24 / 5.02 at draft max 5, counted as tokens per verification step with the target's own token.
+
+**Prediction** (`inference`):
+- tokens per verification step 4.0-5.3; as `llama-speculative-simple` prints it, `n_accept / n_drafted`
+  0.60-0.86. The target here is IQ4_NL, the reference's an exl3 quant, so the two targets do not agree
+  on every token and the figure can sit under the reference's;
+- the generated text equals plain greedy decoding;
+- no speed claim: a CPU run prices nothing on the card.
+
+**PASS** needs both:
+1. tokens per verification step within 4.0-5.3 (accepted drafts per step 3.0-4.3);
+2. the 256 generated tokens byte-equal to plain greedy decoding (`llama-completion --temp 0`) on the
+   same prompt and the same binary tree.
+
+**Reds, each must FAIL:**
+- R1, the tap shifted by one visit (each `t_layer_inp[visit++]` assigned after its layer, so the
+  drafter reads visits 6 / 24 / 42): tokens per step must fall under 2.0;
+- R2, no rollback (`n_rs_seq = 0` and the checkpoint fallback off, so rejected draft tokens stay in the
+  recurrent state): the text must differ from plain greedy.
+
+A red that passes voids the check that it guards.
+
+## 0217-inkling2-rollback-conv-windows-view.patch
+
+The recurrent-state rollback (`n_rs_seq > 0`) of `inkling2` / `inkling2_loop` aborted on every short
+ubatch. Found by the DSpark CPU check above: its first full-prompt run died in the target, before any
+draft was verified. It is a defect of the target's snapshot path and does not need a drafter.
+
+**Cause** (`code`, `measured-here`). `llm_graph_context::build_conv_state_store` (`src/llama-graph.cpp`,
+from 0134) takes the last `Kw = min(n, n_rs_seq + 1)` conv windows of a ubatch as ONE 4-D view on the
+conv input, `ne = [n_cols, Kw, channels, n_seqs]` with `nb[1]` = one element, so consecutive windows
+overlap; one `SET_ROWS` writes them to the snapshot planes. The pin's `ggml_new_tensor_impl` bounds a
+view by a contiguous tensor of its shape, computed before the strides are set:
+`n_cols*Kw*channels` elements plus the offset `n - Kw + 1` must fit in the source's
+`(n + n_cols)*channels`. With `n_cols = 3` that fails for every `2 <= n < ~3*(n_rs_seq + 1)`, although
+the windows stay inside the source. A verify step of 6 tokens (the last token and 5 drafts) is in that
+range, and so is a prompt whose last ubatch is short. Upstream changed the check itself (ggml #31584,
+"bound views by the bytes their strides reach", `bbb02c93e9`, 2026-11-04); the pin predates it and 0134
+ported a store written against it.
+
+**Fix.** The view is created with one window and its `ne[1]` widened afterwards, the idiom upstream's
+own delta-net store used before #31584. Because the widening skips ggml's check, the true bound is
+asserted right after it: `llm_graph_view_in_source`, offset plus the bytes the strides reach
+(`ggml_nbytes`) within the source's bytes, in `size_t`, a sum that would wrap counts as out of bounds.
+The operator's side decided this narrow fix; the port of #31584 is a later change that removes it.
+
+**What it does not touch** (`code`). `build_conv_state_store` has one caller, `inkling2.cpp`'s
+`convolve`. The GDN models store their conv snapshots elsewhere and with one single-window view and one
+copy per slot, which the pin's bound accepts at every batch size: `qwen35` / `qwen35moe` / `qwen3next`
+in `llm_build_delta_net_base::build_conv_state` (`delta-net-base.cpp`), `qwen4exp` in its own
+`build_conv_state_at`. No code those models run changes.
+
+**The unit**, a mode of `tests/test-llama-archs` (`--rs-rollback`; `--rs-cell <n_rs> <n>` for one
+`n_rs_seq` and batch size, since a failing cell can abort), CPU, the test's tiny random `inkling2` and
+`inkling2_loop` models. It is a standing gate: arcint's unit tests build that file as
+`arcint-llama-archs` against `tests/llama-archs-shim` (arcint does not build llama.cpp's common
+library) and run it as the ctest `inkling-rs-rollback`, which the recipe's `ctest -L unit` includes.
+- A cell: a 24-token prefix, then a batch of `n` tokens per sequence whose last `d` are wrong in
+  sequence 0, `llama_memory_seq_rm` of those `d`, then the next right token of every sequence. Each
+  sequence's logits are compared with a context without snapshot planes that never saw a wrong token.
+- The sweep: `n_rs_seq` 1..8 x `n` 1..16 x every `d` from 0 to `min(n_rs_seq, n - 1)` x one and two
+  sequences x 2 archs = 2,336 cells, 1,824 of them with a rollback. A rollback of `d` tokens reads
+  snapshot slot `d`, so every slot 1..8 is read back (480 / 392 / 312 / 240 / 176 / 120 / 72 / 32
+  cells). With two sequences the second is not rolled back and must keep its state.
+- The bound is NMSE <= 1e-6. The reference decodes the kept tokens one at a time and the cell as one
+  batch, so the two differ by float summation order only; a wrong state is orders above it (below).
+- The bound helper: every valid window view for `n` 1..16 x `Kw` 1..9 accepted, each view one window
+  too wide refused, a wrapping offset refused.
+
+`measured-here` (the recipe host's CPU, seed 1; applied series with 0210-0213 as then
+numbered (now 0214-0217) on c2d1fc70, write-tree
+`6b3c57422ad0cd18ab61f6a83e230c9946474553`):
+
+| arm | result |
+|---|---|
+| before the fix, one process per (`n_rs_seq`, batch), the largest rollback of each, one sequence | 158 of 256 abort at `ggml.c:1815`; `n_rs_seq` 5: batches 2..15; `n_rs_seq` 8: all 16 (the 24-token prefix is itself in range) |
+| after the fix | 2,336 of 2,336 cells pass, 1,824 with a rollback; worst NMSE 2.65e-08 (`inkling2`, two sequences, `n_rs_seq` 8, batch 16, 3 dropped); the 6-token verify at `n_rs_seq` 5 with 5 dropped: 9.6e-15 |
+| mutant: the bound helper returns true | the unit fails: a view one window too wide and a wrapping offset are accepted |
+| mutant: the snapshots written to the slots in ascending order | all 2,336 cells fail, NMSE up to 2.4e-02 (5.7e-04 in the first failing cell) |
+
+Not verified: the widened view on OpenCL. `SET_ROWS` with this source runs on the CPU backend here; a
+card run of the rollback followed in the served DSpark windows (the Arc Pro B60: every verify with a refused draft
+rolls back through it, the answers right; the runs in 0241's section and the CHANGELOG); which backend ran its
+`SET_ROWS` there was not read separately. Also not run at the time of this table: the rollback on Inkling 2 Mini
+itself (the DSpark check above is its first use).
+
+## DSpark CPU check (0214-0217): state after the short-prompt runs
+
+This section is the CPU record from before the card runs; the card runs are in 0241's and 0243's sections.
+
+The pre-registered check above is **not finished**: the full 4,096-token DSpark run has not run with
+the fixed rollback (its first attempt found 0217's defect). What exists is the short-prompt pair and
+four probes. All `measured-here` on the recipe host's CPU, applied series (then numbered 0210-0213, on
+c2d1fc70) write-tree
+`6b3c57422ad0cd18ab61f6a83e230c9946474553` unless a line says otherwise.
+
+**Which target file.** Every figure in this section, and the full-run figures below, are on a variant
+of the IQ4_NL file whose lm head is requantised: **target and drafter head `-out-q4k`, `output.weight`
+Q4_K; the card file has Q8_0** (`token_embd.weight` is Q8_0 in both, and the 12 tokenizer keys are
+identical). The drafter borrows the target's lm head and token embeddings at run time, so acceptance and
+the answer-level items are figures for that variant. The drafter file itself took only tokenizer
+metadata from it. The rollback fix, its unit and the rollback probes do not depend on the head's type.
+The same runs on the card file are queued and are reported beside these.
+
+**The drafter.** `tools/inkling2_dspark_to_gguf.py` on the publisher's checkpoint: 58 tensors,
+851,833,824 bytes, sha256 `12780e3e568af53ed781bfa627aa83c2c17bc36c09613029c46549507dc80e8c`
+(bfloat16 projections as in the source, `markov_w2` f32). It loads:
+`block_size=8, n_extract=4, sample_from_anchor=false, has_markov_context=true`.
+
+**Two slips on the way, corrected.** `-f` strips a prompt file's trailing newline, which made 4,095 ids
+of the fixture's 4,096; every run counted here reads the prompt with `-bf` (the tokenizer check: 4,096 of
+4,096 ids). The plain greedy run on the full prompt is done with the right ids (255 runs, 644 bytes).
+
+**Short prompt** (the last 602 ids of the fixture, 64 tokens, `--temp 0`, `--spec-draft-n-max 5`):
+
+| run | result |
+|---|---|
+| plain (`llama-completion`) | exit 0; 602 prompt tokens, 63 runs |
+| DSpark (`llama-speculative-simple`) | exit 0; `n_predict` 67, `n_drafted` 85, `n_accept` 50 (58.8 %); 17 verify steps, 3.94 tokens a step |
+| the same again, on the test build | the same text and the same counters |
+
+3.94 tokens a step is under the 4.0-5.3 band, which was set for the full prompt; it is not the PASS figure.
+
+**The equality criterion fails as written, and not because of the drafter or the rollback.** The DSpark
+text equals plain greedy for 39 tokens and then takes ` any` (id 1004) where plain takes ` int` (id 407).
+Probes on the short prompt and those 39 tokens, a small program on the built library (logits that predict
+each of the 40 positions; KL and the largest logit difference per position):
+
+| arms compared | worst max abs diff | worst KL | what it shows |
+|---|---|---|---|
+| B (6-token batches) vs B3 (the partition shifted by three), no rollback | 1.29e-05 | 1.02e-12 | the floor between two batched decodes |
+| C (3 right + 3 wrong tokens a batch, the wrong ones rolled back) vs B | 8.58e-06 | 1.83e-12 | the rollback adds nothing: under the floor in the logit difference; the KL is 1.8 times the floor's, below the resolution of the computation (single positions print -1e-15), neither pass nor fail |
+| C with the snapshot restore switched off (a test build) vs B | 13.51 | 0.770 | the red: 1e6 times the floor |
+| D (the real run's 17 batches, rejected tails and removals included) vs the run's own dumped logits | 0 | 0 | the replay is exact, 67 rows |
+| E' (the real run's tokens, no rejected tails, no rollback, no one-token batch) vs D | 1.14e-05 | 8.89e-13 | the real run is reproduced without any rollback, 67 rows |
+| A (one token at a time, plain greedy's path) vs B | 3.41 | 9.5e-03 | single-token decode against batched decode |
+| B'' (a partition whose last batch is one token) vs B | 0.407 at the last position, <= 1.3e-05 elsewhere | 7.9e-05 | the one row a one-token batch produced |
+
+A prediction that was wrong, with its cause: B'' (the partition shifted by two) was predicted to equal B
+within 1e-4 and came out 0.407 away. With 39 tokens that partition is 2 6 6 6 6 6 6 1, so its last batch is
+one token; the per-position table shows the whole difference at that last row. B'' was not a floor arm, B3 is.
+
+At position 39 the single-token arm's margin between ids 407 and 1004 is 0.043 logits. A, B, B3 and C
+take 407; D, E' and a partition that starts with a one-token batch take 1004.
+
+So: decodes without a one-token batch agree to 1.3e-05 whatever their partition and whatever they roll
+back; every row decoded by, or after, a one-token batch is 0.3 to 3.4 logits away. Plain greedy decodes
+one token at a time and a verify step decodes six, so a near-tie can fall either way. Why the one-token
+path differs is not established (open; the first differing graph node is the next step, after the
+check).
+
+Read from this result, not measured on other models: any batched verify has this property against
+single-token greedy on this CPU path, the served MTP verify included. A served text at a temperature
+above 0 is not affected; at temperature 0 it is not reproducible against a run without speculation.
+
+**Dispositions** (the operator's side, 2026-11-25). The flip at token 39 is closed as batching. The
+rollback passes in the logit difference (8.58e-06 against the floor 1.29e-05). "Byte-equal to plain greedy"
+is retired as a criterion on these numbers. The criteria that replace it, as agreed with the operator's
+side:
+
+(i) The rollback is exact: on a verify pattern (right + wrong tokens per batch, the wrong ones removed by
+seq_rm) the logits equal those of the same batches without any rollback within the floor, where the floor =
+two batch partitions of the same tokens WITHOUT a one-token batch and without rollback, in max |logit diff|
+and KL per position.
+
+(ii) A red that can fail: with the rollback disabled (the snapshot restore off), the logits must leave the
+no-rollback batches by more than 100x the floor, in max |logit diff| and KL.
+
+(iii) The answer level on the full 4,096-token fixture prompt:
+  - the acceptance figure in the pre-registered band, 4.0-5.3 tokens a step, else reported as a miss;
+  - the fixture's task answered right;
+  - the first divergence from plain greedy named with its margin in plain single-token decode;
+  - KL of the verified logits vs a batched reference without a one-token batch, within the floor.
+
+(iv) The same three on the card, in DSpark's card window.
+
+State against them: (i) and (ii) are met on the short prompt by the table above (the KL of (i) as
+recorded there); (iii) waits for the full run; (iv) for the card window. Red R2 as written
+("the text must differ from plain greedy") no longer tells anything, since the right text differs too;
+the rollback-off row above replaces it. Red R1 (the tap off by one) was unchanged at that point; its run follows.
+
+**Red R1, run** (the taps one visit late, the short prompt, the test build; its log line says the mutant
+is live): 67 tokens, 44 of 111 drafts accepted, 23 verify steps, 2.91 tokens a step, against the green's
+3.94 on the same prompt. **The pre-registered rule "under 2.0" is not met: 2.91, 26 % fewer than the
+green.** It stays on record so; no threshold is restated after the fact (the operator's side).
+
+**Reds R1b, R1c, R1d, written before they run** (the operator's side, 2026-11-25; the same short prompt,
+the test build, each mutant announced in its log):
+- R1b, the four target features in the wrong order (reversed): expected below 2.0 tokens a step;
+- R1c, the taps three visits late: expected below 2.0;
+- R1d, the features zeroed: expected at or near 1.0 (the drafter blind). It is the control that the
+  number depends on the features at all.
+
+If R1b and R1c do not collapse either, the statement is "acceptance is robust to tap errors", and
+criterion (iii) then proves little about the tap positions; they need a direct comparison of the tapped
+features with the reference's.
+
+**The full prompt** (`-out-q4k`; the 4,096-id fixture, 256 tokens; the test build with no red switch, so
+that its steps and verified logits are dumped): 259 tokens in 57 verify steps, **4.544 tokens a step**,
+202 of 283 drafts accepted; in the 4.0-5.3 band. The generated `binary_search` is right on 2,000 random
+sorted lists and the generated test in its complete lines passes. Its text equals plain greedy's for 409
+characters. The token index of that divergence and its margin are open: a first attempt located it by
+re-tokenising the generated text, which does not give back the generated ids, and is withdrawn. The KL
+item of (iii) is open too: on the full prompt the run's verified logits are 1.4e-03 mean KL from a
+batched reference already at the first row, before any rollback, so the short prompt's floor is not the
+floor at this depth; the floor there is measured next.
+
+**Reds R1b, R1c, R1d, run** (`-out-q4k`, the short prompt, steps counted from each run's dump, every
+mutant's line in its log; expectations as written above before the runs):
+
+| run | tokens / steps | tokens a step | accepted drafts | expectation | |
+|---|---|---|---|---|---|
+| green control | 67 / 17 | 3.941 | 50 of 85 | | text identical to the first short run |
+| R1, one visit late | 67 / 23 | 2.913 | 44 of 111 | under 2.0 | not met |
+| R1b, features reversed | 65 / 36 | 1.806 | 29 of 175 | below 2.0 | met |
+| R1c, three visits late | 65 / 37 | 1.757 | 28 of 178 | below 2.0 | met |
+| R1d, features zeroed | 65 / 59 | 1.102 | 6 of 288 | at or near 1.0 | met |
+
+Acceptance depends on the features, on their order and on the tap depth, in a graded way: one visit off
+costs a quarter, three visits off or the wrong order more than half, no features leave the drafter
+blind. Resident memory of each run: 29 GB, the mapped target file included.
+
+**The tap position against the reference** (`code`, both sides): the reference's runner appends the
+residual stream at the top of its visit loop, before the layer body, for the visit indices in
+`taps[:-1]`, and takes the final hidden state as the last feature
+(`patches/trellis-inkling-external-runner.patch` of the reference at `6b71b909`). That is the tensor and
+the indexing of 0214. A numeric comparison needs features dumped from the reference stack; none exist on
+the recipe host.
+
+**Not run when this was written:** the same runs on the card file, the full-prompt floor set, any card.
+
+## 0218-dspark-markov-chain-length.patch and the arcint DSpark driver
+
+**Status: run on the card** (the Arc Pro B60 capped at 165 W, Inkling 2 Mini IQ4_NL at q8_0:q4_0 K/V,
+`measured-here`): served at width 7 and width 3, the capital right in every arm; accept a round 32.6-37.5 % at width
+7 and 49.4-55.7 % at width 3 (three rounds of five code continuations); with 0240-0243 the decode against DSpark off is
+in 0241's section. The KL gate is owed (below). Opt-in: a unit serves it only with
+`--llama-dflash-gguf <the DSpark drafter>`.
+
+**0218.** The vLLM-XPU Inkling port (6b71b909, `inkling_xpu/dspark.py`, `_block`) drafts with the whole trained block,
+`[anchor, mask x 7]`, at every width, and runs the Markov head over the first `steps` rows of it only (`hidden =
+norm(x[1 : steps + 1])`, the loop over `len(hidden)`; `code`). The llama.cpp port (0215) runs its chain over every row
+of the block it is given, and its driver (0216) gives it `n_max + 1` rows, a block the trained model sees only at
+`n_max = 7` (`code`). `llama_set_dspark_chain(ctx, n)` (`llama-ext.h`; a cparam, part of the graph reuse check) stops
+the chain after `n` draft rows; the rows past it keep the base logits as same-shaped columns and are not drafts. `0`,
+the default, builds the old graph node for node. The 178 patches apply in byte order on the pin; the applied series'
+write-tree (`git apply` of every patch on the extracted pin, then `git init` + `git add -A`) is
+`ac5ddd9e7bd53c6c2c1cd7818ca70c38ad9c2408`.
+
+**The driver** (`src/exec/llama_dspark.cpp`, the rules in `src/exec/dspark_ring.h`). The backend reads the drafter's
+`dflash.has_markov_context`: true goes to this driver, everything else to DFlash2's. Per step, under the speculative
+loop that MTP and DFlash2 already run (`generate_spec`, `walk_verify`):
+- after every target decode (prompt chunks and verifies) the four taps (0214: three layer visits and the final norm's
+  output) go into the drafter as an embedding batch, and the f_rnn rows of the last `block + 1` positions into a ring
+  a lane, keyed by position (0216's ring; the reference's `f_ring[positions % ring]`); a prompt chunk farther than
+  that from the prompt's end or from a checkpoint the prefill saves does not copy its f_rnn rows to the host;
+- a draft is one drafter decode of the trained block at `pos0` (the reference's block; 0218 runs the chain over the
+  first `n_draft` rows), the anchor's state embedding the ring's row of `pos0 - 1` (the reference's
+  `f_ring[(start - 1) % ring]`); no draft when the ring lacks it (0216's rule). The drafts are the argmax of those rows
+  (the lowest id on a tie, as `argmax(dim=-1)`), cut to the step's budget; the block then leaves the draft cache;
+- the verify is `1 + drafts` rows of the target (2 to 8: 0226's fused loop controller covers them); after the walk the
+  target (its `n_rs_seq = --llama-dflash` snapshots, 0217 for the conv windows), the drafter and the ring are cut at
+  the kept end;
+- a context checkpoint carries the drafter's windowed layers (`PARTIAL_ONLY`; the global layer's cells below the cut
+  stay, as the target's do) and the ring's rows before it.
+
+`--llama-dflash N` is the width, 1 to 7, **default 7**: the reference's `INKLING2_DRAFT_MAX` default
+(`scripts/serve-vllm-exl3.sh:106`, `code`). The card leg measures 5 against 7; the default stays 7 unless 5 wins by the
+fixed rule (5's slowest run faster than 7's fastest). `--llama-dflash-min-p` must stay 0 (the drafter has no
+confidence head; the pin refuses it too). `/props` `dflash.kind` is `dspark` or `dflash2`.
+
+**Why it is lossless (`code` + the unit cases).** The drafts are greedy (the in-graph chain is argmax, `cur_p->data[0]`
+in the pin, `argmax` in the reference's greedy mode). The verify walk draws every verified row with the request's own
+sampler (the same chain: temperature, top-k, top-p, min-p, penalties, the tool grammar; the same random stream; the
+history it has itself accepted), emits the drawn token, and goes on to the next row only while the drawn token equals
+the draft at that position. Row `i` holds the target's logits for the prefix `[cells, id_last, d_1 .. d_i]`, and the
+walk reaches row `i` only when every earlier draw equalled its draft, so that prefix is the emitted text. Every emitted
+token is therefore a draw from the target's distribution given the emitted text, as in the plain loop.
+- Greedy (temperature 0): each emitted token is the argmax of the target's row given the emitted prefix.
+- Sampled: this is the standard speculative rejection rule with a one-hot proposal `q = delta(d)`. The draft is kept
+  with probability `p(d)`, and a rejected row's draw is distributed as `p` without `d`, renormalised, which is
+  `(p - q)+` normalised. The drafts move the acceptance rate, never the distribution. With the same seed the output is
+  the plain loop's token for token (`dspark_cycle_sampled_is_the_plain_loop_token_for_token`, 30 seeds x widths 5 and
+  7 x a right and a wrong drafter).
+- What is not covered by this argument: the target's verified rows are computed in a 2-to-8-row batch, not a one-row
+  decode, so their rounding differs (other kernel paths: 0226's small pair, the FA port at T rows, the expert products
+  at T rows). That is the card leg's KL gate (the answer-level bar), not a property of the driver. On the CPU it moved
+  a greedy text at a 0.11-logit near-tie (the DSpark CPU check above).
+
+**Deviations from the reference** (the vLLM-XPU Inkling port at 6b71b909, `code`), each with its reason:
+
+| # | the reference | arcint | why |
+|---|---|---|---|
+| 1 | verification by vLLM's rejection sampler (`standard`; `block` opt-in, `INKLING2_DSPARK_VERIFICATION`) | the sample-and-compare walk (`verify_walk.h`) | the same distribution and the same acceptance probability `p(d)` for a one-hot proposal (above); arcint's walk is the one every drafter uses. `block` verification (a joint acceptance over the block) is not ported |
+| 2 | draft sampling `greedy` by default, `probabilistic` (top-k draws, `INKLING2_DRAFT_SAMPLE_TOPK`) opt-in; its coding-agent profile serves probabilistic + block verification at width 3 | greedy only | the llama.cpp port drafts greedily in-graph (the chain conditions on argmax) and the pin has no verifier that reads a draft distribution `q`; porting #32218's probabilistic drafting is the operator's open question. Lossless either way; at temperature 1.0 greedy drafts accept less than probabilistic ones would (not measured) |
+| 3 | adaptive width (`INKLING2_DSPARK_ADAPTIVE`, a 0.75 confidence cut, requires probabilistic proposals), shortlist (`INKLING2_DSPARK_SHORTLIST`), FP8 global drafter KV (`INKLING2_DRAFT_FP8_GLOBAL`): all opt-in, off by default | not ported | the defaults are matched; each is an opt-in of the reference |
+| 4 | the taps stay on the device (`store()` on the GPU tensors) | the taps go to the host (`llama_get_embeddings_layer_inp`, 4 x 2,304 floats = 36 KiB a token) and back as an embedding batch; the f_rnn rows come back near the end only | libllama's drafter interface is a second context fed by embedding batches (DFlash2's path); a device path needs new libllama API. Its price is the card leg's prefill row |
+| 5 | rejected rows are overwritten in place: position-indexed rings for the drafter and the target's conv state (`attention_prep.sycl`), no rollback | the drafter's K/V of rejected positions are removed (`seq_rm`), the f_rnn ring is cut, the target rolls back through its `n_rs_seq` snapshots (0217) | the pin's memory model; the result is the same state. The snapshots cost a write a verify row: the card leg's verify ms |
+| 6 | the drafter's forward replayed as an XPU graph (`INKLING2_DSPARK_GRAPH`) | OpenCL launches in order, no replay | the installed OpenCL runtime has no command buffers (`flash-next-llama-engine` record); the drafter's launches are part of the propose ms the leg reports |
+| 7 | the f_rnn ring holds 16 positions (64 with the ring prefix cache) | 9 (`block + 1`, 0216's) | keyed by position either way; a draft reads one row, `pos0 - 1` |
+| 8 | the Markov head in bf16 steps (`raw.to(torch.bfloat16)`, the fold `lm @ hidden_out` held in bf16) | the port's f32 graph, `markov_w2` (the fold) in f32 | the llama.cpp port's numerics; precision moves acceptance only |
+| 9 | one sequence (`max_num_seqs` must be 1) | named lanes draft in one decode | arcint's lanes; the card leg is one lane |
+| 10 | `logits.argmax(dim=-1)`: on an exact tie the first maximum (torch) | the last maximum, in the chain's ARGMAX (ggml's CPU rule; the OpenCL op of 0240 keeps it) and in the host pick (`dspark_pick`, moved to it) | one rule for the drafts and the ids the chain conditions on; an OpenCL op must equal the CPU op it replaces |
+| 11 | `markov_w1` in bfloat16 | F32 (the converter's default since 0240, `--markov-w1`; the bfloat16 widened, exact, 204,859,392 B) | OpenCL takes no BF16 GET_ROWS: a BF16 table stays in host memory and its row is a CPU island every Markov step (0240's measurement) |
+
+On an exact tie the drafter takes the highest id where torch's argmax takes the first; the target verifies every draft,
+so the output is unchanged (lossless).
+
+Not deviations: the width default (7), the block (the trained 8 rows at every width, with 0218), the anchor's context
+row (`pos0 - 1`), greedy proposals by argmax, the drafter's K/V in f16 (the reference's serving type) with the global
+layer sized to the context (`max_context`) and the two local layers to their window.
+
+**Tests** (`tests/test_dspark.cpp`, in `arcint-test`, `ctest -L unit`): 13 cases on the ring (by position only, the
+rollback cut, the checkpoint's rows and their refusal), the anchor's row, the block and the verify width (2 to 8 rows,
+never more drafts than the target's snapshots), the argmax pick (not the anchor's row; the highest id on a tie, ggml's ARGMAX rule, since 0240: red 11, the old
+first-maximum pick, fails its case), the
+chunks whose rows come back, and a whole cycle on a synthetic target whose next token depends on the two tokens
+before it (so a draft needs the ring's row): greedy and sampled output equal to the plain loop's, a right drafter
+accepting every draft, a wrong one costing steps and no tokens, every rollback within the snapshots. Red first
+(`measured-here`, a device-free build of these files on the recipe host, `ARCINT_DSPARK_RED`, the CMake cache switch
+of the same name): green 13 of 13 (16 of 16 with the review's three cases below); red 1 (the anchor reads its own row) 5 failed, red 2 (the ring keeps rejected rows)
+1, red 3 (the anchor's row drafted) 4, red 4 (the port's `n_max + 1`-row block) 1, red 5 (a checkpoint carries later
+rows) 1, red 6 (the step's budget ignored) 2, red 7 (the anchor reads the row one position early) 4. The served reds
+for the card leg are the same builds: red 7 drafts from the wrong context (acceptance must fall, graded, as the tap
+reds R1-R1d did), red 1 drafts nothing (its rollback cuts the row it reads), red 4 is the port's own layout (an arm,
+data); and `ARCINT_DFLASH_RED=7` (every draft accepted whatever the target says: the answers must suffer; the backend's
+check, drafter-independent).
+
+**After the review** (a read-only review of the branch before its card leg; driver and patches "land for the card"):
+- the load refuses a target that is not `inkling2` / `inkling2_loop` (`dspark_target_refusal`): a model of the same
+  width and vocabulary size reached the graph's tap assert at its first decode before; red 8 (any target taken) fails
+  its case;
+- a drafter state that does not come back with a checkpoint (`set_carried_state`) is a warning and a cumulative
+  counter, the decode line's `dflash lane failures`: the lane's global drafter layer has no cell below the cut from
+  then on (acceptance falls, the output stays the target's), which was logged at the verbose level only before; the
+  payload's layout is checked by `dspark_state_split` (red 9, a payload read without its bounds; red 10, failures not
+  counted: each fails its case); 16 of 16 green, reds 1-7 fail as before;
+- the think tracker sees each verified token once: on this base the verify walk makes the observation itself
+  (`src/exec/verify_walk.h`; 1.8.3's fix of the twice-fed tracker under `--loop-guard`), and the DSpark cycle calls
+  the walk like every other drafter, so it inherits the single observation.
+
+**`--llama-dflash-kv K[:V]`** (after the review): the DSpark drafter context's K/V type, `f16` by default (as trained,
+the reference's serving type), `q8_0` or `q8_0:q4_0` (the pairs `--llama-kv` admits; anything else is refused at
+parse, the flag without a drafter too, and with a DFlash2 drafter at load). A quantized cache turns flash attention
+on for the draft context, so a context that cannot take the type refuses at load. It touches only the drafter: every
+draft is verified by the target, so the type moves the accept rate, not the output. Its purpose is the context: the
+global drafter layer at 262,144 cells is 1,024 MiB at f16, 544 MiB at q8_0, about 400 MiB at q8_0:q4_0. Precedent in
+the reference: an 8-bit global drafter K/V (`INKLING2_DRAFT_FP8_GLOBAL`, off by default); q4_0 has none. Red first:
+the parse case and the plan case (`dspark_kv_plan`) failed before the flag existed (1 of 1 each), green after; the
+device-free suite 997 cases, 0 failed.
+
+**Done on the card:** the recipe's unit cases; widths 7 and 3 served (tokens a verify, accept rate, verify and propose
+ms); the propose profile (0240's section); decode against DSpark off at depth 0, 32k and 77k with 0241's shortlist.
+**Owed:** n_max 5 against 7 at the three depths; the KL gate against the CPU base at T = 1 and at the verify widths;
+the memory at the unit's context (the drafter's weights, its f16 global layer at the context, its compute buffer); the
+CPU equivalence of this driver with the pin's on the fixture (draft for draft against the pin driver's step file, with
+0218's block at n_max 7, where both drive the same 8 rows).
+
+## 0240-opencl-argmax.patch
+
+**Status: run on the card** (the Arc Pro B60, `measured-here`): the op suite's ARGMAX cases, the scheduler test (ARGMAX in
+the device's split) and the served drafter graph without an ARGMAX on the CPU, with 0242. On by default once applied; `GGML_OPENCL_ARGMAX=0` leaves the op to the CPU (the A/B arm and the scheduler test's red).
+
+**Why.** The DSpark drafter's Markov chain takes `ggml_argmax` of a 200,058-float column at every step but the last
+(0215 / 0218, `build_dspark_markov_head`), and of the K-candidate column with 0241's shortlist. The pin's OpenCL backend has no `GGML_OP_ARGMAX` (`supports_op`'s default
+returns false), so each of those ARGMAX nodes was a CPU split: the queue drained, the column read to the host (781
+KiB), the CPU's argmax, and markov_w1's row (a BF16 weight OpenCL's GET_ROWS declines, so it stayed in host memory)
+gathered there too. Measured on the B60 (`measured-here`, the DSpark profile window, width 7, depth 0, the Inkling
+unit's settings): 16 splits a block graph, 8 on the CPU; a 4.43 ms device propose against 48.82 ms a verify for the
+propose unprofiled; 37.2 ms a propose in the CPU splits' input copies, 0.5 ms of CPU compute.
+
+**What.** `kernel_argmax_f32` (`kernels/argmax.cl`): one work-group a row (256 lanes, halved and rebuilt until both
+the device's and the built kernel's own work-group limits take it), each lane scanning its stride of the row in index
+order, then a tree over the lanes. A program that does not build leaves the op to the CPU with a `DOWNGRADE ...
+op=ARGMAX ... reason=no-kernel` line (`build_program_from_source_optional`), not an abort (the review). F32 rows with contiguous
+elements and any row stride (a view); I32 out, one index a row. Bounded at `ne00`: no padding, the V mod 4 = 2 tail
+of Inkling 2's vocabulary read with scalar loads. Built without the fast-math options (the scan starts at -inf and a
+row of -inf must give the CPU's answer).
+
+**The tie rule is ggml's CPU rule: the LAST maximum.** `ggml_vec_argmax_f32` (`ggml-cpu/vec.h`): `max = MAX(max,
+x[i]); if (max == x[i]) idx = i;`, so an equal value moves the index forward. The kernel keeps it (a lane takes a
+value `>=` its best; the tree keeps the larger index of two equal values): the OpenCL op equals the CPU op it
+replaces. A NaN is never selected by the kernel, where the CPU loop's `MAX` lets one reset its running maximum; a NaN
+in logits is a failure on both paths, named here, not matched. The drafter's host pick (`dspark_pick`) moved to the
+same rule in the same change, so the drafts and the ids the chain conditions on agree on a tie.
+
+**Tests.**
+- `test-backend-ops -o ARGMAX` (against the CPU backend, exact): the stock cases plus [200,058 x 1] and [200,058 x 8]
+  (unique values) and `test_argmax_tie` at 200,058 (rows: a tie between V / 3 and 200,057, the tail; a tie between two
+  neighbouring indices in the middle, an even and the next odd lane, which a lower-lane-wins tree meets in that order;
+  a tie one work-group stride apart, inside one lane; every value equal: the answer is 200,057), the same as a view
+  with a row stride of 200,064 floats starting one row into its tensor (the pad above every real value and a decoy
+  row 0 whose maximum is elsewhere: a kernel that reads past `ne00` or ignores the view offset is wrong), and at 1,000.
+  Red arms, `GGML_OPENCL_ARGMAX_RED`: 1 = the lowest index on a tie, 2 = the lower lane wins a tie in the tree. A
+  CPU emulation of the kernel (scan + tree, on these rows) gives: the green rule right on every row; red 1 wrong on all
+  four tie rows; red 2 wrong on the tail, middle and all-equal rows (the one-lane pair is red 1's row).
+  `GGML_OPENCL_ARGMAX=0`: the cases are "not supported" (the summary's counts asserted, not read as a pass).
+- `test-opencl-argmax-sched` (needs the card; built, run by name): one Markov step (the column -> ARGMAX -> GET_ROWS
+  of a [256 x 200,058] markov_w1 -> a device op) scheduled over OpenCL and the CPU as llama.cpp schedules the drafter:
+  `w1-f32` (the converter's F32 table in an OpenCL buffer) must give one split, no CPU node, the last maximum
+  (200,057) and w1's row exact; `w1-bf16-host` (today's drafter) and `GGML_OPENCL_ARGMAX=0` must fail it.
+- The served graph: the next profile window's block graph has 1 CPU split (the leading one: the anchor's GET_ROWS of
+  the target's host-resident `token_embd`, before any device work), and markov_w1's placement line is gone.
+
+**Not in the clang list** (`tests/opencl_clang_clean.txt`): the recipe host has no clang to measure it with.
+
+**The numbers behind it** (`measured-here`, the B60, width 7, depth 0): 7 islands a propose at 0.50-0.54 ms (3.15 ms;
+the DSpark profile's kernel trace); one island in isolation 0.48 ms of overhead with a round trip of 14.7
+us and the 781 KiB read 382 us (the island probe). With 0241's shortlist the ARGMAX is over K candidates; this op
+removes the island either way.
+
+**The anchor's row stays on the CPU**: the block graph's first split reads the target's
+input-layer `token_embd` (host memory by llama.cpp's input-layer rule, `llama-model.cpp`), which waits on no device
+work and costs a 2,304-float dequantization and a 9 KiB upload.
+
+## 0241-dspark-shortlist.patch
+
+**Status: run on the card** (the Arc Pro B60 capped at 165 W, `measured-here`; the results below). Opt-in:
+`llama_set_dspark_shortlist(ctx, K)`, arcint's `--llama-dflash-shortlist K` (1-1024; 0, the default, builds the full
+chain node for node). The reference's coding profile serves K = 256 (`INKLING2_DSPARK_SHORTLIST=256`,
+`scripts/serve-coding-agent.sh`; `inkling_xpu/dspark.py:282-318` at 6b71b90, `code`).
+
+**Why** (`measured-here`, the DSpark profile's kernel trace, the B60, width 7, depth 0): the full chain is
+37.67 of the 42.08 ms device propose: 14 vocabulary-wide ADDs at 1.75 ms (one work-group a row: V mod 4 = 2), 7
+cumulative CONCATs (9.61 ms), 7 `markov_w2` GEMVs of 205 MB (3.37 ms, at bandwidth). The reference computes the
+Markov correction for each draft row's 256 best base logits only; nothing of the chain is vocabulary-wide there.
+
+**What** (`src/models/dflash.cpp`, `build_dspark_markov_head`, the `use_short` branch; inkling-shaped drafters only:
+the rnn head, no confidence head, no reduced vocabulary, no `markov_w2` scale):
+- once a propose: `idx = ggml_top_k_ordered(base, K)` over the head's rows; the candidates' base values, fold rows
+  (`markov_w2` [256, V] by GET_ROWS) and biases gathered by `idx`;
+- a step, for every block: the correction over the K (`mul_mat` of the gathered [256, K] fold by the step's markov
+  vector), the bias, the base, the softcap, `ggml_argmax` over the K, and the id it maps to (`GET_ROWS` of `idx`);
+  the next step's `markov_w1` row by that id (F32 with the converter's `--markov-w1 f32`: on the card);
+- the graph's output is the drafted ids, `t_dspark_ids` I32 [steps, blocks]; `res->t_logits` is null on this path (the
+  block's rows ask for no logits); `llama_get_dspark_ids(ctx, seq, out, n)` returns a sequence's ids after the decode
+  (each block's sequence read from its first token at the extraction: the graph's blocks are the ubatch's token runs,
+  whose order is the arrival order of the lanes, not the ascending sequence ids);
+- the fold rows and biases are gathered with the ids flattened (GET_ROWS pairs a 2-D id tensor's rows with the
+  source's third dimension); a shortlist the path cannot take (a confidence head, a reduced vocabulary, a scaled
+  `markov_w2`, K > V, a one-row block) builds the full chain, and the driver warns once that no ids came back.
+
+**`ggml_top_k_ordered`** (new op variant, `op_params[0] = 1` on `GGML_OP_TOP_K`): the k largest with the set
+determined and ordered: among equal values at the cut the higher index gets in (ggml_argmax's rule), and the k indices
+come back in ascending order. CPU: `std::partial_sort` with the total order (value, then index) and a sort of the k.
+OpenCL: `kernel_top_k_f32_ordered` (`top_k_ordered.cl`, its own optional program: a build failure leaves the op to the
+CPU with a DOWNGRADE line; k <= 1024): the stock kernel's radix select, then, when the keys equal to the k-th largest
+exceed the k still needed, the highest indices among them by a descending chunk scan, and a bitonic sort of the k in
+local memory. The stock `ggml_top_k` and its kernel are unchanged (the QSA indexer's path). CPU and OpenCL agree on
+rows without a NaN and without both -0 and +0 at the cut.
+
+**The tie rule is by token id, not by candidate position**: the candidates are in ascending id order, so
+the ARGMAX's last maximum is the highest id among equal maxima, whatever order the radix select found them in; the
+full chain's ARGMAX over the vocabulary picks the same id. The reference takes the lowest id among equal maxima in
+its shortlist (`amin`); lossless either way (the target verifies every draft), a deviation for exact ties only.
+
+**Tests.**
+- `test-backend-ops -o TOP_K`: `test_top_k_ordered` against the CPU backend, exact (the same k indices in the same
+  order): [200,058 x 7] k = 256 with unique values, with the stock case's duplicate fill (ties at the cut), and with
+  a constructed tie of three indices (9, V / 2, V - 1) at ranks 256-258 (the answer: V - 1); K = V at 1,000; k = 1024.
+  Perf: the stock and the ordered op at [200,058 x 7], k = 256 (pre-registered: <= 3 ms on the card, else the
+  shortlist is re-decided before the accept gate).
+- `test-dspark-shortlist` (CPU by default, the card with `gpu`; built, run by name): the shortlist pick against the
+  full chain's, the ops as `dflash.cpp` composes them: K = V on random rows (the same id), K = 256 with the full
+  chain's winner in the base top-256 (the same id), a K = V tie row (the higher id, by both paths), the tie at rank
+  256 / 257 (the higher id in, ascending), and 20 runs of one row (identical). `DSPARK_SHORTLIST_RED=1` (the
+  candidates in descending id order, the position taken as is) must fail the tie case.
+- arcint: `dspark_ids_take` (the budget's prefix; none for a lane the graph returned none for; none at all for an id
+  outside the vocabulary; red 12 drops the bound) and `config_llama_dflash_shortlist` (1-1024, a drafter required,
+  refused with `--stub`).
+- The served gates (card): the TOP_K perf case; accept at width 3 with and without the shortlist, inside the spread
+  of the earlier width-3 accept rounds (49.4-55.7 %); then decode at d0 / 32k / 77k against DSpark off in the same window (Inkling 2 Mini has no MTP head). The default stays off
+  until it beats off by more than 2 SE at the three depths, with the w3 accept inside the spread.
+
+**What stays vocabulary-wide a propose**: the head on the block's rows (1.16 ms on the B60), its pad cut (0.02 ms), and
+the ordered top-k over the 8 rows.
+
+**Measured on the card** (`measured-here`; the Arc Pro B60 capped at 165 W, Inkling 2 Mini IQ4_NL at q8_0:q4_0 K/V,
+width 3, the F32 `markov_w1`, the unit's sampler, 768-token code continuations; DSpark off has no drafter):
+- against DSpark off, paired (the same continuation in the same round, 10 pairs a depth), K = 256: 42.03 -> 49.12
+  t/s at depth 0 (+16.9 %, SE 1.31), 31.30 -> 38.02 at 32,768 (+21.4 %, SE 1.48), 27.74 -> 31.51 at 77,000 (+13.6 %,
+  SE 0.77): more than 2 SE at all three;
+- the accept price at depth 0, against width 3 without the shortlist on the same continuations: 48.58 % against
+  55.67 % (-7.09 points, SE_d 3.90; pooled over the offered drafts -6.96). 0243's probe predicts 4.91 points from
+  the positions whose full-chain pick lies outside the top 256 (12.4 % of the offered positions), with no inside
+  divergence and its membership check clean: read as the design's price (0243's reading). The reference's own
+  width-3 accept with its shortlist is 50.2 % (its benchmark notes at 6b71b90, `paper`);
+- K at depth 0 (two rounds of five): 128 / 256 / 512 accept 48.7 / 49.6 / 51.6 %, 48.55 / 51.26 / 52.68 t/s,
+  propose 6.73 / 6.75 / 6.79 ms a verify;
+- an earlier run on the same card: width 3 with K = 256 against width 3 without the shortlist, 49.23 against 37.15
+  t/s (+32.5 %), propose 27.65 -> 6.75 ms a verify, verify 42.59 / 42.43 ms.
+
+## 0242-opencl-argmax-topk-load-on-compute.patch
+
+**Status: run on the card** (the Arc Pro B60: `test-dspark-shortlist gpu`, `test-opencl-argmax-sched direct` and
+`refuse`). A fix to 0240 and 0241.
+
+**What failed** (`measured-here`, the B60, the shortlist window's `test-dspark-shortlist gpu`): `GGML_ASSERT(backend_ctx->
+kernel_argmax_f32 != nullptr) failed` in `ggml_cl_argmax`. In the same window and binary, the op suite's ARGMAX and TOP_K
+cases passed and the scheduler test placed ARGMAX on the card in one split: the programs build on the B60.
+
+**Why** (`code`): 0240 and 0241 load their kernels lazily, and only `supports_op` called the loaders
+(`load_cl_kernels_argmax`, `load_cl_kernels_top_k_ordered`). A graph computed on the OpenCL backend directly
+(`ggml_backend_graph_compute`, as `test-dspark-shortlist` does) never asks `supports_op`, so the kernel pointer was
+still null when `ggml_cl_argmax` ran. Not a compile error, not a missing embed: the op suite and the scheduler ask
+`supports_op` first, and so does the served path (llama.cpp's scheduler), where the program loads.
+
+**Fix:** the compute dispatch loads the kernel too (both ops); without a kernel it refuses the op cleanly (the
+backend's own "op not supported" line) instead of asserting inside the kernel call. `supports_op` already says no when
+the kernel is not there. Test hooks `GGML_OPENCL_ARGMAX_FAIL=1` / `GGML_OPENCL_TOPK_ORDERED_FAIL=1` make the programs
+count as not built (one DOWNGRADE line each), and `GGML_OPENCL_ARGMAX_RED=4` is the red of the refusal (the op claimed
+without its kernel). After the review: both loaders build under a mutex (a second caller on the device's shared
+context waits for the first build's result instead of reading a null kernel), and the compute path keeps the ordered
+top-k's k <= 1024 bound that `supports_op` keeps.
+
+**Tests** (`test-opencl-argmax-sched`, two new modes):
+- `direct`: ARGMAX and `ggml_top_k_ordered` computed on the OpenCL backend directly, no scheduler, the top-k first:
+  the last maximum, the top 256 ascending with both tied maxima in. Red: the 0240 / 0241 build fails there, at the
+  top-k's null kernel first.
+- `refuse`: both programs counted as not built: `supports_op` must refuse both ops, and the scheduled step runs with
+  ARGMAX on the CPU (one CPU node, two splits) and the right answer, no assert; the window counts exactly one
+  ARGMAX DOWNGRADE line. Red:
+  `GGML_OPENCL_ARGMAX_RED=4` fails it.
+- The served path stays the proof that the program loads on the card: the shortlist window's served-graph row counts
+  0 ARGMAX nodes on the CPU and 0 ARGMAX / ordered TOP_K DOWNGRADE lines; any of them is red, not a pass on the CPU.
+
+## 0243-dspark-shortlist-probe.patch
+
+**Status: run on the card** (the Arc Pro B60 capped at 165 W, in two untimed runs; the reading below). A measurement
+aid for 0241, off by default.
+
+**Why:** the shortlist's served gate measured the acceptance about 5 points under DSpark without it (`measured-here`,
+the B60, w3, d0). A shortlist loses a draft exactly where the full chain's pick is not among the base top-K. The
+probe records, at every draft position of a shortlist run, whether it is, so the loss can be predicted from the same
+run and set against the measured one; a measured loss clearly above the prediction would be a defect in the shortlist
+path, not its price.
+
+**What it does** (`llama_set_dspark_probe(ctx, true)`, with the shortlist on): in the shortlist chain's step i, beside
+the shortlist's pick, the full path's step on the same state: the GEMV `w2 . m` (+ b), + the base logits, the softcap,
+the ARGMAX over the vocabulary (`src/llama-dspark-probe.h`, `dspark_probe_full_pick`). The chain goes on with the
+shortlist's pick, so the run's drafts are the shortlist's. The graph also outputs every step's pick of the full chain
+([steps, blocks]) and every row's K candidates ([K, n_tokens]); `llama_get_dspark_probe(ctx, seq, full, inside, n)`
+returns the full chain's picks of a sequence's block and, for each, whether it is among its step's candidates
+(`dspark_probe_inside`). The probe is part of the graph reuse check. It puts the full chain's cost back into every
+step: a probe run is never a timing run.
+
+**arcint** (`--llama-dflash-shortlist-probe FILE`, needs the DSpark drafter, with or without the shortlist): one JSON
+line a verified draft, written at the verify (`src/exec/dspark_ring.h`, `dspark_probe_line`): `seq`, `pos0`,
+`id_last`, the kept count `a`, `sl` (K, or 0), the drafts `d` and, with the shortlist, `f` and `in`. Without the
+shortlist `f` is `d`: that run gives the per-position accept rates the reader needs after a divergence.
+`tools/dspark_probe_read.py` reads the logs: the target's draw at a refused row is the next line's `id_last` (the
+verify samples a row and keeps a draft only when it draws it, `src/exec/verify_walk.h`), so the full chain's pick at
+the first divergence is judged against the same run's draw.
+
+**Tests** (`test-dspark-shortlist`, a new case and a check in the old ones): `probe` builds rows whose full-chain
+argmax lies outside the base top-256 (a base value of -5 under a top-256 cut near 8, a correction of +60): the probe's
+pick must be the full chain's id, not the shortlist's, and read "not inside". In every other case the probe's pick must
+equal the test's own full-chain composition. Red: `LLAMA_DSPARK_PROBE_RED=1` (test only) makes the probe the pick
+over the K candidates (the shortlist's own): `probe` fails, every row reading "inside" with the shortlist's id, and
+only `probe` fails (`measured-here`, the CPU backend).
+
+**The reading, pre-registered** (`tools/dspark_probe_read.py` prints it): measured = the mean paired accept difference
+of the shortlist against width 3 without it at depth 0 (the window's timed pairs) with its SE_d; prediction = the probe
+logs, outside only. GREEN iff |prediction - measured| <= max(2 points, 2 SE_d), inside_loss <= 0.5 points absolute and
+the membership tripwire (a position with in = 0 and f = d, impossible) is 0. INVALID, no verdict, when an arm's
+unpaired lines or the shortlist's refused rows with an unknown draw exceed 5 % of its lines; NOT READ without a
+measured value. The probe runs' own difference is data.
+
+**Run on the card** (`measured-here`, the Arc Pro B60 capped at 165 W, width 3, K = 256, one round of five
+continuations an arm): 1,594 and 1,441 lines, 6 unpaired in each (0.4 %, each request's last line), no unknown draw,
+no draft without a probe, no line lost; tripwire 0, inside_loss 0.00; 12.4 % of the offered positions outside the top
+256, at 176 of the 223 outside refused rows the full chain's pick was the target's draw. Prediction 4.91 points
+against the measured 7.09 (SE_d 3.90): GREEN, inside a band of 7.80 points that the measured side's spread sets; the
+prediction sits under every measured view (7.09 paired, 6.96 pooled, 9.08 between the two probe runs). Not read: the
+accepts after a counterfactual hit come from the run-without's per-position rates, and the positions after the round.

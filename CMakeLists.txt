@@ -164,7 +164,7 @@ if(ARCINT_LLAMA)
   add_subdirectory("${ARCINT_LLAMA_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/llama.cpp" EXCLUDE_FROM_ALL)
   find_package(OpenCL REQUIRED)
   target_sources(arcint_core PRIVATE src/exec/backend_llama.cpp src/exec/llama_spec.cpp src/exec/llama_dflash.cpp
-                                     src/exec/llama_toolgrammar.cpp)
+                                     src/exec/llama_dspark.cpp src/exec/llama_toolgrammar.cpp)
   # The DFlash2 drafter's red cases (tests/dflash/legs.sh): a build with a
   # mutant compiled in, which says so at load. 0 is the served build; the
   # cases are listed in src/exec/llama_dflash.cpp and tests/dflash/legs.sh
@@ -173,6 +173,17 @@ if(ARCINT_LLAMA)
     message(WARNING "ARCINT_DFLASH_RED=${ARCINT_DFLASH_RED}: a DFlash2 red-case build, not for serving")
   endif()
   target_compile_definitions(arcint_core PRIVATE ARCINT_DFLASH_RED=${ARCINT_DFLASH_RED})
+  # The DSpark drafter's red cases (src/exec/dspark_ring.h, src/exec/llama_dspark.cpp):
+  # 1 the anchor reads its own Markov context row, 2 the ring keeps rejected rows,
+  # 3 the anchor's row drafted, 4 the llama.cpp port's n_max + 1-row block,
+  # 5 a checkpoint carries later rows, 6 the step's budget ignored, 7 the anchor reads the row one
+  # position early, 8 any target model taken, 9 a checkpoint payload read without its bounds, 10 failed
+  # restores neither counted nor warned. A test build only.
+  set(ARCINT_DSPARK_RED "0" CACHE STRING "DSpark red-case mutant (0: none; a test build only)")
+  if(NOT ARCINT_DSPARK_RED STREQUAL "0")
+    message(WARNING "ARCINT_DSPARK_RED=${ARCINT_DSPARK_RED}: a DSpark red-case build, not for serving")
+  endif()
+  target_compile_definitions(arcint_core PRIVATE ARCINT_DSPARK_RED=${ARCINT_DSPARK_RED})
   # llama-ext.h: the pinned llama.cpp's staging API (nextn embeddings, MTP)
   target_include_directories(arcint_core PRIVATE "${ARCINT_LLAMA_DIR}/src" "${ARCINT_LLAMA_DIR}/tools/mtmd")
   target_link_libraries(arcint_core PUBLIC llama mtmd OpenCL::OpenCL)
@@ -355,6 +366,7 @@ if(ARCINT_TESTS)
     tests/test_mtp_capture.cpp
     tests/test_draft_policy.cpp
     tests/test_dflash_walk.cpp
+    tests/test_dspark.cpp
     tests/test_spec_state.cpp
     tests/test_bytes.cpp
     tests/test_token_ids.cpp
@@ -406,6 +418,10 @@ if(ARCINT_TESTS)
   )
   target_link_libraries(arcint-test PRIVATE arcint_core)
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  # tests/test_dspark.cpp runs dspark_ring.h's rules, a header: its red cases need the switch here too
+  if(DEFINED ARCINT_DSPARK_RED)
+    target_compile_definitions(arcint-test PRIVATE ARCINT_DSPARK_RED=${ARCINT_DSPARK_RED})
+  endif()
   # round 13: test_loan_book reads the loan-KL driver's rule header
   # (contrib/llama-loan-kld/loan_kld_book.h), a device-free plain-data header
   target_include_directories(arcint-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/contrib/llama-loan-kld")
@@ -629,6 +645,14 @@ if(ARCINT_TESTS)
                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_patch_series_order.py")
   set_tests_properties(patch-series-order PROPERTIES LABELS unit)
 
+  # tools/dspark_probe_read.py: the DSpark shortlist's probe log (patch 0243) read against a hand-counted fixture,
+  # device-free; DSPARK_PROBE_READ_RED=1 / 2 / 3 / 4 are its reds (the kept count one too many, the inside divergences
+  # folded into the prediction, the membership tripwire not counted, the validity limits not applied)
+  add_test(NAME dspark-probe-read
+           COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
+                   "${CMAKE_CURRENT_SOURCE_DIR}/tests/python/test_dspark_probe_read.py")
+  set_tests_properties(dspark-probe-read PROPERTIES LABELS unit)
+
   # tools/fn_sweep.py's flag tables and --no-mtp (the T1 leg), device-free.
   add_test(NAME fn-sweep-flags
            COMMAND "${CMAKE_COMMAND}" -E env "PYTHONDONTWRITEBYTECODE=1"
@@ -730,6 +754,29 @@ if(ARCINT_TESTS)
     target_compile_options(arcint-kv-stream-map PRIVATE -Wall -Wextra -Wpedantic)
     add_test(NAME kv-stream-map COMMAND arcint-kv-stream-map)
     set_tests_properties(kv-stream-map PROPERTIES LABELS unit)
+    # patch 0217's device-free cell: the recurrent-state rollback of inkling2 / inkling2_loop
+    # (n_rs_seq 1..8, batches of 1..16 tokens, every rollback depth, one and two sequences) against
+    # contexts that never saw the removed tokens, and the bound of the widened conv-window view.
+    # It is the pinned tree's own tests/test-llama-archs.cpp, built against tests/llama-archs-shim
+    # in place of llama.cpp's common library, which arcint does not build.
+    # A tree without the mode stops the configure: the gate must not drop out of `ctest -L unit`
+    # when the series is renumbered, rebased or applied in part.
+    set(ARCINT_ARCHS_RS "")
+    if(EXISTS "${ARCINT_LLAMA_DIR}/tests/test-llama-archs.cpp")
+      file(STRINGS "${ARCINT_LLAMA_DIR}/tests/test-llama-archs.cpp" ARCINT_ARCHS_RS REGEX "--rs-rollback")
+    endif()
+    if(NOT ARCINT_ARCHS_RS)
+      message(FATAL_ERROR "ARCINT_LLAMA_DIR lacks contrib/llama.cpp patch 0217 (the --rs-rollback mode of "
+                          "tests/test-llama-archs.cpp): the ctest inkling-rs-rollback cannot be built; apply the series")
+    endif()
+    add_executable(arcint-llama-archs "${ARCINT_LLAMA_DIR}/tests/test-llama-archs.cpp")
+    target_link_libraries(arcint-llama-archs PRIVATE arcint_core)
+    target_include_directories(arcint-llama-archs BEFORE PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/tests/llama-archs-shim"
+        "${ARCINT_LLAMA_DIR}/include" "${ARCINT_LLAMA_DIR}/ggml/include" "${ARCINT_LLAMA_DIR}/src")
+    add_test(NAME inkling-rs-rollback COMMAND arcint-llama-archs -s 1 --rs-rollback)
+    set_tests_properties(inkling-rs-rollback PROPERTIES LABELS unit TIMEOUT 600
+        ENVIRONMENT "GGML_NO_BACKTRACE=1")
     # patch 0123zzzzz3's device-free cell: the stream's page moves are per attention
     # layer. Three layers share one ring slot (the stream's slots[ikv % 2]); every
     # attention call copies its own host-store pages into the slot before it reads

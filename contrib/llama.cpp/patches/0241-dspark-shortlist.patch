@@ -1,0 +1,843 @@
+0241: the DSpark chain over each draft row's base top K (llama_set_dspark_shortlist, opt-in; ggml_top_k_ordered on CPU and OpenCL), the drafted ids out instead of the block's logits.
+
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 0607d59..b36d96b 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2692,6 +2692,15 @@ extern "C" {
+             struct ggml_tensor  * a,
+             int                   k);
+ 
++    // 0241: the same k largest, determined: among equal values at the cut the higher index gets in (the rule of
++    // ggml_argmax: the last maximum), and the k indices are returned in ascending order (op_params[0] = 1). CPU and
++    // OpenCL agree on rows without NaN and without both -0 and +0 at the cut (the OpenCL key orders -0 below +0 and
++    // a NaN on top; the CPU comparator treats -0 == +0 and is no strict order with a NaN)
++    GGML_API struct ggml_tensor * ggml_top_k_ordered(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * a,
++            int                   k);
++
+     GGML_API struct ggml_tensor * ggml_arange(
+             struct ggml_context * ctx,
+             float                 start,
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 0045505..4d6c77c 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -9351,6 +9351,14 @@ struct cmp_top_k {
+     }
+ };
+ 
++// 0241 (ggml_top_k_ordered): a total order: the larger value first, an equal value with the higher index first
++struct cmp_top_k_ordered {
++    const float * data;
++    bool operator()(int32_t a, int32_t b) const {
++        return data[a] > data[b] || (data[a] == data[b] && a > b);
++    }
++};
++
+ static void ggml_compute_forward_top_k_f32(
+     const ggml_compute_params * params,
+     ggml_tensor * dst) {
+@@ -9377,10 +9385,18 @@ static void ggml_compute_forward_top_k_f32(
+             tmp[j] = j;
+         }
+ 
+-        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data});
+-
+         int32_t * dst_data = (int32_t *)((char *) dst->data + i*nb1);
+ 
++        if (ggml_get_op_params_i32(dst, 0) == 1) {
++            // 0241: ggml_top_k_ordered
++            std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k_ordered{src_data});
++            std::sort(tmp, tmp + top_k);
++            std::copy(tmp, tmp + top_k, dst_data);
++            continue;
++        }
++
++        std::partial_sort(tmp, tmp + top_k, tmp + ne00, cmp_top_k{src_data});
++
+         std::copy(tmp, tmp + top_k, dst_data);
+ 
+         // emphasize that the order is not important
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 8d6b8f6..3eec3e1 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -106,6 +106,7 @@ set(GGML_OPENCL_KERNELS
+     moe_add_id_glu
+     argsort
+     argmax
++    top_k_ordered
+     tri
+     fill
+     clamp
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 21f3b21..7e7eaf2 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -1525,6 +1525,8 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_solve_tri_f32;
+     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
+     cl_kernel kernel_top_k_f32 = nullptr;   // argsort.cl
++    cl_kernel kernel_top_k_f32_ordered = nullptr;   // 0241: top_k_ordered.cl, ggml_top_k_ordered
++    bool      kernels_loaded_top_k_ordered = false;
+     cl_kernel kernel_argsort_f32_i32;
+     cl_kernel  kernel_argmax_f32  = nullptr;   // 0240: argmax.cl
+     cl_program program_argmax     = nullptr;
+@@ -2210,6 +2212,39 @@ static void load_cl_kernels_argmax(ggml_backend_opencl_context * backend_ctx) {
+                   red == 1 ? " -- RED CASE 1: the lowest index on a tie" : red == 2 ? " -- RED CASE 2: the lower lane wins a tie" : "");
+ }
+ 
++// 0241: ggml_top_k_ordered's kernel, its own optional program: a build failure leaves the op to the CPU
++static void load_cl_kernels_top_k_ordered(ggml_backend_opencl_context * backend_ctx) {
++    if (backend_ctx->kernels_loaded_top_k_ordered) {
++        return;
++    }
++    backend_ctx->kernels_loaded_top_k_ordered = true;
++    // the stock top-k's options (integer keys: the fast-math options do not touch it)
++    const std::string compile_opts = std::string("-cl-std=CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." +
++                                     std::to_string(backend_ctx->opencl_c_version.minor) +
++                                     " -cl-mad-enable -cl-unsafe-math-optimizations -cl-finite-math-only -cl-fast-relaxed-math";
++#ifdef GGML_OPENCL_EMBED_KERNELS
++    const std::string kernel_src {
++        #include "top_k_ordered.cl.h"
++    };
++#else
++    const std::string kernel_src = read_file("top_k_ordered.cl");
++#endif
++    cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), compile_opts);
++    cl_int     err  = CL_SUCCESS;
++    cl_kernel  k    = prog != nullptr ? clCreateKernel(prog, "kernel_top_k_f32_ordered", &err) : nullptr;
++    if (prog == nullptr || err != CL_SUCCESS || k == nullptr || backend_ctx->get_kernel_workgroup_size(k) < 256) {
++        if (k != nullptr) {
++            clReleaseKernel(k);
++        }
++        if (prog != nullptr) {
++            clReleaseProgram(prog);
++        }
++        ggml_cl_downgrade("op=TOP_K ordered=1 type=f32 path=cpu reason=no-kernel (top_k_ordered.cl did not build or takes no 256 lanes)");
++        return;
++    }
++    backend_ctx->kernel_top_k_f32_ordered = k;
++}
++
+ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
+ #ifndef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+     GGML_UNUSED(backend_ctx);
+@@ -14320,7 +14355,17 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+             load_cl_kernels_argmax(backend_ctx);
+             return backend_ctx->kernel_argmax_f32 != nullptr;   // no kernel: the loader's downgrade line, the CPU
+         case GGML_OP_TOP_K:
+-            // F32 rows -> the I32 indices of their k largest (a QSA indexer's block selection)
++            // F32 rows -> the I32 indices of their k largest (a QSA indexer's block selection);
++            // 0241: ggml_top_k_ordered (op_params[0] = 1) for k <= 1024 (its local sort)
++            if (ggml_get_op_params_i32(op, 0) == 1) {
++                if (op->ne[0] > 1024) {
++                    return false;
++                }
++                load_cl_kernels_top_k_ordered(backend_ctx);
++                if (backend_ctx->kernel_top_k_f32_ordered == nullptr) {
++                    return false;
++                }
++            }
+             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+                    op->src[0]->nb[0] == sizeof(float) && ggml_is_contiguous(op);
+         case GGML_OP_SUM_ROWS:
+@@ -43202,7 +43247,8 @@ static void ggml_cl_top_k(ggml_backend_t backend, const ggml_tensor * src0, cons
+     const cl_ulong nb1  = dst->nb[1], nb2 = dst->nb[2], nb3 = dst->nb[3];
+     GGML_ASSERT(k <= ne00);
+ 
+-    cl_kernel kernel = backend_ctx->kernel_top_k_f32;
++    // 0241: ggml_top_k_ordered's kernel, the same arguments
++    cl_kernel kernel = ggml_get_op_params_i32(dst, 0) == 1 ? backend_ctx->kernel_top_k_f32_ordered : backend_ctx->kernel_top_k_f32;
+     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),   &extra0->data_device));
+     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong), &offset0));
+     CL_CHECK(clSetKernelArg(kernel,  2, sizeof(cl_mem),   &extrad->data_device));
+diff --git a/ggml/src/ggml-opencl/kernels/top_k_ordered.cl b/ggml/src/ggml-opencl/kernels/top_k_ordered.cl
+new file mode 100644
+index 0000000..dbf3907
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/top_k_ordered.cl
+@@ -0,0 +1,110 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++
++// 0241: its own program (built on demand, optional: a build failure leaves ggml_top_k_ordered to the CPU with a
++// DOWNGRADE line and the stock argsort / top-k program untouched). The key and the work-group are argsort.cl's.
++#define TOPK_WG 256
++static inline uint topk_key(float f) {
++    const uint u = as_uint(f);
++    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++}
++// 0241: ggml_top_k_ordered. The same radix select as kernel_top_k_f32, then the set made determinate and ordered:
++// when the keys equal to the k-th largest are more than the k still needed (a tie at the cut), the ones with the
++// HIGHEST indices get in (ggml_argmax's rule), scanned in descending chunks of TOPK_WG; the k indices are then sorted
++// ascending in local memory (bitonic, padded to a power of two). k <= TOPK_ORD_MAX.
++#define TOPK_ORD_MAX 1024
++kernel void kernel_top_k_f32_ordered(
++        global const char * src0, ulong offset0,
++        global       char * dst,  ulong offsetd,
++        int ne00, ulong nb01, ulong nb02, ulong nb03,
++        int k,    ulong nb1,  ulong nb2,  ulong nb3) {
++    local int  hist[256];
++    local int  sel[TOPK_ORD_MAX];
++    local int  scan[TOPK_WG];
++    local uint s_prefix;
++    local int  s_need, s_gt, s_eq, s_cnt_eq, s_taken;
++    const int lid = get_local_id(0);
++    const int i1 = get_group_id(0), i2 = get_group_id(1), i3 = get_group_id(2);
++    global const float * x = (global const float *)(src0 + offset0 + i1*nb01 + i2*nb02 + i3*nb03);
++    global int * y = (global int *)(dst + offsetd + i1*nb1 + i2*nb2 + i3*nb3);
++    if (lid == 0) { s_prefix = 0; s_need = k; s_cnt_eq = 0; }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (int pass = 0; pass < 4; ++pass) {
++        const int shift = 24 - 8 * pass;
++        const uint mask = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
++        for (int b = lid; b < 256; b += TOPK_WG) hist[b] = 0;
++        barrier(CLK_LOCAL_MEM_FENCE);
++        const uint prefix = s_prefix;
++        for (int j = lid; j < ne00; j += TOPK_WG) {
++            const uint key = topk_key(x[j]);
++            if ((key & mask) == prefix) atomic_inc(&hist[(key >> shift) & 0xFF]);
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++        if (lid == 0) {
++            int need = s_need, b = 255;
++            for (; b > 0; --b) {
++                if (hist[b] >= need) break;
++                need -= hist[b];
++            }
++            s_prefix = prefix | ((uint)b << shift);
++            s_need = need;
++            if (pass == 3) s_cnt_eq = hist[b];   // the keys equal to T in the row
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++    const uint T = s_prefix;
++    const int n_eq = s_need;
++    const int n_gt = k - n_eq;
++    if (lid == 0) { s_gt = 0; s_eq = 0; s_taken = 0; }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    const bool all_eq = s_cnt_eq == n_eq;
++    for (int j = lid; j < ne00; j += TOPK_WG) {
++        const uint key = topk_key(x[j]);
++        if (key > T) {
++            sel[atomic_inc(&s_gt)] = j;
++        } else if (all_eq && key == T) {
++            sel[n_gt + atomic_inc(&s_eq)] = j;
++        }
++    }
++    barrier(CLK_LOCAL_MEM_FENCE);
++    if (!all_eq) {
++        // a tie at the cut: the n_eq equal keys with the highest indices, chunk by chunk from the end
++        for (int c0 = ((ne00 - 1) / TOPK_WG) * TOPK_WG; c0 >= 0; c0 -= TOPK_WG) {
++            const int taken = s_taken;
++            if (taken >= n_eq) break;   // uniform: read after the barrier below
++            const int  j = c0 + lid;
++            const bool e = j < ne00 && topk_key(x[j]) == T;
++            // a reversed inclusive scan: scan[r] = equal keys among lanes >= TOPK_WG - 1 - r
++            scan[TOPK_WG - 1 - lid] = e ? 1 : 0;
++            barrier(CLK_LOCAL_MEM_FENCE);
++            for (int off = 1; off < TOPK_WG; off <<= 1) {
++                const int v = lid >= off ? scan[lid - off] : 0;
++                barrier(CLK_LOCAL_MEM_FENCE);
++                scan[lid] += v;
++                barrier(CLK_LOCAL_MEM_FENCE);
++            }
++            const int above = scan[TOPK_WG - 1 - lid] - (e ? 1 : 0);   // equal keys at higher indices in this chunk
++            if (e && taken + above < n_eq) sel[n_gt + taken + above] = j;
++            barrier(CLK_LOCAL_MEM_FENCE);
++            if (lid == 0) s_taken = min(n_eq, taken + scan[TOPK_WG - 1]);
++            barrier(CLK_LOCAL_MEM_FENCE);
++        }
++    }
++    // ascending: a bitonic sort of sel[0..P), the tail padded with INT_MAX
++    int P = 1;
++    while (P < k) P <<= 1;
++    for (int i = lid; i < P; i += TOPK_WG) if (i >= k) sel[i] = INT_MAX;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (int size = 2; size <= P; size <<= 1) {
++        for (int stride = size >> 1; stride > 0; stride >>= 1) {
++            for (int t = lid; t < P / 2; t += TOPK_WG) {
++                const int i = 2 * t - (t & (stride - 1));
++                const int jj = i + stride;
++                const bool asc = (i & size) == 0;
++                const int a = sel[i], b = sel[jj];
++                if ((a > b) == asc) { sel[i] = b; sel[jj] = a; }
++            }
++            barrier(CLK_LOCAL_MEM_FENCE);
++        }
++    }
++    for (int i = lid; i < k; i += TOPK_WG) y[i] = sel[i];
++}
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 7c74694..f8851de 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -5911,6 +5911,15 @@ struct ggml_tensor * ggml_top_k(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_top_k_ordered(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * a,
++        int                   k) {
++    struct ggml_tensor * result = ggml_top_k(ctx, a, k);
++    ggml_set_op_params_i32(result, 0, 1);   // 0241: ties at the cut to the higher index, ascending output
++    return result;
++}
++
+ // ggml_arange
+ 
+ struct ggml_tensor * ggml_arange(
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 728d955..e42cde8 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -2994,6 +2994,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     int64_t n_outputs_prev = 0;
+     int64_t n_tokens_prev  = 0;
+ 
++    // 0241: a decode's drafted ids replace the last one's
++    dspark_ids.clear();
++    dspark_ids_seq.clear();
++    dspark_ids_steps = 0;
++
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+ 
+@@ -3154,6 +3159,20 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+             t_embd = res->get_embd_pooled();
+         }
+ 
++        // 0241: the DSpark shortlist chain's drafted ids, [steps, blocks] I32, the blocks in the ubatch's sequence order
++        if (ggml_tensor * t_ids = res->t_dspark_ids) {
++            ggml_backend_t backend_ids = ggml_backend_sched_get_tensor_backend(sched.get(), t_ids);
++            GGML_ASSERT(backend_ids != nullptr && t_ids->type == GGML_TYPE_I32 && t_ids->ne[1] == (int64_t) ubatch.n_seqs_unq);
++            dspark_ids_steps = (int32_t) t_ids->ne[0];
++            dspark_ids.resize((size_t) ggml_nelements(t_ids));
++            // the graph's blocks are the ubatch's equal token runs in token order (not seq_id_unq's ascending order)
++            dspark_ids_seq.resize(ubatch.n_seqs_unq);
++            for (uint32_t b = 0; b < ubatch.n_seqs_unq; ++b) {
++                dspark_ids_seq[b] = ubatch.seq_id[b * (ubatch.n_tokens / ubatch.n_seqs_unq)][0];
++            }
++            ggml_backend_tensor_get_async(backend_ids, t_ids, dspark_ids.data(), 0, ggml_nbytes(t_ids));
++        }
++
+         // extract logits
+         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+@@ -5419,6 +5438,29 @@ void llama_set_dspark_chain(llama_context * ctx, uint32_t n_steps) {
+     ctx->set_dspark_chain(n_steps);
+ }
+ 
++void llama_set_dspark_shortlist(llama_context * ctx, uint32_t k) {
++    ctx->set_dspark_shortlist(k);
++}
++
++int32_t llama_get_dspark_ids(llama_context * ctx, llama_seq_id seq, int32_t * out, int32_t n_max) {
++    return ctx->get_dspark_ids(seq, out, n_max);
++}
++
++int32_t llama_context::get_dspark_ids(llama_seq_id seq, int32_t * out, int32_t n_max) {
++    synchronize();
++    for (size_t b = 0; b < dspark_ids_seq.size(); ++b) {
++        if (dspark_ids_seq[b] != seq) {
++            continue;
++        }
++        const int32_t n = std::min(n_max, dspark_ids_steps);
++        for (int32_t s = 0; s < n; ++s) {
++            out[s] = dspark_ids[b * (size_t) dspark_ids_steps + (size_t) s];
++        }
++        return n;
++    }
++    return -1;
++}
++
+ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+     ctx->set_embeddings_layer_inp(lid, value);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 1903c3f..0d0d9f9 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -146,6 +146,8 @@ struct llama_context {
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_nextn_skip(bool skip) { embd_nextn_skip = skip; }
+     void set_dspark_chain(uint32_t n_steps) { cparams.dspark_chain = n_steps; }   // 0218
++    void set_dspark_shortlist(uint32_t k) { cparams.dspark_shortlist = k; }       // 0241
++    int32_t get_dspark_ids(llama_seq_id seq, int32_t * out, int32_t n_max);        // 0241
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
+@@ -356,6 +358,10 @@ private:
+     // populated when cparams.output_layer_inp[il] is true
+     std::vector<buffer_view<float>> embd_layer_inp;
+     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
++    // 0241: the DSpark shortlist chain's drafted ids of the last decode, [steps, blocks], the blocks' sequences
++    std::vector<int32_t>      dspark_ids;
++    std::vector<llama_seq_id> dspark_ids_seq;
++    int32_t                   dspark_ids_steps = 0;
+     bool embd_nextn_skip = false;         // llama_set_embeddings_nextn_skip
+ 
+     struct sampling_info {
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 0c73764..a781c6c 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -27,6 +27,7 @@ struct llama_cparams {
+     uint32_t dory_loops = 0;  // ARC-LAB 0118: Dory loop count of this context's graphs; 0 = the model's
+ 
+     uint32_t dspark_chain = 0; // 0218: Markov steps a DSpark draft block runs (rows 1..n); 0 = every row of the block
++    uint32_t dspark_shortlist = 0; // 0241: K > 0: the chain over each row's base top-K candidates, the drafted ids out; 0 = the full chain
+ 
+     float rope_freq_base;
+     float rope_freq_scale;
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 95bcf1a..daa72f2 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -171,6 +171,19 @@ LLAMA_API void llama_set_embeddings_nextn_skip(struct llama_context * ctx, bool
+ // Another value is another graph (it is part of the reuse check).
+ LLAMA_API void llama_set_dspark_chain(struct llama_context * ctx, uint32_t n_steps);
+ 
++// 0241: the DSpark Markov chain over a shortlist: each draft row's K best base logits (the head's own, by
++// ggml_top_k_ordered: ties at the cut to the higher id, the candidates in ascending id order), the Markov
++// correction over those K only, the argmax over them (ggml's rule: among equal maxima the highest id, independent
++// of the candidates' order) and the id it maps to; the graph outputs the drafted ids, not the logits (read them
++// with llama_get_dspark_ids; the block's rows need no logits outputs). The vLLM-XPU Inkling port's coding profile:
++// INKLING2_DSPARK_SHORTLIST=256 (inkling_xpu/dspark.py, _block). 0 (the default): the full chain, node for node.
++// Another value is another graph (part of the reuse check).
++LLAMA_API void llama_set_dspark_shortlist(struct llama_context * ctx, uint32_t k);
++
++// 0241: the ids the last decode's shortlist chain drafted for sequence `seq` (up to n_max, in draft order);
++// returns how many, or -1 when the last decode drafted none for it (no shortlist, another sequence)
++LLAMA_API int32_t llama_get_dspark_ids(struct llama_context * ctx, llama_seq_id seq, int32_t * out, int32_t n_max);
++
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+ // chain multiple trained NextN heads. Default 0 (first head).
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index bb1d8e0..5fa6c39 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1524,6 +1524,7 @@ void llm_graph_result::reset() {
+ 
+     t_sampled.clear();
+     t_sampled_ids = nullptr;
++    t_dspark_ids  = nullptr;   // 0241
+     t_sampled_probs.clear();
+     t_sampled_logits.clear();
+     t_candidates.clear();
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 3eb9787..02e638d 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -977,6 +977,11 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        // 0241: so is another shortlist
++        if (cparams.dspark_shortlist != other.cparams.dspark_shortlist) {
++            return false;
++        }
++
+         // ARC-LAB 0118: another loop count is another topology. LLAMA_DORY_RED_REUSE (test only) drops the check,
+         // the deliberately wrong build of the experiment
+         if (cparams.dory_loops != other.cparams.dory_loops) {
+@@ -1066,6 +1071,7 @@ public:
+ 
+     std::vector<ggml_tensor *> t_sampled;
+     ggml_tensor *              t_sampled_ids = nullptr; // I32 [n_rows]: the same sampled ids in one tensor (one read-back), or null
++    ggml_tensor *              t_dspark_ids  = nullptr; // 0241: I32 [steps, blocks], the DSpark shortlist chain's drafted ids, or null
+     std::vector<ggml_tensor *> t_sampled_probs;
+     std::vector<ggml_tensor *> t_sampled_logits;
+     std::vector<ggml_tensor *> t_candidates;
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index bcf53a0..ce775c7 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -487,6 +487,32 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+     const int64_t n_chain = g.cparams.dspark_chain > 0
+         ? std::min<int64_t>(block_drafts, i_draft_beg + (int64_t) g.cparams.dspark_chain) : block_drafts;
+ 
++    // 0241: the shortlist (llama_set_dspark_shortlist): each row's K best base logits by ggml_top_k_ordered (ties at
++    //       the cut to the higher id, the candidates in ascending id order), their base values, fold rows and biases
++    //       gathered once; a step computes the correction for the K only, softcaps them, takes the ARGMAX over them
++    //       (the last maximum of an ascending list: the highest id among equal maxima, whatever order the top-k
++    //       found them in) and maps it to its id. The graph outputs the drafted ids, [steps, n_blocks], not logits.
++    //       The vLLM-XPU Inkling port: inkling_xpu/dspark.py, _block (INKLING2_DSPARK_SHORTLIST)
++    const int64_t n_short   = (int64_t) g.cparams.dspark_shortlist;
++    const bool    use_short = n_short > 0 && is_rnn && !has_conf && !model.d2t && model.dspark_markov_w2_s == nullptr &&
++                              n_short <= n_vocab && w2->ne[1] == n_vocab && n_chain > i_draft_beg;
++    ggml_tensor * idx = nullptr, * base_k = nullptr, * fold_k = nullptr, * bias_k = nullptr, * ids_all = nullptr;
++    // a view that is already contiguous needs no copy (n_blocks = 1: every step's view is)
++    const auto contig = [&](ggml_tensor * t) { return ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t); };
++    if (use_short) {
++        GGML_ASSERT(ggml_is_contiguous(base));
++        idx    = ggml_top_k_ordered(ctx0, base, (int) n_short);                                                   // I32 [K, n_tok]
++        base_k = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, base, 1, n_vocab, n_tok), idx);                       // [1, K, n_tok]
++        base_k = ggml_reshape_2d(ctx0, base_k, n_short, n_tok);
++        // a 2-D source takes 1-D ids (GET_ROWS pairs a 2-D id tensor's rows with the source's third dimension)
++        ggml_tensor * idx_flat = ggml_reshape_1d(ctx0, idx, n_short * n_tok);
++        fold_k = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, w2, idx_flat), w2->ne[0], n_short, n_tok);            // [R, K, n_tok]
++        if (model.dspark_markov_w2_b) {
++            bias_k = ggml_get_rows(ctx0, ggml_reshape_2d(ctx0, model.dspark_markov_w2_b, 1, n_vocab), idx_flat);  // [1, K n_tok]
++            bias_k = ggml_reshape_2d(ctx0, bias_k, n_short, n_tok);
++        }
++    }
++
+     // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
+     //       token pick, not the Markov conditioning path
+     for (int64_t i = i_draft_beg; i < n_chain; ++i) {
+@@ -516,6 +542,35 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+             markov = ggml_tanh(ctx0, chunk(2));
+         }
+ 
++        if (use_short) {
++            // 0241: the step over the K candidates of row i of every block
++            const int64_t rank   = markov->ne[0];
++            const size_t  bs_idx = (size_t) block_drafts * idx->nb[1];
++            ggml_tensor * idx_i  = contig(ggml_view_2d(ctx0, idx, n_short, n_blocks, bs_idx, i*idx->nb[1]));                 // [K, n_blocks]
++            ggml_tensor * fold_i = contig(ggml_view_3d(ctx0, fold_k, rank, n_short, n_blocks, fold_k->nb[1],
++                                                       (size_t) block_drafts * fold_k->nb[2], i*fold_k->nb[2]));           // [R, K, n_blocks]
++            ggml_tensor * corr   = ggml_mul_mat(ctx0, fold_i, ggml_reshape_3d(ctx0, contig(markov), rank, 1, n_blocks));
++            corr = ggml_reshape_2d(ctx0, corr, n_short, n_blocks);                                                        // [K, n_blocks]
++            if (bias_k) {
++                corr = ggml_add(ctx0, corr, contig(ggml_view_2d(ctx0, bias_k, n_short, n_blocks,
++                                                                 (size_t) block_drafts * bias_k->nb[1], i*bias_k->nb[1])));
++            }
++            ggml_tensor * col_k = ggml_add(ctx0, contig(ggml_view_2d(ctx0, base_k, n_short, n_blocks,
++                                                                     (size_t) block_drafts * base_k->nb[1], i*base_k->nb[1])), corr);
++            if (softcap > 0.0f) {
++                col_k = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, col_k, 1.0f/softcap)), softcap);
++            }
++            ggml_tensor * am  = ggml_argmax(ctx0, col_k);                                                                 // [n_blocks]
++            ggml_tensor * tok = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, idx_i, 1, n_short, n_blocks),
++                                              ggml_reshape_2d(ctx0, am, 1, n_blocks));                                    // [1, 1, n_blocks]
++            tok     = ggml_reshape_2d(ctx0, tok, 1, n_blocks);
++            ids_all = ids_all ? ggml_concat(ctx0, ids_all, tok, 0) : tok;                                                 // [steps, n_blocks]
++            if (i + 1 < n_chain) {
++                prev = ggml_reshape_1d(ctx0, tok, n_blocks);
++            }
++            continue;
++        }
++
+         ggml_tensor * bias    = g.build_lora_mm(w2, markov, model.dspark_markov_w2_s);  // [n_vocab_draft, n_blocks]
+         if (model.dspark_markov_w2_b) {
+             bias = ggml_add(ctx0, bias, model.dspark_markov_w2_b);
+@@ -560,6 +615,16 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+         }
+     }
+ 
++    if (use_short) {
++        // 0241: the drafted ids are the graph's output; no logits (the block's rows ask for none)
++        res->t_dspark_ids = ggml_cont(ctx0, ids_all);
++        ggml_set_name(res->t_dspark_ids, "dspark_ids");
++        ggml_set_output(res->t_dspark_ids);
++        ggml_build_forward_expand(g.gf, res->t_dspark_ids);
++        res->t_logits = nullptr;
++        return;
++    }
++
+     // 0218: the rows past the chain, the base logits as they are (the confidence head, if any, reads 0 there)
+     for (int64_t i = n_chain; i < block_drafts; ++i) {
+         ggml_tensor * col = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]));
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index ca8b0fb..8f40741 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -265,6 +265,13 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     target_link_libraries(test-opencl-kv-view-write PRIVATE ggml)
+ endif()
+ 
++# patch 0241: the DSpark shortlist pick against the full chain, the ops as dflash.cpp composes them (CPU by
++# default, the card with "gpu"). Built, not a ctest case (205 MB of weights a case); run by name.
++if (NOT GGML_BACKEND_DL)
++    add_executable(test-dspark-shortlist test-dspark-shortlist.cpp)
++    target_link_libraries(test-dspark-shortlist PRIVATE ggml ggml-base ggml-cpu)
++endif()
++
+ # patch 0240: one DSpark Markov step (ARGMAX -> GET_ROWS of markov_w1) as the scheduler places it: one split, no
+ # CPU node, the last maximum. Needs the card: built, not a ctest case; run by name.
+ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 6692194..e9863e7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -8776,6 +8776,62 @@ struct test_top_k : public test_case {
+     }
+ };
+ 
++// 0241: ggml_top_k_ordered against the CPU backend, EXACT: the same k indices in the same (ascending) order. With
++// ties = true the rows carry many duplicates (the stock case's fill), so the k-th value has ties at the cut, which
++// the ordered op resolves to the higher indices; cut = true builds rows whose values at ranks k and k + 1 tie
++// between a low, a middle and the last index (V - 1, the V mod 4 = 2 tail of Inkling 2's vocabulary at 200,058)
++struct test_top_k_ordered : public test_top_k {
++    const bool cut;
++    test_top_k_ordered(std::array<int64_t, 4> ne, int k, bool ties, bool cut = false)
++        : test_top_k(GGML_TYPE_F32, ne, k, ties), cut(cut) {}
++
++    std::string vars() override {
++        return test_top_k::vars() + ",ordered=1" + (cut ? ",cut=1" : "");
++    }
++
++    bool run_whole_graph() override { return true; }
++
++    double err(const float * a, const float * b, size_t n) override {
++        double diff = 0.0;
++        for (size_t i = 0; i < n; i++) {
++            diff += a[i] != b[i] ? 1.0 : 0.0;
++        }
++        return diff;
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor(ctx, type, 4, ne.data());
++        ggml_set_name(a, "a");
++        input = a;
++        ggml_tensor * out = ggml_top_k_ordered(ctx, a, k);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        if (!cut) {
++            test_top_k::initialize_tensors(ctx);
++            return;
++        }
++        std::default_random_engine rng(241);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            const int64_t w = t->ne[0];
++            for (int64_t r = 0; r < ggml_nrows(t); r++) {
++                std::vector<float> data(w);
++                for (int64_t i = 0; i < w; i++) {
++                    data[i] = -(float) (i % 977) - 10.0f;   // below every value placed next
++                }
++                std::shuffle(data.begin(), data.end(), rng);
++                for (int i = 0; i < k - 1; i++) {
++                    data[(size_t) (1000 + 7 * i) % (size_t) w] = 100.0f + (float) i;   // k - 1 distinct values above
++                }
++                data[9] = 1.0f; data[w / 2] = 1.0f; data[w - 1] = 1.0f;                // three tie at ranks k .. k + 2
++                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], w * sizeof(float));
++            }
++        }
++    }
++};
++
+ // top_k over rows like log-probabilities: distinct negative values, fewer
+ // than k +inf (none for k = 1, so the expected indices are unique) and many
+ // -inf (masked tokens)
+@@ -14303,6 +14359,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+         test_cases.emplace_back(new test_top_k_inf({4096, 2, 1, 1}, k));
+         test_cases.emplace_back(new test_top_k_inf({248320, 1, 1, 1}, k));
+     }
++    // 0241: the DSpark shortlist's top-k (Inkling 2's vocabulary, the block's draft rows), ties, the cut, K = V
++    test_cases.emplace_back(new test_top_k_ordered({200058, 7, 1, 1}, 256, false));
++    test_cases.emplace_back(new test_top_k_ordered({200058, 7, 1, 1}, 256, true));
++    test_cases.emplace_back(new test_top_k_ordered({200058, 7, 1, 1}, 256, false, true));
++    test_cases.emplace_back(new test_top_k_ordered({1000, 4, 1, 1}, 1000, true));
++    test_cases.emplace_back(new test_top_k_ordered({1000, 4, 1, 1}, 1000, false));
++    test_cases.emplace_back(new test_top_k_ordered({4096, 3, 1, 1}, 1024, true));
+ 
+     for (int i = 0; i < 20; ++i) {
+         for (int k : {1, 2, 3, 7, 15, 100, 500, 1023, 9999}) {
+@@ -15998,6 +16061,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     test_cases.emplace_back(new test_argsort(GGML_TYPE_F32, {200000, 16, 1, 1}));
+ 
+     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {2, 1, 1, 1}, 1));
++    // 0241: the DSpark shortlist's shape, the stock op against the ordered one (pre-registered: <= 3 ms on the card)
++    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {200058, 7, 1, 1}, 256));
++    test_cases.emplace_back(new test_top_k_ordered({200058, 7, 1, 1}, 256, false));
++    test_cases.emplace_back(new test_top_k_ordered({200058, 7, 1, 1}, 256, true));
+     // widths around the tiling threshold
+     for (auto cols : {4096, 8192, 12288, 16384, 24576, 32768, 65536, 131072}) {
+         for (auto nrows : {1, 16}) {
+diff --git a/tests/test-dspark-shortlist.cpp b/tests/test-dspark-shortlist.cpp
+new file mode 100644
+index 0000000..5e34205
+--- /dev/null
++++ b/tests/test-dspark-shortlist.cpp
+@@ -0,0 +1,182 @@
++// 0241: the DSpark shortlist's pick against the full chain's, the ops as src/models/dflash.cpp composes them
++// (build_dspark_markov_head, the use_short branch), on the CPU backend (default) or the first GPU (argv[1] = "gpu").
++//   full:  argmax_V( softcap(base + w2 . m + b) )                                    (ggml's rule: the last maximum)
++//   short: idx = top_k_ordered(base, K); the same over the K gathered candidates; argmax over them; idx[argmax]
++// Cases (each prints PASS / FAIL; exit 0 when all pass):
++//   kv     K = V on random rows: the same id as the full chain, every row
++//   k256   K = 256 on rows built so the full chain's argmax lies in the base top-256: the same id
++//   tie    K = V, a row with an exact tie at the maximum between two ids the top-k does not return in index
++//          order: the pick must be the higher id (as the full chain's ARGMAX)
++//   cut    K = 256, base ties exactly at rank 256 / 257: top_k_ordered takes the higher id, the same set every run
++//   det    the K = 256 indices of one row, 20 runs: identical
++// DSPARK_SHORTLIST_RED=1: the red pick: the candidates in descending id order (the ordered top-k reversed: an order
++// that is not the ids') and the position from ARGMAX taken as it is: the last maximum is then the LOWER tied id, so the
++// tie case must fail, deterministically.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#include <algorithm>
++#include <cmath>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++static const int   R = 256;
++static int         V = 200058;   // the row width of the current case (Inkling 2's vocabulary, or 1,000 for K = V)
++static const float CAP = 30.0f;
++static int g_fail = 0;
++static bool g_red = false;
++
++struct Run {
++    ggml_backend_t be;
++    std::vector<int32_t> full, shortl, idx_row0;
++};
++
++// one graph: n_rows independent rows (base [V, n], fold w2 [R, V], bias [V], markov m [R, n])
++static void run(ggml_backend_t be, int K, const std::vector<float> & base, const std::vector<float> & w2,
++                const std::vector<float> & b, const std::vector<float> & m, int n, Run & out) {
++    ggml_init_params ip = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    ggml_context * cw = ggml_init(ip);
++    ggml_tensor * tb = ggml_new_tensor_2d(cw, GGML_TYPE_F32, V, n);
++    ggml_tensor * tw = ggml_new_tensor_2d(cw, GGML_TYPE_F32, R, V);
++    ggml_tensor * tbias = ggml_new_tensor_1d(cw, GGML_TYPE_F32, V);
++    ggml_tensor * tm = ggml_new_tensor_2d(cw, GGML_TYPE_F32, R, n);
++    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(cw, be);
++    ggml_backend_tensor_set(tb, base.data(), 0, ggml_nbytes(tb));
++    ggml_backend_tensor_set(tw, w2.data(), 0, ggml_nbytes(tw));
++    ggml_backend_tensor_set(tbias, b.data(), 0, ggml_nbytes(tbias));
++    ggml_backend_tensor_set(tm, m.data(), 0, ggml_nbytes(tm));
++
++    ggml_context * cx = ggml_init(ip);
++    // full
++    ggml_tensor * col = ggml_add(cx, tb, ggml_add(cx, ggml_mul_mat(cx, tw, tm), tbias));   // dflash's order: base + (w.m + b)
++    col = ggml_scale(cx, ggml_tanh(cx, ggml_scale(cx, col, 1.0f / CAP)), CAP);
++    ggml_tensor * full = ggml_argmax(cx, col);
++    // short (as dflash.cpp's use_short branch, one block a row: n_blocks = n rows)
++    ggml_tensor * idx = ggml_top_k_ordered(cx, tb, K);                                           // [K, n]
++    ggml_tensor * rev = nullptr;
++    if (g_red) {   // the red: the candidates in DESCENDING id order (not index order), the position taken as is
++        rev = ggml_new_tensor_2d(cx, GGML_TYPE_I32, K, n);
++        ggml_set_input(rev);
++        idx = ggml_reshape_2d(cx, ggml_get_rows(cx, ggml_reshape_3d(cx, idx, 1, K, n), rev), K, n);
++    }
++    ggml_tensor * idx_flat = ggml_reshape_1d(cx, idx, (int64_t) K * n);
++    ggml_tensor * bk = ggml_reshape_2d(cx, ggml_get_rows(cx, ggml_reshape_3d(cx, tb, 1, V, n), idx), K, n);
++    ggml_tensor * fk = ggml_reshape_3d(cx, ggml_get_rows(cx, tw, idx_flat), R, K, n);           // [R, K, n]
++    ggml_tensor * ck = ggml_reshape_2d(cx, ggml_get_rows(cx, ggml_reshape_2d(cx, tbias, 1, V), idx_flat), K, n);
++    ggml_tensor * corr = ggml_reshape_2d(cx, ggml_mul_mat(cx, fk, ggml_reshape_3d(cx, tm, R, 1, n)), K, n);
++    ggml_tensor * colk = ggml_add(cx, bk, ggml_add(cx, corr, ck));   // dflash's order: base + (w.m + b)
++    colk = ggml_scale(cx, ggml_tanh(cx, ggml_scale(cx, colk, 1.0f / CAP)), CAP);
++    ggml_tensor * am = ggml_argmax(cx, colk);
++    ggml_tensor * tok = ggml_reshape_1d(cx, ggml_get_rows(cx, ggml_reshape_3d(cx, idx, 1, K, n), ggml_reshape_2d(cx, am, 1, n)), n);
++    ggml_set_output(full); ggml_set_output(tok); ggml_set_output(idx);
++    ggml_cgraph * gf = ggml_new_graph_custom(cx, 256, false);
++    ggml_build_forward_expand(gf, full);
++    ggml_build_forward_expand(gf, tok);
++    ggml_build_forward_expand(gf, idx);
++    ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
++    bool alloc_ok = ggml_gallocr_alloc_graph(ga, gf);
++    if (alloc_ok && rev != nullptr) {
++        std::vector<int32_t> r(K * (size_t) n);
++        for (int j = 0; j < n; ++j) for (int c = 0; c < K; ++c) r[(size_t) j * K + c] = K - 1 - c;
++        ggml_backend_tensor_set(rev, r.data(), 0, ggml_nbytes(rev));
++    }
++    if (!alloc_ok || ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
++        printf("SHORTLIST FAIL: the graph did not run\n"); g_fail = 1; return;
++    }
++    out.full.resize(n); out.shortl.resize(n); out.idx_row0.resize(K);
++    ggml_backend_tensor_get(full, out.full.data(), 0, sizeof(int32_t) * n);
++    ggml_backend_tensor_get(tok, out.shortl.data(), 0, sizeof(int32_t) * n);
++    ggml_backend_tensor_get(idx, out.idx_row0.data(), 0, sizeof(int32_t) * K);
++    ggml_gallocr_free(ga); ggml_free(cx); ggml_backend_buffer_free(buf); ggml_free(cw);
++}
++
++static void check(const char * name, bool ok, const std::string & why) {
++    printf("SHORTLIST %-6s %s%s%s\n", name, ok ? "PASS" : "FAIL", why.empty() ? "" : ": ", why.c_str());
++    if (!ok) g_fail = 1;
++}
++
++int main(int argc, char ** argv) {
++    g_red = getenv("DSPARK_SHORTLIST_RED") && atoi(getenv("DSPARK_SHORTLIST_RED")) == 1;
++    ggml_backend_t be = nullptr;
++    if (argc > 1 && std::string(argv[1]) == "gpu") {
++        ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++        if (!d) { fprintf(stderr, "no GPU device\n"); return 2; }
++        be = ggml_backend_dev_init(d, nullptr);
++    } else {
++        be = ggml_backend_cpu_init();
++    }
++    printf("SHORTLIST backend %s%s\n", ggml_backend_name(be), g_red ? " -- RED: the stock top-k, the position taken as is" : "");
++    std::mt19937 rng(241);
++    std::normal_distribution<float> nd(0.0f, 1.0f);
++    const int n = 4;
++    std::vector<float> w2((size_t) R * V), b(V), m((size_t) R * n), base((size_t) V * n);
++    for (auto & v : w2) v = nd(rng) * 0.05f;
++    for (auto & v : b) v = nd(rng) * 0.1f;
++    for (auto & v : m) v = std::tanh(nd(rng));
++    for (auto & v : base) v = nd(rng) * 3.0f;
++    Run r;
++    // kv: K = V on 1,000-wide rows (the ordered top-k's local sort takes k <= 1,024)
++    V = 1000;
++    std::vector<float> w2s((size_t) R * V), bs(V), bases((size_t) V * n);
++    for (auto & v : w2s) v = nd(rng) * 0.05f;
++    for (auto & v : bs) v = nd(rng) * 0.1f;
++    for (auto & v : bases) v = nd(rng) * 3.0f;
++    run(be, V, bases, w2s, bs, m, n, r);
++    { bool ok = true; std::string why;
++      for (int i = 0; i < n; ++i) if (r.full[i] != r.shortl[i]) { ok = false; why += " row " + std::to_string(i) + ": " + std::to_string(r.full[i]) + " vs " + std::to_string(r.shortl[i]); }
++      check("kv", ok, why); }
++    // k256: the full chain's winner forced into the base top-256 (a large base value at a random id)
++    V = 200058;
++    {
++        std::vector<float> bb = base;
++        for (int i = 0; i < n; ++i) bb[(size_t) i * V + (size_t) (rng() % V)] = 40.0f;
++        run(be, 256, bb, w2, b, m, n, r);
++        bool ok = true; std::string why;
++        for (int i = 0; i < n; ++i) if (r.full[i] != r.shortl[i]) { ok = false; why += " row " + std::to_string(i); }
++        check("k256", ok, why);
++    }
++    // tie: K = V (1,000-wide rows); corrections zero, two equal base maxima: the higher id must win (id 7 in lane 7,
++    // id 300 in lane 44 of the next round of a 256-lane scan)
++    V = 1000;
++    {
++        std::vector<float> z0((size_t) R * V, 0.0f), zb(V, 0.0f), bb((size_t) V * n);
++        for (auto & v : bb) v = nd(rng);
++        const int lo = 7, hi = 300;
++        for (int i = 0; i < n; ++i) { bb[(size_t) i * V + lo] = 50.0f; bb[(size_t) i * V + hi] = 50.0f; }
++        run(be, V, bb, z0, zb, m, n, r);
++        bool ok = true; std::string why;
++        for (int i = 0; i < n; ++i) if (r.shortl[i] != hi || r.full[i] != hi) { ok = false; why += " row " + std::to_string(i) + ": full " + std::to_string(r.full[i]) + " short " + std::to_string(r.shortl[i]); }
++        check("tie", ok, why);
++    }
++    // cut: K = 256 on 200,058-wide rows; 255 values above, then three equal values at ranks 256-258: ids 9, 120000 and 200057 tie;
++    // the ordered top-k takes the highest (200057) and returns ascending ids
++    {
++        V = 200058;
++        std::vector<float> bb((size_t) V * n);
++        for (auto & v : bb) v = -10.0f + nd(rng) * 0.01f;
++        for (int i = 0; i < n; ++i) {
++            for (int t = 0; t < 255; ++t) bb[(size_t) i * V + 1000 + (size_t) t * 7] = 20.0f + (float) t;
++            bb[(size_t) i * V + 9] = 5.0f; bb[(size_t) i * V + 120000] = 5.0f; bb[(size_t) i * V + (V - 1)] = 5.0f;
++        }
++        std::vector<float> z0((size_t) R * V, 0.0f), zb(V, 0.0f);
++        run(be, 256, bb, z0, zb, m, n, r);
++        const bool asc = std::is_sorted(r.idx_row0.begin(), r.idx_row0.end());
++        const bool has_hi = std::find(r.idx_row0.begin(), r.idx_row0.end(), V - 1) != r.idx_row0.end();
++        const bool no_lo = std::find(r.idx_row0.begin(), r.idx_row0.end(), 9) == r.idx_row0.end() &&
++                           std::find(r.idx_row0.begin(), r.idx_row0.end(), 120000) == r.idx_row0.end();
++        check("cut", asc && has_hi && no_lo, std::string(asc ? "" : " not ascending") + (has_hi ? "" : " 200057 missing") + (no_lo ? "" : " a lower tied id taken"));
++        // det: 20 runs of the same row
++        std::vector<int32_t> first = r.idx_row0; bool same = true;
++        for (int t = 0; t < 19 && same; ++t) { run(be, 256, bb, z0, zb, m, n, r); same = r.idx_row0 == first; }
++        check("det", same, same ? "" : " the set or its order changed between runs");
++    }
++    printf("SHORTLIST %s\n", g_fail ? "FAIL" : "PASS");
++    ggml_backend_free(be);
++    return g_fail;
++}

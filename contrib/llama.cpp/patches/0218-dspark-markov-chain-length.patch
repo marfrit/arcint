@@ -1,0 +1,118 @@
+0218: the DSpark Markov chain over the first n rows of the trained block (llama_set_dspark_chain), as the vLLM-XPU Inkling port drafts with the whole block at every width.
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 7c33303..728d955 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -5415,6 +5415,10 @@ void llama_set_embeddings_nextn_skip(llama_context * ctx, bool skip) {
+     ctx->set_embeddings_nextn_skip(skip);
+ }
+ 
++void llama_set_dspark_chain(llama_context * ctx, uint32_t n_steps) {
++    ctx->set_dspark_chain(n_steps);
++}
++
+ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool value) {
+     ctx->set_embeddings_layer_inp(lid, value);
+ }
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 43ae7c8..1903c3f 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -145,6 +145,7 @@ struct llama_context {
+     void set_embeddings (bool value);
+     void set_embeddings_nextn(bool value, bool masked);
+     void set_embeddings_nextn_skip(bool skip) { embd_nextn_skip = skip; }
++    void set_dspark_chain(uint32_t n_steps) { cparams.dspark_chain = n_steps; }   // 0218
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 6ded57e..0c73764 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -26,6 +26,8 @@ struct llama_cparams {
+ 
+     uint32_t dory_loops = 0;  // ARC-LAB 0118: Dory loop count of this context's graphs; 0 = the model's
+ 
++    uint32_t dspark_chain = 0; // 0218: Markov steps a DSpark draft block runs (rows 1..n); 0 = every row of the block
++
+     float rope_freq_base;
+     float rope_freq_scale;
+ 
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index 2482aff..95bcf1a 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -165,6 +165,12 @@ LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value
+ // caller that knows it will not read them (a draft context's prompt catch-up) saves the transfer
+ LLAMA_API void llama_set_embeddings_nextn_skip(struct llama_context * ctx, bool skip);
+ 
++// 0218: a DSpark draft block of the trained size runs its Markov chain over its first n_steps draft rows
++// only (the vLLM-XPU Inkling port drafts n of the block's rows: inkling_xpu/dspark.py, _block); the rows
++// past them keep the unbiased base logits and are not drafts. 0 (the default): every row of the block.
++// Another value is another graph (it is part of the reuse check).
++LLAMA_API void llama_set_dspark_chain(struct llama_context * ctx, uint32_t n_steps);
++
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+ // chain multiple trained NextN heads. Default 0 (first head).
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 9b8b2f5..3eb9787 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -972,6 +972,11 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        // 0218: another DSpark chain length is another graph
++        if (cparams.dspark_chain != other.cparams.dspark_chain) {
++            return false;
++        }
++
+         // ARC-LAB 0118: another loop count is another topology. LLAMA_DORY_RED_REUSE (test only) drops the check,
+         // the deliberately wrong build of the experiment
+         if (cparams.dory_loops != other.cparams.dory_loops) {
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index 21a46d0..bcf53a0 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -482,9 +482,14 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+         }
+     }
+ 
++    // 0218: the chain may stop before the block ends (llama_set_dspark_chain): rows i >= n_chain keep the
++    //       base logits, unbiased (and uncapped), as columns of the same shape; they are not drafts
++    const int64_t n_chain = g.cparams.dspark_chain > 0
++        ? std::min<int64_t>(block_drafts, i_draft_beg + (int64_t) g.cparams.dspark_chain) : block_drafts;
++
+     // TODO: the in-graph chain is greedy (argmax); sampling params affect only the final
+     //       token pick, not the Markov conditioning path
+-    for (int64_t i = i_draft_beg; i < block_drafts; ++i) {
++    for (int64_t i = i_draft_beg; i < n_chain; ++i) {
+         ggml_tensor * w1_prev = ggml_get_rows(ctx0, w1, prev);                          // [R, n_blocks]
+         ggml_tensor * markov  = w1_prev;
+ 
+@@ -550,11 +555,21 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+             cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, conf, 1) : conf;
+         }
+ 
+-        if (i + 1 < block_drafts) {
++        if (i + 1 < n_chain) {
+             prev = ggml_argmax(ctx0, col);
+         }
+     }
+ 
++    // 0218: the rows past the chain, the base logits as they are (the confidence head, if any, reads 0 there)
++    for (int64_t i = n_chain; i < block_drafts; ++i) {
++        ggml_tensor * col = ggml_cont(ctx0, ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]));
++        cat = cat ? ggml_concat(ctx0, cat, col, 1) : col;
++        if (has_conf) {
++            ggml_tensor * zero = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_blocks), 0.0f);
++            cat_conf = cat_conf ? ggml_concat(ctx0, cat_conf, zero, 1) : zero;
++        }
++    }
++
+     // cat is position-major; restore ubatch block-major order
+     ggml_tensor * out = ggml_reshape_3d(ctx0, cat, n_vocab, n_blocks, block_drafts);
+     out = ggml_cont(ctx0, ggml_permute(ctx0, out, 0, 2, 1, 3)); // [n_vocab, block_drafts, n_blocks]

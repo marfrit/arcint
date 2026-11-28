@@ -96,6 +96,17 @@ string helpers copied from `common/common.cpp`. `src/core/toolgrammar.cpp`
 copies `permute` from `common/chat-peg-parser.cpp` and mirrors the tool-call
 block of `common/parsers/qwen3-coder.cpp`.
 
+Ported from an open llama.cpp pull request (MIT, the ggml authors; the PR is
+a contribution to that project under its licence): **#32218 "feat: Inkling 2
+DSpark support"**, head `9f57b4453570c6a5fef01fec8e65a44d783a63e0`, by Xuan Son
+Nguyen, Piotr Wilkin and ruixiang63. `contrib/llama.cpp/patches/0214` to `0216`
+carry its graph and driver hunks in the pin's layout, and
+`tools/inkling2_dspark_to_gguf.py` is a numpy port of its converter class
+(`conversion/inkling2.py`, `Inkling2DSparkModel`); the file carries the MIT
+notice. `tests/llama-archs-shim/` declares the few names of llama.cpp's
+`common/common.h` and `common/log.h` that the pinned tree's
+`tests/test-llama-archs.cpp` uses, so that arcint's unit tests can build it.
+
 Vendored for the compliance gate (Apache-2.0): the Open Responses specification
 repository's **2026-04-24 release** (`package.json` 0.1.0; the checkout carries
 no git metadata, so the release document is the pin), at

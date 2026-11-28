@@ -1189,8 +1189,25 @@ public:
                 throw std::runtime_error(log::format("llama.cpp could not load %s", cfg.llama_dflash_gguf.c_str()));
             std::string err;
             int         n_dft = cfg.llama_dflash;   // the drafter's block may allow fewer
-            spec_ = make_llama_dflash(dflash_model_, ctx_, n_dft, lanes_, cfg.llama_dflash_ubatch, threads,
-                                      cfg.llama_dflash_min_p, cp.kv_unified, err);
+            // an Inkling 2 DSpark drafter (dflash.has_markov_context) has its own
+            // driver (llama_dspark.cpp); every other dflash GGUF is DFlash2's
+            dspark_ = llama_model_is_dspark_markov(dflash_model_);
+            if (!dspark_ && (cfg.llama_dflash_kv_k != "f16" || cfg.llama_dflash_kv_v != "f16"))
+                throw std::runtime_error(log::format("--llama-dflash-kv %s:%s: the DFlash2 drafter's context takes f16 only "
+                                                     "(the flag is the DSpark drafter's)", cfg.llama_dflash_kv_k.c_str(),
+                                                     cfg.llama_dflash_kv_v.c_str()));
+            if (!dspark_ && !cfg.llama_dflash_shortlist_probe.empty())
+                throw std::runtime_error("--llama-dflash-shortlist-probe: the DFlash2 drafter has no Markov chain "
+                                         "(the flag is the DSpark drafter's)");
+            if (!dspark_ && cfg.llama_dflash_shortlist > 0)
+                throw std::runtime_error(log::format("--llama-dflash-shortlist %d: the DFlash2 drafter has no Markov chain "
+                                                     "(the flag is the DSpark drafter's)", cfg.llama_dflash_shortlist));
+            spec_   = dspark_ ? make_llama_dspark(dflash_model_, ctx_, n_dft, lanes_, cfg.llama_dflash_ubatch, threads,
+                                                  cfg.llama_dflash_min_p, cp.kv_unified, cfg.llama_dflash_kv_k,
+                                                  cfg.llama_dflash_kv_v, cfg.llama_dflash_shortlist,
+                                                  cfg.llama_dflash_shortlist_probe, err)
+                              : make_llama_dflash(dflash_model_, ctx_, n_dft, lanes_, cfg.llama_dflash_ubatch, threads,
+                                                  cfg.llama_dflash_min_p, cp.kv_unified, err);
             if (!spec_)
                 throw std::runtime_error(log::format("--llama-dflash-gguf %s: %s", cfg.llama_dflash_gguf.c_str(), err.c_str()));
             n_draft_ = n_dft;
@@ -1202,6 +1219,7 @@ public:
         status_.mtp_enabled    = n_draft_ > 0 && !dflash_;
         status_.dflash_enabled = dflash_;
         status_.dflash_drafts  = dflash_ ? n_draft_ : 0;
+        status_.dflash_kind    = !dflash_ ? "" : dspark_ ? "dspark" : "dflash2";
         slot_tokens_.resize(static_cast<size_t>(lanes_));
         // --llama-dory-max-loops: the count each lane's cells were written at, and the one the context
         // is set to. Every request is served at one count (generate), a decode sets it under mu_
@@ -1750,7 +1768,7 @@ public:
                   desc, arch, static_cast<double>(llama_model_size(model_)) / (1u << 30), card_names.c_str(),
                   split ? "devices" : "device", cl_ids.c_str(),
                   seconds_since(t_load), lane_desc.c_str(),
-                  n_draft_ > 0 ? log::format("; %s drafts up to %d", dflash_ ? "DFlash2" : "MTP", n_draft_).c_str() : "");
+                  n_draft_ > 0 ? log::format("; %s drafts up to %d", dspark_ ? "DSpark" : dflash_ ? "DFlash2" : "MTP", n_draft_).c_str() : "");
         if (named_) {
             // one line per lane, and the pool they share
             for (int i = 0; i < lanes_; ++i)
@@ -2740,6 +2758,11 @@ private:
             }
         }
         stats.prefill_seconds = seconds_since(t_prefill);
+        // the drafter's failed checkpoint restores, cumulative (the decode line shows them when non-zero)
+        {
+            std::lock_guard<std::mutex> lk(mu_);   // the counters change under mu_ (set_carried_state)
+            stats.dflash_lane_failures = spec_->state_failures();
+        }
 
         // ------------------------------------------------------------- decode
         const auto   t_decode = clock_type::now();
@@ -3565,7 +3588,8 @@ private:
     llama_model*                          model_ = nullptr;
     llama_model*                          mtp_model_ = nullptr;   // --llama-mtp-gguf
     llama_model*                          dflash_model_ = nullptr;   // --llama-dflash-gguf
-    bool                                  dflash_    = false;     // the drafter is DFlash2's
+    bool                                  dflash_    = false;     // the drafter is a dflash GGUF's (DFlash2 or DSpark)
+    bool                                  dspark_    = false;     // ... and that drafter is Inkling 2's DSpark
     llama_context*                        ctx_   = nullptr;
 #ifdef ARCINT_MTMD
     mtmd_context*                         mctx_  = nullptr;   // --mmproj (libmtmd)

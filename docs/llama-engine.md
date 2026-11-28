@@ -478,6 +478,36 @@ fall in the text differs between the drafters. Not attributed further
 2026-10-16); the legs and the red cases are `tests/dflash/legs.sh` and
 `tests/dflash/build-red.sh`.
 
+## DSpark (`--llama-dflash-gguf FILE` with Inkling 2 Mini's drafter)
+
+Opt-in; without the flag nothing changes. A drafter GGUF whose metadata says `dflash.has_markov_context` goes to
+arcint's DSpark driver (`src/exec/llama_dspark.cpp`; every other `dflash` GGUF is DFlash2's, above). It is Inkling 2
+Mini's own speculative drafter, converted from the publisher's checkpoint by `tools/inkling2_dspark_to_gguf.py`
+(`markov_w1` as F32 by default, `--markov-w1`), and the series' patches 0214-0218 and 0240-0243 carry it; the patch
+README's sections give the design, the lossless argument and every deviation from the vLLM-XPU reference.
+
+- **What it reads**: four taps of the target (the inputs of three layer visits and the final norm's output) after
+  every decode, prompt chunk or verify, written into the drafter's K/V; the Markov head's context row goes into a ring
+  keyed by position.
+- **A draft**: one drafter decode of the trained 8-row block at the anchor's position; the Markov chain over the first
+  `--llama-dflash N` rows (1-7, default 7) gives N greedy drafts; the target verifies 1 + N rows and rolls back
+  through its recurrent snapshots.
+- **`--llama-dflash-shortlist K`** (1-1024, off by default): the chain over each row's K best base logits only, the
+  drafted ids out of the graph instead of the logits; the reference's coding profile serves 256.
+- **`--llama-dflash-kv K[:V]`**: the drafter context's K/V (f16 as trained, q8_0, q8_0:q4_0).
+- **`--llama-dflash-shortlist-probe FILE`** (a measurement aid, off by default): a JSON line a verified draft with
+  the full chain's pick at each position; `tools/dspark_probe_read.py` reads the shortlist's accept price from it. It
+  adds the full chain's cost back to every propose.
+- **Refused**: a target that is not Inkling 2, `--llama-dflash-min-p` (the drafter has no confidence head), with
+  `--llama-mtp`, and the shortlist flags with a DFlash2 drafter.
+- **Logged**: the load line names the driver, the width and the shortlist; `/props` `dflash.kind` is `dspark`.
+
+On the Arc Pro B60 capped at 165 W (`measured-here`; Inkling 2 Mini IQ4_NL at q8_0:q4_0 K/V, width 3, F32
+`markov_w1`, K = 256, 768-token code continuations, paired against DSpark off): +16.9 % decode t/s at depth 0,
++21.4 % at 32,768 and +13.6 % at 77,000, each more than 2 SE; the shortlist's accept 48.6 % against 55.7 % for width
+3 without it, as its probe predicts within the run's spread. The figures and the K sweep are in the CHANGELOG
+("Unreleased") and the patch README's 0241 section. Owed: the KL gate against the CPU base, width 5 against 7.
+
 ## Quantized KV (`--llama-kv K[:V]`)
 
 `q8_0` and `q8_0:q4_0` run on the Intel attention kernels of

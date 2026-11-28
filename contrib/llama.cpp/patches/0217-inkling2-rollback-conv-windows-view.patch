@@ -1,0 +1,368 @@
+0217: Inkling 2 Mini's recurrent rollback reads its conv windows through a widened view, so a speculative verify can be cut back to the accepted end.
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 793009d..3223577 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -4309,6 +4309,20 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
+     );
+ }
+ 
++// a view stays inside its source over the bytes its strides actually reach (ggml_nbytes), not over
++// a contiguous tensor of its shape; size_t arithmetic, an overflowing sum is out of bounds
++// view_src and view_offs are ggml's root source and the offset into it: for the conv windows that
++// is conv_x itself today (a fresh concat); were conv_x a view, the bound would be its root's bytes
++bool llm_graph_view_in_source(const ggml_tensor * view) {
++    const ggml_tensor * src = view->view_src;
++    if (src == nullptr) {
++        return false;
++    }
++    const size_t n_view = ggml_nbytes(view);
++    const size_t n_src  = ggml_nbytes(src);
++    return n_view <= n_src && view->view_offs <= n_src - n_view;
++}
++
+ void llm_graph_context::build_conv_state_store(
+         llm_graph_input_rs * inp,
+         ggml_tensor * s,
+@@ -4356,10 +4370,16 @@ void llm_graph_context::build_conv_state_store(
+ 
+     // window w starts at column n - (Kw - 1) + w (ascending time) and is rollback slot Kw - 1 - w,
+     // consecutive windows start one element apart, so they overlap
++    // ggml bounds a view by a contiguous tensor of its shape, which overlapping windows exceed for a
++    // short ubatch (2 <= n < ~16) although they stay inside conv_x: the view is created with one window
++    // and widened after that check (upstream checks the bytes the strides reach instead, ggml #31584)
+     ggml_tensor * windows = ggml_view_4d(ctx0, conv_x,
+-            n_cols, Kw, channels, n_seqs,
++            n_cols, 1, channels, n_seqs,
+             ggml_element_size(conv_x), conv_x->nb[1], conv_x->nb[2],
+             ggml_row_size(conv_x->type, n - (Kw - 1)));
++    windows->ne[1] = Kw;
++    // the true bound, in place of the one the widening skipped
++    GGML_ASSERT(llm_graph_view_in_source(windows));
+ 
+     // [n_cols, slot, channel, seq] view of the cells of this ubatch
+     ggml_tensor * slots = ggml_view_4d(ctx0, s,
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 7ac7328..99d3bae 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1099,6 +1099,10 @@ struct llm_graph_qkv {
+ // batch the autoregressive path would serve.
+ bool llama_gdn_state_rows_enabled(const llama_cparams & cparams, int64_t n_seqs, int64_t n_seq_tokens);
+ 
++// true when a view's offset plus the bytes its strides reach fit in its source. For a view whose
++// shape was widened after ggml's own check (overlapping conv windows, build_conv_state_store).
++bool llm_graph_view_in_source(const ggml_tensor * view);
++
+ struct llm_graph_context {
+     const llm_arch arch;
+ 
+diff --git a/tests/test-llama-archs.cpp b/tests/test-llama-archs.cpp
+--- a/tests/test-llama-archs.cpp
++++ b/tests/test-llama-archs.cpp
+@@ -10,6 +10,7 @@
+ // TODO: replace with #include "llama-ext.h" in the future
+ #include "../src/llama-arch.h"
+ #include "../src/llama-model-saver.h"
++#include "../src/llama-graph.h" // llm_graph_view_in_source
+ 
+ #include <cinttypes>
+ #include <cmath>
+@@ -17,6 +18,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <cstdint>
++#include <map>
+ #include <random>
+ #include <regex>
+ #include <stdexcept>
+@@ -94,6 +96,9 @@
+     LOG("  -o, --out <dir>          Save generated test models to <dir> instead of running backend tests\n");
+     LOG("  -v <N>                   Set log verbosity level\n");
+     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
++    LOG("  --rs-rollback            Check the recurrent-state rollback on the CPU: n_rs_seq 1..8, batches of 1..16 tokens,\n");
++    LOG("                           every rollback depth, one and two sequences\n");
++    LOG("  --rs-cell <n_rs> <n>     The same for one n_rs_seq and one batch size\n");
+     LOG("  -h, --help               Show this help message\n\n");
+     LOG("Examples:\n");
+     LOG("  %s\n", argv[0]);
+@@ -898,6 +903,233 @@
+     return 0;
+ }
+ 
++static const double RS_ROLLBACK_NMSE_MAX = 1e-6;
++
++// the bound that guards the widened conv windows of build_conv_state_store (llama-graph.cpp):
++// Kw overlapping windows of n_cols columns, the last one ending at the source's last column, are inside;
++// one window more reaches one element past the source and must be refused
++static bool test_view_bound() {
++    bool ok = true;
++    const int64_t n_cols = 3, channels = 5, n_seqs = 1;
++    for (int64_t n = 1; n <= 16; n++) {
++        for (int64_t Kw = 1; Kw <= std::min<int64_t>(n, 9); Kw++) {
++            ggml_init_params params = { 16*1024*1024, nullptr, false };
++            ggml_context_ptr ctx(ggml_init(params));
++            ggml_tensor * x = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n + n_cols, channels, n_seqs);
++            ggml_tensor * w = ggml_view_4d(ctx.get(), x, n_cols, 1, channels, n_seqs,
++                    ggml_element_size(x), x->nb[1], x->nb[2], ggml_row_size(x->type, n - (Kw - 1)));
++            w->ne[1] = Kw;
++            const bool in  = llm_graph_view_in_source(w);
++            w->ne[1] = Kw + 1;
++            const bool out = !llm_graph_view_in_source(w);
++            if (!in || !out) {
++                LOG("%s: n=%d Kw=%d: %s\n", __func__, (int) n, (int) Kw, !in ? "FAIL (a valid view refused)" : "FAIL (a view one window too wide accepted)");
++                ok = false;
++            }
++        }
++    }
++    // an offset near SIZE_MAX must not wrap into bounds
++    {
++        ggml_init_params params = { 1024*1024, nullptr, false };
++        ggml_context_ptr ctx(ggml_init(params));
++        ggml_tensor * x = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 8);
++        ggml_tensor * w = ggml_view_1d(ctx.get(), x, 4, 0);
++        w->view_offs = SIZE_MAX - 8;
++        if (llm_graph_view_in_source(w)) {
++            LOG("%s: FAIL (a wrapping offset accepted)\n", __func__);
++            ok = false;
++        }
++    }
++    LOG("%s: %s\n", __func__, ok ? "passed" : "FAILED");
++    return ok;
++}
++
++// recurrent-state rollback (n_rs_seq), on the CPU. A cell: after a prefix, a batch of n_batch tokens per
++// sequence; the last n_drop of sequence 0 are wrong and are removed with llama_memory_seq_rm(), then every
++// sequence gets its next right token. The logits of each must be the ones of a context without snapshot
++// planes that never saw a wrong token. This is what a speculative verify step does to the target.
++// A rollback of d tokens reads snapshot slot d, so the sweep over n_drop reads every slot back.
++// With two sequences the second one is not rolled back and must keep its state.
++struct rs_rollback_fixture {
++    llama_model * model;
++    uint32_t      n_vocab;
++    std::vector<llama_token> tokens[2]; // one stream per sequence
++
++    static constexpr uint32_t n_prefix = 24;
++
++    // reference logits of the token at position pos of a stream, after its right tokens [0, pos)
++    std::map<std::pair<int, uint32_t>, std::vector<float>> refs;
++
++    llama_context_ptr make_ctx(uint32_t n_rs, uint32_t n_seq) const {
++        llama_context_params ctx_params = llama_context_default_params();
++        ctx_params.n_ctx           = 0;
++        ctx_params.n_threads       = 4;
++        ctx_params.n_threads_batch = 4;
++        ctx_params.n_ubatch        = 64;
++        ctx_params.n_seq_max       = n_seq;
++        ctx_params.n_rs_seq        = n_rs;
++        llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
++        if (!lctx) {
++            throw std::runtime_error("failed to create llama context");
++        }
++        return lctx;
++    }
++
++    // one batch: for each sequence the tokens [beg[s], end[s]) of stream[s], the last n_wrong of sequence 0 replaced
++    // returns the logits of the first row of each sequence
++    std::vector<std::vector<float>> decode(llama_context * lctx, const int * stream, uint32_t n_seq,
++            const uint32_t * beg, const uint32_t * end, uint32_t n_wrong) const {
++        common_batch batch(lctx);
++        std::vector<int32_t> first;
++        for (uint32_t s = 0; s < n_seq; s++) {
++            first.push_back(batch.size());
++            for (uint32_t pos = beg[s]; pos < end[s]; pos++) {
++                const llama_token tok   = tokens[stream[s]][pos];
++                const bool        wrong = s == 0 && pos >= end[s] - n_wrong;
++                batch.add(wrong ? (tok + 1) % n_vocab : tok, pos, s, true);
++            }
++        }
++        if (llama_process(lctx, LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
++            throw std::runtime_error("failed to decode batch");
++        }
++        std::vector<std::vector<float>> ret;
++        for (uint32_t s = 0; s < n_seq; s++) {
++            const float * logits = llama_get_logits_ith(lctx, first[s]);
++            ret.emplace_back(logits, logits + n_vocab);
++        }
++        return ret;
++    }
++
++    const std::vector<float> & ref(int stream, uint32_t pos) {
++        const auto key = std::make_pair(stream, pos);
++        auto it = refs.find(key);
++        if (it != refs.end()) {
++            return it->second;
++        }
++        // the prefix as one batch, then one token at a time, in a context without snapshot planes
++        llama_context_ptr lctx = make_ctx(0, 1);
++        const uint32_t b0 = 0, e0 = n_prefix;
++        decode(lctx.get(), &stream, 1, &b0, &e0, 0);
++        for (uint32_t p = n_prefix; p <= pos; p++) {
++            const uint32_t b = p, e = p + 1;
++            auto logits = decode(lctx.get(), &stream, 1, &b, &e, 0);
++            refs[std::make_pair(stream, p)] = std::move(logits[0]);
++        }
++        return refs.at(key);
++    }
++
++    // returns 0 = ok, 1 = wrong logits, 2 = the removal was refused; err = the worst NMSE of the cell
++    int cell(uint32_t n_rs_seq, uint32_t n_batch, uint32_t n_drop, uint32_t n_seq, double & err) {
++        GGML_ASSERT(n_drop <= n_rs_seq && n_drop < n_batch && n_seq >= 1 && n_seq <= 2);
++        GGML_ASSERT(n_prefix + n_batch + 1 <= tokens[0].size());
++
++        const int      stream[2] = { 0, 1 };
++        const uint32_t n_all     = n_prefix + n_batch;
++        const uint32_t n_keep    = n_all - n_drop; // the tokens of sequence 0 that stay
++
++        llama_context_ptr lctx = make_ctx(n_rs_seq, n_seq);
++        if (llama_n_rs_seq(lctx.get()) != n_rs_seq) {
++            throw std::runtime_error("the context did not take n_rs_seq");
++        }
++        {
++            const uint32_t beg[2] = { 0, 0 }, end[2] = { n_prefix, n_prefix };
++            decode(lctx.get(), stream, n_seq, beg, end, 0);
++        }
++        {
++            const uint32_t beg[2] = { n_prefix, n_prefix }, end[2] = { n_all, n_all };
++            decode(lctx.get(), stream, n_seq, beg, end, n_drop);
++        }
++        if (n_drop > 0 && !llama_memory_seq_rm(llama_get_memory(lctx.get()), 0, n_keep, -1)) {
++            return 2;
++        }
++        const uint32_t beg[2] = { n_keep, n_all }, end[2] = { n_keep + 1, n_all + 1 };
++        const auto got = decode(lctx.get(), stream, n_seq, beg, end, 0);
++
++        // the bound: the kept tokens are decoded one at a time in the reference and as one batch here, so the
++        // two differ by float summation order only (1e-8 class on these models); a state that kept a wrong
++        // token's conv input, or a snapshot read from the wrong slot, is off by 1e-4 and more
++        err = 0.0;
++        for (uint32_t s = 0; s < n_seq; s++) {
++            err = std::max(err, nmse(ref(stream[s], beg[s]), got[s]));
++        }
++        return err > RS_ROLLBACK_NMSE_MAX ? 1 : 0;
++    }
++};
++
++// cell_rs / cell_batch > 0: only the cells of that n_rs_seq and batch size (a failing cell can abort the
++// process, so a caller can walk the cells one process each)
++static int test_rs_rollback(const std::string & arch_filter, const size_t seed, const float stdev, const uint32_t cell_rs, const uint32_t cell_batch) {
++    const uint32_t n_vocab = 128;
++
++    bool all_ok = cell_rs > 0 || test_view_bound();
++    size_t n_cells = 0, n_rollback = 0, n_failed = 0;
++    double worst = 0.0;
++    std::string worst_cell = "none";
++    // slots_read[d]: cells that rolled back d tokens, i.e. read snapshot slot d
++    std::vector<size_t> slots_read(9, 0);
++
++    for (const llm_arch & arch : llm_arch_all()) {
++        if (arch != LLM_ARCH_INKLING2 && arch != LLM_ARCH_INKLING2_LOOP) {
++            continue; // the archs whose conv state store is checked here
++        }
++        if (!arch_matches(arch_filter, arch)) {
++            continue;
++        }
++        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
++        auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, stdev, { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) });
++        model_and_ctx.second.reset();
++
++        rs_rollback_fixture fx;
++        fx.model     = model_and_ctx.first.get();
++        fx.n_vocab   = n_vocab;
++        fx.tokens[0] = get_tokens(64, n_vocab, seed);
++        fx.tokens[1] = get_tokens(64, n_vocab, seed + 1);
++
++        for (uint32_t n_seq = 1; n_seq <= 2; n_seq++) {
++            for (uint32_t n_rs = 1; n_rs <= 8; n_rs++) {
++                if (cell_rs > 0 && cell_rs != n_rs) {
++                    continue;
++                }
++                for (uint32_t n_batch = 1; n_batch <= 16; n_batch++) {
++                    if (cell_batch > 0 && cell_batch != n_batch) {
++                        continue;
++                    }
++                    // every rollback the batch allows: 0 (nothing removed) up to the plane count
++                    for (uint32_t n_drop = 0; n_drop <= std::min(n_rs, n_batch - 1); n_drop++) {
++                        double err = 0.0;
++                        const int rc = fx.cell(n_rs, n_batch, n_drop, n_seq, err);
++                        n_cells++;
++                        n_rollback += n_drop > 0;
++                        slots_read[n_drop]++;
++                        const std::string name = std::string(llm_arch_name(arch)) + " seqs=" + std::to_string(n_seq) + " n_rs_seq=" + std::to_string(n_rs) +
++                                " batch=" + std::to_string(n_batch) + " drop=" + std::to_string(n_drop);
++                        if (err >= worst) {
++                            worst      = err;
++                            worst_cell = name;
++                        }
++                        if (rc != 0) {
++                            n_failed++;
++                            if (n_failed <= 16 || cell_rs > 0) {
++                                LOG("%s: %s: %s (nmse %.2e)\n", __func__, name.c_str(), rc == 1 ? "FAIL (logits)" : "FAIL (seq_rm refused)", err);
++                            }
++                        }
++                        all_ok = all_ok && rc == 0;
++                    }
++                }
++            }
++        }
++    }
++    std::string slots;
++    for (size_t d = 1; d < slots_read.size(); d++) {
++        slots += (d > 1 ? " " : "") + std::to_string(slots_read[d]);
++    }
++    LOG("%s: %zu cell(s), %zu with a rollback, %zu failed; cells per rollback depth 1..8: %s\n", __func__, n_cells, n_rollback, n_failed, slots.c_str());
++    LOG("%s: %s; worst nmse %.2e (%s), bound %.0e\n", __func__, all_ok && n_cells > 0 ? "all passed" : "FAILED",
++            worst, worst_cell.c_str(), RS_ROLLBACK_NMSE_MAX);
++    common_log_flush(common_log_main());
++    return all_ok && n_cells > 0 ? 0 : 1;
++}
++
+ static int test_backends(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * target_backend) {
+     struct user_data_t {
+         struct {
+@@ -1189,6 +1421,9 @@
+     float stdev = 0.1f;
+     std::string out;
+     const char * target_backend = nullptr;
++    bool     rs_rollback   = false;
++    uint32_t rs_cell_rs    = 0;
++    uint32_t rs_cell_batch = 0;
+ 
+     int verbosity = LOG_LEVEL_ERROR;
+ 
+@@ -1243,6 +1478,17 @@
+                 usage(argv);
+                 return 1;
+             }
++        } else if (strcmp(argv[i], "--rs-rollback") == 0) {
++            rs_rollback = true;
++        } else if (strcmp(argv[i], "--rs-cell") == 0) {
++            if (i + 2 < argc) {
++                rs_rollback   = true;
++                rs_cell_rs    = (uint32_t) std::stoul(argv[++i]);
++                rs_cell_batch = (uint32_t) std::stoul(argv[++i]);
++            } else {
++                usage(argv);
++                return 1;
++            }
+         } else if (strcmp(argv[i], "-b") == 0 || strcmp(argv[i], "--backend") == 0) {
+             if (i + 1 < argc) {
+                 const char * backend_name = argv[++i];
+@@ -1272,6 +1518,16 @@
+         if (!out.empty()) {
+             return save_models(arch_filter, seed, stdev, verbosity, out);
+         }
++        if (rs_rollback) {
++            static int rs_verbosity;
++            rs_verbosity = verbosity;
++            llama_log_set([](ggml_log_level level, const char * text, void *) {
++                if (common_log_get_verbosity(level) <= rs_verbosity) {
++                    fputs(text, stderr);
++                }
++            }, nullptr);
++            return test_rs_rollback(arch_filter, seed, stdev, rs_cell_rs, rs_cell_batch);
++        }
+         return test_backends(arch_filter, seed, stdev, verbosity, target_backend);
+     } catch (const std::exception & err) {
+         fprintf(stderr, "encountered runtime error: %s\n", err.what());

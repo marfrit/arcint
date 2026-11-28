@@ -1,0 +1,203 @@
+0242: the OpenCL ARGMAX and ordered TOP_K kernels load on the compute path too (a graph computed without supports_op had a null kernel), under a mutex, with the k bound.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 7e7eaf2..de95ae6 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -2160,12 +2160,22 @@ static bool ggml_cl_argmax_on() {
+ }
+ 
+ static void load_cl_kernels_argmax(ggml_backend_opencl_context * backend_ctx) {
++    // 0242: one build at a time (the loader is reached from supports_op and from the compute path; the context is
++    // the device's, shared by every backend of it): a second caller waits for the first build's result
++    static std::mutex mu;
++    std::lock_guard<std::mutex> lock(mu);
+     if (backend_ctx->kernels_loaded_argmax) {
+         return;
+     }
+     backend_ctx->kernels_loaded_argmax = true;
+     static const char * re  = getenv("GGML_OPENCL_ARGMAX_RED");
+     static const int    red = re != nullptr ? atoi(re) : 0;
++    // 0242: GGML_OPENCL_ARGMAX_FAIL=1 (a test hook): the program counts as not built, the refusal path runs
++    static const char * fe = getenv("GGML_OPENCL_ARGMAX_FAIL");
++    if (fe != nullptr && atoi(fe) != 0) {
++        ggml_cl_downgrade("op=ARGMAX type=f32 path=cpu reason=no-kernel (GGML_OPENCL_ARGMAX_FAIL: the test hook)");
++        return;
++    }
+ #ifdef GGML_OPENCL_EMBED_KERNELS
+     const std::string kernel_src {
+         #include "argmax.cl.h"
+@@ -2214,10 +2224,18 @@ static void load_cl_kernels_argmax(ggml_backend_opencl_context * backend_ctx) {
+ 
+ // 0241: ggml_top_k_ordered's kernel, its own optional program: a build failure leaves the op to the CPU
+ static void load_cl_kernels_top_k_ordered(ggml_backend_opencl_context * backend_ctx) {
++    static std::mutex mu;   // 0242: as load_cl_kernels_argmax
++    std::lock_guard<std::mutex> lock(mu);
+     if (backend_ctx->kernels_loaded_top_k_ordered) {
+         return;
+     }
+     backend_ctx->kernels_loaded_top_k_ordered = true;
++    // 0242: GGML_OPENCL_TOPK_ORDERED_FAIL=1 (a test hook): the program counts as not built, the refusal path runs
++    static const char * fe = getenv("GGML_OPENCL_TOPK_ORDERED_FAIL");
++    if (fe != nullptr && atoi(fe) != 0) {
++        ggml_cl_downgrade("op=TOP_K ordered=1 type=f32 path=cpu reason=no-kernel (GGML_OPENCL_TOPK_ORDERED_FAIL: the test hook)");
++        return;
++    }
+     // the stock top-k's options (integer keys: the fast-math options do not touch it)
+     const std::string compile_opts = std::string("-cl-std=CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." +
+                                      std::to_string(backend_ctx->opencl_c_version.minor) +
+@@ -14353,6 +14371,13 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+                 return false;
+             }
+             load_cl_kernels_argmax(backend_ctx);
++            {
++                // 0242's red (GGML_OPENCL_ARGMAX_RED=4): the op claimed without its kernel
++                static const char * re4 = getenv("GGML_OPENCL_ARGMAX_RED");
++                if (re4 != nullptr && atoi(re4) == 4) {
++                    return true;
++                }
++            }
+             return backend_ctx->kernel_argmax_f32 != nullptr;   // no kernel: the loader's downgrade line, the CPU
+         case GGML_OP_TOP_K:
+             // F32 rows -> the I32 indices of their k largest (a QSA indexer's block selection);
+@@ -44506,6 +44531,16 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             if (!any_on_device) {
+                 return false;
+             }
++            {
++                // 0242: a graph computed on this backend directly (no scheduler) never asked supports_op, which is
++                // where the kernel loads: load it here too, and refuse cleanly ("op not supported") without it
++                ggml_backend_opencl_context * bctx = (ggml_backend_opencl_context *) backend->context;
++                load_cl_kernels_argmax(bctx);
++                if (bctx->kernel_argmax_f32 == nullptr) {
++                    GGML_LOG_ERROR("ggml_opencl: ARGMAX: the kernel is not built (supports_op refuses the op)\n");
++                    return false;
++                }
++            }
+             func = ggml_cl_argmax;
+             break;
+         case GGML_OP_ARGSORT:
+@@ -44518,6 +44553,20 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             if (!any_on_device) {
+                 return false;
+             }
++            if (ggml_get_op_params_i32(tensor, 0) == 1) {
++                // 0242: ggml_top_k_ordered's kernel loads on the compute path too (see ARGMAX); its local sort takes
++                // k <= 1024, the bound supports_op keeps
++                if (tensor->ne[0] > 1024) {
++                    GGML_LOG_ERROR("ggml_opencl: TOP_K (ordered): k %d > 1024 (supports_op refuses the op)\n", (int) tensor->ne[0]);
++                    return false;
++                }
++                ggml_backend_opencl_context * bctx = (ggml_backend_opencl_context *) backend->context;
++                load_cl_kernels_top_k_ordered(bctx);
++                if (bctx->kernel_top_k_f32_ordered == nullptr) {
++                    GGML_LOG_ERROR("ggml_opencl: TOP_K (ordered): the kernel is not built (supports_op refuses the op)\n");
++                    return false;
++                }
++            }
+             func = ggml_cl_top_k;
+             break;
+         case GGML_OP_SUM_ROWS:
+diff --git a/tests/test-dspark-shortlist.cpp b/tests/test-dspark-shortlist.cpp
+index 5e34205..0b07722 100644
+--- a/tests/test-dspark-shortlist.cpp
++++ b/tests/test-dspark-shortlist.cpp
+@@ -111,7 +111,7 @@ int main(int argc, char ** argv) {
+     } else {
+         be = ggml_backend_cpu_init();
+     }
+-    printf("SHORTLIST backend %s%s\n", ggml_backend_name(be), g_red ? " -- RED: the stock top-k, the position taken as is" : "");
++    printf("SHORTLIST backend %s%s\n", ggml_backend_name(be), g_red ? " -- RED: the candidates in descending id order, the position taken as is" : "");
+     std::mt19937 rng(241);
+     std::normal_distribution<float> nd(0.0f, 1.0f);
+     const int n = 4;
+diff --git a/tests/test-opencl-argmax-sched.cpp b/tests/test-opencl-argmax-sched.cpp
+index cf221a4..81e81e4 100644
+--- a/tests/test-opencl-argmax-sched.cpp
++++ b/tests/test-opencl-argmax-sched.cpp
+@@ -7,6 +7,13 @@
+ //   w1-f32        w1 F32 in an OpenCL buffer (the converter's F32 copy): expect ONE split and no node on the CPU
+ //   w1-bf16-host  w1 BF16 in host memory (today's drafter: the loader keeps it there, OpenCL's GET_ROWS takes no
+ //                 BF16): expect the GET_ROWS on the CPU, i.e. this run FAILS (its red case)
++//   direct        0242: ARGMAX and ggml_top_k_ordered computed on the OpenCL backend DIRECTLY (ggml_backend_graph_compute,
++//                 no scheduler, so supports_op is never asked): the kernels must load on the compute path; the last
++//                 maximum, and the top 256 ascending with the tied last index in. Red: the 0240 / 0241 build aborts
++//   refuse        0242: the programs counted as not built (GGML_OPENCL_ARGMAX_FAIL=1, GGML_OPENCL_TOPK_ORDERED_FAIL=1,
++//                 set by the test itself): supports_op must refuse both ops, and the scheduled step must run with
++//                 ARGMAX on the CPU and the right answer, no assert. Red: GGML_OPENCL_ARGMAX_RED=4 (the op claimed
++//                 without its kernel) must fail it
+ // GGML_OPENCL_ARGMAX=0 (the op left to the CPU) makes the w1-f32 run fail too (the ARGMAX's red case).
+ // Also checks the answer: the id is the column's LAST maximum (ggml's CPU rule; the column carries a tie at
+ // 200,057, the V mod 4 = 2 tail), and the row is w1's row of that id, exact.
+@@ -28,7 +35,15 @@
+ int main(int argc, char ** argv) {
+     const std::string mode = argc > 1 ? argv[1] : "w1-f32";
+     const bool w1_host = mode == "w1-bf16-host";
+-    if (!w1_host && mode != "w1-f32") { fprintf(stderr, "usage: %s [w1-f32 | w1-bf16-host]\n", argv[0]); return 2; }
++    const bool direct  = mode == "direct";
++    const bool refuse  = mode == "refuse";
++    if (!w1_host && !direct && !refuse && mode != "w1-f32") {
++        fprintf(stderr, "usage: %s [w1-f32 | w1-bf16-host | direct | refuse]\n", argv[0]); return 2;
++    }
++    if (refuse) {   // before the backend exists: the loaders read these once
++        setenv("GGML_OPENCL_ARGMAX_FAIL", "1", 1);
++        setenv("GGML_OPENCL_TOPK_ORDERED_FAIL", "1", 1);
++    }
+     const int V = 200058, R = 256;
+ 
+     ggml_backend_dev_t gd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+@@ -69,6 +84,40 @@ int main(int argc, char ** argv) {
+     }
+ 
+     ggml_init_params gp = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    if (direct || refuse) {
++        // the two ops alone, on the OpenCL backend's own compute (direct) or asked first (refuse)
++        ggml_context * cd = ggml_init(gp);
++        ggml_tensor * am = ggml_argmax(cd, col);
++        ggml_tensor * tk = ggml_top_k_ordered(cd, col, 256);
++        ggml_set_output(am); ggml_set_output(tk);
++        if (refuse) {
++            const bool s_am = ggml_backend_supports_op(gpu, am), s_tk = ggml_backend_supports_op(gpu, tk);
++            printf("SCHED refuse: supports_op ARGMAX %s, TOP_K ordered %s (both must be no)\n", s_am ? "yes" : "no", s_tk ? "yes" : "no");
++            ggml_free(cd);
++            if (s_am || s_tk) { printf("SCHED FAIL\n"); return 1; }
++            // the scheduled step below then runs ARGMAX on the CPU: one split more, the right answer
++        } else {
++            // the top-k first: on a build without 0242 each op's own red (the top-k's null kernel, then the argmax)
++            ggml_cgraph * gdir = ggml_new_graph(cd);
++            ggml_build_forward_expand(gdir, tk);
++            ggml_build_forward_expand(gdir, am);
++            ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(gpu));
++            if (!ggml_gallocr_alloc_graph(ga, gdir) || ggml_backend_graph_compute(gpu, gdir) != GGML_STATUS_SUCCESS) {
++                printf("SCHED FAIL: the direct graph did not run\n"); return 1;
++            }
++            int32_t id = -1; std::vector<int32_t> ks(256);
++            ggml_backend_tensor_get(am, &id, 0, sizeof(id));
++            ggml_backend_tensor_get(tk, ks.data(), 0, sizeof(int32_t) * 256);
++            const bool asc = std::is_sorted(ks.begin(), ks.end());
++            const bool has = std::find(ks.begin(), ks.end(), V - 1) != ks.end() && std::find(ks.begin(), ks.end(), V / 3) != ks.end();
++            const bool ok = id == V - 1 && asc && has;
++            printf("SCHED direct: ARGMAX %d (expect %d) | TOP_K ordered ascending %s, both tied maxima in %s\n", id, V - 1,
++                   asc ? "yes" : "NO", has ? "yes" : "NO");
++            printf("SCHED %s\n", ok ? "PASS: the kernels loaded on the compute path" : "FAIL");
++            ggml_gallocr_free(ga); ggml_free(cd);
++            return ok ? 0 : 1;
++        }
++    }
+     ggml_context * cx = ggml_init(gp);
+     ggml_tensor * prev = ggml_argmax(cx, col);
+     ggml_set_name(prev, "prev");
+@@ -103,8 +152,11 @@ int main(int argc, char ** argv) {
+     const bool id_ok = id == V - 1;
+     printf("SCHED splits %d, CPU nodes %d | id %d (expect %d: the last maximum) %s | w1's row %s\n", n_splits, cpu_nodes, id,
+            V - 1, id_ok ? "right" : "WRONG", row_ok ? "exact" : "WRONG");
+-    const bool pass = n_splits == 1 && cpu_nodes == 0 && id_ok && row_ok;
+-    printf("SCHED %s\n", pass ? "PASS: one split, the step on the device" : "FAIL");
++    // refuse: ARGMAX on the CPU (its split and its node), GET_ROWS and SCALE on the card, the answer right
++    const bool pass = refuse ? (cpu_nodes == 1 && n_splits == 2 && id_ok && row_ok)
++                             : (n_splits == 1 && cpu_nodes == 0 && id_ok && row_ok);
++    printf("SCHED %s\n", pass ? (refuse ? "PASS: refused cleanly, ARGMAX on the CPU, the answer right"
++                                         : "PASS: one split, the step on the device") : "FAIL");
+     ggml_backend_sched_free(sched);
+     ggml_free(cx);
+     ggml_backend_buffer_free(bg); if (bh) ggml_backend_buffer_free(bh);

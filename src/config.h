@@ -113,6 +113,10 @@ struct Config {
     int         llama_dflash        = 0;
     double      llama_dflash_min_p  = 0.0;
     int         llama_dflash_ubatch = 0;
+    std::string llama_dflash_kv_k   = "f16";   // --llama-dflash-kv: the drafter context's K/V (f16 as trained)
+    std::string llama_dflash_kv_v   = "f16";
+    int         llama_dflash_shortlist = 0;  // --llama-dflash-shortlist K: the DSpark chain over each row's base top-K (0: off)
+    std::string llama_dflash_shortlist_probe;  // --llama-dflash-shortlist-probe FILE: a line a verified DSpark draft (0243; empty: off)
     bool        llama_dflash_on() const { return !llama_dflash_gguf.empty(); }
     // --llama-reserve-cells N: the compute buffers are reserved for a prompt
     // ubatch at N cache cells instead of the whole context, and a prompt chunk

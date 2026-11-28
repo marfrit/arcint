@@ -1,0 +1,467 @@
+0240: GGML_OP_ARGMAX on OpenCL, one work-group a row, ggml's CPU tie rule (the last maximum); GGML_OPENCL_ARGMAX=0 leaves it to the CPU.
+
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 52a91f7..8d6b8f6 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -105,6 +105,7 @@ set(GGML_OPENCL_KERNELS
+     add_id
+     moe_add_id_glu
+     argsort
++    argmax
+     tri
+     fill
+     clamp
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 3901fa0..21f3b21 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -841,6 +841,7 @@ struct ggml_backend_opencl_context {
+     // argsort is loaded in supports_op because its availability depends on how
+     // many workgroups are allowed, which requires kernel compilation.
+     bool kernels_loaded_argsort = false;
++    bool kernels_loaded_argmax  = false;   // 0240
+     // rest of the kernels are currently always loaded in alloc_buffer.
+     bool kernels_loaded = false;
+ 
+@@ -1525,6 +1526,9 @@ struct ggml_backend_opencl_context {
+     cl_kernel kernel_im2col_f32, kernel_im2col_f16;
+     cl_kernel kernel_top_k_f32 = nullptr;   // argsort.cl
+     cl_kernel kernel_argsort_f32_i32;
++    cl_kernel  kernel_argmax_f32  = nullptr;   // 0240: argmax.cl
++    cl_program program_argmax     = nullptr;
++    int       argmax_wg         = 0;
+     cl_kernel kernel_sum_rows_f32, kernel_sum_rows_f32_4;
+     cl_kernel kernel_cumsum_blk, kernel_cumsum_add;
+     cl_kernel kernel_repeat_f32, kernel_repeat_f32_small;
+@@ -2145,6 +2149,67 @@ static void load_cl_kernels_argsort(ggml_backend_opencl_context *backend_ctx) {
+     }
+ }
+ 
++// 0240: GGML_OP_ARGMAX on the device. GGML_OPENCL_ARGMAX=0 leaves the op to the CPU (the A/B arm and the red case
++// of the scheduler test); GGML_OPENCL_ARGMAX_RED=1 / 2 builds the red kernels of the tie tests (argmax.cl).
++static bool ggml_cl_argmax_on() {
++    static const char * e  = getenv("GGML_OPENCL_ARGMAX");
++    static const bool   on = e == nullptr || atoi(e) != 0;
++    return on;
++}
++
++static void load_cl_kernels_argmax(ggml_backend_opencl_context * backend_ctx) {
++    if (backend_ctx->kernels_loaded_argmax) {
++        return;
++    }
++    backend_ctx->kernels_loaded_argmax = true;
++    static const char * re  = getenv("GGML_OPENCL_ARGMAX_RED");
++    static const int    red = re != nullptr ? atoi(re) : 0;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++    const std::string kernel_src {
++        #include "argmax.cl.h"
++    };
++#else
++    const std::string kernel_src = read_file("argmax.cl");
++#endif
++    // the work-group: 256 lanes, halved until the device's and the built kernel's own limits take it (the local arrays
++    // are sized by ARGMAX_WG, so a smaller group is a rebuild). A program that does not build leaves the op to the CPU
++    // with a downgrade line, not an abort.
++    int wg = 256;
++    while (wg > 1 && (size_t) wg > backend_ctx->max_workgroup_size) {
++        wg /= 2;
++    }
++    for (;;) {
++        // no fast-math options: the scan starts at -INFINITY and must order -inf as the CPU does
++        const std::string compile_opts = std::string("-cl-std=CL") + std::to_string(backend_ctx->opencl_c_version.major) + "." +
++                                         std::to_string(backend_ctx->opencl_c_version.minor) + " -DARGMAX_WG=" +
++                                         std::to_string(wg) + " -DARGMAX_RED=" + std::to_string(red);
++        cl_program prog = build_program_from_source_optional(backend_ctx, kernel_src.c_str(), compile_opts);
++        cl_int     err  = CL_SUCCESS;
++        cl_kernel  k    = prog != nullptr ? clCreateKernel(prog, "kernel_argmax_f32", &err) : nullptr;
++        if (prog == nullptr || err != CL_SUCCESS || k == nullptr) {
++            if (prog != nullptr) {
++                clReleaseProgram(prog);
++            }
++            ggml_cl_downgrade("op=ARGMAX type=f32 path=cpu reason=no-kernel (argmax.cl did not build, WG %d)", wg);
++            return;
++        }
++        const size_t kmax = backend_ctx->get_kernel_workgroup_size(k);
++        if ((size_t) wg <= kmax || wg == 1) {
++            backend_ctx->program_argmax    = prog;
++            backend_ctx->kernel_argmax_f32 = k;
++            break;
++        }
++        clReleaseKernel(k);
++        clReleaseProgram(prog);
++        while (wg > 1 && (size_t) wg > kmax) {
++            wg /= 2;
++        }
++    }
++    backend_ctx->argmax_wg = wg;
++    GGML_LOG_INFO("ggml_opencl: ARGMAX on the device (a tie: the last maximum, ggml's CPU rule), %d lanes a row%s\n", wg,
++                  red == 1 ? " -- RED CASE 1: the lowest index on a tie" : red == 2 ? " -- RED CASE 2: the lower lane wins a tie" : "");
++}
++
+ static bool use_adreno_bin_kernels(ggml_backend_opencl_context * backend_ctx) {
+ #ifndef GGML_OPENCL_USE_ADRENO_BIN_KERNELS
+     GGML_UNUSED(backend_ctx);
+@@ -14245,6 +14310,15 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
+ 
+             return cols <= max_workgroup_size && op->src[0]->type == GGML_TYPE_F32;
+         }
++        case GGML_OP_ARGMAX:
++            // 0240: F32 rows (contiguous elements, any row stride) -> one I32 index a row
++            if (!ggml_cl_argmax_on() || op->src[0]->type != GGML_TYPE_F32 || op->type != GGML_TYPE_I32 ||
++                op->src[0]->nb[0] != sizeof(float) || op->src[0]->ne[2] != 1 || op->src[0]->ne[3] != 1 ||
++                !ggml_is_contiguous(op)) {
++                return false;
++            }
++            load_cl_kernels_argmax(backend_ctx);
++            return backend_ctx->kernel_argmax_f32 != nullptr;   // no kernel: the loader's downgrade line, the CPU
+         case GGML_OP_TOP_K:
+             // F32 rows -> the I32 indices of their k largest (a QSA indexer's block selection)
+             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_I32 &&
+@@ -43147,6 +43221,32 @@ static void ggml_cl_top_k(ggml_backend_t backend, const ggml_tensor * src0, cons
+     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
+ }
+ 
++// 0240: one work-group a row (argmax.cl)
++static void ggml_cl_argmax(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    GGML_UNUSED(src1);
++    GGML_ASSERT(src0 && src0->extra && dst && dst->extra);
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32 && src0->nb[0] == sizeof(float));
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    GGML_ASSERT(backend_ctx->kernel_argmax_f32 != nullptr);
++    ggml_tensor_extra_cl * extra0 = (ggml_tensor_extra_cl *) src0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *) dst->extra;
++    const cl_ulong offset0 = extra0->offset + src0->view_offs;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const int      ne00    = (int) src0->ne[0];
++    const cl_ulong nb01    = src0->nb[1];
++    const int      nrows   = (int) src0->ne[1];
++    cl_kernel k = backend_ctx->kernel_argmax_f32;
++    CL_CHECK(clSetKernelArg(k, 0, sizeof(cl_mem),   &extra0->data_device));
++    CL_CHECK(clSetKernelArg(k, 1, sizeof(cl_ulong), &offset0));
++    CL_CHECK(clSetKernelArg(k, 2, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(k, 3, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(k, 4, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(k, 5, sizeof(cl_ulong), &nb01));
++    size_t global_work_size[] = { (size_t) nrows * (size_t) backend_ctx->argmax_wg, 1, 1 };
++    size_t local_work_size[]  = { (size_t) backend_ctx->argmax_wg, 1, 1 };
++    backend_ctx->enqueue_ndrange_kernel(k, 1, global_work_size, local_work_size, dst);
++}
++
+ static void ggml_cl_argsort(ggml_backend_t backend, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_ASSERT(src0);
+     GGML_ASSERT(src0->extra);
+@@ -44356,6 +44456,12 @@ bool ggml_cl_compute_forward(ggml_backend_t backend, struct ggml_tensor * tensor
+             }
+             func = ggml_cl_im2col;
+             break;
++        case GGML_OP_ARGMAX:
++            if (!any_on_device) {
++                return false;
++            }
++            func = ggml_cl_argmax;
++            break;
+         case GGML_OP_ARGSORT:
+             if (!any_on_device) {
+                 return false;
+diff --git a/ggml/src/ggml-opencl/kernels/argmax.cl b/ggml/src/ggml-opencl/kernels/argmax.cl
+new file mode 100644
+index 0000000..0b62d68
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/argmax.cl
+@@ -0,0 +1,58 @@
++// 0240: GGML_OP_ARGMAX, F32 rows -> one I32 index a row, ggml's CPU rule (ggml-cpu/vec.h ggml_vec_argmax_f32):
++// the LAST maximum wins a tie ("max = MAX(max, x[i]); if (max == x[i]) idx = i"). One work-group a row, ARGMAX_WG
++// lanes (the host's choice, a power of two <= 256): lane l scans l, l + WG, ... in index order and keeps a value
++// that is >= its best (an equal value moves the index forward, as the CPU loop does), then the lanes combine in a
++// tree where the larger value wins and an equal value keeps the larger index. The result is the CPU loop's for every
++// row without a NaN; a NaN is never selected here (the CPU loop's MAX lets one reset its running maximum): a NaN in
++// logits is a failure on both paths. Built without the fast-math options: the scan starts at -INFINITY and a row of
++// -inf must give the CPU's answer (its last index).
++// ARGMAX_RED (the red cases of the op's tests, GGML_OPENCL_ARGMAX_RED): 1 = the lowest index on a tie (torch's rule),
++// 2 = the lower lane wins a tie in the tree whatever its index (a reduction-order kernel). Both must fail the tie cases.
++#ifndef ARGMAX_WG
++#define ARGMAX_WG 256
++#endif
++#ifndef ARGMAX_RED
++#define ARGMAX_RED 0
++#endif
++
++kernel void kernel_argmax_f32(global const char * src0, ulong offset0, global char * dst, ulong offsetd, int ne00,
++                              ulong nb01) {
++    local float lv[ARGMAX_WG];
++    local int   li[ARGMAX_WG];
++    const int row = get_group_id(0);
++    const int l   = get_local_id(0);
++    global const float * x = (global const float *) (src0 + offset0 + (ulong) row * nb01);
++    float bv = -INFINITY;
++    int   bi = -1;   // a lane with no element never wins a tie
++    for (int i = l; i < ne00; i += ARGMAX_WG) {
++        const float v = x[i];
++#if ARGMAX_RED == 1
++        if (v > bv || bi < 0) { bv = v; bi = i; }
++#else
++        if (v >= bv) { bv = v; bi = i; }
++#endif
++    }
++    lv[l] = bv; li[l] = bi;
++    barrier(CLK_LOCAL_MEM_FENCE);
++    for (int s = ARGMAX_WG / 2; s > 0; s >>= 1) {
++        if (l < s) {
++            const float ov = lv[l + s];
++            const int   oi = li[l + s];
++            const float mv = lv[l];
++            const int   mi = li[l];
++#if ARGMAX_RED == 1
++            const bool take = oi >= 0 && (mi < 0 || ov > mv || (ov == mv && oi < mi));
++#elif ARGMAX_RED == 2
++            const bool take = oi >= 0 && (mi < 0 || ov > mv);
++#else
++            const bool take = oi >= 0 && (mi < 0 || ov > mv || (ov == mv && oi > mi));
++#endif
++            if (take) { lv[l] = ov; li[l] = oi; }
++        }
++        barrier(CLK_LOCAL_MEM_FENCE);
++    }
++    if (l == 0) {
++        global int * d = (global int *) (dst + offsetd);
++        d[row] = li[0] < 0 ? 0 : li[0];
++    }
++}
+diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
+index 1b4eb35..ca8b0fb 100644
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -265,6 +265,13 @@ if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
+     target_link_libraries(test-opencl-kv-view-write PRIVATE ggml)
+ endif()
+ 
++# patch 0240: one DSpark Markov step (ARGMAX -> GET_ROWS of markov_w1) as the scheduler places it: one split, no
++# CPU node, the last maximum. Needs the card: built, not a ctest case; run by name.
++if (GGML_OPENCL AND NOT GGML_BACKEND_DL)
++    add_executable(test-opencl-argmax-sched test-opencl-argmax-sched.cpp)
++    target_link_libraries(test-opencl-argmax-sched PRIVATE ggml ggml-base ggml-cpu)
++endif()
++
+ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
+     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
+     llama_build_and_test(test-unicode.cpp LINK llama)
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f53c695..6692194 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -3098,6 +3098,81 @@ struct test_argmax : public test_case {
+     }
+ };
+ 
++// 0240: GGML_OP_ARGMAX with ties at the maximum, one tie pattern a row, against the CPU backend's rule (the LAST
++// maximum, ggml-cpu/vec.h ggml_vec_argmax_f32). Row 0: a tie with the last element (the V mod 4 = 2 tail of the
++// vocabulary); row 1: two neighbouring indices in the middle (two lanes of one work-group); row 2: two indices one
++// work-group stride apart (one lane); row 3: every element equal (the answer is the last index). The rest of a row
++// is a shuffle of distinct values below the tie. A kernel that takes the lowest index, or lets a lower lane win
++// a tie, fails rows 0-3. With pad > 0 the rows are a view with a row stride of ne0 + pad floats that starts one row
++// into its tensor (a view offset: a kernel that ignores it reads the decoy row 0, whose maximum is elsewhere).
++struct test_argmax_tie : public test_case {
++    const int64_t ne0;
++    const int64_t pad;
++
++    std::string vars() override {
++        return VARS_TO_STR2(ne0, pad);
++    }
++
++    test_argmax_tie(int64_t ne0 = 200058, int64_t pad = 0) : ne0(ne0), pad(pad) {}
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0 + pad, pad > 0 ? 5 : 4);
++        ggml_set_name(a, "a");
++        ggml_tensor * v = pad > 0 ? ggml_view_2d(ctx, a, ne0, 4, a->nb[1], a->nb[1]) : a;
++        ggml_tensor * out = ggml_argmax(ctx, v);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        std::default_random_engine rng(218);
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (t->view_src != nullptr) {
++                continue;
++            }
++            if (strcmp(t->name, "a") != 0) {
++                init_tensor_uniform(t);   // the framework's other tensors (the sentinels): not the case's rows
++                continue;
++            }
++            const int64_t w = t->ne[0];
++            const int64_t mid = (ne0 / 2) & ~(int64_t) 1;   // an even index: the pair sits in an even and the next odd lane, so a lower-lane-wins tree meets them in that order
++            const int64_t pairs[3][2] = { { ne0 / 3, ne0 - 1 }, { mid, mid + 1 }, { ne0 / 5, ne0 / 5 + 256 } };
++            const int64_t r0 = t->ne[1] - 4;   // 1 for the view (row 0 a decoy), else 0
++            if (r0 > 0) {
++                std::vector<float> decoy(w);
++                for (int64_t i = 0; i < w; i++) {
++                    decoy[i] = (float) ((i * 7) % ne0);
++                }
++                decoy[3] = (float) (3 * ne0);   // the decoy's maximum at index 3, which no real row's answer is
++                ggml_backend_tensor_set(t, decoy.data(), 0, w * sizeof(float));
++            }
++            for (int64_t r = 0; r < 4; r++) {
++                std::vector<float> data(w);
++                for (int64_t i = 0; i < w; i++) {
++                    data[i] = (float) i;
++                }
++                std::shuffle(data.begin(), data.begin() + ne0, rng);
++                if (r < 3) {
++                    data[pairs[r][0]] = (float) ne0;
++                    data[pairs[r][1]] = (float) ne0;
++                } else {
++                    for (int64_t i = 0; i < ne0; i++) {
++                        data[i] = 7.0f;
++                    }
++                }
++                for (int64_t i = ne0; i < w; i++) {
++                    data[i] = (float) (2 * ne0);   // the pad: above every real value; a kernel that reads it is wrong
++                }
++                ggml_backend_tensor_set(t, data.data(), (r0 + r) * t->nb[1], w * sizeof(float));
++            }
++        }
++    }
++
++    double max_nmse_err() override {
++        return 0.0;
++    }
++};
++
+ // GGML_OP_COUNT_EQUAL
+ struct test_count_equal : public test_case {
+     const ggml_type type;
+@@ -12510,6 +12585,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {1024, 12, 1, 1}));
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {2000, 10, 1, 1}));
+     test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {5438,  3, 1, 1}));
++    // 0240: the DSpark Markov chain's row (Inkling 2's vocabulary, V mod 4 = 2), one row and the block's 8, and ties
++    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {200058, 1, 1, 1}));
++    test_cases.emplace_back(new test_argmax(GGML_TYPE_F32, {200058, 8, 1, 1}));
++    test_cases.emplace_back(new test_argmax_tie(200058, 0));
++    test_cases.emplace_back(new test_argmax_tie(200058, 6));
++    test_cases.emplace_back(new test_argmax_tie(1000, 0));
+ 
+     for (int ne3 : {1, 3}) { // CUDA backward pass only supports ne3 == 1
+         test_cases.emplace_back(new test_repeat(GGML_TYPE_F32, {10, 5, 4, ne3}, {1, 1, 1, 1}));
+diff --git a/tests/test-opencl-argmax-sched.cpp b/tests/test-opencl-argmax-sched.cpp
+new file mode 100644
+index 0000000..cf221a4
+--- /dev/null
++++ b/tests/test-opencl-argmax-sched.cpp
+@@ -0,0 +1,114 @@
++// 0240: one DSpark Markov step as the scheduler places it, on the card. Built, not a ctest case (it needs the
++// device); run by name:
++//   test-opencl-argmax-sched [w1-f32 | w1-bf16-host]
++// The graph: a 200,058-float column (Inkling 2's vocabulary) -> ARGMAX -> GET_ROWS of markov_w1 [256 x 200,058]
++// with that id -> a device op (SCALE) -> the output, scheduled over the OpenCL and the CPU backends as llama.cpp
++// schedules a drafter graph (op_offload on). The column and w1 are weights in their backends' buffers.
++//   w1-f32        w1 F32 in an OpenCL buffer (the converter's F32 copy): expect ONE split and no node on the CPU
++//   w1-bf16-host  w1 BF16 in host memory (today's drafter: the loader keeps it there, OpenCL's GET_ROWS takes no
++//                 BF16): expect the GET_ROWS on the CPU, i.e. this run FAILS (its red case)
++// GGML_OPENCL_ARGMAX=0 (the op left to the CPU) makes the w1-f32 run fail too (the ARGMAX's red case).
++// Also checks the answer: the id is the column's LAST maximum (ggml's CPU rule; the column carries a tie at
++// 200,057, the V mod 4 = 2 tail), and the row is w1's row of that id, exact.
++// Exit 0 only with one split, no CPU node and the right answer. The first GPU device is taken: run it with the
++// card pinned (ZE_AFFINITY_MASK) on a host with two.
++#include "ggml.h"
++#include "ggml-alloc.h"
++#include "ggml-backend.h"
++#include "ggml-cpu.h"
++
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <random>
++#include <string>
++#include <vector>
++
++int main(int argc, char ** argv) {
++    const std::string mode = argc > 1 ? argv[1] : "w1-f32";
++    const bool w1_host = mode == "w1-bf16-host";
++    if (!w1_host && mode != "w1-f32") { fprintf(stderr, "usage: %s [w1-f32 | w1-bf16-host]\n", argv[0]); return 2; }
++    const int V = 200058, R = 256;
++
++    ggml_backend_dev_t gd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
++    if (!gd) { fprintf(stderr, "no GPU device\n"); return 2; }
++    ggml_backend_t gpu = ggml_backend_dev_init(gd, nullptr);
++    ggml_backend_t cpu = ggml_backend_cpu_init();
++    printf("SCHED device: %s (%s), mode %s\n", ggml_backend_dev_name(gd), ggml_backend_dev_description(gd), mode.c_str());
++
++    ggml_init_params wp = { 8 * ggml_tensor_overhead(), nullptr, true };
++    ggml_context * cg = ggml_init(wp);   // device weights
++    ggml_context * ch = ggml_init(wp);   // host weights
++    ggml_tensor * col = ggml_new_tensor_2d(cg, GGML_TYPE_F32, V, 1);
++    ggml_set_name(col, "col");
++    ggml_tensor * w1 = w1_host ? ggml_new_tensor_2d(ch, GGML_TYPE_BF16, R, V) : ggml_new_tensor_2d(cg, GGML_TYPE_F32, R, V);
++    ggml_set_name(w1, "markov_w1.weight");
++    ggml_backend_buffer_t bg = ggml_backend_alloc_ctx_tensors(cg, gpu);
++    ggml_backend_buffer_t bh = w1_host ? ggml_backend_alloc_ctx_tensors(ch, cpu) : nullptr;
++    ggml_backend_buffer_set_usage(bg, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++    if (bh) ggml_backend_buffer_set_usage(bh, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
++
++    // the column: distinct values, a tie at the maximum between V / 3 and V - 1 (the answer: V - 1)
++    std::mt19937 rng(218);
++    std::vector<float> c(V);
++    for (int i = 0; i < V; ++i) c[i] = (float) i;
++    std::shuffle(c.begin(), c.end(), rng);
++    c[V / 3] = (float) V; c[V - 1] = (float) V;
++    ggml_backend_tensor_set(col, c.data(), 0, sizeof(float) * V);
++    // w1: integers below 256, exact in bfloat16, so the two modes' rows are the same values and only the placement
++    // differs
++    std::vector<float> w1f((size_t) R * V);
++    for (int k = 0; k < V; ++k) for (int j = 0; j < R; ++j) w1f[(size_t) k * R + j] = (float) ((k * 31 + j) % 256);
++    if (w1_host) {
++        std::vector<ggml_bf16_t> b(w1f.size());
++        for (size_t i = 0; i < w1f.size(); ++i) b[i] = ggml_fp32_to_bf16(w1f[i]);
++        ggml_backend_tensor_set(w1, b.data(), 0, b.size() * sizeof(ggml_bf16_t));
++    } else {
++        ggml_backend_tensor_set(w1, w1f.data(), 0, w1f.size() * sizeof(float));
++    }
++
++    ggml_init_params gp = { 64 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
++    ggml_context * cx = ggml_init(gp);
++    ggml_tensor * prev = ggml_argmax(cx, col);
++    ggml_set_name(prev, "prev");
++    ggml_tensor * row = ggml_get_rows(cx, w1, prev);
++    ggml_set_name(row, "w1_prev");
++    ggml_tensor * out = ggml_scale(cx, row, 1.0f);
++    ggml_set_name(out, "out");
++    ggml_set_output(out);
++    ggml_set_output(prev);
++    ggml_cgraph * gf = ggml_new_graph(cx);
++    ggml_build_forward_expand(gf, out);
++
++    ggml_backend_t backends[2] = { gpu, cpu };
++    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, GGML_DEFAULT_GRAPH_SIZE, false, true);
++    if (!ggml_backend_sched_alloc_graph(sched, gf)) { fprintf(stderr, "alloc failed\n"); return 2; }
++    const int n_splits = ggml_backend_sched_get_n_splits(sched);
++    int cpu_nodes = 0;
++    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
++        ggml_tensor * n = ggml_graph_node(gf, i);
++        ggml_backend_t b = ggml_backend_sched_get_tensor_backend(sched, n);
++        const bool on_cpu = b == cpu;
++        cpu_nodes += on_cpu;
++        printf("SCHED node %d %-10s %-18s on %s\n", i, ggml_op_desc(n), n->name, b ? ggml_backend_name(b) : "?");
++    }
++    if (ggml_backend_sched_graph_compute(sched, gf) != GGML_STATUS_SUCCESS) { fprintf(stderr, "compute failed\n"); return 2; }
++    int32_t id = -1;
++    ggml_backend_tensor_get(prev, &id, 0, sizeof(id));
++    std::vector<float> got(R);
++    ggml_backend_tensor_get(out, got.data(), 0, sizeof(float) * R);
++    bool row_ok = id >= 0 && id < V;
++    for (int j = 0; row_ok && j < R; ++j) row_ok = got[j] == w1f[(size_t) id * R + j];
++    const bool id_ok = id == V - 1;
++    printf("SCHED splits %d, CPU nodes %d | id %d (expect %d: the last maximum) %s | w1's row %s\n", n_splits, cpu_nodes, id,
++           V - 1, id_ok ? "right" : "WRONG", row_ok ? "exact" : "WRONG");
++    const bool pass = n_splits == 1 && cpu_nodes == 0 && id_ok && row_ok;
++    printf("SCHED %s\n", pass ? "PASS: one split, the step on the device" : "FAIL");
++    ggml_backend_sched_free(sched);
++    ggml_free(cx);
++    ggml_backend_buffer_free(bg); if (bh) ggml_backend_buffer_free(bh);
++    ggml_free(cg); ggml_free(ch);
++    ggml_backend_free(gpu); ggml_backend_free(cpu);
++    return pass ? 0 : 1;
++}

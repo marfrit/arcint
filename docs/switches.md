@@ -211,6 +211,7 @@ These names are not in a table:
 | `GGML_OPENCL_CPU_MISS_MT` | on (AVX2, FMA, F16C) | `0`: the CPU miss path on ggml-cpu's single-token dot products, as its prototype. | 0056 | ggml-cpu's Q2_0 dot product 661 against 72 us a matrix (`measured-here`). |
 | `LLAMA_SLOT_LOAN_EVICTION_GUARD` | on (absent) | 0, off, false or no (any case) turn the loan's eviction guard off; a typo keeps it on. | 0068 | `code`: 0068:3944-3946. |
 | `GGML_OPENCL_CPU_MISS_PREFETCH` | 0 | `1`: a next-block prefetch (field 1, two blocks ahead) in the miss rows; `2`: also a synchronous page-touch pass over the missed experts' slices at publish. | 0075 | **Window 42 (`measured-here`)**: level 0 34.12/34.40 t/s with 0 and 10 major faults, level 1 34.28 (spread), level 2 30.12/33.73 with one leg at +479,730 faults — faults ~0, level 1 buys nothing, level 2 costs. Keep off. |
+| `GGML_OPENCL_ARGMAX` | on | `0`: `GGML_OP_ARGMAX` stays on the CPU (the A/B arm; the DSpark Markov chain then has a CPU split a step). Unset, the OpenCL backend runs it: one work-group a row, the last maximum on a tie (ggml's CPU rule). | 0240 | The scheduler test puts ARGMAX in the device's split; the served DSpark drafter graph has no ARGMAX on the CPU (`measured-here`, the Arc Pro B60). |
 
 ### Red case
 
@@ -240,6 +241,10 @@ These names are not in a table:
 | `LLAMA_SLOT_LOAN_MUTATE` | 0 | A value-coded red mutation of the loan: `1` a tensor of the last lent layer left uncopied, `2` the lend's last table row dropped, `3` the lent sizing skipped (the lend branch's dst tensor, about 0.64 GiB a chunk, measured in the resident chunk), `4` the return's re-reserve skipped, `5` a lent layer's bank row off by one (the KL gate's red). | 0068 | `code`: 0068:968-971,1299-1302. |
 | `LLAMA_DORY_RED_REUSE` | off | `1`: the loop count is left out of the graph-reuse key, so a graph built for one count is reused at another: a request is then served at a wrong count with no error. The red case of the per-count graph. Test only; never set it on a unit. | 0118 | `measured-here`, CPU: 6 of 9 probes fail with it. |
 | `LLAMA_DORY_RESERVE_DEFAULT` | off | `1`: the compute buffers are reserved at the file's count instead of the maximum, so a request at more loops than the first one grows the buffer. Breaks the no-growth property of the reserve (the test of it), not the output. Test only; never set it on a unit. | 0118 | `code`: the `graph_reserve` hunk of 0118. |
+| `GGML_OPENCL_ARGMAX_RED` | off | `1`: the lowest index on a tie; `2`: the lower lane wins a tie in the reduction (red builds of the ARGMAX kernel, wrong on ties by design: the tie cases fail); `4`: the op claimed without its kernel (the refusal's red, `test-opencl-argmax-sched refuse`). | 0240, 0242 | Each fails its test (`measured-here`, the recipe host and the Arc Pro B60). |
+| `GGML_OPENCL_ARGMAX_FAIL` / `GGML_OPENCL_TOPK_ORDERED_FAIL` | off | `1`: the ARGMAX / ordered TOP_K program counts as not built (one DOWNGRADE line each): `supports_op` refuses the op and the compute path does not assert. | 0242 | `test-opencl-argmax-sched refuse` (the Arc Pro B60). |
+| `LLAMA_DSPARK_PROBE_RED` | off | `1`: the DSpark shortlist probe's red, the pick over the K candidates instead of the full chain's: every position reads "inside". Never in a real probe run. | 0243 | `test-dspark-shortlist`: only its `probe` case fails (`measured-here`, the CPU backend). |
+| `DSPARK_SHORTLIST_RED` | off | `1`: the shortlist test's red: the candidates in descending id order, the argmax position taken as is (a tie goes to the lower id). | 0241 | `test-dspark-shortlist`: `tie` and `cut` fail. |
 
 ### Diagnostic
 
@@ -304,3 +309,4 @@ service.
 | switch | default | what it does | tool | evidence |
 |---|---|---|---|---|
 | `ARCINT_PROBE_RED_DESYNC` | unset (off) | `1` (exactly) turns the grammar probe's red desync arm on; any other value is off. | `tools/tool_grammar_probe.cpp:127` | `code` |
+| `DSPARK_PROBE_READ_RED` | unset (off) | `1`: the kept count one too many; `2`: the inside divergences folded into the prediction; `3`: the membership tripwire not counted; `4`: the validity limits not applied. | `tools/dspark_probe_read.py` | `tests/python/test_dspark_probe_read.py`: each fails cases (14 / 2 / 1 / 4). |

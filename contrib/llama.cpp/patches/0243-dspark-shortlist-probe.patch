@@ -1,0 +1,431 @@
+0243: the DSpark shortlist's probe (llama_set_dspark_probe, off by default): the full chain's pick at every step on the same state and its membership in the step's candidates.
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index e42cde8..4b7a5a9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -1,4 +1,5 @@
+ #include "llama-context.h"
++#include "llama-dspark-probe.h"
+ #include "llama-expert-cache.h"
+ #include "llama-expert-route-trace.h"
+ #include "llama-loan-book.h"
+@@ -2998,6 +2999,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+     dspark_ids.clear();
+     dspark_ids_seq.clear();
+     dspark_ids_steps = 0;
++    dspark_probe_full.clear();   // 0243
++    dspark_probe_idx.clear();
+ 
+     do {
+         const auto & ubatch = mctx->get_ubatch();
+@@ -3171,6 +3174,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
+                 dspark_ids_seq[b] = ubatch.seq_id[b * (ubatch.n_tokens / ubatch.n_seqs_unq)][0];
+             }
+             ggml_backend_tensor_get_async(backend_ids, t_ids, dspark_ids.data(), 0, ggml_nbytes(t_ids));
++            // 0243: the probe's outputs, the same blocks
++            ggml_tensor * t_pf = res->t_dspark_probe_full;
++            ggml_tensor * t_pi = res->t_dspark_probe_idx;
++            if (t_pf != nullptr && t_pi != nullptr) {
++                GGML_ASSERT(t_pf->type == GGML_TYPE_I32 && t_pi->type == GGML_TYPE_I32 && ggml_are_same_shape(t_pf, t_ids) &&
++                            t_pi->ne[1] == (int64_t) ubatch.n_tokens && ggml_is_contiguous(t_pi));
++                dspark_probe_k    = (int32_t) t_pi->ne[0];
++                dspark_probe_rows = (int32_t) (ubatch.n_tokens / ubatch.n_seqs_unq);
++                dspark_probe_row0 = res->dspark_probe_row0;
++                GGML_ASSERT(dspark_probe_row0 + dspark_ids_steps <= dspark_probe_rows);
++                dspark_probe_full.resize((size_t) ggml_nelements(t_pf));
++                dspark_probe_idx.resize((size_t) ggml_nelements(t_pi));
++                ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_pf), t_pf,
++                                              dspark_probe_full.data(), 0, ggml_nbytes(t_pf));
++                ggml_backend_tensor_get_async(ggml_backend_sched_get_tensor_backend(sched.get(), t_pi), t_pi,
++                                              dspark_probe_idx.data(), 0, ggml_nbytes(t_pi));
++            }
+         }
+ 
+         // extract logits
+@@ -5446,6 +5466,35 @@ int32_t llama_get_dspark_ids(llama_context * ctx, llama_seq_id seq, int32_t * ou
+     return ctx->get_dspark_ids(seq, out, n_max);
+ }
+ 
++void llama_set_dspark_probe(llama_context * ctx, bool on) {
++    ctx->set_dspark_probe(on);
++}
++
++int32_t llama_get_dspark_probe(llama_context * ctx, llama_seq_id seq, int32_t * full, int8_t * inside, int32_t n_max) {
++    return ctx->get_dspark_probe(seq, full, inside, n_max);
++}
++
++int32_t llama_context::get_dspark_probe(llama_seq_id seq, int32_t * full, int8_t * inside, int32_t n_max) {
++    synchronize();
++    if (dspark_probe_full.empty()) {
++        return -1;
++    }
++    for (size_t b = 0; b < dspark_ids_seq.size(); ++b) {
++        if (dspark_ids_seq[b] != seq) {
++            continue;
++        }
++        const int32_t n = std::min(n_max, dspark_ids_steps);
++        for (int32_t s = 0; s < n; ++s) {
++            const int32_t f   = dspark_probe_full[b * (size_t) dspark_ids_steps + (size_t) s];
++            const size_t  row = b * (size_t) dspark_probe_rows + (size_t) (dspark_probe_row0 + s);
++            full[s]   = f;
++            inside[s] = dspark_probe_inside(dspark_probe_idx.data() + row * (size_t) dspark_probe_k, dspark_probe_k, f) ? 1 : 0;
++        }
++        return n;
++    }
++    return -1;
++}
++
+ int32_t llama_context::get_dspark_ids(llama_seq_id seq, int32_t * out, int32_t n_max) {
+     synchronize();
+     for (size_t b = 0; b < dspark_ids_seq.size(); ++b) {
+diff --git a/src/llama-context.h b/src/llama-context.h
+index 0d0d9f9..4dfe7db 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -148,6 +148,8 @@ struct llama_context {
+     void set_dspark_chain(uint32_t n_steps) { cparams.dspark_chain = n_steps; }   // 0218
+     void set_dspark_shortlist(uint32_t k) { cparams.dspark_shortlist = k; }       // 0241
+     int32_t get_dspark_ids(llama_seq_id seq, int32_t * out, int32_t n_max);        // 0241
++    void set_dspark_probe(bool on) { cparams.dspark_probe = on; }                  // 0243
++    int32_t get_dspark_probe(llama_seq_id seq, int32_t * full, int8_t * inside, int32_t n_max);   // 0243
+     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+     void set_nextn_layer_offset(int32_t offset);
+     void set_causal_attn(bool value);
+@@ -362,6 +364,13 @@ private:
+     std::vector<int32_t>      dspark_ids;
+     std::vector<llama_seq_id> dspark_ids_seq;
+     int32_t                   dspark_ids_steps = 0;
++    // 0243: the probe of the last decode: the full chain's picks [steps, blocks], every row's K candidates
++    //       [K, n_tokens] (block b's rows b * rows .. b * rows + rows - 1), the row of step 0
++    std::vector<int32_t>      dspark_probe_full;
++    std::vector<int32_t>      dspark_probe_idx;
++    int32_t                   dspark_probe_k     = 0;
++    int32_t                   dspark_probe_rows  = 0;
++    int32_t                   dspark_probe_row0  = 0;
+     bool embd_nextn_skip = false;         // llama_set_embeddings_nextn_skip
+ 
+     struct sampling_info {
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index a781c6c..d5c6d11 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -28,6 +28,7 @@ struct llama_cparams {
+ 
+     uint32_t dspark_chain = 0; // 0218: Markov steps a DSpark draft block runs (rows 1..n); 0 = every row of the block
+     uint32_t dspark_shortlist = 0; // 0241: K > 0: the chain over each row's base top-K candidates, the drafted ids out; 0 = the full chain
++    bool     dspark_probe     = false; // 0243: with the shortlist, every step's full-chain pick and the K candidates out too
+ 
+     float rope_freq_base;
+     float rope_freq_scale;
+diff --git a/src/llama-dspark-probe.h b/src/llama-dspark-probe.h
+new file mode 100644
+index 0000000..95b73be
+--- /dev/null
++++ b/src/llama-dspark-probe.h
+@@ -0,0 +1,37 @@
++// 0243: the DSpark shortlist's probe (llama_set_dspark_probe): beside the shortlist's pick, the step the full
++// chain would take on the same state, and whether that id was among the step's K candidates. A measurement aid,
++// off by default: it adds the full chain's GEMV and its ARGMAX over the vocabulary back to every step.
++// Shared by src/models/dflash.cpp and tests/test-dspark-shortlist.cpp; ggml only.
++#pragma once
++
++#include "ggml.h"
++
++#include <cstdint>
++#include <cstdlib>
++
++// the full chain's pick of one step, the ops in the full path's order: argmax_V( softcap(base_i + bias) ), bias the
++// Markov correction w2 . m (+ b) as the caller built it; [n_blocks] I32. pick_short: the shortlist's pick of the same
++// step, [n_blocks] I32. LLAMA_DSPARK_PROBE_RED=1 (test only): the red probe, the pick over the K candidates (the
++// shortlist's own) in place of the full one: every position then reads "inside"
++static inline ggml_tensor * dspark_probe_full_pick(ggml_context * ctx, ggml_tensor * base_i, ggml_tensor * bias,
++                                                   float softcap, ggml_tensor * pick_short) {
++    const char * red = getenv("LLAMA_DSPARK_PROBE_RED");
++    if (red != nullptr && atoi(red) == 1) {
++        return pick_short;
++    }
++    ggml_tensor * col = ggml_add(ctx, base_i, bias);
++    if (softcap > 0.0f) {
++        col = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, col, 1.0f/softcap)), softcap);
++    }
++    return ggml_argmax(ctx, col);
++}
++
++// whether id is among a step's k candidates
++static inline bool dspark_probe_inside(const int32_t * cand, int64_t k, int32_t id) {
++    for (int64_t c = 0; c < k; ++c) {
++        if (cand[c] == id) {
++            return true;
++        }
++    }
++    return false;
++}
+diff --git a/src/llama-ext.h b/src/llama-ext.h
+index daa72f2..0987e4e 100644
+--- a/src/llama-ext.h
++++ b/src/llama-ext.h
+@@ -184,6 +184,17 @@ LLAMA_API void llama_set_dspark_shortlist(struct llama_context * ctx, uint32_t k
+ // returns how many, or -1 when the last decode drafted none for it (no shortlist, another sequence)
+ LLAMA_API int32_t llama_get_dspark_ids(struct llama_context * ctx, llama_seq_id seq, int32_t * out, int32_t n_max);
+ 
++// 0243: the shortlist's probe, a measurement aid (off by default; it adds the full chain's GEMV and its ARGMAX over
++// the vocabulary back to every step): with the shortlist on, every step also computes the id the full chain would
++// draft on the same state. Another value is another graph (part of the reuse check).
++LLAMA_API void llama_set_dspark_probe(struct llama_context * ctx, bool on);
++
++// 0243: for the last decode's shortlist chain of sequence `seq`, in draft order: full[s] the full chain's pick of
++// step s, inside[s] 1 when it is among that step's K candidates (else 0); returns how many (up to n_max), or -1
++// when the last decode has no probe for it (probe off, no shortlist, another sequence)
++LLAMA_API int32_t llama_get_dspark_probe(struct llama_context * ctx, llama_seq_id seq, int32_t * full, int8_t * inside,
++                                         int32_t n_max);
++
+ // Select which appended NextN block the DECODER_MTP graph runs (offset past
+ // the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+ // chain multiple trained NextN heads. Default 0 (first head).
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 5fa6c39..fd556ef 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1525,6 +1525,9 @@ void llm_graph_result::reset() {
+     t_sampled.clear();
+     t_sampled_ids = nullptr;
+     t_dspark_ids  = nullptr;   // 0241
++    t_dspark_probe_full = nullptr;   // 0243
++    t_dspark_probe_idx  = nullptr;
++    dspark_probe_row0   = 0;
+     t_sampled_probs.clear();
+     t_sampled_logits.clear();
+     t_candidates.clear();
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 02e638d..4675909 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -982,6 +982,11 @@ struct llm_graph_params {
+             return false;
+         }
+ 
++        // 0243: and the probe
++        if (cparams.dspark_probe != other.cparams.dspark_probe) {
++            return false;
++        }
++
+         // ARC-LAB 0118: another loop count is another topology. LLAMA_DORY_RED_REUSE (test only) drops the check,
+         // the deliberately wrong build of the experiment
+         if (cparams.dory_loops != other.cparams.dory_loops) {
+@@ -1072,6 +1077,9 @@ public:
+     std::vector<ggml_tensor *> t_sampled;
+     ggml_tensor *              t_sampled_ids = nullptr; // I32 [n_rows]: the same sampled ids in one tensor (one read-back), or null
+     ggml_tensor *              t_dspark_ids  = nullptr; // 0241: I32 [steps, blocks], the DSpark shortlist chain's drafted ids, or null
++    ggml_tensor *              t_dspark_probe_full = nullptr; // 0243: I32 [steps, blocks], the full chain's pick of each step, or null
++    ggml_tensor *              t_dspark_probe_idx  = nullptr; // 0243: I32 [K, n_tokens], every row's shortlist candidates, or null
++    int32_t                    dspark_probe_row0   = 0;       // 0243: the block row of step 0
+     std::vector<ggml_tensor *> t_sampled_probs;
+     std::vector<ggml_tensor *> t_sampled_logits;
+     std::vector<ggml_tensor *> t_candidates;
+diff --git a/src/models/dflash.cpp b/src/models/dflash.cpp
+index ce775c7..21dddcb 100644
+--- a/src/models/dflash.cpp
++++ b/src/models/dflash.cpp
+@@ -1,5 +1,6 @@
+ #include "models.h"
+ 
++#include "llama-dspark-probe.h"
+ #include "llama-impl.h"
+ #include "llama-kv-cache.h"
+ #include "llama-kv-cache-iswa.h"
+@@ -497,6 +498,9 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+     const bool    use_short = n_short > 0 && is_rnn && !has_conf && !model.d2t && model.dspark_markov_w2_s == nullptr &&
+                               n_short <= n_vocab && w2->ne[1] == n_vocab && n_chain > i_draft_beg;
+     ggml_tensor * idx = nullptr, * base_k = nullptr, * fold_k = nullptr, * bias_k = nullptr, * ids_all = nullptr;
++    // 0243: the probe (llama_set_dspark_probe): every step's full-chain pick on the same state, [steps, n_blocks]
++    const bool    probe    = use_short && g.cparams.dspark_probe;
++    ggml_tensor * full_all = nullptr;
+     // a view that is already contiguous needs no copy (n_blocks = 1: every step's view is)
+     const auto contig = [&](ggml_tensor * t) { return ggml_is_contiguous(t) ? t : ggml_cont(ctx0, t); };
+     if (use_short) {
+@@ -565,6 +569,18 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+                                               ggml_reshape_2d(ctx0, am, 1, n_blocks));                                    // [1, 1, n_blocks]
+             tok     = ggml_reshape_2d(ctx0, tok, 1, n_blocks);
+             ids_all = ids_all ? ggml_concat(ctx0, ids_all, tok, 0) : tok;                                                 // [steps, n_blocks]
++            if (probe) {
++                // 0243: the step the full chain takes on this state: the full path's GEMV (+ b), + base, softcap,
++                //       ARGMAX over the vocabulary (llama-dspark-probe.h); the chain itself goes on with the shortlist's
++                ggml_tensor * bias_f = g.build_lora_mm(w2, markov, nullptr);                                          // [n_vocab, n_blocks]
++                if (model.dspark_markov_w2_b) {
++                    bias_f = ggml_add(ctx0, bias_f, model.dspark_markov_w2_b);
++                }
++                ggml_tensor * base_i = ggml_view_2d(ctx0, base, n_vocab, n_blocks, base_stride, i*base->nb[1]);
++                ggml_tensor * f = dspark_probe_full_pick(ctx0, base_i, bias_f, softcap, ggml_reshape_1d(ctx0, tok, n_blocks));
++                f        = ggml_reshape_2d(ctx0, f, 1, n_blocks);
++                full_all = full_all ? ggml_concat(ctx0, full_all, f, 0) : f;                                              // [steps, n_blocks]
++            }
+             if (i + 1 < n_chain) {
+                 prev = ggml_reshape_1d(ctx0, tok, n_blocks);
+             }
+@@ -621,6 +637,18 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model &
+         ggml_set_name(res->t_dspark_ids, "dspark_ids");
+         ggml_set_output(res->t_dspark_ids);
+         ggml_build_forward_expand(g.gf, res->t_dspark_ids);
++        if (probe) {
++            // 0243: the full chain's picks and every row's K candidates (the host reads the membership off them)
++            res->t_dspark_probe_full = ggml_cont(ctx0, full_all);
++            ggml_set_name(res->t_dspark_probe_full, "dspark_probe_full");
++            ggml_set_output(res->t_dspark_probe_full);
++            ggml_build_forward_expand(g.gf, res->t_dspark_probe_full);
++            res->t_dspark_probe_idx = idx;                                                                            // [K, n_tok]
++            ggml_set_name(idx, "dspark_probe_idx");
++            ggml_set_output(idx);
++            ggml_build_forward_expand(g.gf, idx);
++            res->dspark_probe_row0 = (int32_t) i_draft_beg;
++        }
+         res->t_logits = nullptr;
+         return;
+     }
+diff --git a/tests/test-dspark-shortlist.cpp b/tests/test-dspark-shortlist.cpp
+index 0b07722..6f4f2af 100644
+--- a/tests/test-dspark-shortlist.cpp
++++ b/tests/test-dspark-shortlist.cpp
+@@ -9,14 +9,22 @@
+ //          order: the pick must be the higher id (as the full chain's ARGMAX)
+ //   cut    K = 256, base ties exactly at rank 256 / 257: top_k_ordered takes the higher id, the same set every run
+ //   det    the K = 256 indices of one row, 20 runs: identical
++//   probe  0243 (llama-dspark-probe.h, as dflash.cpp's probe uses it): K = 256 on rows built so the full chain's
++//          argmax lies OUTSIDE the base top-256 (a low base value, a large correction): the probe's pick must be the
++//          full chain's id, not the shortlist's, and must read "not inside"; in every other case the probe's pick
++//          is the full chain's too
+ // DSPARK_SHORTLIST_RED=1: the red pick: the candidates in descending id order (the ordered top-k reversed: an order
+ // that is not the ids') and the position from ARGMAX taken as it is: the last maximum is then the LOWER tied id, so the
+ // tie case must fail, deterministically.
++// LLAMA_DSPARK_PROBE_RED=1: the red probe (the pick over the K candidates only, the shortlist's): the probe case must
++// fail, deterministically (it reads "inside" and the shortlist's id).
+ #include "ggml.h"
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+ #include "ggml-cpu.h"
+ 
++#include "../src/llama-dspark-probe.h"
++
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdio>
+@@ -34,7 +42,7 @@ static bool g_red = false;
+ 
+ struct Run {
+     ggml_backend_t be;
+-    std::vector<int32_t> full, shortl, idx_row0;
++    std::vector<int32_t> full, shortl, idx_row0, probe, idx_all;
+ };
+ 
+ // one graph: n_rows independent rows (base [V, n], fold w2 [R, V], bias [V], markov m [R, n])
+@@ -54,7 +62,8 @@ static void run(ggml_backend_t be, int K, const std::vector<float> & base, const
+ 
+     ggml_context * cx = ggml_init(ip);
+     // full
+-    ggml_tensor * col = ggml_add(cx, tb, ggml_add(cx, ggml_mul_mat(cx, tw, tm), tbias));   // dflash's order: base + (w.m + b)
++    ggml_tensor * bias_f = ggml_add(cx, ggml_mul_mat(cx, tw, tm), tbias);
++    ggml_tensor * col = ggml_add(cx, tb, bias_f);   // dflash's order: base + (w.m + b)
+     col = ggml_scale(cx, ggml_tanh(cx, ggml_scale(cx, col, 1.0f / CAP)), CAP);
+     ggml_tensor * full = ggml_argmax(cx, col);
+     // short (as dflash.cpp's use_short branch, one block a row: n_blocks = n rows)
+@@ -74,9 +83,12 @@ static void run(ggml_backend_t be, int K, const std::vector<float> & base, const
+     colk = ggml_scale(cx, ggml_tanh(cx, ggml_scale(cx, colk, 1.0f / CAP)), CAP);
+     ggml_tensor * am = ggml_argmax(cx, colk);
+     ggml_tensor * tok = ggml_reshape_1d(cx, ggml_get_rows(cx, ggml_reshape_3d(cx, idx, 1, K, n), ggml_reshape_2d(cx, am, 1, n)), n);
+-    ggml_set_output(full); ggml_set_output(tok); ggml_set_output(idx);
++    // 0243: the probe as dflash.cpp builds it: the full step from the same correction, beside the shortlist's pick
++    ggml_tensor * probe = dspark_probe_full_pick(cx, tb, bias_f, CAP, tok);
++    ggml_set_output(full); ggml_set_output(tok); ggml_set_output(idx); ggml_set_output(probe);
+     ggml_cgraph * gf = ggml_new_graph_custom(cx, 256, false);
+     ggml_build_forward_expand(gf, full);
++    ggml_build_forward_expand(gf, probe);
+     ggml_build_forward_expand(gf, tok);
+     ggml_build_forward_expand(gf, idx);
+     ggml_gallocr_t ga = ggml_gallocr_new(ggml_backend_get_default_buffer_type(be));
+@@ -89,7 +101,9 @@ static void run(ggml_backend_t be, int K, const std::vector<float> & base, const
+     if (!alloc_ok || ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+         printf("SHORTLIST FAIL: the graph did not run\n"); g_fail = 1; return;
+     }
+-    out.full.resize(n); out.shortl.resize(n); out.idx_row0.resize(K);
++    out.full.resize(n); out.shortl.resize(n); out.idx_row0.resize(K); out.probe.resize(n); out.idx_all.resize((size_t) K * n);
++    ggml_backend_tensor_get(probe, out.probe.data(), 0, sizeof(int32_t) * n);
++    ggml_backend_tensor_get(idx, out.idx_all.data(), 0, sizeof(int32_t) * (size_t) K * n);
+     ggml_backend_tensor_get(full, out.full.data(), 0, sizeof(int32_t) * n);
+     ggml_backend_tensor_get(tok, out.shortl.data(), 0, sizeof(int32_t) * n);
+     ggml_backend_tensor_get(idx, out.idx_row0.data(), 0, sizeof(int32_t) * K);
+@@ -101,6 +115,14 @@ static void check(const char * name, bool ok, const std::string & why) {
+     if (!ok) g_fail = 1;
+ }
+ 
++// 0243: the probe's pick is the full chain's, row for row
++static std::string probe_vs_full(const Run & r) {
++    std::string why;
++    for (size_t i = 0; i < r.full.size(); ++i)
++        if (r.probe[i] != r.full[i]) why += " row " + std::to_string(i) + ": probe " + std::to_string(r.probe[i]) + " full " + std::to_string(r.full[i]);
++    return why;
++}
++
+ int main(int argc, char ** argv) {
+     g_red = getenv("DSPARK_SHORTLIST_RED") && atoi(getenv("DSPARK_SHORTLIST_RED")) == 1;
+     ggml_backend_t be = nullptr;
+@@ -111,7 +133,9 @@ int main(int argc, char ** argv) {
+     } else {
+         be = ggml_backend_cpu_init();
+     }
+-    printf("SHORTLIST backend %s%s\n", ggml_backend_name(be), g_red ? " -- RED: the candidates in descending id order, the position taken as is" : "");
++    const char * pr = getenv("LLAMA_DSPARK_PROBE_RED");
++    printf("SHORTLIST backend %s%s%s\n", ggml_backend_name(be), g_red ? " -- RED: the candidates in descending id order, the position taken as is" : "",
++           pr && atoi(pr) == 1 ? " -- PROBE RED: the probe's pick over the K candidates only" : "");
+     std::mt19937 rng(241);
+     std::normal_distribution<float> nd(0.0f, 1.0f);
+     const int n = 4;
+@@ -130,7 +154,8 @@ int main(int argc, char ** argv) {
+     run(be, V, bases, w2s, bs, m, n, r);
+     { bool ok = true; std::string why;
+       for (int i = 0; i < n; ++i) if (r.full[i] != r.shortl[i]) { ok = false; why += " row " + std::to_string(i) + ": " + std::to_string(r.full[i]) + " vs " + std::to_string(r.shortl[i]); }
+-      check("kv", ok, why); }
++      const std::string pw = probe_vs_full(r);
++      check("kv", ok && pw.empty(), why + pw); }
+     // k256: the full chain's winner forced into the base top-256 (a large base value at a random id)
+     V = 200058;
+     {
+@@ -139,7 +164,28 @@ int main(int argc, char ** argv) {
+         run(be, 256, bb, w2, b, m, n, r);
+         bool ok = true; std::string why;
+         for (int i = 0; i < n; ++i) if (r.full[i] != r.shortl[i]) { ok = false; why += " row " + std::to_string(i); }
+-        check("k256", ok, why);
++        const std::string pw = probe_vs_full(r);
++        check("k256", ok && pw.empty(), why + pw);
++    }
++    // probe (0243): the full chain's winner OUTSIDE the base top-256: id x with a low base value (-5, far under the
++    // top-256 cut of N(0, 3) rows at ~8) and a correction of +60 through its bias; softcapped it is ~28.5 against
++    // the rest's <= ~15: the full chain picks x, the shortlist (which never sees x) another id
++    {
++        std::vector<float> bb = base, bp = b;
++        const int32_t x = (int32_t) (rng() % V);
++        for (int i = 0; i < n; ++i) bb[(size_t) i * V + (size_t) x] = -5.0f;
++        bp[(size_t) x] = 60.0f;
++        run(be, 256, bb, w2, bp, m, n, r);
++        bool ok = true; std::string why;
++        for (int i = 0; i < n; ++i) {
++            const bool in = dspark_probe_inside(r.idx_all.data() + (size_t) i * 256, 256, r.probe[i]);
++            if (r.full[i] != x || r.probe[i] != x || r.shortl[i] == x || in) {
++                ok = false;
++                why += " row " + std::to_string(i) + ": full " + std::to_string(r.full[i]) + " probe " + std::to_string(r.probe[i]) +
++                       " short " + std::to_string(r.shortl[i]) + (in ? " inside" : " outside") + " (x " + std::to_string(x) + ")";
++            }
++        }
++        check("probe", ok, why);
+     }
+     // tie: K = V (1,000-wide rows); corrections zero, two equal base maxima: the higher id must win (id 7 in lane 7,
+     // id 300 in lane 44 of the next round of a 256-lane scan)
+@@ -152,7 +198,8 @@ int main(int argc, char ** argv) {
+         run(be, V, bb, z0, zb, m, n, r);
+         bool ok = true; std::string why;
+         for (int i = 0; i < n; ++i) if (r.shortl[i] != hi || r.full[i] != hi) { ok = false; why += " row " + std::to_string(i) + ": full " + std::to_string(r.full[i]) + " short " + std::to_string(r.shortl[i]); }
+-        check("tie", ok, why);
++        const std::string pw = probe_vs_full(r);
++        check("tie", ok && pw.empty(), why + pw);
+     }
+     // cut: K = 256 on 200,058-wide rows; 255 values above, then three equal values at ranks 256-258: ids 9, 120000 and 200057 tie;
+     // the ordered top-k takes the highest (200057) and returns ascending ids

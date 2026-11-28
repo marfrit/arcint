@@ -79,8 +79,8 @@ public:
         top_k_ = llama_model_dflash_selector_top_k(model);
         char meta[32] = {};
         if (top_k_ <= 0 || llama_model_meta_val_str(model, "lilicorr.candidate_topk", meta, sizeof(meta)) >= 0) {
-            err = "the drafter has no DFlash2 selector (a DFlash1, LiliCorr or DSpark drafter); "
-                  "--llama-dflash-gguf drives DFlash2";
+            err = "the drafter has no DFlash2 selector (a DFlash1, LiliCorr or DSpark drafter without a Markov "
+                  "context); --llama-dflash-gguf drives DFlash2 and Inkling 2's DSpark";
             return;
         }
         const int32_t* ids = llama_model_target_layer_ids(model);

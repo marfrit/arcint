@@ -1,0 +1,63 @@
+0214: Inkling 2 Mini's target taps for the DSpark drafter (llama.cpp PR #32218): the inputs of three layer visits and the final norm's output, taken after the norm in either form of the depth mix.
+
+diff --git a/src/models/inkling2-loop.cpp b/src/models/inkling2-loop.cpp
+index 83f12d3..086f5b7 100644
+--- a/src/models/inkling2-loop.cpp
++++ b/src/models/inkling2-loop.cpp
+@@ -80,7 +80,12 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
+ 
+     auto * cur = build_inputs();
+     std::vector<ggml_tensor *> blocks;
++
++    // DSpark target features are indexed by layer visit, not by cache slot
++    int visit = 0;
++
+     for (int il = 0; il < start; ++il) {
++        res->t_layer_inp[visit++] = cur;
+         cur = build_layer(il, il, cur, blocks);
+     }
+ 
+@@ -112,6 +117,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
+         }
+         for (int ip = start; ip < end; ++ip) {
+             const int il = pass == 0 ? ip : m.n_phys + (pass - 1)*(end - start) + (ip - start);
++            res->t_layer_inp[visit++] = cur;
+             if (pass == 0) {
+                 cur = build_layer(il, ip, cur, blocks);
+                 continue;
+@@ -122,7 +128,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
+     }
+ 
+     for (int il = end; il < m.n_phys; ++il) {
++        res->t_layer_inp[visit++] = cur;
+         cur = build_layer(il, il, cur, blocks);
+     }
++    GGML_ASSERT(visit == n_layer);
+     build_output(cur, blocks);
+ }
+diff --git a/src/models/inkling2.cpp b/src/models/inkling2.cpp
+index 723dd0f..2cef49a 100644
+--- a/src/models/inkling2.cpp
++++ b/src/models/inkling2.cpp
+@@ -629,6 +629,12 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
+         cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
+     }
+ 
++    // DSpark target features: the last one is the final norm output of every token, taken before
++    // inp_out_ids. With the folded depth mix that is the op's own output `om` ([n_embd, n_tokens, 1],
++    // the same bytes as the reshape the lm head reads): a reshape view marked as an output does not
++    // keep its source from being reused by ggml-alloc, the op's node does. Otherwise the norm node.
++    res->t_layer_inp[n_layer] = cur->view_src == om ? om : cur;
++
+     if (inp_out_ids) {
+         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
+     }
+@@ -658,6 +664,8 @@ llama_model_inkling2::graph::graph(const llm_graph_params & params) : llm_graph_
+ 
+     std::vector<ggml_tensor *> blocks;
+     for (int il = 0; il < n_layer; ++il) {
++        // DSpark target features: the partial block at the layer input
++        res->t_layer_inp[il] = cur;
+         cur = build_layer(il, il, cur, blocks);
+     }
+ 

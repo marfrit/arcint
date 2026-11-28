@@ -1,7 +1,9 @@
 // The libllama engine's speculative decoding behind a narrow interface: the
 // GGUF's MTP head drafting (llama.cpp's draft-mtp, rebuilt on libllama in
-// llama_spec.cpp) or a DFlash2 drafter (llama.cpp's draft-dflash, rebuilt in
-// llama_dflash.cpp), the target verifying.
+// llama_spec.cpp), a DFlash2 drafter (llama.cpp's draft-dflash, rebuilt in
+// llama_dflash.cpp) or Inkling 2's DSpark drafter (llama.cpp's draft-dspark
+// with #32218's Markov context, rebuilt in llama_dspark.cpp), the target
+// verifying.
 #pragma once
 
 #ifdef ARCINT_LLAMA
@@ -97,6 +99,9 @@ public:
     // context (its model's weights, KV and compute buffers, from llama_get_memory_breakdown)
     // and the MTP draft head's row buffer (allocated outside that breakdown). Null/0 when
     // this drafter has none.
+    // Failed restores of the drafter's state with a checkpoint, cumulative over every lane (the decode line's
+    // "dflash lane failures"): a drafter whose state did not come back drafts worse for the rest of the lane's life
+    virtual int state_failures() const { return 0; }
     virtual llama_context* draft_context() const { return nullptr; }
     virtual size_t draft_head_device_bytes() const { return 0; }
 
@@ -156,6 +161,33 @@ std::unique_ptr<LlamaSpec> make_llama_mtp(llama_model* model, llama_context* ctx
 std::unique_ptr<LlamaSpec> make_llama_dflash(llama_model* model_dft, llama_context* ctx_tgt, int& n_draft, int n_seq,
                                              int n_ubatch, int threads, double min_p, bool kv_unified,
                                              std::string& err);
+
+// True when model_dft is an Inkling 2 DSpark drafter (general.architecture "dflash"
+// with dflash.has_markov_context = true, tools/inkling2_dspark_to_gguf.py): the
+// backend then makes it with make_llama_dspark, not make_llama_dflash.
+bool llama_model_is_dspark_markov(const llama_model* model_dft);
+
+// model_dft: an Inkling 2 DSpark drafter (llama_model_is_dspark_markov), loaded
+// on the target's card; ctx_tgt: n_rs_seq >= n_draft, n_outputs_max_per_seq >=
+// 1 + n_draft. The draft context is llama.cpp's for draft-dspark: the target's
+// n_ctx and kv_unified (the global drafter layer attends the whole context, as
+// the vLLM-XPU reference sizes it), ctx_other = ctx_tgt (the target's
+// embeddings and LM head), f16 K/V, the windowed layers at window size. Every
+// draft is the trained block (8 rows), its Markov chain over the first n_draft
+// rows (contrib/llama.cpp 0218), the drafts their argmax (exec/dspark_ring.h).
+// n_draft: requested (--llama-dflash, 1..7, default 7 as the reference's
+// INKLING2_DRAFT_MAX), set to what the block allows (block_size - 1).
+// min_p: must be 0 (the drafter has no confidence head). n_ubatch: the draft
+// context's (--llama-dflash-ubatch), raised to a block a lane. Null with `err`
+// set when the GGUF is not an Inkling 2 DSpark drafter for this target or the
+// context cannot be made (a K/V type it cannot take included).
+// kv_k / kv_v: --llama-dflash-kv's types for the draft context ("f16" as trained, "q8_0", "q4_0" for V).
+// shortlist: --llama-dflash-shortlist's K (0: the full chain; patch 0241).
+// probe_path: --llama-dflash-shortlist-probe's log (empty: off; patch 0243), a line a verified draft.
+std::unique_ptr<LlamaSpec> make_llama_dspark(llama_model* model_dft, llama_context* ctx_tgt, int& n_draft, int n_seq,
+                                             int n_ubatch, int threads, double min_p, bool kv_unified,
+                                             const std::string& kv_k, const std::string& kv_v, int shortlist,
+                                             const std::string& probe_path, std::string& err);
 
 }  // namespace lgc
 

@@ -200,8 +200,9 @@ struct ModelStatus {
     // reference or bytes, which is why /props carries the count and
     // GET /v1/audio/voices the names.
     std::vector<std::string> voices;
-    bool        dflash_enabled = false;   // --llama-dflash-gguf: the DFlash2 drafter loaded
+    bool        dflash_enabled = false;   // --llama-dflash-gguf: the DFlash2 or DSpark drafter loaded
     int         dflash_drafts  = 0;       // its drafts a verify: --llama-dflash capped by its block
+    std::string dflash_kind;              // "dflash2" or "dspark" (Inkling 2's Markov drafter); empty when none
     uint64_t    weights_bytes = 0;
     // A Dory model (core/dory.h): the loop count and recurrent KV mode that serve, each with
     // where it came from, and the physical and executed layer counts. present is false for

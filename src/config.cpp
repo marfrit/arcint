@@ -382,16 +382,19 @@ std::string usage_text() {
         "  --llama-mtp-cost-seed LIST the round ms per width, one list a context\n"
         "                            bucket: \"T1,T2,..;T1,..;T1,..\" (needs\n"
         "                            --llama-mtp-policy cost)\n"
-        "  --llama-dflash-gguf FILE  draft with this DFlash2 drafter (llama.cpp's\n"
-        "                            'dflash' GGUF for the served model) instead of\n"
-        "                            an MTP head: one drafter pass proposes a block,\n"
+        "  --llama-dflash-gguf FILE  draft with this DFlash2 or Inkling 2 DSpark drafter\n"
+        "                            (llama.cpp's 'dflash' GGUF for the served model;\n"
+        "                            DSpark: tools/inkling2_dspark_to_gguf.py) instead\n"
+        "                            of an MTP head: one drafter pass proposes a block,\n"
         "                            verified in one pass (not with --llama-mtp, not\n"
         "                            under --llama-layer-split)\n"
-        "  --llama-dflash N          drafts a verify with the DFlash2 drafter (1-7,\n"
-        "                            default 7)\n"
+        "  --llama-dflash N          drafts a verify with the DFlash2 or DSpark drafter\n"
+        "                            (1-7, default 7)\n"
         "  --llama-dflash-min-p P    stop the DFlash2 block at a position whose pick\n"
         "                            has less than P of its candidates' softmax (0-1;\n"
-        "                            0 off: always --llama-dflash drafts)\n"
+        "                            0 off: always --llama-dflash drafts; DSpark: 0)\n"
+        "  --llama-dflash-kv K[:V]   the DSpark drafter context's K/V: f16 (default, as\n"
+        "                            trained), q8_0 or q8_0:q4_0 (DFlash2: f16 only)\n"
         "  --llama-dflash-ubatch N   the DFlash2 drafter's ubatch, 8-512 (default 64):\n"
         "                            its compute buffer holds N rows of logits\n"
         "  --llama-slot-loan MIB     lend the expert cache's tail layers' slots to a\n"
@@ -634,7 +637,7 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v)) return fail("--llama-mtp-cost-seed needs a cost table: \"T1,T2,..;T1,..;T1,..\"");
             cfg.llama_mtp_cost_seed = std::string(v);
         } else if (arg == "--llama-dflash-gguf") {
-            if (!value(v)) return fail("--llama-dflash-gguf needs a DFlash2 drafter GGUF");
+            if (!value(v)) return fail("--llama-dflash-gguf needs a DFlash2 or DSpark drafter GGUF");
             cfg.llama_dflash_gguf = std::string(v);
         } else if (arg == "--llama-dflash") {
             if (!value(v) || !parse_int(v, cfg.llama_dflash) || cfg.llama_dflash < 1 || cfg.llama_dflash > 7)
@@ -643,6 +646,27 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             if (!value(v) || !parse_double(v, cfg.llama_dflash_min_p) || cfg.llama_dflash_min_p < 0.0 ||
                 cfg.llama_dflash_min_p > 1.0)
                 return fail("--llama-dflash-min-p needs a probability from 0 to 1");
+        } else if (arg == "--llama-dflash-kv") {
+            if (!value(v)) return fail("--llama-dflash-kv needs K[:V] (f16, q8_0 or q8_0:q4_0)");
+            const std::string kv(v);
+            const size_t colon = kv.find(':');
+            cfg.llama_dflash_kv_k = kv.substr(0, colon);
+            cfg.llama_dflash_kv_v = colon == std::string::npos ? cfg.llama_dflash_kv_k : kv.substr(colon + 1);
+            // the pairs --llama-kv admits (the attention kernels' pairs); f16 is the drafter as trained
+            const std::string& k = cfg.llama_dflash_kv_k;
+            const std::string& vt = cfg.llama_dflash_kv_v;
+            if (!(k == vt && (k == "f16" || k == "q8_0")) && !(k == "q8_0" && vt == "q4_0"))
+                return fail("--llama-dflash-kv takes f16, q8_0 or q8_0:q4_0");
+        } else if (arg == "--llama-dflash-shortlist") {
+            // the reference's coding profile serves 256 (INKLING2_DSPARK_SHORTLIST); the ordered top-k sorts K <= 1024
+            if (!value(v) || !parse_int(v, cfg.llama_dflash_shortlist) || cfg.llama_dflash_shortlist < 1 ||
+                cfg.llama_dflash_shortlist > 1024)
+                return fail("--llama-dflash-shortlist needs a candidate count from 1 to 1024 (the reference serves 256)");
+        } else if (arg == "--llama-dflash-shortlist-probe") {
+            // patch 0243, a measurement aid: a JSON line a verified draft (tools/dspark_probe_read.py)
+            if (!value(v) || v.empty())
+                return fail("--llama-dflash-shortlist-probe needs a file to write");
+            cfg.llama_dflash_shortlist_probe = v;
         } else if (arg == "--llama-dflash-ubatch") {
             if (!value(v) || !parse_int(v, cfg.llama_dflash_ubatch) || cfg.llama_dflash_ubatch < 8 ||
                 cfg.llama_dflash_ubatch > 512)
@@ -1051,11 +1075,12 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
             !cfg.llama_mtp_gguf.empty() || cfg.llama_mtp_min_p > 0.0 || cfg.llama_mtp_policy ||
             !cfg.llama_mtp_cost_seed.empty() || cfg.llama_dflash_on() || cfg.llama_dflash > 0 ||
             cfg.llama_dflash_min_p > 0.0 || cfg.llama_dflash_ubatch > 0 ||
-            cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_swa_window || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
+            cfg.llama_dflash_kv_k != "f16" || cfg.llama_dflash_kv_v != "f16" || cfg.llama_dflash_shortlist > 0 ||
+            !cfg.llama_dflash_shortlist_probe.empty() || cfg.llama_kv_k != "f16" || cfg.llama_kv_v != "f16" || cfg.llama_swa_window || cfg.llama_checkpoints != 32 || cfg.llama_checkpoint_step != 8192 ||
             cfg.llama_expert_cache_on() || !cfg.llama_expert_profile.empty() || cfg.llama_layer_split > 0 || cfg.llama_mtp_card >= 0 ||
             cfg.llama_dory_loops > 0 || !cfg.llama_dory_kv.empty() || cfg.llama_dory_max_loops > 0 || cfg.llama_reserve_cells > 0 || cfg.tts || !cfg.tts_profiles.empty() || cfg.tts_lang != "de" ||
             cfg.tts_gen_device != "gpu" || !cfg.mmproj_path.empty())
-            return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch, "
+            return fail("--llama-cpu-moe, --llama-threads, --llama-mtp, --llama-mtp-vocab/-gguf/-min-p, --llama-dflash/-gguf/-min-p/-ubatch/-kv/-shortlist/-shortlist-probe, "
                         "--llama-kv, --llama-swa-window, --llama-checkpoints/-step, "
                         "--llama-expert-cache/-profile, --llama-layer-split, --llama-mtp-card, --llama-dory-loops/-kv/-max-loops, --llama-reserve-cells, --mmproj and --tts "
                         "(-profiles/-lang/-gen-device) are options of "
@@ -1105,8 +1130,14 @@ ArgParse parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.llama_dflash > 0 && !cfg.llama_dflash_on()) return fail("--llama-dflash needs --llama-dflash-gguf (the drafter)");
     if (cfg.llama_dflash_min_p > 0.0 && !cfg.llama_dflash_on())
         return fail("--llama-dflash-min-p needs --llama-dflash-gguf (the drafter)");
+    if ((cfg.llama_dflash_kv_k != "f16" || cfg.llama_dflash_kv_v != "f16") && !cfg.llama_dflash_on())
+        return fail("--llama-dflash-kv needs --llama-dflash-gguf (the drafter)");
     if (cfg.llama_dflash_ubatch > 0 && !cfg.llama_dflash_on())
         return fail("--llama-dflash-ubatch needs --llama-dflash-gguf (the drafter)");
+    if (cfg.llama_dflash_shortlist > 0 && !cfg.llama_dflash_on())
+        return fail("--llama-dflash-shortlist needs --llama-dflash-gguf (the drafter)");
+    if (!cfg.llama_dflash_shortlist_probe.empty() && !cfg.llama_dflash_on())
+        return fail("--llama-dflash-shortlist-probe needs --llama-dflash-gguf (the drafter)");
     if (cfg.llama_dflash_on() && (cfg.llama_mtp > 0 || !cfg.llama_mtp_vocab.empty() || !cfg.llama_mtp_gguf.empty() ||
                                   cfg.llama_mtp_min_p > 0.0 || cfg.llama_mtp_policy || !cfg.llama_mtp_cost_seed.empty()))
         return fail("--llama-dflash-gguf and --llama-mtp (-vocab, -gguf, -min-p) are exclusive: one drafter a context, "

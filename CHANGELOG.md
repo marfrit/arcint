@@ -58,6 +58,49 @@ point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
   that. Not measured: any card but the Arc Pro B60, any model but the dense 27B hybrid at these cache types. The units
   are unchanged.
 
+- **Inkling 2 Mini's DSpark drafter, opt-in** (`--llama-dflash-gguf` with a drafter converted by
+  `tools/inkling2_dspark_to_gguf.py`; patches 0214-0218 and 0240-0243, `src/exec/llama_dspark.cpp`; without the flag
+  nothing changes). The target's four taps feed the drafter after every decode; a draft is one decode of the trained
+  8-row block with the Markov chain over the first `--llama-dflash N` rows (1-7, default 7, the vLLM-XPU reference's);
+  the target verifies 1 + N rows (0226's loop controller covers 2-8) and rolls back through its recurrent snapshots
+  (0217). Lossless: greedy drafts, every verified row drawn with the request's own sampler (the argument and the
+  deviations from the reference in the patch README, "0218 and the arcint DSpark driver"). The load refuses a target
+  that is not Inkling 2; a drafter state that does not come back with a checkpoint is warned and counted ("dflash lane
+  failures" on the decode line). `--llama-dflash-kv` sets the drafter context's K/V (f16 as trained, q8_0,
+  q8_0:q4_0); `/props` `dflash.kind` names the driver (`"dflash2"` on a DFlash2 unit too).
+  With no DSpark flag set, three things change all the same: OpenCL takes any F32 ARGMAX node (0240, exact: ggml's CPU
+  tie rule; no graph arcint serves has one today, the first upstream path it moves is mtmd's mimo-audio;
+  `GGML_OPENCL_ARGMAX=0` leaves it to the CPU), `/props` carries `dflash.kind`, and the
+  speculative path takes one more lock a request.
+  - **`--llama-dflash-shortlist K`** (patch 0241, opt-in, 1-1024): the Markov chain over each draft row's K best base
+    logits instead of the whole vocabulary, as the reference's coding profile (K = 256), and the drafter's graph
+    returns the drafted ids instead of the block's logits. New op variant `ggml_top_k_ordered` (ties at the cut to
+    the higher index, ascending output; CPU and OpenCL). Before it, 37.7 of the 42.1 ms device propose (width 7,
+    depth 0) was the vocabulary-wide chain.
+  - **OpenCL ARGMAX** (patches 0240, 0242; on once applied, `GGML_OPENCL_ARGMAX=0` leaves it to the CPU): one
+    work-group a row, ggml's CPU tie rule (the last maximum); the driver's host pick takes the same rule. With the
+    converter's F32 `markov_w1` (now its default, `--markov-w1`; exact, 204,859,392 B), which OpenCL's GET_ROWS takes,
+    the Markov chain has no CPU island left (before: 8 CPU splits a block graph). A drafter converted before needs
+    `--markov-w1 f32`.
+  - **`--llama-dflash-shortlist-probe FILE`** (patch 0243, a measurement aid, off by default): a JSON line a verified
+    draft, with the full chain's pick at each position on the same state and whether it was among the K candidates;
+    `tools/dspark_probe_read.py` predicts the shortlist's accept loss from it and reads it against the measured loss
+    (a pre-registered rule it prints). It puts the full chain's cost back into
+    every propose: never a timing run.
+  - **Runs** (the Arc Pro B60 capped at 165 W, Inkling 2 Mini IQ4_NL at q8_0:q4_0 K/V, width 3, the F32 `markov_w1`,
+    the unit's sampler, 768-token code continuations; `measured-here`):
+    - against DSpark off, paired (10 pairs a depth), K = 256: +16.9 % t/s at depth 0 (42.03 -> 49.12), +21.4 % at
+      32,768 (31.30 -> 38.02), +13.6 % at 77,000 (27.74 -> 31.51), each more than 2 SE;
+    - the shortlist's accept price at depth 0 against width 3 without it: 48.6 % against 55.7 % (-7.1 points, SE_d
+      3.9); the probe predicts 4.9 points from the positions outside the top 256, with no divergence inside it (so
+      no gather defect); the rest of the gap is open, most likely the estimate of the accepts after a hit. The reference's own width-3 accept with its shortlist is 50.2 % (its notes, `paper`);
+    - K at depth 0: 128 / 256 / 512 accept 48.7 / 49.6 / 51.6 %, 48.6 / 51.3 / 52.7 t/s;
+    - an earlier run: width 3 with K = 256 against width 3 without the shortlist, 49.2 against 37.2 t/s (+32.5 %);
+      accept a round 32.6-37.5 % at width 7, 49.4-55.7 % at width 3 without the shortlist;
+    - the capital right in every arm. Owed: the KL gate against the CPU base, width 5 against 7.
+  - The F32 `markov_w1` (204,859,392 B, 195 MiB) lives in VRAM. Not measured: any card but the Arc Pro B60, any target
+    but Inkling 2 Mini. The units are unchanged.
+
 ## 1.8.3 — 2026-11-27
 
 Inkling 2 Mini's release on 1.8.2: context checkpoints come back at q8_0 / q4_0 K/V on OpenCL (patch 0209 performs

@@ -399,8 +399,27 @@ TEST(props_reports_the_dflash_drafter) {
         CHECK_EQ(j.at("dflash").at("requested").get<std::string>(), std::string("on"));
         CHECK(j.at("dflash").at("enabled").get<bool>());
         CHECK_EQ(j.at("dflash").at("drafts").get<int>(), 5);   // what is served, not the flag
+        CHECK(j.at("dflash").at("kind").is_null());              // the backend named no driver
         CHECK_EQ(j.at("mtp").at("requested").get<std::string>(), std::string("off"));
         CHECK(!j.at("mtp").at("enabled").get<bool>());
+    }
+    {
+        // which driver serves the GGUF: Inkling 2's DSpark (dflash.has_markov_context) or DFlash2
+        for (const char* kind : {"dspark", "dflash2"}) {
+            Config cfg;
+            cfg.llama_dflash_gguf = "/m/d.gguf";
+            cfg.llama_dflash      = 7;
+            FakeBackend backend;
+            backend.st.loaded         = true;
+            backend.st.dflash_enabled = true;
+            backend.st.dflash_drafts  = 7;
+            backend.st.dflash_kind    = kind;
+            SlotPool slots(1);
+            Context  ctx{&cfg, &backend, &slots};
+            const nlohmann::json j = lgc::api::props(ctx);
+            CHECK_EQ(j.at("dflash").at("kind").get<std::string>(), std::string(kind));
+            CHECK_EQ(j.at("dflash").at("drafts").get<int>(), 7);
+        }
     }
     {
         // requested but not (yet) loaded: no count to report

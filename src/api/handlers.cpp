@@ -569,7 +569,9 @@ json props(const Context& ctx) {
         {"dflash", {{"requested", std::string(cfg.llama_dflash_on() ? "on" : "off")},
                     {"enabled", st.dflash_enabled},
                     // the drafter's own count: --llama-dflash capped by its trained block
-                    {"drafts", st.dflash_drafts > 0 ? json(st.dflash_drafts) : json(nullptr)}}},
+                    {"drafts", st.dflash_drafts > 0 ? json(st.dflash_drafts) : json(nullptr)},
+                    // which driver serves the GGUF: "dflash2", or "dspark" for Inkling 2's Markov drafter
+                    {"kind", st.dflash_kind.empty() ? json(nullptr) : json(st.dflash_kind)}}},
         // A Dory model (looped nGPT, core/dory.h): the loop count and the recurrent KV mode that SERVE,
         // each with where it came from ("flag", "gguf", or "default" for an absent key), and the
         // physical block count against the layers executed (model.n_layer is the weights' count).

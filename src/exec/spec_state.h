@@ -20,6 +20,9 @@ namespace lgc {
 enum class SpecStateKind : uint32_t {
     MtpRow       = 1,   // the MTP drafter's carried hidden row (floats)
     DflashWindow = 2,   // the DFlash2 drafter's sliding-window K/V (llama_state_seq_get_data_ext, PARTIAL_ONLY)
+    // the DSpark drafter's: [u64 window bytes][its windowed layers' K/V, PARTIAL_ONLY][the Markov
+    // context ring's rows before n_tokens, exec/dspark_ring.h DsparkRing::save]
+    DsparkWindowRing = 3,
 };
 
 constexpr uint32_t kSpecStateMagic  = 0x53505341;   // "ASPS"

@@ -490,6 +490,75 @@ TEST(config_llama_cpu_moe_and_threads) {
     }
 }
 
+// --llama-dflash-kv: the drafter context's K/V type (f16 as trained, q8_0, q8_0:q4_0: the pairs the attention kernels
+// take, as --llama-kv); anything else, or the flag without a drafter, is refused
+TEST(config_llama_dflash_shortlist) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_shortlist, 0);   // off: the full chain
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-shortlist", "256"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_shortlist, 256);
+    }
+    for (const char* bad : {"0", "1025", "-1", "x", ""})
+        CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-shortlist", bad}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-shortlist", "256"}));   // no drafter
+    CHECK(rejected({"--stub", "--llama-dflash-shortlist", "256"}));
+}
+
+// --llama-dflash-shortlist-probe FILE (0243): off by default; a file with the drafter, with or without the shortlist
+// (the run without it gives the per-position rates); refused without a drafter, empty, or with --stub
+TEST(config_llama_dflash_shortlist_probe) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf"}, cfg).ok);
+        CHECK(cfg.llama_dflash_shortlist_probe.empty());   // off
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-shortlist", "256",
+                   "--llama-dflash-shortlist-probe", "/tmp/p.jsonl"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_shortlist_probe, std::string("/tmp/p.jsonl"));
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-shortlist-probe", "/tmp/o.jsonl"},
+                  cfg).ok);   // without the shortlist: the drafts and kept counts
+        CHECK_EQ(cfg.llama_dflash_shortlist_probe, std::string("/tmp/o.jsonl"));
+    }
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-shortlist-probe", ""}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-shortlist-probe", "/tmp/p.jsonl"}));   // no drafter
+    CHECK(rejected({"--stub", "--llama-dflash-shortlist-probe", "/tmp/p.jsonl"}));
+}
+
+TEST(config_llama_dflash_kv) {
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_kv_k, std::string("f16"));   // the drafter as trained
+        CHECK_EQ(cfg.llama_dflash_kv_v, std::string("f16"));
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-kv", "q8_0"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_kv_k, std::string("q8_0"));
+        CHECK_EQ(cfg.llama_dflash_kv_v, std::string("q8_0"));
+    }
+    {
+        Config cfg;
+        CHECK(run({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-kv", "q8_0:q4_0"}, cfg).ok);
+        CHECK_EQ(cfg.llama_dflash_kv_k, std::string("q8_0"));
+        CHECK_EQ(cfg.llama_dflash_kv_v, std::string("q4_0"));
+    }
+    for (const char* bad : {"q4_0", "bf16", "f16:q4_0", "q4_0:q8_0", "q8_0:f16", ""})
+        CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-gguf", "/m/d.gguf", "--llama-dflash-kv", bad}));
+    CHECK(rejected({"--gguf", "/m/q.gguf", "--llama-dflash-kv", "q8_0"}));   // no drafter
+    CHECK(rejected({"--stub", "--llama-dflash-kv", "q8_0"}));
+}
+
 // --llama-dflash-gguf / --llama-dflash / --llama-dflash-min-p: the DFlash2
 // drafter (docs/campaigns/dflash2-agent.md). One drafter a context, one card.
 TEST(config_llama_dflash) {
