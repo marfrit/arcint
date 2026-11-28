@@ -1,0 +1,108 @@
+0230: set_tensor refuses a partial write into a q8_0 / q4_0 tensor instead of converting the whole tensor from it (the conversion read past the caller's data); whole writes and 0209's plain copy are unchanged.
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-soa-route.h b/ggml/src/ggml-opencl/ggml-opencl-soa-route.h
+new file mode 100644
+index 0000000..b72557c
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-soa-route.h
+@@ -0,0 +1,25 @@
++// ggml-opencl-soa-route.h - 0230: which way set_tensor takes a write that reaches the q8_0 / q4_0 split conversion
++// (after 0209's plain copy has taken the non-weights writes into a tensor that is not split). The conversion uploads
++// the WHOLE tensor from the caller's data, so only a whole write of a whole, contiguous base may take it; a view
++// keeps 0209's refusal, and a partial write (offset != 0 or size != the tensor's bytes) is refused too: it read past
++// the caller's data and re-cut the split layout. A pure function (CPU-testable).
++#pragma once
++
++#include <cstddef>
++
++enum ggml_cl_soa_route {
++    GGML_CL_SOA_CONVERT        = 0,   // a whole write of a whole, contiguous base: convert (today's path)
++    GGML_CL_SOA_REFUSE_VIEW    = 1,   // a view or a non-contiguous tensor: 0209's WARN, not performed
++    GGML_CL_SOA_REFUSE_PARTIAL = 2,   // 0230: a partial write: WARN, not performed
++};
++
++static inline ggml_cl_soa_route ggml_cl_soa_write_route(bool view_or_noncontiguous, size_t offset, size_t size,
++                                                        size_t nbytes) {
++    if (view_or_noncontiguous) return GGML_CL_SOA_REFUSE_VIEW;
++#ifndef GGML_CL_SOA_ROUTE_RED
++    if (offset != 0 || size != nbytes) return GGML_CL_SOA_REFUSE_PARTIAL;
++#else
++    (void) offset; (void) size; (void) nbytes;   // the red build: today's routing, a partial write converts
++#endif
++    return GGML_CL_SOA_CONVERT;
++}
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index 12edaf8..b20b345 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -18,6 +18,7 @@
+ #include "ggml-opencl-cpy-t01.h"
+ #include "ggml-opencl-q8-2d.h"   // 0220: the dense Q8_0 2D GEMM's gate and launch shape, pure
+ #include "ggml-opencl-gdn-shape.h"   // 0228: the Intel GDN kernel's shape check, pure (CPU-testable)
++#include "ggml-opencl-soa-route.h"   // 0230: the split conversion's write route, pure (CPU-testable)
+ #include <cstdarg>
+ #include <cstdio>
+ #include "ggml-backend-impl.h"
+@@ -15663,6 +15664,22 @@ static void ggml_cl_warn_view_write_dropped(const ggml_tensor * tensor, ggml_bac
+                   ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? "weights" : "non-weights");
+ }
+ 
++// 0230: a partial write that reached the q8_0 / q4_0 split conversion is refused (the conversion uploads the whole
++// tensor from `data` and would read past it); once per process and type, so a path that lands here shows in the log.
++static void ggml_cl_warn_partial_write_refused(const ggml_tensor * tensor, ggml_backend_buffer_t buffer, size_t offset,
++                                               size_t size) {
++    static std::atomic<bool> warned_q8_0{false};
++    static std::atomic<bool> warned_q4_0{false};
++    std::atomic<bool> & warned = tensor->type == GGML_TYPE_Q8_0 ? warned_q8_0 : warned_q4_0;
++    if (warned.exchange(true)) {
++        return;
++    }
++    GGML_LOG_WARN("ggml_opencl: set_tensor: a partial write into a q8_0/q4_0 tensor was refused, not converted "
++                  "(tensor '%s', type %s, offset %zu, size %zu of %zu, %s buffer); logged once per process and type\n",
++                  tensor->name, ggml_type_name(tensor->type), offset, size, ggml_nbytes(tensor),
++                  ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ? "weights" : "non-weights");
++}
++
+ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+     if (((ggml_backend_opencl_buffer_context *) buffer->context)->usm) {
+         ggml_cl_usm_set_tensor((ggml_backend_opencl_buffer_context *) buffer->context, tensor, data, offset, size);
+@@ -15798,11 +15815,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+     // buffers for quantized bits and scales, which are then populated by the
+     // conversion kernel.
+     if (tensor->type == GGML_TYPE_Q4_0) {
+-        // Views can't SoA-ify here — parent owns the layout (see q8_0 guard).
+-        if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
++        // Views can't SoA-ify here — parent owns the layout (see q8_0 guard). 0230: nor can a partial write.
++        const ggml_cl_soa_route route = ggml_cl_soa_write_route(tensor->view_src != nullptr || !ggml_is_contiguous(tensor),
++                                                                offset, size, ggml_nbytes(tensor));
++        if (route == GGML_CL_SOA_REFUSE_VIEW) {
+             ggml_cl_warn_view_write_dropped(tensor, buffer);   // 0209: never silent
+             return;
+         }
++        if (route == GGML_CL_SOA_REFUSE_PARTIAL) {
++            ggml_cl_warn_partial_write_refused(tensor, buffer, offset, size);   // 0230
++            return;
++        }
+         // Tensors should have been preallocated, therefore they should
+         // already have ggml_tensor_extra_cl as extra.
+         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
+@@ -16535,11 +16558,17 @@ static void ggml_backend_opencl_buffer_set_tensor(ggml_backend_buffer_t buffer,
+         return;
+     }
+     if (tensor->type == GGML_TYPE_Q8_0) {
+-        // Views share the parent's buffer; parent owns SoA conversion.
+-        if (tensor->view_src != nullptr || !ggml_is_contiguous(tensor)) {
++        // Views share the parent's buffer; parent owns SoA conversion. 0230: a partial write is refused.
++        const ggml_cl_soa_route route = ggml_cl_soa_write_route(tensor->view_src != nullptr || !ggml_is_contiguous(tensor),
++                                                                offset, size, ggml_nbytes(tensor));
++        if (route == GGML_CL_SOA_REFUSE_VIEW) {
+             ggml_cl_warn_view_write_dropped(tensor, buffer);   // 0209: never silent
+             return;
+         }
++        if (route == GGML_CL_SOA_REFUSE_PARTIAL) {
++            ggml_cl_warn_partial_write_refused(tensor, buffer, offset, size);   // 0230
++            return;
++        }
+ 
+         ggml_tensor_extra_cl * extra_orig = (ggml_tensor_extra_cl *)tensor->extra;
+         GGML_ASSERT(extra_orig && "Tesnors in OpenCL backend should have been allocated and initialized");

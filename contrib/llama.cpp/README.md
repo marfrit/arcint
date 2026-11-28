@@ -13376,3 +13376,17 @@ local block read's pointer to be 16-byte aligned (its section 6.13.X.1; a global
 (B60: 4, 4, 32, 8; A770: 2, 2, 64, 16) are aligned and unchanged; the kernel is unchanged.
 Tests (`contrib/refkernels/gdn-intel/gdn_shape_test.cpp`, CPU): 13 cases; green rc 0 (13 of 13); the red build
 `-DGGML_CL_GDN_SHAPE_RED_NO_ALIGN` rc 1 (2 of 13 failing, cases 3 and 6). Not run on a card here.
+
+## 0230-opencl-soa-partial-write-refused.patch
+
+A write into a q8_0 / q4_0 tensor on OpenCL that is not a view and that 0209's plain copy does not take (a weights
+tensor, or a non-weights tensor already in the split layout) goes to the split conversion, which uploads the whole
+tensor from the caller's data. A partial write there (offset not 0, or fewer bytes than the tensor) read past the
+caller's data and re-cut the split layout. It is now refused with a WARN, once per process and type
+(`ggml_cl_soa_write_route`, ggml-opencl-soa-route.h, pure); a whole write converts as before, a view keeps 0209's
+WARN. What is split stays as it was: a whole write of a q8_0 / q4_0 tensor converts it, in any buffer; a range or a
+view written into a tensor already split is refused, not written (writing it into the split planes is owed).
+Tests (`contrib/refkernels/soa-route/soa_route_test.cpp`, CPU): green `SOA ROUTE: 8 of 8 cases right`, rc 0, no
+compiler warning; the red build `-DGGML_CL_SOA_ROUTE_RED` (today's routing) `SOA ROUTE: 4 of 8 cases right`, rc 1,
+its four failures cases 4, 5, 6 and 8 (the short write, the offset-to-the-end write, the row range, the q4_0 short
+write), each read as CONVERT where it must be REFUSE_PARTIAL. Not run on a card here.
