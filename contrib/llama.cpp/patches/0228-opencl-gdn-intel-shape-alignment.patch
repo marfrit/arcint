@@ -1,0 +1,55 @@
+0228: the Intel gated delta-net kernel refuses a shape whose second local chunk buffer is not 16-byte aligned (GGML_OPENCL_GDN_INTEL overrides only; the default shapes are unchanged).
+
+diff --git a/ggml/src/ggml-opencl/ggml-opencl-gdn-shape.h b/ggml/src/ggml-opencl/ggml-opencl-gdn-shape.h
+new file mode 100644
+index 0000000..eab327f
+--- /dev/null
++++ b/ggml/src/ggml-opencl/ggml-opencl-gdn-shape.h
+@@ -0,0 +1,22 @@
++// ggml-opencl-gdn-shape.h - 0228: the shape check of gated_delta_net_intel.cl, a pure function (CPU-testable).
++// A shape is (r_tg, r_pp, nsg, tc): rows per sub-group for one token and for a prompt, sub-groups per prompt
++// work-group, tokens per staged chunk. The prompt kernel stages two chunks in local float buf[2][CH_FLOATS],
++// CH_FLOATS = tc * (2 * S_V + nsg * r_pp + 2) with S_V = 128, and reads both with 16-byte sub-group block reads:
++// buf[1] starts 4 * CH_FLOATS bytes in, so CH_FLOATS % 4 == 0 is required (else buf[1] is 8 bytes off 16).
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++static inline bool ggml_cl_gdn_intel_shape_ok(int r_tg, int r_pp, int nsg, int tc, int sg, size_t max_wg_size,
++                                              uint64_t local_mem) {
++    const auto fits = [&](int r) { return r > 0 && 128 % r == 0 && r <= sg; };
++    if (!(fits(r_tg) && fits(r_pp) && nsg > 0 && tc > 0 && 128 % (r_pp * nsg) == 0)) return false;
++    if ((size_t)nsg * sg > max_wg_size) return false;
++    const uint64_t ch_floats = (uint64_t)tc * (2 * 128 + (uint64_t)nsg * r_pp + 2);
++    if ((uint64_t)2 * ch_floats * sizeof(float) > local_mem) return false;
++#ifndef GGML_CL_GDN_SHAPE_RED_NO_ALIGN
++    if (ch_floats % 4 != 0) return false;   // buf[1] on a 16-byte boundary
++#endif
++    return true;
++}
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index b69f926..12edaf8 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -17,6 +17,7 @@
+ #include "ggml-opencl-fa-bias-route.h"   // 0212: the indexed-bias decode route, a pure function (CPU-testable)
+ #include "ggml-opencl-cpy-t01.h"
+ #include "ggml-opencl-q8-2d.h"   // 0220: the dense Q8_0 2D GEMM's gate and launch shape, pure
++#include "ggml-opencl-gdn-shape.h"   // 0228: the Intel GDN kernel's shape check, pure (CPU-testable)
+ #include <cstdarg>
+ #include <cstdio>
+ #include "ggml-backend-impl.h"
+@@ -5609,10 +5610,8 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
+         }
+         cl_ulong local_mem = 0;
+         clGetDeviceInfo(backend_ctx->device, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(local_mem), &local_mem, NULL);
+-        const auto fits = [&](int r) { return r > 0 && 128 % r == 0 && r <= sg; };
+-        const bool shape_ok = fits(r_tg) && fits(r_pp) && nsg > 0 && tc > 0 && 128 % (r_pp * nsg) == 0 &&
+-                              (size_t)nsg * sg <= backend_ctx->max_workgroup_size &&
+-                              (cl_ulong)2 * tc * (2 * 128 + nsg * r_pp + 2) * sizeof(float) <= local_mem;
++        const bool shape_ok = ggml_cl_gdn_intel_shape_ok(r_tg, r_pp, nsg, tc, sg, backend_ctx->max_workgroup_size,
++                                                         (uint64_t)local_mem);
+         if (on && !shape_ok) {
+             GGML_LOG_WARN("ggml_opencl: GGML_OPENCL_GDN_INTEL=%s ignored (shape does not fit the device)\n", gdn_env);
+             defaults();

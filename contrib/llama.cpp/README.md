@@ -13364,3 +13364,15 @@ no draft without a probe, no line lost; tripwire 0, inside_loss 0.00; 12.4 % of 
 against the measured 7.09 (SE_d 3.90): GREEN, inside a band of 7.80 points that the measured side's spread sets; the
 prediction sits under every measured view (7.09 paired, 6.96 pooled, 9.08 between the two probe runs). Not read: the
 accepts after a counterfactual hit come from the run-without's per-position rates, and the positions after the round.
+
+## 0228-opencl-gdn-intel-shape-alignment.patch
+
+The Intel gated delta-net prompt kernel stages two token chunks in one local array and reads both with 16-byte
+sub-group block reads; the second chunk starts 4 x CH_FLOATS bytes in (CH_FLOATS = TC x (2 x 128 + NSG x R + 2)),
+so an override `GGML_OPENCL_GDN_INTEL=r_tg,r_pp,nsg,tc` with CH_FLOATS not a multiple of 4 (for example TC 7 with
+NSG x R = 128) read 8 bytes off a 16-byte boundary, where cl_intel_subgroup_local_block_io requires a
+local block read's pointer to be 16-byte aligned (its section 6.13.X.1; a global block read needs 4). The shape check is now `ggml_cl_gdn_intel_shape_ok`
+(ggml-opencl-gdn-shape.h, pure) and refuses such a shape: the existing warning, then the defaults. The default shapes
+(B60: 4, 4, 32, 8; A770: 2, 2, 64, 16) are aligned and unchanged; the kernel is unchanged.
+Tests (`contrib/refkernels/gdn-intel/gdn_shape_test.cpp`, CPU): 13 cases; green rc 0 (13 of 13); the red build
+`-DGGML_CL_GDN_SHAPE_RED_NO_ALIGN` rc 1 (2 of 13 failing, cases 3 and 6). Not run on a card here.
