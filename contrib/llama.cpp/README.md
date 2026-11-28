@@ -12367,11 +12367,15 @@ too and dispatches the case.
 - **The case:** `src0` Q8_0 SoA, `src1` F32, one column, contiguous, no view offset, Intel; the activation is
   the K-quant matvecs' two-term q8_1 (`ggml_cl_kq_quantize_src1`), cached a graph per src1. A KV cache's Q8_0
   is not SoA and declines; from two columns 0115's paths take the product.
-- **Kill switch:** `GGML_OPENCL_Q80_INT8=0` keeps the float kernel; unset or `auto` keeps the route on.
-- **Measured** (`measured-here`, one B70 at 220 W, Inkling 2 Mini IQ4_NL, the same tree with the switch on and
-  off): `tg128` 30.93 against 30.19 t/s at depth 0, 31.61 against 30.58 at 4,096, 30.69 against 29.41 at
-  32,768; prompt (`pp512`) unchanged within noise. In the profiling build the product was 5.2 ms of 21.6 ms
-  of device time a token across 356 launches. The kernel sits at the memory roofline, which is why the gain is
-  small.
-- **Not run on a card against this series:** the rebased patch is compile-checked against the pin plus the
-  series (`ggml-opencl` target); the card rows (tg at 0 / 4,096 / 32,768 and KL against the CPU) are owed.
+- **Opt-in:** `GGML_OPENCL_Q80_INT8=1` uses the int8 dot; unset or `0` keeps the float kernel. Default-off,
+  because the rebased card rows below regress at shallow depth.
+- **Measured on 1.8.0** (`measured-here`, one B70 at 220 W, Inkling 2 Mini IQ4_NL, the same tree with the
+  switch on and off): `tg128` 30.93 against 30.19 t/s at depth 0, 31.61 against 30.58 at 4,096, 30.69 against
+  29.41 at 32,768; `pp512` unchanged within noise. In the profiling build the product was 5.2 ms of 21.6 ms of
+  device time a token across 356 launches.
+- **Measured on the 1.8.3 series** (one B70, same model, full GPU offload, 3 reps at 0 / 4,096, 1 at 32,768):
+  `tg128` **35.86 ± 0.44 against 37.68 ± 0.11 t/s at depth 0** (the route is 4.8 % slower), 36.33 ± 0.35
+  against 36.80 ± 0.76 at 4,096, 36.22 against 35.51 at 32,768; `pp512` 1138.76 against 1140.81. The series'
+  own host-side work has closed the gap the int8 dot used to win back at one column.
+- **Not run:** KL against the CPU, argmax agreement and the quality battery; the route's default-off state
+  stands until they are measured.
