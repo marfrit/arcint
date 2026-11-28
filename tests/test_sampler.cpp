@@ -304,7 +304,7 @@ namespace {
 // The mask's ids for a test: stand-in ids for the two specials, and the tags
 // exactly as the reasoning table spells them.
 ThinkBlockIds table_ids() {
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     ThinkBlockIds t;
     t.eog        = {0};      // stands in for the turn-ending id
     t.open_ids   = {1};      // stands in for the block's opener id
@@ -350,7 +350,7 @@ TEST(sampler_mask_on_blocks_a_second_opener_while_open) {
 }
 
 TEST(sampler_mask_clears_once_the_closer_has_been_emitted) {
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     Sampler     s(masked_params(true), 1);
     s.start_in_think_block(true);
     s.observe_think_text("some reasoning");
@@ -362,7 +362,7 @@ TEST(sampler_mask_clears_once_the_closer_has_been_emitted) {
 TEST(sampler_mask_engages_when_the_model_opens_the_block_itself) {
     // The template did not open it; the model's own opener, at the lead of the
     // generation, engages the mask.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     Sampler     s(masked_params(true), 1);
     s.start_in_think_block(false);
     CHECK_EQ(s.sample(eog_first().data(), 4), 0);            // not open: allowed
@@ -373,7 +373,7 @@ TEST(sampler_mask_engages_when_the_model_opens_the_block_itself) {
 TEST(sampler_mask_ignores_an_opener_that_is_not_at_the_lead) {
     // Mirrors split_reasoning: only an opener at the very start opens a block.
     // An answer that quotes a tag later must still be able to end normally.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     Sampler     s(masked_params(true), 1);
     s.start_in_think_block(false);
     s.observe_think_text("the template writes " + pairs[0].first + " first");
@@ -384,7 +384,7 @@ TEST(sampler_mask_off_is_the_old_behaviour_even_with_the_ids_set) {
     auto    l = eog_first();
     Sampler s(masked_params(false), 1);
     s.start_in_think_block(true);
-    s.observe_think_text(think_tag_pairs(false)[0].first);
+    s.observe_think_text(think_tag_pairs(ChatDialect::Qwen)[0].first);
     CHECK_EQ(s.sample(l.data(), l.size()), 0);
 }
 
@@ -427,7 +427,7 @@ TEST(sampler_mask_covers_the_client_stop_ids_too) {
     // and once the block has closed the stop id is offered again: the mask
     // holds it back only while the block is open, exactly as the stop check
     // ends the turn only when it comes.
-    s.observe_think_text(think_tag_pairs(false)[0].second);
+    s.observe_think_text(think_tag_pairs(ChatDialect::Qwen)[0].second);
     auto l2 = logits({3.5f, 3.4f, 1.0f, 4.5f});
     CHECK_EQ(s.sample(l2.data(), l2.size()), 3);
 }
@@ -453,7 +453,7 @@ TEST(sampler_mask_honours_ignore_eos_like_the_stop_check) {
 TEST(sampler_mask_notices_a_closer_split_across_pieces) {
     // Cut from the table's own string, never written out here: a closer that
     // straddles two emitted pieces still clears the mask.
-    const std::string closer = think_tag_pairs(false)[0].second;
+    const std::string closer = think_tag_pairs(ChatDialect::Qwen)[0].second;
     const size_t      cut    = closer.size() / 2;
     Sampler           s(masked_params(true), 1);
     s.start_in_think_block(true);
@@ -466,7 +466,7 @@ TEST(sampler_mask_notices_a_closer_split_across_pieces) {
 TEST(sampler_mask_notices_a_closer_inside_one_long_piece) {
     // The tail kept for the straddle is never shorter than the piece just
     // appended: a closer that lands wholly inside a long piece is still seen.
-    const std::string closer = think_tag_pairs(false)[0].second;
+    const std::string closer = think_tag_pairs(ChatDialect::Qwen)[0].second;
     Sampler           s(masked_params(true), 1);
     s.start_in_think_block(true);
     s.observe_think_text(std::string(closer.size() * 3, 'x') + closer + std::string(closer.size() * 3, 'y'));
@@ -478,7 +478,7 @@ TEST(sampler_mask_engages_on_an_opener_split_across_pieces) {
     // -- it could still grow into an opener, so the state stays undecided and
     // the mask does not engage yet (engaging on a partial match is what
     // stranded a diverging lead at the length cap). The full match engages.
-    const std::string opener = think_tag_pairs(false)[0].first;
+    const std::string opener = think_tag_pairs(ChatDialect::Qwen)[0].first;
     const size_t      cut    = opener.size() / 2;
     Sampler           s(masked_params(true), 1);
     s.start_in_think_block(false);
@@ -497,7 +497,7 @@ TEST(sampler_mask_a_looming_lead_that_diverges_stays_undecided) {
     // and the turn runs to the length cap. While the lead only looms the
     // state must stay undecided; on divergence it settles to content and the
     // turn may end.
-    const auto&      pairs  = think_tag_pairs(false);
+    const auto&      pairs  = think_tag_pairs(ChatDialect::Qwen);
     const std::string opener = pairs[0].first;
     Sampler          s(masked_params(true), 1);
     s.start_in_think_block(false);
@@ -514,7 +514,7 @@ TEST(sampler_mask_a_looming_lead_that_diverges_stays_undecided) {
 TEST(sampler_mask_lets_go_when_the_lead_is_plainly_not_an_opener) {
     // The other side of the same rule: an answer that starts as content is not
     // held back for the length of a tag.
-    const std::string opener = think_tag_pairs(false)[0].first;
+    const std::string opener = think_tag_pairs(ChatDialect::Qwen)[0].first;
     Sampler           s(masked_params(true), 1);
     s.start_in_think_block(false);
     s.observe_think_text(opener.substr(0, 1) + "n ordinary sentence");
@@ -531,7 +531,7 @@ TEST(sampler_mask_stays_released_after_a_self_opened_block_closes) {
     // The model opened the block itself, closed it, and the answer begins.
     // The state is settled content: the first content piece must not
     // re-open the block, and the turn-ender is legal again.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     Sampler     s(masked_params(true), 1);
     s.start_in_think_block(false);
     s.observe_think_text(pairs[0].first + "why");
@@ -550,7 +550,7 @@ TEST(sampler_mask_stays_released_after_a_template_opened_block_closes) {
     // first piece is a strict prefix of the opener. It is content, and it
     // must not re-open the block: with the old bool plus lead, the empty
     // lead absorbed the piece and matched the opener's prefix again.
-    const auto& pairs     = think_tag_pairs(false);
+    const auto& pairs     = think_tag_pairs(ChatDialect::Qwen);
     const std::string opener_prefix = pairs[0].first.substr(0, 3);
     Sampler s(masked_params(true), 1);
     s.start_in_think_block(true);
@@ -570,9 +570,9 @@ TEST(sampler_mask_engages_on_a_blank_lead_like_split_reasoning) {
     // an answer: split_reasoning strips it before looking for the opener, and
     // the mask must agree. With the old raw-lead comparison the lead settled
     // as content on the blanks and the mask never engaged.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     const std::string raw = "\n\n" + pairs[0].first + "why" + pairs[0].second;
-    const ReasoningSplit split = split_reasoning(raw, false, false);
+    const ReasoningSplit split = split_reasoning(raw, false, ChatDialect::Qwen);
     CHECK(split.closed);
     CHECK_EQ(split.reasoning, "why");
     CHECK(split.content.empty());
@@ -593,7 +593,7 @@ TEST(sampler_mask_still_holds_while_the_block_is_open) {
     // Control for the settling cases above: a block that has not closed keeps
     // masking the turn-ender, template-opened and self-opened alike. This one
     // is green before and after.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     Sampler     s(masked_params(true), 1);
     s.start_in_think_block(true);
     s.observe_think_text("still reasoning");
@@ -620,7 +620,7 @@ namespace {
 // 1 the closer (in the EOG list and, separately, as a client stop id), 2 the
 // opener. The tags come from the shared table; nothing is written out.
 ThinkBlockIds pathologic_ids() {
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     ThinkBlockIds t;
     t.eog        = {0, 1};
     t.open_ids   = {2};
@@ -687,7 +687,7 @@ namespace {
 // on), so these cases take the id path in the close role alone. The tag
 // strings come from the shared table; nothing is written out here.
 ThinkBlockIds id_close_ids() {
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     ThinkBlockIds t;
     t.eog        = {0};
     t.close_ids  = {2};
@@ -705,7 +705,7 @@ SamplerParams id_close_params() {
 
 // The closer spelled from ordinary tokens: same text, different ids. Assembled
 // from the table's own string, never written out here.
-std::string spelled_closer() { return std::string(think_tag_pairs(false)[0].second); }
+std::string spelled_closer() { return std::string(think_tag_pairs(ChatDialect::Qwen)[0].second); }
 
 }  // namespace
 
@@ -742,7 +742,7 @@ TEST(sampler_id_rule_no_ids_keeps_the_text_behaviour) {
     // The fallback: a template whose tags are not single special tokens (no ids
     // known) behaves exactly as before -- the closer matched as text closes the
     // block. This case is green before and after the id rule.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     Sampler     s(masked_params(true), 1);   // table_ids(): no close_ids
     s.start_in_think_block(true);
     s.observe_think_text("reasoning");
@@ -958,7 +958,7 @@ TEST(sampler_non_thinking_turn_keeps_the_normal_rows_presence_over_all_history) 
 // closer that family never emits. Only a set of lists that kept one id per pair
 // can be zipped; otherwise no pairing is built at all.
 TEST(sampler_positional_ids_refuse_a_lossy_pairing) {
-    const auto& pairs = think_tag_pairs(true);
+    const auto& pairs = think_tag_pairs(ChatDialect::Extended);
     SamplerParams p = greedy_params();
     p.think_eog_mask = true;
     p.think_ids.open_tags  = {pairs[0].first, pairs[1].first};

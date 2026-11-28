@@ -1737,11 +1737,11 @@ struct ReplayFixture {
 };
 
 std::string open_tag() {
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     return pairs.empty() ? std::string() : pairs[0].first;
 }
 std::string close_tag() {
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     return pairs.empty() ? std::string() : pairs[0].second;
 }
 

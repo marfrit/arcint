@@ -26,8 +26,8 @@ using json = nlohmann::json;
 constexpr int kOpenId  = 6;
 constexpr int kCloseId = 7;
 
-const std::string& opener() { return lgc::think_tag_pairs(false)[0].first; }
-const std::string& closer() { return lgc::think_tag_pairs(false)[0].second; }
+const std::string& opener() { return lgc::think_tag_pairs(lgc::ChatDialect::Qwen)[0].first; }
+const std::string& closer() { return lgc::think_tag_pairs(lgc::ChatDialect::Qwen)[0].second; }
 
 class IdScriptBackend final : public lgc::Backend {
 public:
@@ -68,7 +68,7 @@ private:
 lgc::api::PreparedChat prepared(bool think_open, std::vector<std::string> stop) {
     lgc::api::PreparedChat prep;
     prep.think_open                  = think_open;
-    prep.dialect         = false;
+    prep.dialect         = lgc::ChatDialect::Qwen;
     prep.parse_tool_calls            = false;
     prep.id                          = "test";
     prep.model                       = "stub";
@@ -197,7 +197,7 @@ TEST(no_block_keeps_the_content_as_generated) {
     CHECK_EQ(n.content, std::string("\n\nHello"));
     const Answer s = streamed(backend, prepared(false, {"\nUser:"}));
     CHECK_EQ(s.content, std::string("\n\nHello"));
-    CHECK_EQ(lgc::split_reasoning("\n\nHello", false, false).content, n.content);
+    CHECK_EQ(lgc::split_reasoning("\n\nHello", false, lgc::ChatDialect::Qwen).content, n.content);
 }
 
 // A stop string that begins with the LAST bytes of the closer's text splits the

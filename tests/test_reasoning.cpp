@@ -82,21 +82,21 @@ TEST(reasoning_streamer_undecided_start_resolves_both_ways) {
 TEST(reasoning_split_other_think_tags) {
     // Cydonia 24B (Mistral Small 3.2) thinks in the angle-bracket tags, Magistral
     // tunes in the square-bracket ones
-    const auto a = split_reasoning(angle_open() + "\nplot first\n" + angle_close() + "\n\nThe storm broke.", false, true);
+    const auto a = split_reasoning(angle_open() + "\nplot first\n" + angle_close() + "\n\nThe storm broke.", false, ChatDialect::Extended);
     CHECK(a.closed);
     CHECK_EQ(a.reasoning, std::string("plot first"));
     CHECK_EQ(a.content, std::string("The storm broke."));
-    const auto b = split_reasoning(square_open() + "weigh it" + square_close() + "Answer.", false, true);
+    const auto b = split_reasoning(square_open() + "weigh it" + square_close() + "Answer.", false, ChatDialect::Extended);
     CHECK_EQ(b.reasoning, std::string("weigh it"));
     CHECK_EQ(b.content, std::string("Answer."));
     // a closer of another pair does not close the block
-    const auto c = split_reasoning(angle_open() + "a " + qwen_close() + " b" + angle_close() + "c", false, true);
+    const auto c = split_reasoning(angle_open() + "a " + qwen_close() + " b" + angle_close() + "c", false, ChatDialect::Extended);
     CHECK_EQ(c.reasoning, "a " + qwen_close() + " b");
     CHECK_EQ(c.content, std::string("c"));
 }
 
 TEST(reasoning_streamer_other_think_tags) {
-    ReasoningStreamer st(false, true);
+    ReasoningStreamer st(false, ChatDialect::Extended);
     std::string r, c;
     for (std::string_view p : {"<thi", "nking>\nplot", " first</think", "ing>\n\nThe storm", " broke."}) {
         auto s = st.push(p); r += s.reasoning; c += s.content;
@@ -104,7 +104,7 @@ TEST(reasoning_streamer_other_think_tags) {
     const auto t = st.flush(); r += t.reasoning; c += t.content;
     CHECK_EQ(r, std::string("\nplot first"));
     CHECK_EQ(c, std::string("The storm broke."));
-    ReasoningStreamer m(false, true);
+    ReasoningStreamer m(false, ChatDialect::Extended);
     std::string r2, c2;
     for (std::string_view p : {"[TH", "INK]x[/TH", "INK]y"}) { auto s = m.push(p); r2 += s.reasoning; c2 += s.content; }
     CHECK_EQ(r2, std::string("x"));
@@ -132,7 +132,7 @@ TEST(reasoning_other_tags_only_when_extended) {
 TEST(reasoning_extended_edges) {
     // the bare / angle-bracket think boundary across pieces
     auto run = [](std::vector<std::string> pieces) {
-        ReasoningStreamer st(false, true);
+        ReasoningStreamer st(false, ChatDialect::Extended);
         std::pair<std::string, std::string> rc;
         for (auto p : pieces) { auto s = st.push(p); rc.first += s.reasoning; rc.second += s.content; }
         auto t = st.flush(); rc.first += t.reasoning; rc.second += t.content;
@@ -143,19 +143,19 @@ TEST(reasoning_extended_edges) {
           std::make_pair(std::string("x"), std::string("y")));
     CHECK(run({qwen_open(), "ing>a" + qwen_close() + "b"}) == std::make_pair(std::string("ing>a"), std::string("b")));
     // unclosed: all reasoning
-    const auto u = split_reasoning(square_open() + "still going", false, true);
+    const auto u = split_reasoning(square_open() + "still going", false, ChatDialect::Extended);
     CHECK(!u.closed);
     CHECK_EQ(u.reasoning, std::string("still going"));
     CHECK(u.content.empty());
     // a pre-opened bare think block is closed only by its own closer
-    const auto o = split_reasoning("a" + angle_close() + "b" + square_close() + "c" + qwen_close() + "d", true, true);
+    const auto o = split_reasoning("a" + angle_close() + "b" + square_close() + "c" + qwen_close() + "d", true, ChatDialect::Extended);
     CHECK_EQ(o.reasoning, "a" + angle_close() + "b" + square_close() + "c");
     CHECK_EQ(o.content, std::string("d"));
     // leading whitespace, near misses, case
-    CHECK_EQ(split_reasoning("\n " + square_open() + "p" + square_close() + "q", false, true).content, std::string("q"));
-    CHECK_EQ(split_reasoning("<thinkpad> is a laptop", false, true).content, std::string("<thinkpad> is a laptop"));
-    CHECK_EQ(split_reasoning("[THINKING] no", false, true).content, std::string("[THINKING] no"));
-    CHECK_EQ(split_reasoning("[think]x[/think]y", false, true).content, std::string("[think]x[/think]y"));
+    CHECK_EQ(split_reasoning("\n " + square_open() + "p" + square_close() + "q", false, ChatDialect::Extended).content, std::string("q"));
+    CHECK_EQ(split_reasoning("<thinkpad> is a laptop", false, ChatDialect::Extended).content, std::string("<thinkpad> is a laptop"));
+    CHECK_EQ(split_reasoning("[THINKING] no", false, ChatDialect::Extended).content, std::string("[THINKING] no"));
+    CHECK_EQ(split_reasoning("[think]x[/think]y", false, ChatDialect::Extended).content, std::string("[think]x[/think]y"));
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +168,7 @@ TEST(reasoning_extended_edges) {
 TEST(reasoning_streaming_and_nonstreaming_agree_on_a_spelled_and_a_real_closer) {
     // The Qwen pair, template-opened: its closer is one special token, id 7.
     // The opener has no id here; the template already opened the block.
-    const std::string closer = think_tag_pairs(false)[0].second;
+    const std::string closer = think_tag_pairs(ChatDialect::Qwen)[0].second;
     const std::vector<std::pair<int, int>> ids = {{-1, 7}};
     std::vector<std::pair<std::string, int>> pieces;
     pieces.emplace_back("the marker is ", 30);
@@ -178,7 +178,7 @@ TEST(reasoning_streaming_and_nonstreaming_agree_on_a_spelled_and_a_real_closer) 
     pieces.emplace_back(closer, 7);   // the real closer, one special token
     pieces.emplace_back("answer", 34);
 
-    ReasoningStreamer streamed(true, false, ids);
+    ReasoningStreamer streamed(true, ChatDialect::Qwen, ids);
     std::string       reasoning, content;
     for (const auto& [piece, id] : pieces) {
         const auto step = streamed.push(piece, id);
@@ -189,7 +189,7 @@ TEST(reasoning_streaming_and_nonstreaming_agree_on_a_spelled_and_a_real_closer) 
     reasoning += tail.reasoning;
     content += tail.content;
 
-    const ReasoningSplit split = split_reasoning_tokens(pieces, true, false, ids);
+    const ReasoningSplit split = split_reasoning_tokens(pieces, true, ChatDialect::Qwen, ids);
     CHECK(split.closed);
     CHECK_EQ(split.reasoning, reasoning);   // the two paths are one implementation
     CHECK_EQ(split.content, content);
@@ -203,14 +203,14 @@ TEST(reasoning_streaming_and_nonstreaming_agree_on_a_spelled_and_a_real_closer) 
 // non-streaming split drops them (the reference), and the stream drops them
 // too, so both paths give the same content for the same token stream.
 TEST(reasoning_streaming_and_nonstreaming_drop_the_closer_line_breaks) {
-    const std::string closer = think_tag_pairs(false)[0].second;
+    const std::string closer = think_tag_pairs(ChatDialect::Qwen)[0].second;
     const std::vector<std::pair<int, int>> ids = {{-1, 7}};
     const std::vector<std::pair<std::string, int>> pieces = {{"the reasoning", 30},
                                                              {closer, 7},
                                                              {"\n\n", 15},
                                                              {"Hello", 16}};
 
-    ReasoningStreamer streamed(true, false, ids);
+    ReasoningStreamer streamed(true, ChatDialect::Qwen, ids);
     std::string       reasoning, content;
     for (const auto& [piece, id] : pieces) {
         const auto step = streamed.push(piece, id);
@@ -221,7 +221,7 @@ TEST(reasoning_streaming_and_nonstreaming_drop_the_closer_line_breaks) {
     reasoning += tail.reasoning;
     content += tail.content;
 
-    const ReasoningSplit split = split_reasoning_tokens(pieces, true, false, ids);
+    const ReasoningSplit split = split_reasoning_tokens(pieces, true, ChatDialect::Qwen, ids);
     CHECK(split.closed);
     CHECK_EQ(content, std::string("Hello"));   // no leading line breaks
     CHECK_EQ(split.content, content);

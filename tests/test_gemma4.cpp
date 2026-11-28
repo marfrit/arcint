@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -230,8 +231,8 @@ TEST(gemma4_tag_table) {
     CHECK_EQ(think_tag_pairs(ChatDialect(ChatDialect::Qwen)).size(), 1u);
     CHECK_EQ(think_tag_pairs(ChatDialect(ChatDialect::Qwen))[0].first, std::string(markers::kThinkOpen));
     CHECK_EQ(think_tag_pairs(ChatDialect(ChatDialect::Extended)).size(), 3u);
-    CHECK_EQ(think_tag_pairs(true).size(), 3u);
-    CHECK_EQ(think_tag_pairs(false).size(), 1u);
+    CHECK_EQ(think_tag_pairs(ChatDialect::Extended).size(), 3u);
+    CHECK_EQ(think_tag_pairs(ChatDialect::Qwen).size(), 1u);
 }
 
 TEST(gemma4_prompt_ends_inside_the_channel) {
@@ -463,6 +464,9 @@ TEST(gemma4_call_text_is_left_alone_on_a_qwen_dialect_model) {
 }
 
 TEST(chat_dialect_converts_from_the_old_bool_and_names_its_rules) {
+    // 1.8.4: a bool is not a dialect by accident (the constructor from bool is explicit).
+    static_assert(!std::is_convertible_v<bool, ChatDialect>, "ChatDialect must not convert implicitly from bool");
+    static_assert(std::is_constructible_v<ChatDialect, bool>, "ChatDialect(bool) stays available, explicitly");
     CHECK(ChatDialect(false) == ChatDialect::Qwen);
     CHECK(ChatDialect(true) == ChatDialect::Extended);
     CHECK(ChatDialect().kind == ChatDialect::Qwen);

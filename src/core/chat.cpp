@@ -1086,7 +1086,7 @@ std::string render_chatml_stub(const ChatRequest& req) {
         const bool replay_reasoning = m.role == "assistant" && !m.reasoning.empty() &&
                                       (req.preserve_thinking || i > last_user);
         if (replay_reasoning) {
-            const auto& pairs = think_tag_pairs(false);
+            const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
             if (!pairs.empty()) {
                 out += pairs[0].first;
                 out += "\n";

@@ -109,7 +109,7 @@ std::vector<json> run_stream_with(lgc::Backend& backend, bool think_open) {
 
     lgc::api::PreparedChat prep;
     prep.think_open          = think_open;  // the prompt ended inside a think block
-    prep.dialect = false;
+    prep.dialect = lgc::ChatDialect::Qwen;
     prep.parse_tool_calls    = false;
     prep.id                  = "test";
     prep.model               = "stub";
@@ -294,7 +294,7 @@ TEST(stream_reasoning_flushed_at_end_of_stream) {
 // the next piece starts with its remainder, as a byte-level detokenizer does;)
 // here the remainder and the close tag arrive in the same step.)
 TEST(stream_reasoning_frames_precede_content_frames) {
-    const auto& closer = think_tag_pairs(false)[0].second;
+    const auto& closer = think_tag_pairs(ChatDialect::Qwen)[0].second;
     const std::string first  = "w \xe2\x87";   // a space and a torn code point's first two bytes
     const std::string second = "\xa9" + closer + " s";  // the remainder, the close, the answer's start
     const std::vector<json> objs = run_stream_pieces({ first, second });
@@ -353,7 +353,7 @@ json run_chat_reply(const std::string& reply, bool think_open) {
 
     lgc::api::PreparedChat prep;
     prep.think_open          = think_open;
-    prep.dialect = false;
+    prep.dialect = ChatDialect::Qwen;
     prep.parse_tool_calls    = false;
     prep.id                  = "test";
     prep.model               = "stub";
@@ -364,8 +364,8 @@ json run_chat_reply(const std::string& reply, bool think_open) {
 }  // namespace
 
 TEST(chat_run_reports_reasoning_closed) {
-    const auto& opener = think_tag_pairs(false)[0].first;
-    const auto& closer = think_tag_pairs(false)[0].second;
+    const auto& opener = think_tag_pairs(ChatDialect::Qwen)[0].first;
+    const auto& closer = think_tag_pairs(ChatDialect::Qwen)[0].second;
     json        msg;
 
     // Pre-opened block that closes: the field is true and the split is right.
@@ -395,7 +395,7 @@ TEST(chat_run_reports_reasoning_closed) {
 // a closed-block empty answer from a mid-block stop. On the same condition
 // the non-streaming path uses (reasoning was non-empty); absent otherwise.
 TEST(stream_final_chunk_carries_reasoning_closed) {
-    const auto& closer = think_tag_pairs(false)[0].second;
+    const auto& closer = think_tag_pairs(ChatDialect::Qwen)[0].second;
     const std::vector<json> objs = run_stream("why" + closer + "answer");
     const json& closed = objs.back()["choices"][0]["delta"];
     CHECK(closed.value("reasoning_closed", false));
@@ -463,7 +463,7 @@ json run_chat_loop_stats() {
     ctx.backend = &backend;
     lgc::api::PreparedChat prep;
     prep.think_open          = false;
-    prep.dialect = false;
+    prep.dialect = ChatDialect::Qwen;
     prep.parse_tool_calls    = false;
     prep.id                  = "test";
     prep.model               = "stub";

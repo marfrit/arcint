@@ -51,7 +51,7 @@ std::string distinct_line(int i) {
 // The text case: the closer spelled by two ordinary tokens (50, 51), which the
 // sampler knows by text only; newline-free reasoning words 60..69; answer
 // words 70..72, repeated, which the answer's presence penalty reads.
-std::string close_tag() { return think_tag_pairs(false)[0].second; }
+std::string close_tag() { return think_tag_pairs(ChatDialect::Qwen)[0].second; }
 
 std::string piece_of(int id) {
     if (id == kCloser) return close_tag();
@@ -104,7 +104,7 @@ SamplerParams base_params() {
     p.loop_guard_door_ids   = {6, 7};
     for (size_t i = 0; i < kNudge.size(); ++i) p.loop_guard_nudge_ids.push_back(kNudgeFirst + static_cast<int>(i));
     p.think_ctx_reserve    = 1;   // arms the context guard's countdown
-    const auto& pairs      = think_tag_pairs(false);
+    const auto& pairs      = think_tag_pairs(ChatDialect::Qwen);
     p.think_ids.eog        = {kEog};
     p.think_ids.close_ids  = {kCloser};
     p.think_ids.close_tags = {pairs[0].second};

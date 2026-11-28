@@ -36,7 +36,7 @@ SamplerParams ctx_params() {
     p.loop_guard         = LoopGuardMode::Off;
     // A vocabulary where the closer is one special token and the template
     // opened the block (the agent's shape). The opener has no id.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     p.think_ids.eog        = {0};
     p.think_ids.close_ids  = {5};
     p.think_ids.close_tags = {pairs[0].second};
@@ -180,7 +180,7 @@ TEST(a_think_budget_leaves_the_answer_alone) {
     std::vector<float> l = row_with_argmax(2);
     const int closer = s.sample(l.data(), l.size());
     CHECK_EQ(closer, 5);
-    s.observe(closer, think_tag_pairs(false)[0].second);
+    s.observe(closer, think_tag_pairs(ChatDialect::Qwen)[0].second);
     for (int i = 0; i < 8; ++i) CHECK_EQ(drive(s), 2);
     CHECK_EQ(s.loop_guard_counts().think_closes, 1);
 }

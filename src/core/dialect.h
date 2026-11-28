@@ -20,15 +20,15 @@ namespace lgc {
 //             parsing. The Qwen dialect replaces it only when the template
 //             carries the Qwen call form (core/chat.cpp).
 //
-// Converts implicitly from bool for the callers that predate the third
-// dialect: true meant "extended tags".
+// The constructor from bool (true = Extended, false = Qwen) is explicit: a
+// bool is not a dialect by accident.
 struct ChatDialect {
     enum Kind : unsigned char { Qwen, Extended, Gemma4, Inkling, Neutral };
     Kind kind = Qwen;
 
     constexpr ChatDialect() = default;
     constexpr ChatDialect(Kind k) : kind(k) {}
-    constexpr ChatDialect(bool extended) : kind(extended ? Extended : Qwen) {}
+    constexpr explicit ChatDialect(bool extended) : kind(extended ? Extended : Qwen) {}
 
     constexpr bool extended() const { return kind == Extended; }
     constexpr bool gemma4() const { return kind == Gemma4; }

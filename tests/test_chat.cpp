@@ -825,7 +825,7 @@ TEST(stub_render_keeps_reasoning_only_after_the_last_user_message) {
     CHECK_EQ(prompt.find("EARLY-REASONING"), std::string::npos);   // before the last user
     CHECK(prompt.find("LATE-REASONING") != std::string::npos);      // after the last user
     // The late block is the template's own shape: opener, reasoning, closer.
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     CHECK(!pairs.empty());
     if (pairs.empty()) return;
     const std::string block = pairs[0].first + "\n" + "LATE-REASONING" + "\n" + pairs[0].second;

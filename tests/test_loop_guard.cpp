@@ -31,7 +31,7 @@ SamplerParams base_params(LoopGuardMode mode, int window = 10, int grace = 5) {
     p.loop_guard_grace    = grace;
     // A vocabulary where the closer is one special token: the slap forces it
     // by id. The opener has no id (the template opened the block).
-    const auto& pairs = think_tag_pairs(false);
+    const auto& pairs = think_tag_pairs(ChatDialect::Qwen);
     p.think_ids.eog        = {0};
     p.think_ids.close_ids  = {5};
     p.think_ids.close_tags = {pairs[0].second};
@@ -1251,7 +1251,7 @@ TEST(loop_guard_text_closer_answer_starts_from_a_clean_window) {
     feed_lines(s, 9, 18, true);   // detection; the door opens
     CHECK_EQ(s.loop_guard_counts().detections, 1);
 
-    feed_text(s, think_tag_pairs(false)[0].second);   // the model spells the closer
+    feed_text(s, think_tag_pairs(ChatDialect::Qwen)[0].second);   // the model spells the closer
     CHECK(!s.think_block_open());
     CHECK_EQ(s.loop_guard_counts().self_closes, 1);
     CHECK_EQ(s.loop_guard_counts().slaps, 0);
@@ -1921,7 +1921,7 @@ TEST(loop_guard_closer_in_the_same_piece_does_not_nudge_into_the_answer) {
     CHECK_EQ(s.loop_guard_counts().detections, 0);
 
     // The 8th repeat line ends inside a piece that also spells the closer.
-    feed_text(s, loop_line(17) + think_tag_pairs(false)[0].second);
+    feed_text(s, loop_line(17) + think_tag_pairs(ChatDialect::Qwen)[0].second);
     CHECK_EQ(s.loop_guard_counts().detections, 1);   // the reasoning line counts
     CHECK_EQ(s.loop_guard_counts().nudges, 0);       // but no nudge into the answer
     CHECK(!s.think_block_open());
@@ -1933,7 +1933,7 @@ TEST(loop_guard_closer_in_the_same_piece_does_not_nudge_into_the_answer) {
 // text: the slap must not force the other family's closer id into the output.
 TEST(loop_guard_slap_forces_no_closer_from_another_family) {
     SamplerParams p = base_params(LoopGuardMode::Slap, 10, 5);
-    const auto& pairs = think_tag_pairs(true);   // Qwen and the wider family
+    const auto& pairs = think_tag_pairs(ChatDialect::Extended);   // Qwen and the wider family
     p.think_ids.open_tags  = {pairs[0].first, pairs[1].first, pairs[2].first};
     p.think_ids.close_tags = {pairs[0].second, pairs[1].second, pairs[2].second};
     // The flattened set: only family 0's closer is one special token.
@@ -2005,7 +2005,7 @@ TEST(completions_start_inside_an_open_block_like_chat) {
         return prep;
     };
 
-    const std::string opener = think_tag_pairs(false)[0].first;
+    const std::string opener = think_tag_pairs(ChatDialect::Qwen)[0].first;
     CHECK(prepared("a raw prompt").input.think_open == false);
     CHECK(prepared("reasoning so far\n" + opener + "\n").input.think_open);
     CHECK(prepared("reasoning so far\n" + opener).input.think_open == false);   // no newline
@@ -2027,7 +2027,7 @@ TEST(opener_start_state_is_one_helper_for_chat_and_completions) {
             st.loaded      = true;
             st.stub        = true;
             st.n_ctx       = 4096;
-            st.dialect = extended;
+            st.dialect = ChatDialect(extended);
         }
         const ModelStatus& status() const override { return st; }
         Tokenizer&         tokenizer() override { return tok_; }
@@ -2068,7 +2068,7 @@ TEST(opener_start_state_is_one_helper_for_chat_and_completions) {
         return cp.input.think_open;
     };
 
-    const auto& pairs = think_tag_pairs(true);
+    const auto& pairs = think_tag_pairs(ChatDialect::Extended);
     const std::string default_open = pairs[0].first + "\n";
     const std::string extended_open = pairs[1].first + "\n";
 
