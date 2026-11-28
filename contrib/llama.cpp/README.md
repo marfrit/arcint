@@ -12354,3 +12354,24 @@ lines with the split's state, and `TAKEN src=opencl op=FLASH_ATTN port=fa_kern k
 are WARN under `std::call_once`; its split-scratch growth line is WARN once a growth; its trace line is WARN a call,
 behind `GGML_OPENCL_FA_PORT_TRACE=1`. It needs nothing from 0224. `test_taken_lines_183.py` does not hold its split line
 yet, nor 0225's `kv=q8_0:q4_0` line (owed).
+
+## 0227-opencl-dense-q8_0-one-column-int8.patch
+
+`ggml-opencl.cpp`: a dense Q8_0 weight times one column (a decode step) takes the q8_1 integer-dot matvec
+(`kernel_mul_mv_q8_0_q8_1`, the kernel 0115 builds for its arm) ahead of the float kernel
+(`kernel_mul_mv_q8_0_f32_flat`). The one-column Q8_0 program already carries `-DMV_Q8_0` (0156 builds it
+there), but the Q8_0 matvec kernel itself was created only under 0115's arm (`GGML_OPENCL_KQ_MV_NCOLS` > 4),
+so a one-column dense product never reached it. This patch creates that kernel for the one-column program
+too and dispatches the case.
+
+- **The case:** `src0` Q8_0 SoA, `src1` F32, one column, contiguous, no view offset, Intel; the activation is
+  the K-quant matvecs' two-term q8_1 (`ggml_cl_kq_quantize_src1`), cached a graph per src1. A KV cache's Q8_0
+  is not SoA and declines; from two columns 0115's paths take the product.
+- **Kill switch:** `GGML_OPENCL_Q80_INT8=0` keeps the float kernel; unset or `auto` keeps the route on.
+- **Measured** (`measured-here`, one B70 at 220 W, Inkling 2 Mini IQ4_NL, the same tree with the switch on and
+  off): `tg128` 30.93 against 30.19 t/s at depth 0, 31.61 against 30.58 at 4,096, 30.69 against 29.41 at
+  32,768; prompt (`pp512`) unchanged within noise. In the profiling build the product was 5.2 ms of 21.6 ms
+  of device time a token across 356 launches. The kernel sits at the memory roofline, which is why the gain is
+  small.
+- **Not run on a card against this series:** the rebased patch is compile-checked against the pin plus the
+  series (`ggml-opencl` target); the card rows (tg at 0 / 4,096 / 32,768 and KL against the CPU) are owed.

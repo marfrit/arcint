@@ -1,0 +1,86 @@
+0227: OpenCL: a dense Q8_0 weight times one column (a decode step) runs on the q8_1 integer-dot matvec instead of the float kernel.
+
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -3003,7 +3003,7 @@
+                         continue;
+                     }
+                     CL_CHECK((backend_ctx->kernel_mul_mv_q40_q8_1[nc - 1] = clCreateKernel(prog, "kernel_mul_mv_q4_0_q8_1", &err), err));
+-                    if (backend_ctx->kq_mv_arm > 4) {
++                    if (nc == 1 || backend_ctx->kq_mv_arm > 4) {   // 0227: nc == 1 for ggml_cl_mul_mv_q8_0_int8 (dense decode)
+                         CL_CHECK((backend_ctx->kernel_mul_mv_q80_q8_1[nc - 1] = clCreateKernel(prog, "kernel_mul_mv_q8_0_q8_1", &err), err));
+                     }
+                     for (int i = 0; i < 11; ++i) {
+@@ -35177,6 +35177,62 @@
+     return true;
+ }
+ 
++// ARC-LAB 0227 (was 0153): Intel: a dense Q8_0 weight times one column (a decode step) on the
++// q8_1 integer-dot matvec (kernel_mul_mv_q8_0_q8_1, the kernel 0115 built for its
++// arm), ahead of upstream's float kernel (kernel_mul_mv_q8_0_f32_flat). A model whose
++// trunk is Q8_0 spends its decode there: Inkling 2 Mini's attention projections, 356
++// launches a token, took 5.2 of 21.6 ms of device time a token (`measured-here`,
++// B70, the profiling build), and the case was never named by a DOWNGRADE line (one
++// column reports nothing). The activation is the K-quant matvecs' two-term q8_1
++// (ggml_cl_kq_quantize_src1), cached a graph per src1. From 2 columns 0115's paths
++// take it (its arm, the few-column product); the Q8_0 of a KV cache is not SoA and
++// declines. GGML_OPENCL_Q80_INT8=0 keeps the float kernel.
++static bool ggml_cl_mul_mv_q8_0_int8(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * src0,
++                                     const ggml_tensor * src1, ggml_tensor * dst) {
++    static const char * env = getenv("GGML_OPENCL_Q80_INT8");
++    static const bool   on  = env == nullptr || atoi(env) != 0;
++    if (!on || backend_ctx->gpu_family != INTEL || !kq_q8_1_enabled(backend_ctx) ||
++        src0->type != GGML_TYPE_Q8_0 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
++        src1->ne[1] * src1->ne[2] * src1->ne[3] != 1 ||
++        src0->ne[0] % 32 != 0 || src0->ne[2] != 1 || src0->ne[3] != 1 || src0->view_offs != 0 ||
++        !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) ||
++        !ggml_cl_is_q8_0_soa(src0)) {
++        return false;
++    }
++    const ggml_tensor * soa0 = src0->view_src != nullptr ? src0->view_src : src0;
++    if (((ggml_backend_opencl_buffer_context *) soa0->buffer->context)->usm) {
++        return false;
++    }
++    cl_kernel k = backend_ctx->kernel_mul_mv_q80_q8_1[0];
++    if (k == nullptr) {
++        return false;
++    }
++    const int ne00 = (int)src0->ne[0];
++    const int ne01 = (int)src0->ne[1];
++    const ggml_tensor_extra_cl_q8_0 * e = (const ggml_tensor_extra_cl_q8_0 *)soa0->extra;
++    ggml_tensor_extra_cl * extrad = (ggml_tensor_extra_cl *)dst->extra;
++    const cl_ulong offsetd = extrad->offset + dst->view_offs;
++    const cl_ulong nb1     = dst->nb[1];
++    const cl_ulong off0    = 0;
++    ggml_cl_kq_quantize_src1(backend_ctx, src1, ne00, dst);
++    cl_uint a = 0;
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->q));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &off0));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &e->d));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xq.buffer));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &backend_ctx->prealloc_kq_xd.buffer));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_mem),   &extrad->data_device));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &offsetd));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(cl_ulong), &nb1));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne00));
++    CL_CHECK(clSetKernelArg(k, a++, sizeof(int),      &ne01));
++    const int rows_per_wg = backend_ctx->kq_q8_1_ndst * 4;
++    size_t gws[] = { (size_t)CEIL_DIV(ne01, rows_per_wg) * 16, 4, 1 };
++    size_t lws[] = { 16, 4, 1 };
++    backend_ctx->enqueue_ndrange_kernel(k, 3, gws, lws, dst);
++    return true;
++}
++
+ // ARC-LAB 0096: Intel: a dense Q4_0 weight (Llama 2 7B, the community GPU tables'
+ // file) on the K-quants' fast paths; it took upstream's float kernels: the tiled
+ // GEMM ~95 % of a 512-token prefill, the 8x matvec 2/3 to 4/5 of a decode step
+@@ -36388,6 +36444,9 @@
+     if (ggml_cl_mul_mat_q4_0_xmx(backend_ctx, src0, src1, dst)) {
+         return;
+     }
++    if (ggml_cl_mul_mv_q8_0_int8(backend_ctx, src0, src1, dst)) {   // 0227
++        return;
++    }
+     if (ggml_cl_mul_mm_kq_few(backend_ctx, src0, src1, dst) || ggml_cl_mul_mv_kq_q8_1(backend_ctx, src0, src1, dst) ||
+         ggml_cl_mul_mm_kq_f16(backend_ctx, src0, src1, dst)) {
+         return;
