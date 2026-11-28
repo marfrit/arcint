@@ -1,0 +1,1108 @@
+0227: decode / verify flash attention for a q8_0 K and a q4_0 V cache at head size 256, read in place (GGML_OPENCL_FA_DEC27=1, default off; unset, the dispatch is what it was). The dense 27B hybrid's 4 to 8-row attention calls (the 6-row verify of a 5-token draft) run flash_attn_gqa_dpas today: K and V are converted to f16 a 32-key tile into local memory, three barriers a tile, one work-group a core. kernels/flash_attn_dec27.cl takes the read forms of the FA port's q8_0:q4_0 build (0199q1 / 0225) to these calls: raw cache bytes by 2D block reads, codes and nibbles made f16 by integer operations, each block's scale in f32, no local memory, no barrier, Q as f16 through the DPAS as today. A sub-group owns 8 (query head, token) rows of a kv head and all 256 output columns (128 of the 256 registers); Q is re-read a key group from an f16 scratch a prepass writes (flash_attn_dpas2's form at this head size); the keys are split across threads so that one wave of the device is full (fa_dec27_gate.h: fa_dec27_splits - 32 splits at 6 rows on 160 compute units, 640 threads; a split walks 16 blocks at least), and a merge kernel joins the split states. fa_dec27_gate.h is the arm's pure gate (q8_0 K, q4_0 V, head 256, 4 to 8 rows, an f16 mask of one head, the strides the reads need, no sink / indexed bias / port sources / pages / ALiBi / softcap) and split rule. The dispatch asks the gate first, after the port's check: an accepted call is three launches (kernel_fa_dec27_q, kernel_fa_dec27, kernel_fa_dec27_merge); an 8-row block of a 9 to 64-row call (the row-block split) is not the arm's and keeps today's kernels (fa_dec27_gate_call, "row-block"); a call of the arm's kind that it does not serve is a DOWNGRADE line (dec27=declined reason=.., dec27=not-built ..) and keeps today's kernels. A TAKEN line, WARN once a process: "TAKEN src=opencl op=FLASH_ATTN dec27=in-place kv=q8_0:q4_0 head=256 grf=256 n_q=.. n_kv=.. kv_heads=.. tiles=.. mt=.. split=.. blocks=.. threads=.. wave=.. minblk=.. force=.. pv=norm". Knobs: GGML_OPENCL_FA_DEC27_SPLIT=N (the split count), _MINBLK=N (the least blocks a split, unset 16), _CU=N (the compute units of the wave), _TRACE=1 (a line a call), _RED=1..7 (red builds: V's scale from the next block, the last key dropped, a seam block a split lost, the merge without the maxima, K's scale twice, the P V phase without its 1 / c, the mask run block-read whatever its pointer), The P V phase has one form: the scale in P normalised a (32-key block, q4_0 block) by a power of two, pe = f16(p d c), O taken to that scale for the two DPAS and back in f32; offline its main kernel spills 3,648 bytes of scratch at 256 registers (no recompile). Two other forms were built and measured on the 24 GB card and are not in the series (the README's record): f16(p d 8) without the normalisation fails the V-floor case (4.9e-3; this form 3.4e-6), and P V in f32 without the DPAS is right and slower (1,793 against 1,186 us a 6-row call at 77,297 keys; today's kernels 2,811). The TAKEN line says pv=norm. fa_dec27_gate.h's slot numbers are checked against ggml-impl.h by static_asserts in the backend, and the gate looks at every source slot of the op (5 .. 19). get_proc_address "ggml_backend_opencl_fa_dec27_stats": the launches and the last one's split, for the tests. The dispatch takes the arm from FA_DEC27_MIN_KV = 8192 keys on: fa_dec27 has a fixed cost of ~153 us a call against ~50 us for flash_attn_gqa_dpas, independent of the keys; below 8192 keys the dispatch keeps today's kernel; at 4,096 keys the arm loses the 8-row case (+4.7 %), at 8,192 it wins at 4, 6 and 8 rows (-68 / -46 / -44 %); a shorter call is refused "below-crossover" (a ROUTE line once, no DOWNGRADE), GGML_OPENCL_FA_DEC27=2 forces the arm at every key count (the tests), and the TAKEN line carries min_kv. The mask run of a key group is a 16-half block read only where its pointer is on a 4-byte boundary, else a read a key: on the 24 GB card the first build's block read of an odd row over an odd key count (2 bytes past a boundary) gave the odd lanes the cell two before their own, and a call of 1,013 keys stood 7.0e-4 from the CPU; the served cache's key counts are multiples of 256, where every run is on 4 bytes.
+
+diff --git a/ggml/src/ggml-opencl/CMakeLists.txt b/ggml/src/ggml-opencl/CMakeLists.txt
+index 52a91f7..aa9d15a 100644
+--- a/ggml/src/ggml-opencl/CMakeLists.txt
++++ b/ggml/src/ggml-opencl/CMakeLists.txt
+@@ -276,6 +276,7 @@ set(GGML_OPENCL_KERNELS
+     flash_attn_dpas
+     flash_attn_dpas2
+     flash_attn_port
++    flash_attn_dec27
+     flash_attn_gqa_dpas
+     sub
+     sum_rows
+diff --git a/ggml/src/ggml-opencl/fa_dec27_gate.h b/ggml/src/ggml-opencl/fa_dec27_gate.h
+new file mode 100644
+index 0000000..c9f5884
+--- /dev/null
++++ b/ggml/src/ggml-opencl/fa_dec27_gate.h
+@@ -0,0 +1,236 @@
++// fa_dec27_gate.h - 0227: the eligibility and the key split of the decode flash-attention arm
++// (kernels/flash_attn_dec27.cl), as pure functions (no OpenCL call, no backend state), so a CPU
++// test can feed them a graph export's own lines.
++//
++// The arm serves a decode / verify call of 4 to 8 query rows over a q8_0 K and a q4_0 V cache at
++// head size 256, read in place - the call as the model emits it, not an 8-row block of a 9 to 64-row
++// call, and from 8,192 keys on (fa_dec27_gate_call). Each rule exists because of what the kernel indexes:
++//   q:     the prepass reads a float at head*nb[2] + row*nb[1] + 4*dim: D contiguous floats,
++//          float-aligned strides, any row and head stride (the model's Q is a permuted view);
++//   k:     ggml's q8_0 blocks, 34 bytes for 32 values, 8 blocks = 272 bytes a (key, kv head). The
++//          transposed dword reads take a surface whose base is the head's first byte rounded down
++//          to 64 and whose x coordinate carries the remainder in dwords: the head's first byte is
++//          a multiple of 4 (view offset and head stride) on a 64-byte aligned buffer; a surface
++//          row holds up to 60 + 272 bytes, so the row pitch is at least 332, a multiple of 16
++//          and below 2^24 (the 2D block reads' own limits);
++//   v:     ggml's q4_0 blocks, 18 bytes for 32 values, 8 blocks = 144 bytes a (key, kv head); the
++//          transformed byte reads take the same kind of surface (x a multiple of 4), so the row
++//          pitch is at least 204, a multiple of 16 and below 2^24;
++//   mask:  f16 [n_kv, rows], row*nb[1]/2 + key, one head and one stream;
++//   dst:   f32, head*nb[1] + row*nb[2] + 4*dim.
++// A call with a sink, an indexed bias, the port's sources, a page table, ALiBi or a softcap is
++// another kernel's. The model's lines (the dense 27B hybrid's attention with -ctk q8_0 -ctv q4_0):
++// q [256, T, 24] nb [4, 24576, 1024], K [256, n_kv, 4] nb [34, 1088, 272], V [256, n_kv, 4] nb
++// [18, 576, 144].
++#ifndef FA_DEC27_GATE_H
++#define FA_DEC27_GATE_H
++
++#include <ggml.h>
++#include <stdint.h>
++#include <string.h>
++
++#if defined(__cplusplus)
++extern "C" {
++#endif
++
++#define FA_DEC27_D          256
++#define FA_DEC27_ROWS_MIN   4
++#define FA_DEC27_ROWS_MAX   8
++#define FA_DEC27_KBYTES     (FA_DEC27_D / 32 * 34)   // 272: q8_0 bytes a (key, kv head)
++#define FA_DEC27_VBYTES     (FA_DEC27_D / 32 * 18)   // 144: q4_0 bytes a (key, kv head)
++// a split state's floats: O as a sub-group holds it (16 chunks x 8 rows x 16 lanes), then m (8) and l (8)
++#define FA_DEC27_STATE_FLOATS (FA_DEC27_D / 16 * 128 + 16)
++// the Q scratch a tile: 8 rows x 256 halves (4,096 bytes, so a tile's base keeps the buffer's
++// alignment), then 8 blocks x 8 rows of floats (the accumulator starts)
++#define FA_DEC27_QTILE_BYTES  (8 * FA_DEC27_D * 2)
++#define FA_DEC27_NQTILE_FLOATS 64
++
++// the op's slots and params the gate reads (ggml-impl.h's GGML_FA_SRC_* / GGML_FA_PARAM_*, repeated so this
++// header needs ggml.h only). Every slot after the sink up to the op's last (GGML_MAX_SRC - 1) is "extra": paged
++// K/V, an indexed bias, the port's sources, and any slot a later patch gives a meaning. The numbers are checked
++// against ggml-impl.h by static_asserts in ggml-opencl.cpp, where both headers are seen (a check here would be dead:
++// this header is included before ggml-impl.h).
++enum {
++    FA_DEC27_SRC_SINK = 4, FA_DEC27_SRC_FIRST_EXTRA = 5, FA_DEC27_SRC_PORT_SINK = 18, FA_DEC27_SRC_LAST_EXTRA = 19,
++    FA_DEC27_PARAM_BIAS_FLAG = 15,
++};
++
++// the rows the switch is about: a call of this kind that the gate refuses is said (a DOWNGRADE
++// line); any other call is simply not the arm's (a 1-row step, a prompt, another cache type)
++static inline int fa_dec27_in_scope(const struct ggml_tensor * op) {
++    const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2];
++    return q != NULL && k != NULL && v != NULL &&
++           q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0 &&
++           q->ne[0] == FA_DEC27_D && k->ne[0] == FA_DEC27_D && v->ne[0] == FA_DEC27_D &&
++           q->ne[1] >= FA_DEC27_ROWS_MIN && q->ne[1] <= FA_DEC27_ROWS_MAX;
++}
++
++// 1 accept, 0 refuse with *why set. Pure: the op's tensors' type / ne / nb / view_offs and its
++// params. buf_align is the backend's buffer alignment: a tensor's placed offset is its buffer's (a
++// multiple of buf_align, by the allocator) plus its view offset.
++static inline int fa_dec27_gate_op(const struct ggml_tensor * op, size_t buf_align, int is_intel, const char ** why_out) {
++#define REFUSE(r) do { *why_out = (r); return 0; } while (0)
++    const struct ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * mask = op->src[3];
++    if (!is_intel) REFUSE("device");
++    if (q == NULL || k == NULL || v == NULL) REFUSE("shape");
++    if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_Q8_0 || v->type != GGML_TYPE_Q4_0) REFUSE("kv-type");
++    if (q->ne[0] != FA_DEC27_D || k->ne[0] != FA_DEC27_D || v->ne[0] != FA_DEC27_D) REFUSE("head");
++    if (q->ne[1] < FA_DEC27_ROWS_MIN || q->ne[1] > FA_DEC27_ROWS_MAX) REFUSE("rows");
++    if (q->ne[3] != 1 || k->ne[3] != 1 || v->ne[3] != 1) REFUSE("streams");
++    if (op->src[FA_DEC27_SRC_SINK] != NULL) REFUSE("sinks");
++#ifdef FA_DEC27_GATE_RED_EXTRA
++    // the red rule: only the page table is looked at - a call with a ring, a host store, an indexed
++    // bias or the port's sources would be read as a plain one
++    if (op->src[FA_DEC27_SRC_FIRST_EXTRA] != NULL) REFUSE("extra-sources");
++#else
++    for (int i = FA_DEC27_SRC_FIRST_EXTRA; i <= FA_DEC27_SRC_LAST_EXTRA; ++i) {
++        if (op->src[i] != NULL) REFUSE("extra-sources");     // paged K/V, an indexed bias, the port's sources
++    }
++#endif
++    {
++        int32_t flag;
++        float max_bias, softcap;
++        memcpy(&flag,     (const char *) op->op_params + FA_DEC27_PARAM_BIAS_FLAG * sizeof(int32_t), sizeof flag);
++        memcpy(&max_bias, (const char *) op->op_params + 1 * sizeof(float), sizeof max_bias);
++        memcpy(&softcap,  (const char *) op->op_params + 2 * sizeof(float), sizeof softcap);
++        if (flag != 0) REFUSE("extra-sources");
++        if (max_bias != 0.0f) REFUSE("alibi");
++        if (softcap != 0.0f) REFUSE("softcap");
++    }
++    const int64_t D = FA_DEC27_D, rows = q->ne[1], n_head = q->ne[2], n_kv = k->ne[1], n_head_kv = k->ne[2];
++    if (n_kv < 1 || n_kv >= (1 << 24) || n_head_kv < 1 || n_head < 1 || n_head % n_head_kv != 0 ||
++        v->ne[1] != n_kv || v->ne[2] != n_head_kv) REFUSE("shape");
++    if ((n_head / n_head_kv) * rows > 8 * 64) REFUSE("tiles");     // 64 tiles a kv head at most
++    if (mask == NULL || mask->type != GGML_TYPE_F16 || mask->ne[2] != 1 || mask->ne[3] != 1 ||
++        mask->ne[0] < n_kv || mask->ne[1] < rows || mask->nb[0] != 2 || mask->nb[1] % 2 != 0 ||
++        mask->nb[1] < (size_t) (n_kv * 2)) REFUSE("mask");
++    if (op->type != GGML_TYPE_F32 || op->ne[0] != D || op->ne[1] != n_head || op->ne[2] < rows ||
++        op->nb[0] != 4 || op->nb[1] % 4 != 0 || op->nb[2] % 4 != 0 || op->nb[1] < (size_t) (D * 4)) REFUSE("dst");
++    if (q->nb[0] != 4 || q->nb[1] < 4 || q->nb[2] < 4 || q->nb[1] % 4 != 0 || q->nb[2] % 4 != 0 ||
++        q->view_offs % 4 != 0) REFUSE("layout-q");
++    if (buf_align % 64 != 0) REFUSE("layout-align");
++#ifdef FA_DEC27_GATE_RED_STRIDE
++    // a wrong rule, an f16 cache's head stride asked of this one: refuses the model (K 272, V 144)
++    if (k->nb[2] % 64 != 0 || v->nb[2] % 64 != 0) REFUSE("layout-k");
++#endif
++    if (k->nb[0] != 34 || k->nb[1] % 16 != 0 || k->nb[1] < 60 + (size_t) FA_DEC27_KBYTES || k->nb[1] >= ((size_t) 1 << 24) ||
++        k->nb[2] % 4 != 0 || k->view_offs % 4 != 0) REFUSE("layout-k");
++    if (v->nb[0] != 18 || v->nb[1] % 16 != 0 || v->nb[1] < 60 + (size_t) FA_DEC27_VBYTES || v->nb[1] >= ((size_t) 1 << 24) ||
++        v->nb[2] % 4 != 0 || v->view_offs % 4 != 0) REFUSE("layout-v");
++#undef REFUSE
++    return 1;
++}
++
++// The call as the dispatch sees it. A 9 to 64-row call is cut into blocks of up to 8 rows that
++// re-enter the dispatch (the row-block split); such a block has the shape of a verify, and it is
++// NOT the arm's: the arm serves the calls the model emits with 4 to 8 rows, nothing a split makes
++// (a second path, with prompts' shapes and timings, that its cases and card rows do not cover).
++// row_block: the op is a block of that split. FA_DEC27_GATE_RED_ROW_BLOCK: the form before this
++// rule (the unit test's red).
++//
++// THE CROSSOVER. The arm has a fixed cost: fa_dec27 costs ~153 us a call against ~50 us for
++// flash_attn_gqa_dpas, independent of the keys; below 8192 keys the dispatch keeps today's kernel
++// (a measured crossover). The sweep, on the 24 GB card, the FA family's launch
++// time a call, today's kernels against the arm at 4 / 6 / 8 rows: at 4,096 keys the arm loses the
++// 8-row case (+4.7 %); at 8,192 it wins every row (-68 / -46 / -44 %), and at every larger size
++// measured. The threshold is that measured point, not an interpolation. A call the shape's gate
++// accepts with fewer keys is refused "below-crossover": the designed route, not a fallback.
++// force != 0 (the tests: GGML_OPENCL_FA_DEC27=2) takes the arm at every key count the shape's
++// gate accepts. FA_DEC27_GATE_RED_NO_MIN_KV: the form before this rule (the unit test's red).
++#define FA_DEC27_MIN_KV 8192
++static inline int fa_dec27_gate_call(const struct ggml_tensor * op, int row_block, int force, size_t buf_align, int is_intel, const char ** why_out) {
++#ifndef FA_DEC27_GATE_RED_ROW_BLOCK
++    if (row_block) { *why_out = "row-block"; return 0; }
++#else
++    (void) row_block;
++#endif
++    if (!fa_dec27_gate_op(op, buf_align, is_intel, why_out)) return 0;
++#ifndef FA_DEC27_GATE_RED_NO_MIN_KV
++    if (!force && op->src[1]->ne[1] < FA_DEC27_MIN_KV) { *why_out = "below-crossover"; return 0; }
++#else
++    (void) force;
++#endif
++    return 1;
++}
++
++// ---- the tiles ----
++// A query "row" of a kv head is a (query head, token) pair: flat row f is query head kvh*G + f % G,
++// token f / G (G = n_head / n_head_kv), the order flash_attn_gqa_dpas.cl has. A sub-group owns 8
++// flat rows (the DPAS's M), a tile; a kv head has ceil(G * rows / 8) tiles.
++static inline int fa_dec27_tiles(int G, int rows) {
++    return (G * rows + 7) / 8;
++}
++
++// the tokens a tile's 8 flat rows span, at most (the mask rows a tile reads a key group): the
++// kernel is built with it (-DDEC27_MT). G 6: 2, G 8: 1, G 4: 2, G 1: 8.
++static inline int fa_dec27_mask_slots(int G, int rows) {
++    int mt = 1;
++    for (int t = 0; t < fa_dec27_tiles(G, rows); ++t) {
++        const int last = (8 * t + 7) / G < rows - 1 ? (8 * t + 7) / G : rows - 1;
++        const int n = last - (8 * t) / G + 1;
++        if (n > mt) mt = n;
++    }
++    return mt;
++}
++
++// ---- the key split ----
++// A sub-group is a thread, and the kernel has no local memory and no barrier, so a thread is the
++// unit the device schedules: a Xe core holds 32 threads at 256 GRF (8 vector engines x 4), and
++// CL_DEVICE_MAX_COMPUTE_UNITS counts the engines. B60 (160): 20 cores, 640 threads; B70 (256): 1,024.
++static inline int fa_dec27_cores(int n_cu) {
++    return n_cu / 8;
++}
++static inline int fa_dec27_wave(int n_cu) {
++    return n_cu < 8 ? 0 : fa_dec27_cores(n_cu) * 32;
++}
++
++#define FA_DEC27_SPLIT_MAX        256
++#define FA_DEC27_SPLIT_MIN_BLOCKS 16     // 512 keys a split at least (flash_attn_gqa_dpas.cl's split size)
++
++// p for one call. A split costs threads_per_split = n_head_kv x tiles threads; each walks 1/p of the
++// 32-key blocks and writes a state the merge reads (FA_DEC27_STATE_FLOATS floats, as much as ~100
++// keys of K and V), so a split walks at least min_blocks blocks (0: FA_DEC27_SPLIT_MIN_BLOCKS).
++// Above that floor p fills ONE wave and no more: the most p with p x threads_per_split <= wave,
++// then - the wave rule - stepped down to the next p whose threads are a multiple of the core count
++// (every core the same number of threads), when there is one. force > 0 sets p (bounded by the
++// call's blocks and FA_DEC27_SPLIT_MAX): the tests and a window's sweep.
++// FA_DEC27_SPLIT_RED_NO_WAVE: the rule without the wave bound (the unit test's red: 512 keys a
++// split at any depth, flash_attn_gqa_dpas.cl's rule, 2.4 waves at 77k keys with the last 40 % full).
++static inline int fa_dec27_splits(int threads_per_split, int n_cu, int64_t n_kv, int force, int min_blocks) {
++    const int64_t blocks = (n_kv + 31) / 32;
++    if (force > 0) {
++        int64_t p = force < FA_DEC27_SPLIT_MAX ? force : FA_DEC27_SPLIT_MAX;
++        if (p > blocks) p = blocks;
++        return p < 1 ? 1 : (int) p;
++    }
++    const int wave = fa_dec27_wave(n_cu), cores = fa_dec27_cores(n_cu);
++    if (threads_per_split < 1) return 1;
++    int64_t p = blocks / (min_blocks > 0 ? min_blocks : FA_DEC27_SPLIT_MIN_BLOCKS);
++    if (p > FA_DEC27_SPLIT_MAX) p = FA_DEC27_SPLIT_MAX;
++    if (p < 1) p = 1;
++#ifndef FA_DEC27_SPLIT_RED_NO_WAVE
++    if (wave > 0 && p * threads_per_split > wave) {
++        p = wave / threads_per_split;
++        if (p < 1) p = 1;
++        // the wave rule: the threads a multiple of the core count
++        for (int64_t c = p; c >= 1 && c > p - cores; --c) {
++            if ((c * threads_per_split) % cores == 0) { p = c; break; }
++        }
++    }
++#else
++    (void) wave; (void) cores;
++#endif
++    return (int) p;
++}
++
++// the 32-key blocks a split walks: split s takes [s * b, min(B, (s + 1) * b)) of the call's B blocks.
++// A split past B (p does not divide B evenly) walks none: its state is (M_INIT, 0) and weighs 0.
++static inline int fa_dec27_split_blocks(int64_t n_kv, int p) {
++    const int64_t blocks = (n_kv + 31) / 32;
++    return (int) ((blocks + p - 1) / (p < 1 ? 1 : p));
++}
++
++#if defined(__cplusplus)
++}
++#endif
++#endif
+diff --git a/ggml/src/ggml-opencl/ggml-opencl.cpp b/ggml/src/ggml-opencl/ggml-opencl.cpp
+index d5e6f08..dd99fbb 100644
+--- a/ggml/src/ggml-opencl/ggml-opencl.cpp
++++ b/ggml/src/ggml-opencl/ggml-opencl.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "ggml-opencl.h"
+ #include "fa_port_gate.h"   // 0198: the port arm's eligibility, a pure function (CPU-testable)
++#include "fa_dec27_gate.h"  // 0227: the decode FA arm's gate and key-split rule, pure (CPU-testable)
+ #include "ggml-opencl-planes.h"   // 0022 / 0116: the planar layout, device-free
+ #include "ggml-backend.h"
+ #include "ggml-impl.h"
+@@ -728,6 +729,8 @@ static std::map<std::string, uint64_t> g_cl_downgrades;
+ 
+ static void ggml_cl_bounds(const char * arm, const char * which, cl_mem buf, size_t upto);   // 0198: defined below, used by the port arm
+ static void ggml_cl_downgrade(const char * fmt, ...) GGML_ATTRIBUTE_FORMAT(1, 2);
++// 0227: the decode FA arm's launch record, defined with the arm; get_proc_address hands it to the tests
++static void ggml_backend_opencl_fa_dec27_stats(int64_t out[6]);
+ // 0205: the depth-mix arm, defined below; supports_op at the top reaches it
+ static bool ggml_cl_depth_mix_on();
+ static cl_kernel ggml_cl_depth_mix_kernel(ggml_backend_opencl_context * backend_ctx);
+@@ -1604,6 +1607,12 @@ struct ggml_backend_opencl_context {
+     bool fa_port_split_tried[3] = {};
+     size_t fa_port_split_wg[3] = {};
+     int fa_port_n_cu = -1;   // CL_DEVICE_MAX_COMPUTE_UNITS, asked once (-1: not yet)
++    // 0227: the decode FA arm (flash_attn_dec27.cl), GGML_OPENCL_FA_DEC27=1: a program a mask-slot
++    // count (-DDEC27_MT=1 .. 8), built on the first call that needs it
++    cl_program program_fa_dec27[9] = {};
++    cl_kernel kernel_fa_dec27[9] = {}, kernel_fa_dec27_q[9] = {}, kernel_fa_dec27_merge[9] = {};
++    bool fa_dec27_tried[9] = {};
++    int fa_dec27_n_cu = -1;  // CL_DEVICE_MAX_COMPUTE_UNITS, asked once (-1: not yet)
+     int       fa_dpas2_bq = 0, fa_dpas2_nthr = 0;
+     // 0106: the build options of the head-256 prompt kernels, so that the
+     // head-512 builds made on first use match them (sub-group, sub-groups a
+@@ -19474,6 +19483,10 @@ static void * ggml_backend_opencl_reg_get_proc_address(ggml_backend_reg_t reg, c
+     if (strcmp(name, "ggml_backend_opencl_topk_moe_sigmoid_fused_count") == 0) {
+         return (void *) ggml_backend_opencl_topk_moe_sigmoid_fused_count;
+     }
++    if (strcmp(name, "ggml_backend_opencl_fa_dec27_stats") == 0) {
++        // 0227: the decode FA arm's launches and the last one's split, for test-backend-ops
++        return (void *) ggml_backend_opencl_fa_dec27_stats;
++    }
+     if (strcmp(name, "ggml_backend_opencl_fa_port_split_stats") == 0) {
+         g_fa_port_stats_wanted = true;   // 0226b: the launches record split_blocks / n_kv from now on
+         // 0223: the port's launches and the last one's split, for test-backend-ops' split cases
+@@ -27484,6 +27497,292 @@ static void ggml_cl_flash_attn_port(ggml_backend_t backend, ggml_tensor * dst) {
+     }
+ }
+ 
++// 0227: the decode / verify arm for a q8_0 K and a q4_0 V cache at head size 256, read in place
++// (flash_attn_dec27.cl; the rules are fa_dec27_gate.h's pure functions). GGML_OPENCL_FA_DEC27=1 turns
++// it on; unset or 0, the dispatch below is exactly what it was. =1 takes the arm from FA_DEC27_MIN_KV keys on (the
++// measured crossover; a shorter call keeps today's kernels and says so once, a ROUTE line), =2 at every key count (the
++// tests). It takes a call the gate accepts
++// (4 to 8 query rows as the model emits them; never a block of the row-block split) before any
++// other branch, in three launches: Q to an f16 scratch, the split kernel, the merge. A call of its kind that it
++// does not serve is said once (a DOWNGRADE line) and keeps today's kernels.
++// GGML_OPENCL_FA_DEC27_SPLIT=N sets the split count (the tests, a window's sweep),
++// GGML_OPENCL_FA_DEC27_MINBLK=N the least 32-key blocks a split walks (unset: 16),
++// GGML_OPENCL_FA_DEC27_CU=N stands for the device's compute units in the wave (unset: the
++// device's), GGML_OPENCL_FA_DEC27_TRACE=1 logs a line a call, GGML_OPENCL_FA_DEC27_RED=1 .. 7 builds
++// a red kernel (the tests only). The kernel has one form of its P V phase: the scale in P normalised a
++// (32-key block, q4_0 block) by a power of two (flash_attn_dec27.cl); offline it spills 3,648 bytes of scratch at
++// 256 registers, without a recompile. Two other forms were built and measured and are not in the series (the README).
++// fa_dec27_gate.h's slot numbers against ggml-impl.h's, here where both are seen
++static_assert(GGML_FA_SRC_PAGES == FA_DEC27_SRC_FIRST_EXTRA && GGML_FA_SRC_SINK_Q == FA_DEC27_SRC_PORT_SINK &&
++              GGML_FA_PARAM_BIAS_FLAG == FA_DEC27_PARAM_BIAS_FLAG, "fa_dec27_gate.h's slots are not ggml-impl.h's");
++static_assert(GGML_MAX_SRC == FA_DEC27_SRC_LAST_EXTRA + 1 && GGML_FA_SRC_SINK_Q <= FA_DEC27_SRC_LAST_EXTRA,
++              "fa_dec27_gate.h does not look at every source slot of the op");
++static int ggml_cl_dec27_env_int(const char * name, int dflt) {
++    const char * e = getenv(name);
++    return e != nullptr ? atoi(e) : dflt;
++}
++static bool ggml_cl_dec27_on() {
++    static const bool on = ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27", 0) != 0;
++    return on;
++}
++// GGML_OPENCL_FA_DEC27=2: the arm at every key count its shape's gate accepts (the tests); 1: from the measured
++// crossover on (FA_DEC27_MIN_KV keys, fa_dec27_gate.h)
++static bool ggml_cl_dec27_force_kv() {
++    static const bool force = ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27", 0) == 2;
++    return force;
++}
++
++// what the launches did, for the tests (get_proc_address "ggml_backend_opencl_fa_dec27_stats"):
++// launches, then the last launch's split count, wave, threads a split, tiles a kv head, mask slots
++static int64_t g_fa_dec27_launches = 0;
++static int     g_fa_dec27_last[5] = { 0, 0, 0, 0, 0 };
++static void ggml_backend_opencl_fa_dec27_stats(int64_t out[6]) {
++    out[0] = g_fa_dec27_launches;
++    for (int i = 0; i < 5; ++i) out[1 + i] = g_fa_dec27_last[i];
++}
++
++// the program of a mask-slot count, built once a device; a failure is remembered and said
++static bool ggml_cl_dec27_kernels(ggml_backend_opencl_context * backend_ctx, int mt) {
++    GGML_ASSERT(mt >= 1 && mt <= 8);
++    if (backend_ctx->kernel_fa_dec27[mt] != nullptr) return true;
++    if (backend_ctx->fa_dec27_tried[mt]) return false;
++    backend_ctx->fa_dec27_tried[mt] = true;
++    if (backend_ctx->kernel_compile_opts.empty()) return false;
++#ifdef GGML_OPENCL_EMBED_KERNELS
++    const std::string src {
++        #include "flash_attn_dec27.cl.h"
++    };
++#else
++    const std::string src = read_file("flash_attn_dec27.cl");
++#endif
++    if (src.empty()) {
++        ggml_cl_downgrade("op=FLASH_ATTN dec27=not-built reason=%s", "source-missing");
++        return false;
++    }
++    // 256 GRF: a tile's output is 128 registers (tools/ocloc_fa_dec27.sh: no scratch at 256)
++    std::string opts = backend_ctx->kernel_compile_opts + " -cl-intel-256-GRF-per-thread -DDEC27_MT=" + std::to_string(mt);
++    const int red = ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27_RED", 0);
++    if (red == 1) opts += " -DDEC27_RED_V_SCALE";    // V's scale from the next block
++    if (red == 2) opts += " -DDEC27_RED_TAIL";       // the call's last key dropped
++    if (red == 3) opts += " -DDEC27_RED_SEAM";       // the first block of every split from the second on skipped
++    if (red == 4) opts += " -DDEC27_RED_NOMAX";      // the states merged without their maxima
++    if (red == 5) opts += " -DDEC27_RED_K_SCALE2";   // K's scale applied twice
++    if (red == 7) opts += " -DDEC27_RED_MASK_ALIGN"; // a mask run block-read whatever its pointer (wrong on a card at an odd key count)
++    if (red == 6) opts += " -DDEC27_RED_PVNORM_IC";  // O not brought back from a block's scale (the 1 / c left out)
++    cl_program p = build_program_from_source_optional(backend_ctx, src.c_str(), opts);
++    if (p == nullptr) {
++        ggml_cl_downgrade("op=FLASH_ATTN dec27=not-built reason=%s mt=%d", "compile", mt);
++        return false;
++    }
++    cl_int err = CL_SUCCESS;
++    cl_kernel kq = clCreateKernel(p, "kernel_fa_dec27_q", &err);
++    cl_kernel km = err == CL_SUCCESS ? clCreateKernel(p, "kernel_fa_dec27", &err) : nullptr;
++    cl_kernel kg = err == CL_SUCCESS ? clCreateKernel(p, "kernel_fa_dec27_merge", &err) : nullptr;
++    size_t wg = 0;
++    if (err == CL_SUCCESS) {
++        CL_CHECK(clGetKernelWorkGroupInfo(km, backend_ctx->device, CL_KERNEL_WORK_GROUP_SIZE, sizeof wg, &wg, nullptr));
++    }
++    if (err != CL_SUCCESS || wg < 16) {
++        if (kq != nullptr) CL_CHECK(clReleaseKernel(kq));
++        if (km != nullptr) CL_CHECK(clReleaseKernel(km));
++        if (kg != nullptr) CL_CHECK(clReleaseKernel(kg));
++        CL_CHECK(clReleaseProgram(p));
++        ggml_cl_downgrade("op=FLASH_ATTN dec27=not-built reason=%s mt=%d", err != CL_SUCCESS ? "kernel" : "work-group", mt);
++        return false;
++    }
++    backend_ctx->program_fa_dec27[mt] = p;
++    backend_ctx->kernel_fa_dec27_q[mt] = kq;
++    backend_ctx->kernel_fa_dec27[mt] = km;
++    backend_ctx->kernel_fa_dec27_merge[mt] = kg;
++    return true;
++}
++
++// the dispatch's row-block split is re-entering with a block of a 9 to 64-row call (set around
++// those calls only): such a block is not the arm's (fa_dec27_gate.h: fa_dec27_gate_call)
++static thread_local bool g_fa_dec27_row_block = false;
++
++// true: the call ran on the arm. false: it is not the arm's, and nothing was enqueued.
++static bool ggml_cl_flash_attn_dec27(ggml_backend_t backend, ggml_tensor * dst) {
++    ggml_backend_opencl_context * backend_ctx = (ggml_backend_opencl_context *) backend->context;
++    const char * why = nullptr;
++    if (!fa_dec27_gate_call(dst, g_fa_dec27_row_block ? 1 : 0, ggml_cl_dec27_force_kv() ? 1 : 0, (size_t) backend_ctx->alignment,
++                            backend_ctx->gpu_family == INTEL, &why)) {
++        if (why != nullptr && strcmp(why, "below-crossover") == 0) {
++            // the designed route, not a fallback: no DOWNGRADE. Said once, so a log shows which path a short call took
++            static std::once_flag routed;
++            std::call_once(routed, [&] {
++                GGML_LOG_WARN("ROUTE src=opencl op=FLASH_ATTN dec27=below-crossover n_kv=%d min_kv=%d: today's kernels below the measured crossover\n",
++                              (int) dst->src[1]->ne[1], FA_DEC27_MIN_KV);
++            });
++        } else if (!g_fa_dec27_row_block && fa_dec27_in_scope(dst)) {
++            ggml_cl_downgrade("op=FLASH_ATTN dec27=declined reason=%s", why);
++        }
++        return false;
++    }
++    const ggml_tensor * q = dst->src[0], * k = dst->src[1], * v = dst->src[2], * mask = dst->src[3];
++    const int n_q = (int) q->ne[1], n_kv = (int) k->ne[1], n_head = (int) q->ne[2], n_head_kv = (int) k->ne[2];
++    const int G = n_head / n_head_kv;
++    const int n_tiles = fa_dec27_tiles(G, n_q), mt = fa_dec27_mask_slots(G, n_q);
++    if (!ggml_cl_dec27_kernels(backend_ctx, mt)) {
++        return false;      // said by the build
++    }
++    cl_kernel kq = backend_ctx->kernel_fa_dec27_q[mt], km = backend_ctx->kernel_fa_dec27[mt], kg = backend_ctx->kernel_fa_dec27_merge[mt];
++
++    // the split: one wave of the device's threads (fa_dec27_gate.h)
++    if (backend_ctx->fa_dec27_n_cu < 0) {
++        cl_uint n_cu = 0;
++        CL_CHECK(clGetDeviceInfo(backend_ctx->device, CL_DEVICE_MAX_COMPUTE_UNITS, sizeof(n_cu), &n_cu, NULL));
++        backend_ctx->fa_dec27_n_cu = (int) n_cu;
++    }
++    static const int cu_env = ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27_CU", 0);
++    static const int force  = ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27_SPLIT", 0);
++    static const int minblk = ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27_MINBLK", 0);
++    const int n_cu = cu_env > 0 ? cu_env : backend_ctx->fa_dec27_n_cu;
++    const int tps = n_head_kv * n_tiles;
++    const int n_split = fa_dec27_splits(tps, n_cu, n_kv, force, minblk);
++    const int split_blocks = fa_dec27_split_blocks(n_kv, n_split);
++    g_fa_dec27_launches++;
++    g_fa_dec27_last[0] = n_split; g_fa_dec27_last[1] = fa_dec27_wave(n_cu); g_fa_dec27_last[2] = tps;
++    g_fa_dec27_last[3] = n_tiles; g_fa_dec27_last[4] = mt;
++
++    auto argbuf = [](const ggml_tensor * t, cl_mem * m, cl_ulong * off) {
++        ggml_tensor_extra_cl * e = (ggml_tensor_extra_cl *) t->extra;
++        *m = e->data_device;
++        *off = e->offset + t->view_offs;
++    };
++    cl_mem bq = nullptr, bk = nullptr, bv = nullptr, bo = nullptr, bm = nullptr;
++    cl_ulong oq = 0, ok = 0, ov = 0, oo = 0, om = 0;
++    argbuf(q, &bq, &oq); argbuf(k, &bk, &ok); argbuf(v, &bv, &ov); argbuf(dst, &bo, &oo); argbuf(mask, &bm, &om);
++    cl_ulong q_nb1 = q->nb[1], q_nb2 = q->nb[2], k_nb1 = k->nb[1], k_nb2 = k->nb[2], v_nb1 = v->nb[1], v_nb2 = v->nb[2];
++    cl_ulong o_nb1 = dst->nb[1], o_nb2 = dst->nb[2], mask_nb1 = mask->nb[1];
++    // a quantized tensor written with set_tensor is stored as planes (codes, scales); its blocks
++    // are rebuilt into a buffer that lives until the launches have run. The model's cache is
++    // written by the graph and is blocks already
++    ggml_cl_flash_attn_temp_buffer temp_k, temp_v;
++    {
++        cl_ulong nb3 = 0;
++        const bool rk = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, k, temp_k, bk, ok, k_nb1, k_nb2, nb3);
++        const bool rv = ggml_cl_flash_attn_reconstruct_aos(backend_ctx, v, temp_v, bv, ov, v_nb1, v_nb2, nb3);
++        if (rk || rv) {
++            ggml_cl_downgrade("op=FLASH_ATTN dec27=kv-rebuilt reason=%s", rk && rv ? "q8_0:q4_0-planes" : rk ? "q8_0-planes" : "q4_0-planes");
++        }
++    }
++    // the kernel rounds a head's first byte down to 64 for the surface base and puts the rest
++    // into the x coordinate (dwords for K, a 4-byte grid for V). The gate decided it from the view
++    // offset, the head stride and the backend's alignment: an assertion of that, not a refusal
++    if (ok % 4 != 0 || ov % 4 != 0 || k_nb2 % 4 != 0 || v_nb2 % 4 != 0) {
++        GGML_LOG_ERROR("op=FLASH_ATTN dec27: a K/V base off the backend's alignment: k nb [%zu, %zu, %zu] at %llu, v nb [%zu, %zu, %zu] at %llu\n",
++                       k->nb[0], k->nb[1], k->nb[2], (unsigned long long) ok, v->nb[0], v->nb[1], v->nb[2], (unsigned long long) ov);
++        GGML_ABORT("op=FLASH_ATTN dec27: a K/V base off the backend's alignment");
++    }
++
++    // the scratches: Q (4,096 bytes a tile) and the accumulator starts (64 floats a tile), the split
++    // states. Grown to the largest call and kept; the load-time spill guard does not see them, so
++    // the states' growth is said
++    const size_t ntl = (size_t) n_head_kv * n_tiles;
++    const size_t qs_size = ntl * FA_DEC27_QTILE_BYTES, nq_size = ntl * FA_DEC27_NQTILE_FLOATS * sizeof(float);
++    const size_t part_size = (size_t) n_split * ntl * FA_DEC27_STATE_FLOATS * sizeof(float);
++    ggml_cl_buffer & qsbuf = backend_ctx->scratch_buffer("fa_dec27_q");
++    ggml_cl_buffer & nqbuf = backend_ctx->scratch_buffer("fa_dec27_nq");
++    ggml_cl_buffer & partbuf = backend_ctx->scratch_buffer("fa_dec27_part");
++    qsbuf.allocate(backend_ctx->context, qs_size);
++    nqbuf.allocate(backend_ctx->context, nq_size);
++    if (part_size > partbuf.size) {
++        GGML_LOG_WARN("op=FLASH_ATTN dec27: the split scratch grows to %zu bytes (split=%d kv_heads=%d tiles=%d)\n",
++                      part_size, n_split, n_head_kv, n_tiles);
++    }
++    partbuf.allocate(backend_ctx->context, part_size);
++
++    // every buffer the launches touch, against its allocation, before any enqueue
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "q", bq, oq + (size_t)(n_head - 1) * q_nb2 + (size_t)(n_q - 1) * q_nb1 + (size_t) FA_DEC27_D * sizeof(float));
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "k", bk, ok + (size_t)(n_head_kv - 1) * k_nb2 + (size_t)(n_kv - 1) * k_nb1 + FA_DEC27_KBYTES);
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "v", bv, ov + (size_t)(n_head_kv - 1) * v_nb2 + (size_t)(n_kv - 1) * v_nb1 + FA_DEC27_VBYTES);
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "o", bo, oo + (size_t)(n_head - 1) * o_nb1 + (size_t)(n_q - 1) * o_nb2 + (size_t) FA_DEC27_D * sizeof(float));
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "mask", bm, om + (size_t)(n_q - 1) * mask_nb1 + (size_t) n_kv * sizeof(cl_half));
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "q-scratch", qsbuf.buffer, qs_size);
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "nq-scratch", nqbuf.buffer, nq_size);
++    ggml_cl_bounds("op=FLASH_ATTN dec27", "split", partbuf.buffer, part_size);
++
++    {
++        static std::once_flag taken;
++        std::call_once(taken, [&] {
++            GGML_LOG_WARN("TAKEN src=opencl op=FLASH_ATTN dec27=in-place kv=q8_0:q4_0 head=256 grf=256 n_q=%d n_kv=%d kv_heads=%d tiles=%d mt=%d "
++                          "split=%d blocks=%d threads=%d wave=%d minblk=%d force=%d pv=%s min_kv=%d%s\n",
++                          n_q, n_kv, n_head_kv, n_tiles, mt, n_split, split_blocks, n_split * tps, fa_dec27_wave(n_cu), minblk, force,
++                          "norm",       // the one form of the P V phase: the scale normalised a block
++                          ggml_cl_dec27_force_kv() ? 0 : FA_DEC27_MIN_KV,      // 0: forced at every key count (GGML_OPENCL_FA_DEC27=2)
++                          ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27_RED", 0) != 0 ? " RED-BUILD-WRONG-ANSWERS" : "");
++        });
++        static const bool trace = ggml_cl_dec27_env_int("GGML_OPENCL_FA_DEC27_TRACE", 0) != 0;
++        if (trace) {
++            GGML_LOG_WARN("FA_DEC27 call n_q=%d n_kv=%d tiles=%d mt=%d split=%d blocks=%d threads=%d wave=%d\n",
++                          n_q, n_kv, n_tiles, mt, n_split, split_blocks, n_split * tps, fa_dec27_wave(n_cu));
++        }
++    }
++
++    const float scale = ((const float *) dst->op_params)[0];
++    const float scale_log2 = 1.4426950408889634f * scale;
++    int a = 0;
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem),   &bq));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_ulong), &oq));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_ulong), &q_nb1));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_ulong), &q_nb2));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(int),      &n_q));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(int),      &G));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(int),      &n_tiles));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(int),      &n_head_kv));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem),   &qsbuf.buffer));
++    CL_CHECK(clSetKernelArg(kq, a++, sizeof(cl_mem),   &nqbuf.buffer));
++    size_t qlws[3] = { 8, 8, 1 };
++    size_t qgws[3] = { 8, 8, ntl };
++    backend_ctx->enqueue_ndrange_kernel(kq, 3, qgws, qlws, dst);
++
++    a = 0;
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_mem),   &qsbuf.buffer));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_mem),   &nqbuf.buffer));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_mem),   &bk));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &ok));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &k_nb1));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &k_nb2));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_mem),   &bv));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &ov));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &v_nb1));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &v_nb2));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_mem),   &bm));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &om));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_ulong), &mask_nb1));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(int),      &n_q));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(int),      &n_kv));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(int),      &G));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(int),      &n_tiles));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(int),      &n_head_kv));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(int),      &n_split));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(int),      &split_blocks));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(float),    &scale_log2));
++    CL_CHECK(clSetKernelArg(km, a++, sizeof(cl_mem),   &partbuf.buffer));
++    // one sub-group a work-group: (tile, split, kv head), so the tiles of a (kv head, split) - the
++    // threads that read the same keys - are next to each other
++    size_t lws[3] = { 16, 1, 1 };
++    size_t gws[3] = { (size_t) 16 * n_tiles, (size_t) n_split, (size_t) n_head_kv };
++    backend_ctx->enqueue_ndrange_kernel(km, 3, gws, lws, dst);
++
++    a = 0;
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(cl_mem),   &partbuf.buffer));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(cl_mem),   &bo));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(cl_ulong), &oo));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(cl_ulong), &o_nb1));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(cl_ulong), &o_nb2));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(int),      &n_q));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(int),      &G));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(int),      &n_tiles));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(int),      &n_head_kv));
++    CL_CHECK(clSetKernelArg(kg, a++, sizeof(int),      &n_split));
++    size_t mlws[3] = { 16, 1, 1 };
++    size_t mgws[3] = { 16, (size_t) n_tiles, (size_t) n_head_kv };
++    backend_ctx->enqueue_ndrange_kernel(kg, 3, mgws, mlws, dst);
++    return true;
++}
++
+ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, const ggml_tensor * k, ggml_tensor * dst) {
+     const ggml_tensor * v = dst->src[2];
+     const ggml_tensor * mask = dst->src[3];
+@@ -27510,6 +27809,13 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+         return;
+     }
+ 
++    // 0227: a 4 to 8-row call over a q8_0 K and a q4_0 V at head size 256, read in place
++    // (GGML_OPENCL_FA_DEC27=1; fa_dec27_gate.h). Unset, a call the gate does not take, or a block
++    // of the row-block split below: the dispatch below, untouched
++    if (ggml_cl_dec27_on() && ggml_cl_flash_attn_dec27(backend, dst)) {
++        return;
++    }
++
+     // 0123zzzzz3: this layer's streamed pages into its ring slot, before anything reads it
+ 
+     const int n_q = q->ne[1];
+@@ -27774,7 +28080,9 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
+                 mv.ne[1]     = nr;
+                 mv.view_offs = mask->view_offs + (size_t) r0 * mask->nb[1];
+                 dv.src[3]    = &mv;
++                g_fa_dec27_row_block = true;     // 0227: a block of this split is not the decode arm's
+                 ggml_cl_flash_attn(backend, &qv, k, &dv);
++                g_fa_dec27_row_block = false;
+             }
+             return;
+         }
+diff --git a/ggml/src/ggml-opencl/kernels/flash_attn_dec27.cl b/ggml/src/ggml-opencl/kernels/flash_attn_dec27.cl
+new file mode 100644
+index 0000000..d805866
+--- /dev/null
++++ b/ggml/src/ggml-opencl/kernels/flash_attn_dec27.cl
+@@ -0,0 +1,484 @@
++#pragma OPENCL EXTENSION cl_khr_fp16 : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups : enable
++#pragma OPENCL EXTENSION cl_intel_subgroups_short : enable
++#pragma OPENCL EXTENSION cl_intel_required_subgroup_size : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable
++#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable
++
++// 0227: decode / verify flash attention (4 to 8 query rows) over a q8_0 K and a q4_0 V cache at head
++// size 256, both read in place. The read forms are flash_attn_port.cl's (its PORT_KV8 + PORT_V4
++// build, 0199q1 / 0225): raw cache bytes by 2D block reads with the key in the lane (K) or in the
++// dword (V), codes and nibbles made f16 by integer operations on whole dwords, each block's scale
++// applied in f32. Nothing is staged in local memory, there is no barrier, and no K or V value is
++// rounded before its product.
++//
++// The rows. A query "row" of a kv head is a (query head, token) pair, flat row f = query head
++// kvh*G + f % G, token f / G (flash_attn_gqa_dpas.cl's order). A sub-group (16 lanes) owns a tile of
++// 8 flat rows (the DPAS's M) and all 256 output columns: O is 16 float8, 128 of the 256 registers.
++// That leaves no room for a tile's Q (64 registers), so Q is re-read a key group from an f16
++// scratch, as flash_attn_dpas2.cl does at this head size (kernel_fa_dec27_q writes it once a call,
++// 4,096 bytes a tile, already in the lane order K's codes come out in).
++//
++// The sharing. Every tile of a kv head reads the same K and V bytes: at 6 rows 5 tiles, 36 (head,
++// token) rows. A tile's 8 rows share each read in registers; the tiles share it in the cache (the
++// grid puts the tiles of a (kv head, split) next to each other). One read for all tiles in
++// registers would need two tiles' O in one thread, which 256 registers do not hold.
++//
++// The keys split across threads (0045's form, as flash_attn_port.cl's PORT_SPLIT): the grid is
++// (tile, split, kv head), one sub-group a work-group; split s walks the 32-key blocks [s *
++// split_blocks, (s + 1) * split_blocks) with its own online-softmax state and writes it
++// (FA_DEC27_STATE_FLOATS floats, fa_dec27_gate.h); kernel_fa_dec27_merge joins the states and
++// writes the output. The host picks the split count so that the threads fill one wave of the
++// device (fa_dec27_splits).
++//
++// K (q8_0, 8 blocks of 34 bytes = 68 dwords a (key, kv head)): the transposed dword read gives 8
++// dwords of 16 key rows, lane = key; nine of them cover the head (dwords 0, 8 .. 56, and 60 for the
++// last four). Two blocks are 17 dwords, so pair p starts on dword 17 p: its even block has the
++// scale in the low short of dword 0, codes 0, 1 in its high short, codes 2 .. 29 in dwords 1 .. 7,
++// codes 30, 31 in the low short of dword 8, whose high short is the odd block's scale; the odd
++// block's codes are dwords 9 .. 16. B16 turns 4 dwords (16 codes) into 16 halves of value 1152 +
++// code (a code's byte with its top bit flipped is code + 128; 0x6400 | x is the f16 of 1024 + x),
++// a dword's bytes 0 and 2 before its bytes 1 and 3 - the scratch holds Q in that lane order
++// (DEC27_ORD). S = sum over blocks of d_b(key) * (sum q (1152 + code) - 1152 sum q): the DPAS
++// accumulator starts at -1152 sum q (the prepass's sum of the f16 Q, a float a (block, row)), and
++// the scale multiplies the f32 sum once a block.
++//
++// V (q4_0, 8 blocks of 18 bytes): one transformed byte read a block (16 byte columns x 32 key
++// rows: lane = quant byte j, a byte a key) gives dims 32 b + j from the low nibbles and 32 b + 16 +
++// j from the high ones. A byte read's column must be on the 4-byte grid: an odd block's quant
++// bytes start on it; an even block's start 2 bytes off, so it is read 2 bytes on and lanes 14, 15
++// take quant bytes 0, 1 from lanes 2, 3 of a read at the block's first byte. 0x6400 | n is the f16
++// of 1032 + (n - 8). The scale of (key, block) stands under the sum over keys, so it goes into the
++// operand that has the key in its lane, normalised a (32-key block, q4_0 block) by a power of two:
++// c = 2^-e, e the binary exponent of the largest |d| among the block's 32 keys, pe = f16(p d c)
++// (|d c| < 2: no clamp is reached). The accumulator starts 1032 sum pe lower; O is taken to that
++// scale (x c), takes the two DPAS there and comes back (x 1 / c), in f32, so O holds the sum
++// itself. Exact powers of two: only pe's rounding point moves - 11 bits below the 32 keys' largest
++// scale, whatever its size. p itself is rounded to f16 first (a key 2^-24 under its row's maximum
++// weighs nothing, as in flash_attn_gqa_dpas).
++// Two other forms of this phase were built and measured, and are not in this text (the record:
++// the 0227 section of the series' README and the branch it names). pe = f16(p d 8) without the
++// normalisation keeps p d in f16's range from above, not from below: a V block of small values
++// under a flat row of weights leaves pe in the subnormals, and the V-floor test case fails it
++// (4.9e-3 on the 24 GB card; this text 3.4e-6). P V in f32 without the DPAS is right on every
++// input and slower: 1,793 us against 1,186 a 6-row call at 77,297 keys on that card.
++//
++// The mask is f16 [n_kv, rows]; a tile's rows are at most DEC27_MT tokens, so a key group reads
++// DEC27_MT runs of 16 halves (a block read; the last group of a call, which may end inside the
++// run, a clamped read a key). -inf (by its bits) and the f16 lowest hide a cell, any other value
++// is added to the score.
++// The block read needs its pointer on a 4-byte boundary. A row's run starts at row x n_kv cells of
++// 2 bytes: an odd row over an odd key count is 2 bytes past one. Measured on the 24 GB card with
++// the first build, which read every whole group as a block: the odd lanes of such a read held the
++// cell two before their own (the even lanes their own), so an odd row lost key 1 and took a key
++// past its mask's edge, and a call of 1,013 keys stood 7.0e-4 from the CPU. A run that is not on
++// 4 bytes is read a key at a time (mal[]); the served cache's key counts are multiples of 256,
++// so there the block read is the path.
++//
++// Red builds (GGML_OPENCL_FA_DEC27_RED): 1 DEC27_RED_V_SCALE takes V's scale from the next block
++// of the row; 2 DEC27_RED_TAIL drops the call's last key; 3 DEC27_RED_SEAM skips the first block
++// of every split from the second on; 4 DEC27_RED_NOMAX merges the states without their maxima;
++// 5 DEC27_RED_K_SCALE2 applies K's scale twice. Each must FAIL the arm's test cases.
++// 6 DEC27_RED_PVNORM_IC leaves out the 1 / c that brings O back from a block's scale: it must FAIL too.
++// 7 DEC27_RED_MASK_ALIGN block-reads a mask run whatever its pointer: it must FAIL the cases of an odd key count
++// (a device behaviour: only a card run shows it; an even key count has every run on 4 bytes and passes).
++
++#define DK 256
++#define QR 8
++#define BK 32
++#define NKB (BK / 16)
++#define NC (DK / 16)          // 16 chunks of 16 dims
++#define NB8 (DK / 32)         // 8 blocks a (key, kv head)
++#define HBK (NB8 * 34)        // 272
++#define HBV (NB8 * 18)        // 144
++#define STATE (NC * QR * 16 + 2 * QR)   // = FA_DEC27_STATE_FLOATS
++#define QTILE (QR * DK * 2)             // = FA_DEC27_QTILE_BYTES
++#define M_INIT (-3.0e38f)
++#define LOG2E 1.4426950408889634f
++#ifndef DEC27_MT
++#define DEC27_MT 2
++#endif
++#if DEC27_MT < 1 || DEC27_MT > 8
++#error "DEC27_MT: a tile's 8 rows are 1 to 8 tokens"
++#endif
++#define DPAS(a, b, c) intel_sub_group_f16_f16_matrix_mad_k16(a, b, c)
++
++// IGC's value-returning forms of the cl_intel_subgroup_2d_block_io reads (flash_attn_dpas2.cl)
++ushort16 __builtin_IB_subgroup_block_read_flat_u16_m8k16v2(long base, int w, int h, int p, int2 c);
++uint8    __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(long base, int w, int h, int p, int2 c);
++uint8    __builtin_IB_subgroup_block_read_flat_transform_u8_k32(long base, int w, int h, int p, int2 c);
++
++// the code (of 16 in 4 dwords) half h of B16's result holds
++#define DEC27_ORD(h) (4 * (((h) & 7) >> 1) + 2 * ((h) & 1) + ((h) >> 3))
++#define KV8_BIAS 1152.0f
++#define V4_BIAS  1032.0f
++#define ONES16 ((int8)(0x3C003C00))   // sixteen 1.0h, a DPAS b operand
++#define B16(w)  ((uint8)(((w) & 0x00FF00FFu) ^ 0x64806480u, (((w) >> 8) & 0x00FF00FFu) ^ 0x64806480u))
++#define B16L(w) ((uint8)(((w) & 0x000F000Fu) | 0x64006400u, (((w) >> 8) & 0x000F000Fu) | 0x64006400u))
++#define B16H(w) ((uint8)((((w) >> 4) & 0x000F000Fu) | 0x64006400u, (((w) >> 12) & 0x000F000Fu) | 0x64006400u))
++// the byte column of block b's V read, and the quant byte (of 16) lane l holds after the splice
++#define V4X(b) (18 * (b) + (((b) & 1) ? 2 : 4))
++#define V4J(b, l) (((b) & 1) ? (l) : ((l) < 14 ? (l) + 2 : (l) - 14))
++#define V4_ODIM(c, l) (16 * ((c) & 1) + V4J((c) / 2, (l)))
++#if (18 * 0 + 4) % 4 != 0 || (18 * 1 + 2) % 4 != 0 || (18 * 6 + 4) % 4 != 0 || (18 * 7 + 2) % 4 != 0
++#error "flash_attn_dec27.cl: a V read off the 4-byte grid"
++#endif
++#ifdef DEC27_RED_V_SCALE
++#define V4B(b) (((b) + 1) % NB8)      // the red case: the scale of the next block
++#else
++#define V4B(b) (b)
++#endif
++
++// The dim (of a block's 32) lane h of chunk c holds, in the Q scratch and in the K operand:
++//   an odd block (codes on dwords):         16 (c & 1) + ORD(h)
++//   an even block (codes 2 bytes off them): its first chunk codes 2 .. 17 (2 + ORD(h)), its second
++//     codes 18 .. 29 and, in the last dword, 0, 1, 30, 31
++static inline int dec27_qdim(const int c, const int h) {
++    const int ko = DEC27_ORD(h);
++    const int e1 = ko < 12 ? 18 + ko : (ko < 14 ? ko - 12 : ko + 16);
++    return 32 * (c / 2) + (((c / 2) & 1) ? 16 * (c & 1) + ko : ((c & 1) ? e1 : 2 + ko));
++}
++
++// Q to the scratch, once a call: a work-item a (q8_0 block, flat row, tile of a kv head). The
++// tile's 8 rows x 256 halves in K's lane order (unscaled; a row past the call's rows is zero), and
++// -1152 x the sum of the block's 32 f16 values as a float (the DPAS accumulator's start).
++kernel void kernel_fa_dec27_q(global const char * q, ulong q_offset, ulong q_nb1, ulong q_nb2,
++                              int n_q, int G, int n_tiles, int n_head_kv,
++                              global half * qs, global float * nqs) {
++    const int b = get_global_id(0), r = get_global_id(1), tl = get_global_id(2);
++    if (b >= NB8 || r >= QR || tl >= n_tiles * n_head_kv) return;
++    const int kvh = tl / n_tiles, tile = tl % n_tiles;
++    const int f = tile * QR + r;
++    const bool live = f < G * n_q;
++    const int head = kvh * G + (live ? f % G : 0), row = live ? f / G : 0;
++    global const float * qrow = (global const float *)(q + q_offset + (ulong) head * q_nb2 + (ulong) row * q_nb1);
++    global half * out = qs + ((size_t) tl * QR + r) * DK;
++    float sum = 0.f;
++    for (int c = 2 * b; c < 2 * b + 2; ++c) {
++        for (int h = 0; h < 16; ++h) {
++            const half x = live ? (half) qrow[dec27_qdim(c, h)] : 0.0h;
++            out[16 * c + h] = x;
++            sum += (float) x;
++        }
++    }
++    nqs[((size_t) tl * NB8 + b) * QR + r] = -KV8_BIAS * sum;
++}
++
++// Q rows 0 .. 7 of the tile, chunks 2 j and 2 j + 1: lane = the chunk's 16 dims, component = row
++#define QREAD2(j) __builtin_IB_subgroup_block_read_flat_u16_m8k16v2(qb, DK * 2 - 1, QR - 1, DK * 2 - 1, (int2)(32 * (j), 0))
++// K: 8 dwords of 16 key rows from dword w of the head, lane = key
++#define K8W(w, y) __builtin_IB_subgroup_block_read_flat_transpose_u32_k8(kb, kx + HBK - 1, n_kv - 1, kp - 1, (int2)(kx / 4 + (w), (y)))
++// V: 16 byte columns of 32 key rows from byte xb of the head, lane = byte column, a byte a key
++#define V4R(xb, y) __builtin_IB_subgroup_block_read_flat_transform_u8_k32(vb, vx + HBV - 1, n_kv - 1, vp - 1, (int2)(vx + (xb), (y)))
++
++// One pair of q8_0 blocks (2 p, 2 p + 1) of a key group into acc: E0 .. E7, X8 are the even block's
++// nine dwords, O9 .. O16 the odd block's eight; QE, QO the two blocks' Q (ushort16: two chunks)
++#ifdef DEC27_RED_K_SCALE2
++#define DEC27_KD(d) ((d) * (d))        // the red case: the scale applied twice
++#else
++#define DEC27_KD(d) (d)
++#endif
++#define DEC27_PAIR(acc, p, QE, QO, E0, E1, E2, E3, E4, E5, E6, E7, X8, O9, O10, O11, O12, O13, O14, O15, O16) { \
++        const ushort16 qe = (QE), qo = (QO); \
++        const float kde = (float) as_half((ushort) (E0)); \
++        const float kdo = (float) as_half((ushort) ((X8) >> 16)); \
++        const uint  kx0 = ((E0) >> 16) | ((X8) << 16); \
++        float8 t = nq[2 * (p)]; \
++        t = DPAS(as_short8(qe.lo), as_int8(B16((uint4)(E1, E2, E3, E4))), t); \
++        t = DPAS(as_short8(qe.hi), as_int8(B16((uint4)(E5, E6, E7, kx0))), t); \
++        acc += t * DEC27_KD(kde); \
++        t = nq[2 * (p) + 1]; \
++        t = DPAS(as_short8(qo.lo), as_int8(B16((uint4)(O9, O10, O11, O12))), t); \
++        t = DPAS(as_short8(qo.hi), as_int8(B16((uint4)(O13, O14, O15, O16))), t); \
++        acc += t * DEC27_KD(kdo); \
++    }
++// a key group's S: the nine dword reads, three in flight at most
++#define DEC27_S_GROUP(acc, y, Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7) { \
++        const uint8 ra = K8W(0, y), rb = K8W(8, y), rc = K8W(16, y); \
++        DEC27_PAIR(acc, 0, Q0, Q1, ra.s0, ra.s1, ra.s2, ra.s3, ra.s4, ra.s5, ra.s6, ra.s7, rb.s0, \
++                   rb.s1, rb.s2, rb.s3, rb.s4, rb.s5, rb.s6, rb.s7, rc.s0) \
++        const uint8 rd = K8W(24, y), re = K8W(32, y); \
++        DEC27_PAIR(acc, 1, Q2, Q3, rc.s1, rc.s2, rc.s3, rc.s4, rc.s5, rc.s6, rc.s7, rd.s0, rd.s1, \
++                   rd.s2, rd.s3, rd.s4, rd.s5, rd.s6, rd.s7, re.s0, re.s1) \
++        const uint8 rf = K8W(40, y), rg = K8W(48, y); \
++        DEC27_PAIR(acc, 2, Q4, Q5, re.s2, re.s3, re.s4, re.s5, re.s6, re.s7, rf.s0, rf.s1, rf.s2, \
++                   rf.s3, rf.s4, rf.s5, rf.s6, rf.s7, rg.s0, rg.s1, rg.s2) \
++        const uint8 rh = K8W(56, y), ri = K8W(60, y); \
++        DEC27_PAIR(acc, 3, Q6, Q7, rg.s3, rg.s4, rg.s5, rg.s6, rg.s7, rh.s0, rh.s1, rh.s2, rh.s3, \
++                   rh.s4, rh.s5, rh.s6, rh.s7, ri.s4, ri.s5, ri.s6, ri.s7) \
++    }
++
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_fa_dec27(
++        global const char * qs, global const float * nqs,
++        global const char * k, ulong k_offset, ulong k_nb1, ulong k_nb2,
++        global const char * v, ulong v_offset, ulong v_nb1, ulong v_nb2,
++        global const char * mask, ulong mask_offset, ulong mask_nb1,
++        int n_q, int n_kv, int G, int n_tiles, int n_head_kv,
++        int n_split, int split_blocks, float scale_log2,
++        global float * part)
++{
++    const int lane = get_sub_group_local_id();
++    // the ids are the same in all 16 lanes; the broadcast of lane 0 makes them uniform values to
++    // the compiler (flash_attn_port.cl's PORT_UNIFORM), so indices, branches and loops are scalar
++    const int tile = sub_group_broadcast((int) get_group_id(0), 0u);
++    const int sidx = sub_group_broadcast((int) get_global_id(1), 0u);
++    const int kvh  = sub_group_broadcast((int) get_global_id(2), 0u);
++    if (tile >= n_tiles || sidx >= n_split || kvh >= n_head_kv) return;
++    const int tl = kvh * n_tiles + tile;
++
++    // the head's first byte, as an aligned surface base and a byte offset in its rows
++    const long ka = (long) (k + k_offset) + (long) kvh * (long) k_nb2;
++    const long va = (long) (v + v_offset) + (long) kvh * (long) v_nb2;
++    const long kb = ka & ~63L, vb = va & ~63L;
++    const int  kx = (int) (ka & 63L), vx = (int) (va & 63L);
++    const int  kp = (int) k_nb1, vp = (int) v_nb1;
++    const long qb = (long) qs + (long) tl * QTILE;
++    const global float * nqp = nqs + (size_t) tl * (NB8 * QR);
++    const global half * mb = (const global half *)(mask + mask_offset);
++    const size_t mstr = (size_t) (mask_nb1 / sizeof(half));
++
++    // the tile's rows: which are live, and which of the tile's tokens each is
++    const int n_rows = G * n_q;
++    const int tk0 = (tile * QR) / G;
++    bool rlive[QR];
++    int  rslot[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++        const int f = tile * QR + r;
++        rlive[r] = f < n_rows;
++        rslot[r] = min(f / G, n_q - 1) - tk0;
++    }
++    const global half * mrow[DEC27_MT];
++    bool mal[DEC27_MT];                  // the row's runs are on 4 bytes (a key group starts 32 bytes after the one before)
++    _Pragma("unroll")
++    for (int j = 0; j < DEC27_MT; ++j) {
++        mrow[j] = mb + (size_t) min(tk0 + j, n_q - 1) * mstr;
++#ifdef DEC27_RED_MASK_ALIGN
++        mal[j] = true;                   // the red case: the block read whatever the pointer
++#else
++        mal[j] = ((size_t) mrow[j] & 3) == 0;
++#endif
++    }
++
++    float8 nq[NB8];
++    _Pragma("unroll")
++    for (int b = 0; b < NB8; ++b) nq[b] = vload8(0, nqp + b * QR);
++
++    float  m[QR], l[QR];
++    float8 o[NC];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) { m[r] = M_INIT; l[r] = 0.f; }
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) o[c] = (float8)(0.f);
++
++    // this split's blocks; a split past the call's blocks walks none
++#ifdef DEC27_RED_SEAM
++    const int s_lo = sidx * split_blocks * BK + (sidx > 0 ? BK : 0);     // the red case: a seam block lost
++#else
++    const int s_lo = sidx * split_blocks * BK;
++#endif
++    const int s_hi = min(n_kv, (sidx + 1) * split_blocks * BK);
++    const int vord = lane < 8 ? 2 * lane : 2 * lane - 15;                // the key (of 16) a lane of P holds: DEC27_ORD(lane)
++    for (int t0 = s_lo; t0 < s_hi; t0 += BK) {
++        // ---- S = Q K^T: lane = key, component = row. Each key group reads Q itself (16 reads a
++        // block): with one set of Q reads for both groups, 16 more registers are in flight and the
++        // kernel spills (ocloc, both targets: 3,264 bytes of scratch) ----
++        float8 s[NKB];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            float8 acc = (float8)(0.f);
++            DEC27_S_GROUP(acc, t0 + gb * 16, QREAD2(0), QREAD2(1), QREAD2(2), QREAD2(3), QREAD2(4), QREAD2(5), QREAD2(6), QREAD2(7))
++            s[gb] = acc;
++        }
++
++        // ---- score: bounds and the mask ----
++        float sc[NKB][QR];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            const int  kg  = t0 + gb * 16;
++            const int  kk  = min(kg + lane, n_kv - 1);
++#ifdef DEC27_RED_TAIL
++            const bool inb = kg + lane < n_kv - 1;                       // the red case: the last key dropped
++#else
++            const bool inb = kg + lane < n_kv;
++#endif
++            ushort mu[DEC27_MT];
++            _Pragma("unroll")
++            for (int j = 0; j < DEC27_MT; ++j) {
++                if (kg + 16 <= n_kv && mal[j]) {
++                    mu[j] = intel_sub_group_block_read_us((const global ushort *) (mrow[j] + kg));
++                } else {
++                    mu[j] = as_ushort(mrow[j][kk]);
++                }
++            }
++            const float sv8[QR] = { s[gb].s0, s[gb].s1, s[gb].s2, s[gb].s3, s[gb].s4, s[gb].s5, s[gb].s6, s[gb].s7 };
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) {
++                ushort mr = mu[0];
++                _Pragma("unroll")
++                for (int j = 1; j < DEC27_MT; ++j) mr = rslot[r] == j ? mu[j] : mr;
++                const bool  hidden = (mr & 0x7C00) == 0x7C00 || mr == 0xFBFF;
++                const float mv = hidden ? 0.f : (float) as_half(mr);
++                sc[gb][r] = (rlive[r] && inb && !hidden) ? sv8[r] * scale_log2 + LOG2E * mv : M_INIT;
++            }
++        }
++
++        // ---- the online softmax: the rows' block maxima, alpha, l ----
++        float alpha[QR];
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            const float mx = sub_group_reduce_max(fmax(sc[0][r], sc[1][r]));
++            const float mn = fmax(m[r], mx);
++            alpha[r] = native_exp2(m[r] - mn);
++            m[r] = mn;
++            l[r] *= alpha[r];
++        }
++
++        // ---- p = exp2(s - m) <= 1, rounded to f16 once; l the lane's partial sum; P in V's key order ----
++        float ps[NKB][QR];
++        _Pragma("unroll")
++        for (int gb = 0; gb < NKB; ++gb) {
++            _Pragma("unroll")
++            for (int r = 0; r < QR; ++r) {
++                const float pf = (float) (half) (sc[gb][r] > 0.5f * M_INIT ? native_exp2(sc[gb][r] - m[r]) : 0.f);
++                l[r] += pf;
++                ps[gb][r] = intel_sub_group_shuffle(pf, (uint) vord);
++            }
++        }
++
++        // ---- O = O alpha + sum over keys of p d (nibble - 8): lane = quant byte, components = rows ----
++        const float8 av = (float8)(alpha[0], alpha[1], alpha[2], alpha[3], alpha[4], alpha[5], alpha[6], alpha[7]);
++        _Pragma("unroll")
++        for (int b = 0; b < NB8; ++b) {
++            short8 pe[NKB];
++            // the binary exponent of the largest |d| among the block's 32 keys (0: every scale is zero, c = 1), c and
++            // 1 / c: uniform. The scales are read here for the exponent alone and again where P takes them
++            float cn, ic;
++            {
++                const float dr0 = vload_half(0, (global const half *)(v + v_offset + (ulong) kvh * v_nb2 + (ulong) min(t0 + lane, n_kv - 1) * v_nb1 + 18 * V4B(b)));
++                const float dr1 = vload_half(0, (global const half *)(v + v_offset + (ulong) kvh * v_nb2 + (ulong) min(t0 + 16 + lane, n_kv - 1) * v_nb1 + 18 * V4B(b)));
++                const uint  eb  = (as_uint(sub_group_broadcast(sub_group_reduce_max(fmax(fabs(dr0), fabs(dr1))), 0u)) >> 23) & 0xFFu;
++                // eb 0: every scale is zero (or subnormal as a float, which an f16 scale never is); eb 255: a scale
++                // that is inf or NaN. Neither is normalised (c = 1): the block's sum is then whatever those scales give
++                const bool en = eb != 0u && eb != 255u;
++                cn = en ? as_float((254u - eb) << 23) : 1.f;
++#ifdef DEC27_RED_PVNORM_IC
++                ic = 1.f;                        // the red case: the block's sum left at the normalised scale
++#else
++                ic = en ? as_float(eb << 23) : 1.f;
++#endif
++            }
++            _Pragma("unroll")
++            for (int gb = 0; gb < NKB; ++gb) {
++                // the scale of this lane's key: a row past n_kv repeats the last one (its p is 0)
++                const int kr = min(t0 + gb * 16 + vord, n_kv - 1);
++                const float ds = cn * vload_half(0, (global const half *)(v + v_offset + (ulong) kvh * v_nb2 + (ulong) kr * v_nb1 + 18 * V4B(b)));
++                half eh[QR];
++                _Pragma("unroll")
++                for (int r = 0; r < QR; ++r) eh[r] = (half)(ps[gb][r] * ds);
++                pe[gb] = as_short8((half8)(eh[0], eh[1], eh[2], eh[3], eh[4], eh[5], eh[6], eh[7]));
++            }
++            const float8 ns = DPAS(pe[1], ONES16, DPAS(pe[0], ONES16, (float8)(0.f))) * -V4_BIAS;
++            uint8 vr = V4R(V4X(b), t0);          // 4 dwords a lane: the first key group, then the second
++            if ((b & 1) == 0) {
++                // an even block: lanes 14, 15 read the next block's scale; they take the block's quant
++                // bytes 0, 1 from lanes 2, 3 of a read at the block's first byte
++                const uint8 v0 = V4R(18 * b, t0);
++                const uint vsrc = (uint) (lane >= 14 ? lane - 12 : lane);
++                const int  vfix = lane >= 14;
++                vr = (uint8)(vfix ? intel_sub_group_shuffle(v0.s0, vsrc) : vr.s0, vfix ? intel_sub_group_shuffle(v0.s1, vsrc) : vr.s1,
++                             vfix ? intel_sub_group_shuffle(v0.s2, vsrc) : vr.s2, vfix ? intel_sub_group_shuffle(v0.s3, vsrc) : vr.s3,
++                             vfix ? intel_sub_group_shuffle(v0.s4, vsrc) : vr.s4, vfix ? intel_sub_group_shuffle(v0.s5, vsrc) : vr.s5,
++                             vfix ? intel_sub_group_shuffle(v0.s6, vsrc) : vr.s6, vfix ? intel_sub_group_shuffle(v0.s7, vsrc) : vr.s7);
++            }
++            // O goes to the block's normalised scale (x c, exact), takes the two DPAS there, and comes back (x 1 / c):
++            // the same registers as the default form
++            float8 acc = o[2 * b] * av * cn + ns;    // the low nibbles: dims 32 b + j
++            acc = DPAS(pe[0], as_int8(B16L(vr.lo)), acc);
++            acc = DPAS(pe[1], as_int8(B16L(vr.hi)), acc);
++            o[2 * b] = acc * ic;
++            acc = o[2 * b + 1] * av * cn + ns;   // the high nibbles: dims 32 b + 16 + j
++            acc = DPAS(pe[0], as_int8(B16H(vr.lo)), acc);
++            acc = DPAS(pe[1], as_int8(B16H(vr.hi)), acc);
++            o[2 * b + 1] = acc * ic;
++        }
++    }
++
++    // ---- the split's state: O as the sub-group holds it, then the rows' m (lanes 0 .. 7) and their
++    // reduced l (lanes 8 .. 15); the merge divides ----
++    global float * st = part + ((size_t) (sidx * n_head_kv + kvh) * (size_t) n_tiles + (size_t) tile) * STATE;
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) intel_sub_group_block_write8((global uint *) (st + c * QR * 16), as_uint8(o[c]));
++    float mlv = 0.f;
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) {
++        const float lv = sub_group_reduce_add(l[r]);
++        mlv = lane == r ? m[r] : (lane == QR + r ? lv : mlv);
++    }
++    st[NC * QR * 16 + lane] = mlv;
++}
++
++// The merge of a call's split states, one sub-group a (tile, kv head): M = max m_s, w_s = exp2(m_s
++// - M), O = sum w_s O_s, l = sum w_s l_s, out = O / (8 l) into the op's dst at head * o_nb1 + row *
++// o_nb2. A split that walked no visible key has (M_INIT, 0) and weighs 0; a row no split saw is 0.
++__attribute__((intel_reqd_sub_group_size(16)))
++kernel void kernel_fa_dec27_merge(global const float * part, global char * dst, ulong o_offset, ulong o_nb1, ulong o_nb2,
++                                  int n_q, int G, int n_tiles, int n_head_kv, int n_split)
++{
++    const int lane = get_sub_group_local_id();
++    const int tile = sub_group_broadcast((int) get_global_id(1), 0u);
++    const int kvh  = sub_group_broadcast((int) get_global_id(2), 0u);
++    if (tile >= n_tiles || kvh >= n_head_kv) return;
++    const size_t sstride = (size_t) n_head_kv * (size_t) n_tiles * STATE;    // one split's states
++    global const float * st0 = part + ((size_t) kvh * (size_t) n_tiles + (size_t) tile) * STATE;
++
++    float mx[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) mx[r] = M_INIT;
++    for (int s = 0; s < n_split; ++s) {
++        const float ml = st0[(size_t) s * sstride + NC * QR * 16 + lane];
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) mx[r] = fmax(mx[r], sub_group_broadcast(ml, (uint) r));
++    }
++
++    float  ls[QR];
++    float8 o[NC];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) ls[r] = 0.f;
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) o[c] = (float8)(0.f);
++    for (int s = 0; s < n_split; ++s) {
++        global const float * st = st0 + (size_t) s * sstride;
++        const float ml = st[NC * QR * 16 + lane];
++        float w[QR];
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            const float ms = sub_group_broadcast(ml, (uint) r), lv = sub_group_broadcast(ml, (uint) (QR + r));
++#ifdef DEC27_RED_NOMAX
++            w[r] = 1.f;                          // the red case: the states added without their maxima
++#else
++            w[r] = ms > 0.5f * M_INIT ? native_exp2(ms - mx[r]) : 0.f;
++#endif
++            ls[r] += w[r] * lv;
++        }
++        const float8 wv = (float8)(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++        _Pragma("unroll")
++        for (int c = 0; c < NC; ++c) o[c] += wv * as_float8(intel_sub_group_block_read8((global const uint *) (st + c * QR * 16)));
++    }
++    float inv[QR];
++    _Pragma("unroll")
++    for (int r = 0; r < QR; ++r) inv[r] = ls[r] > 0.f ? 1.f / ls[r] : 0.f;                   // O holds the sum itself
++    const int n_rows = G * n_q;
++    _Pragma("unroll")
++    for (int c = 0; c < NC; ++c) {
++        const float ov[QR] = { o[c].s0, o[c].s1, o[c].s2, o[c].s3, o[c].s4, o[c].s5, o[c].s6, o[c].s7 };
++        _Pragma("unroll")
++        for (int r = 0; r < QR; ++r) {
++            const int f = tile * QR + r;
++            if (f >= n_rows) continue;
++            global float * orow = (global float *)(dst + o_offset + (size_t) (kvh * G + f % G) * o_nb1 + (size_t) (f / G) * o_nb2);
++            orow[32 * (c / 2) + V4_ODIM(c, lane)] = ov[r] * inv[r];
++        }
++    }
++}

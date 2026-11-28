@@ -1,0 +1,552 @@
+0227b: test-backend-ops cases for the decode FA arm (0227). test_flash_attn_dec27: FLASH_ATTN_EXT in the dense 27B hybrid's layout (q a permuted view [256, T, 24] nb [4, 24576, 1024]; K q8_0 and V q4_0 permuted views [256, n_kv, 4] of a longer cache, nb [34, 1088, 272] and [18, 576, 144]), the mask as served (row t sees the keys up to its own token), 28 eval cases (two at the dispatch's crossover, 8,191 and 8,192 keys at 6 rows: with the switch at 1 the first must run on today's kernels and the second on the arm; the decisions check asks the gate the same, red first with GGML_TEST_FA_DEC27_DECISIONS=nomin; from the threshold on a run that tests the arm - the op cases, the red builds, a perf case below 8,192 keys - needs GGML_OPENCL_FA_DEC27=2, since at 1 those cases run today's kernels; 13,056 keys with a split that walks nothing, 8,960 cells with a hidden padded tail, 131,072 keys and the V-floor case - block maxima ~1e-6 under a row with no dominant key, which the kernel must pass (a P V phase without the normalised scale fails it) - among them): 4 to 8 rows at 1,013 and 4,096 keys, 4 / 6 / 8 rows at 32,768 and 77,297 keys, a hidden stretch, 16 query heads on 2, calls of 6 and 37 keys; one in the contiguous layout the gate refuses, and two of 12 and 16 rows whose row blocks the arm must not take. A case the arm does not serve runs on today's kernels at their bound, 5e-4. The fill: an amplitude a (kv head, key, block), and the last 8 keys carrying a good part of a row's weight at any depth, so a wrong scale, a dropped tail key and a lost block all move the answer. The bound against the CPU backend for a case on the arm, stated before any card run: 1e-5 below 16,384 keys, 2e-5 from there (the CPU's own distance from a double reference grows with depth; the lost-key reds sit more than 10 times above 2e-5). With GGML_OPENCL_FA_DEC27=1 a case fails when the backend's record shows no launch of the arm for it or a split count that is not the rule's ("[FA_DEC27] split=.."); without the switch the cases run on today's kernels and the arm must not have launched. Device-free: GGML_TEST_FA_DEC27_DECISIONS=1 (every case through the pure gate, the split for both cards; =red: every case in the contiguous layout must FAIL) and GGML_TEST_FA_DEC27_CPU=1 (every case on the CPU backend against a double-precision attention on ggml's dequantization: the CPU within half the bound, a dropped last key and a lost seam block a split each more than 10 times the bound; and what the card does with a 16-half block read of a mask run 2 bytes past a 4-byte boundary - the first build's read, the kernel's red build 7 - more than 10 times the bound in every case of an odd key count but one - the crossover's own case of 8,191 keys shows it at 7.9 times its bound and is named, not asked (11 cases ask the 10 times) - its figures the card's: 7.01e-4 against 7.02e-4 at 1,013 keys and 6 rows, 3.97e-2 at 77,297). Perf cases: 6 rows at 4,096, 32,768, 77,297 and 131,072 keys, 4 and 8 rows at 77,297.
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index f4c2e15..eae05c7 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -20,6 +20,7 @@
+ #include "ggml-backend.h"
+ #include "ggml-cpp.h"
+ #include "../ggml/src/ggml-opencl/fa_port_gate.h"   // 0199: the port arm's gate and routing, pure (no OpenCL)
++#include "../ggml/src/ggml-opencl/fa_dec27_gate.h"  // 0227: the decode FA arm's gate and split rule, pure (no OpenCL)
+ #include "../ggml/src/ggml-backend-impl.h"          // 0199: the registry structs, for the guard test's mock backends
+ 
+ #include <algorithm>
+@@ -10554,6 +10555,226 @@ struct test_flash_attn_ext : public test_case {
+     }
+ };
+ 
++// 0227: GGML_OP_FLASH_ATTN_EXT as the dense 27B hybrid's decode / verify calls have it, for the
++// in-place decode arm (GGML_OPENCL_FA_DEC27=1, kernels/flash_attn_dec27.cl): head size 256, hkv kv
++// heads x G query heads, nb query rows (4 to 8: the verify of a draft), a q8_0 K and a q4_0 V cache
++// in the model's layout - q a permuted view [256, nb, heads] with nb [4, heads*1024, 1024], K and V
++// permuted views [256, kv, hkv] of a cache longer than its use, with nb [34, hkv*272, 272] and
++// [18, hkv*144, 144] - and the mask as served: row t sees the keys up to its own token (the nb rows
++// are the cache's last nb cells). hide: a stretch of cells in the middle hidden from every row
++// (another sequence's cells). layout 1 builds the cache contiguous instead (a key row is one kv
++// head): the arm's gate refuses it, and the case runs on today's kernels.
++// The fill is a deterministic function of the logical index. K and V carry an amplitude a (kv head,
++// key, block) of 0.25 .. 2, so that a scale taken from the wrong block or applied twice moves the
++// answer. The last 8 keys point along a direction every query row of the kv head carries, with a
++// logit about ln(kv / 8) - 4 above the other keys' (1.3 at least): at any depth the tail and the rest both hold a
++// good part of a row's weight, so a dropped tail key and a lost block elsewhere both move the
++// answer (GGML_TEST_FA_DEC27_CPU, on these cases: 7.3e-4 .. 5.8e-2).
++// The bound, stated before any card run: 1e-5 against the CPU backend below 16,384 keys and 2e-5
++// from there. The CPU backend quantizes Q to q8_0 and stands up to 2.9e-6 (to 13,056 keys) and
++// 2.9e-6 .. 4.7e-6 (32,768 to 131,072 keys) from a double-precision attention on the same blocks
++// (GGML_TEST_FA_DEC27_CPU); the kernel's arithmetic stands 5e-8 .. 7e-8 from it
++// (contrib/refkernels/dec27-fa/dec27_kernel_model.py in the arcint tree).
++// With the switch on, a case whose launch the backend's record does not show, or whose split
++// count is not the rule's (fa_dec27_gate.h: fa_dec27_splits), fails: no blind pass. A case the arm
++// does not serve (the switch unset, the refused layout, more than 8 rows) runs on today's kernels
++// at their bound, 5e-4, and fails if the arm launched for it.
++struct test_flash_attn_dec27 : public test_case {
++    const int64_t hkv;   // kv heads
++    const int64_t G;     // query heads a kv head
++    const int64_t kv;    // keys
++    const int64_t nb;    // query rows
++    const int32_t hide;  // 1: cells [kv/3, kv/3 + 400) hidden from every row
++    const int32_t layout;
++    // the last `empty` cells are unused (hidden from every row): the cache presents its cells padded to 256, so a call
++    // of 8,960 cells can hold 8,705 tokens. The rows are then the last nb USED cells, the tail keys the last 8 used
++    const int64_t empty;
++    // 1: the V-floor case. No dominant key (no tail keys: the weights are the usual spread of random scores, none
++    // above the rest) over V blocks whose largest value is ~1e-6: p d lands in f16's subnormals. The
++    // kernel must be right on it: its P V phase normalises the scale a (32-key block, q4_0 block). A form that
++    // rounds f16(p 8 d) without the normalisation fails this case (built and measured: 4.9e-3 on the 24 GB card,
++    // the lane model 6.2e-4; the kernel 3.4e-6 there; the series' README), and so does the kernel's red build 6
++    const int32_t vfloor;
++
++    std::string vars() override {
++        std::string s = VARS_TO_STR5(hkv, G, kv, nb, hide);
++        if (layout != 0) {
++            s += ",layout=" + std::to_string(layout);
++        }
++        if (empty != 0) {
++            s += ",empty=" + std::to_string(empty);
++        }
++        if (vfloor != 0) {
++            s += ",vfloor=" + std::to_string(vfloor);
++        }
++        return s;
++    }
++
++    test_flash_attn_dec27(int64_t hkv = 4, int64_t G = 6, int64_t kv = 4096, int64_t nb = 6, int32_t hide = 0, int32_t layout = 0,
++                          int64_t empty = 0, int32_t vfloor = 0)
++        : hkv(hkv), G(G), kv(kv), nb(nb), hide(hide), layout(layout), empty(empty), vfloor(vfloor) {}
++
++    // the arm serves the case: the switch on, the model's layout, 4 to 8 rows, and the keys at the measured crossover
++    // or above (FA_DEC27_MIN_KV) unless the switch forces the arm at every key count (=2)
++    bool below_crossover() const {
++        const char * e = getenv("GGML_OPENCL_FA_DEC27");
++        return e != nullptr && atoi(e) != 2 && kv < FA_DEC27_MIN_KV;      // as the backend: only the value 2 forces the arm
++    }
++    bool on_arm() const {
++        const char * e = getenv("GGML_OPENCL_FA_DEC27");
++        return e != nullptr && atoi(e) != 0 && layout == 0 && nb >= 4 && nb <= 8 && !below_crossover();
++    }
++    // On the arm: 1e-5 below 16,384 keys, 2e-5 from there. Why two: the CPU backend's own distance from the double
++    // reference grows with the depth (GGML_TEST_FA_DEC27_CPU: up to 2.9e-6 to 13,056 keys, 2.9e-6 .. 4.7e-6 from
++    // 32,768 to 131,072), and the card's kernel adds its own rounding to it. Why 2e-5 is still a bound there: what
++    // it must catch sits far above it - on these cases a lost seam block a split moves the answer by 1.35e-3 at
++    // least from 32,768 keys on (68 times the bound at 131,072, where the figure is smallest) and a dropped last
++    // key by 7.3e-4 at least at any depth (the same check).
++    // Off the arm (the switch unset, the refused layout, more than 8 rows) the case runs on today's kernels, which
++    // round K and V to f16 before their products: their own cases' bound, 5e-4.
++    double arm_bound() const { return kv < 16384 ? 1e-5 : 2e-5; }
++    double max_nmse_err() override { return on_arm() ? arm_bound() : 5e-4; }
++    const char * err_tag() override { return "FA_DEC27"; }
++
++    uint64_t op_flops(ggml_tensor * t) override {
++        GGML_UNUSED(t);
++        return 2 * hkv*G * nb * (256 + 256) * kv;
++    }
++
++    void (*stats)(int64_t *) = nullptr;
++    int64_t before[6] = { 0, 0, 0, 0, 0, 0 };
++    void note_before_eval(ggml_backend_t backend) override {
++        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
++        ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
++        stats = reg ? (void (*)(int64_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_opencl_fa_dec27_stats") : nullptr;
++        if (stats) stats(before);
++    }
++    bool check_after_eval(ggml_backend_t backend) override {
++        GGML_UNUSED(backend);
++        if (stats == nullptr) return true;      // a backend without the arm
++        auto env = [](const char * n) { const char * e = getenv(n); return e ? atoi(e) : 0; };
++        int64_t now[6];
++        stats(now);
++        const bool on = env("GGML_OPENCL_FA_DEC27") != 0;
++        const int64_t launched = now[0] - before[0];
++        if (!on_arm()) {
++            // the switch off, a layout the gate refuses, or more than 8 rows (the 8-row blocks of such a call are not
++            // the arm's): today's kernels, and the arm must not have run
++            printf("[FA_DEC27] %s%s ", !on ? "off" : layout != 0 ? "refused layout" : (nb < 4 || nb > 8) ? "rows outside the arm" : "below the crossover", launched != 0 ? " BUT THE ARM LAUNCHED" : "");
++            return launched == 0;
++        }
++        if (launched <= 0) {
++            printf("[FA_DEC27] NO LAUNCH ");
++            return false;       // the switch on and the case on another kernel is no pass
++        }
++        const int p = (int) now[1], wave = (int) now[2], tps = (int) now[3], tiles = (int) now[4], mt = (int) now[5];
++        const int want_tiles = fa_dec27_tiles((int) G, (int) nb), want_mt = fa_dec27_mask_slots((int) G, (int) nb);
++        const int want = fa_dec27_splits((int) hkv * want_tiles, wave / 4, kv, env("GGML_OPENCL_FA_DEC27_SPLIT"), env("GGML_OPENCL_FA_DEC27_MINBLK"));
++        const bool ok = p == want && tiles == want_tiles && mt == want_mt && tps == (int) hkv * want_tiles;
++        printf("[FA_DEC27] split=%d (rule %d, wave %d, threads %d) tiles=%d mt=%d%s ", p, want, wave, p * tps, tiles, mt, ok ? "" : " MISMATCH");
++        return ok;
++    }
++
++    ggml_tensor * build_graph(ggml_context * ctx) override {
++        const int64_t D = 256, nh = hkv * G;
++        // q: [D, heads, rows] seen as [D, rows, heads], the model's permuted view
++        ggml_tensor * q = ggml_permute(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, nh, nb), 0, 2, 1, 3);
++        ggml_set_name(q, "q");
++        auto cache = [&](ggml_type type, const char * name) -> ggml_tensor * {
++            ggml_tensor * t;
++            if (layout == 0) {
++                // the model's cache: a key row holds the kv heads one after another, and has more cells than are used
++                ggml_tensor * base = ggml_new_tensor_3d(ctx, type, D, hkv, kv + 64);
++                t = ggml_permute(ctx, ggml_view_3d(ctx, base, D, hkv, kv, base->nb[1], base->nb[2], 0), 0, 2, 1, 3);
++            } else {
++                t = ggml_new_tensor_3d(ctx, type, D, kv, hkv);
++            }
++            ggml_set_name(t, name);
++            return t;
++        };
++        ggml_tensor * k = cache(GGML_TYPE_Q8_0, "k");
++        ggml_tensor * v = cache(GGML_TYPE_Q4_0, "v");
++        if (layout == 0) {
++            // the graph export's lines of the model (-ctk q8_0 -ctv q4_0); a case that builds another layout is not the arm's
++            GGML_ASSERT(q->nb[0] == 4 && q->nb[2] == (size_t) D*4 && q->nb[1] == (size_t) nh*D*4);
++            GGML_ASSERT(k->nb[0] == 34 && k->nb[2] == 272 && k->nb[1] == (size_t) hkv*272);
++            GGML_ASSERT(v->nb[0] == 18 && v->nb[2] == 144 && v->nb[1] == (size_t) hkv*144);
++        }
++        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
++        ggml_set_name(m, "m");
++        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf((float) D), 0.0f, 0.0f);
++        ggml_set_name(out, "out");
++        return out;
++    }
++
++    static float rnd(uint64_t salt, uint64_t i) { return -1.0f + 2.0f * test_flash_attn_ext::det01(salt, i); }
++
++    void initialize_tensors(ggml_context * ctx) override {
++        const int64_t D = 256, nh = hkv * G;
++        auto dir = [&](int64_t kvh, int64_t d) -> float { return test_flash_attn_ext::det01(7, (uint64_t) (kvh*D + d)) < 0.5f ? -1.0f : 1.0f; };
++        const float beta = std::max(0.2f, (logf((float) std::max<int64_t>(kv, 64) / 8.0f) - 4.0f) / 6.4f);
++        const int64_t used = kv - empty;         // the cells that hold a token
++        const int64_t n_tail = vfloor != 0 ? 0 : std::min<int64_t>(8, used);
++        const float k_amp = 1.0f, v_amp = vfloor != 0 ? 1e-6f : 1.0f;
++        // logical (dim, key, kv head) -> value
++        auto kval = [&](int64_t d, int64_t key, int64_t kvh) -> float {
++            if (key >= used - n_tail && key < used) {
++                return beta * dir(kvh, d) + 0.3f * rnd(5, (uint64_t) ((kvh*kv + key)*D + d));
++            }
++            const float amp = 0.25f * powf(2.0f, 3.0f * test_flash_attn_ext::det01(17, (uint64_t) ((kvh*kv + key)*(D/32) + d/32)));
++            return k_amp * amp * rnd(1, (uint64_t) ((kvh*kv + key)*D + d));
++        };
++        auto vval = [&](int64_t d, int64_t key, int64_t kvh) -> float {
++            const float amp = 0.25f * powf(2.0f, 3.0f * test_flash_attn_ext::det01(18, (uint64_t) ((kvh*kv + key)*(D/32) + d/32)));
++            return v_amp * amp * rnd(2, (uint64_t) ((kvh*kv + key)*D + d));
++        };
++        // a view's base gets ONE write, all of it (a backend that repacks a quantized tensor at
++        // set_tensor cannot take a second one: 0199q2)
++        auto fill_cache = [&](ggml_tensor * tv, bool is_k) {
++            ggml_tensor * base = tv->view_src ? tv->view_src : tv;
++            const size_t off = tv->view_src ? tv->view_offs : 0;
++            std::vector<uint8_t> buf(ggml_nbytes(base), 0);
++            std::vector<float> row(D);
++            const size_t rb = ggml_row_size(tv->type, D);
++            for (int64_t kvh = 0; kvh < tv->ne[2]; ++kvh) for (int64_t key = 0; key < tv->ne[1]; ++key) {
++                for (int64_t d = 0; d < D; ++d) row[d] = is_k ? kval(d, key, kvh) : vval(d, key, kvh);
++                const size_t at = off + key*tv->nb[1] + kvh*tv->nb[2];
++                GGML_ASSERT(at + rb <= buf.size());
++                ggml_quantize_chunk(tv->type, row.data(), buf.data() + at, 0, 1, D, nullptr);
++            }
++            ggml_backend_tensor_set(base, buf.data(), 0, buf.size());
++        };
++        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
++            if (strcmp(t->name, "q") == 0) {
++                // through the permuted view: [D, rows, heads] over a base [D, heads, rows]
++                ggml_tensor * base = t->view_src ? t->view_src : t;
++                std::vector<float> buf(ggml_nelements(base));
++                for (int64_t h = 0; h < nh; ++h) for (int64_t r = 0; r < nb; ++r) for (int64_t d = 0; d < D; ++d) {
++                    const float x = rnd(0, (uint64_t) ((h*nb + r)*D + d)) + 0.4f * dir(h / G, d);
++                    memcpy((char *) buf.data() + t->view_offs + d*t->nb[0] + r*t->nb[1] + h*t->nb[2], &x, sizeof(float));
++                }
++                ggml_backend_tensor_set(base, buf.data(), 0, buf.size() * sizeof(float));
++            } else if (strcmp(t->name, "k") == 0) {
++                fill_cache(t, true);
++            } else if (strcmp(t->name, "v") == 0) {
++                fill_cache(t, false);
++            } else if (strcmp(t->name, "m") == 0) {
++                std::vector<ggml_fp16_t> d(kv * nb);
++                const int64_t h_lo = kv / 3, h_hi = std::min(used - nb, kv / 3 + 400);
++                for (int64_t r = 0; r < nb; ++r) for (int64_t j = 0; j < kv; ++j) {
++                    const bool vis = j <= used - nb + r && !(hide != 0 && j >= h_lo && j < h_hi);
++                    d[r*kv + j] = ggml_fp32_to_fp16(vis ? 0.0f : -INFINITY);
++                }
++                ggml_backend_tensor_set(t, d.data(), 0, d.size() * sizeof(ggml_fp16_t));
++            } else if (t->view_src == nullptr && !ggml_is_quantized(t->type)) {
++                // q's base (overwritten through the view, which comes after it), the output, the harness's
++                // sentinels. A quantized base is left to its one write through the view
++                init_tensor_uniform(t);
++            }
++        }
++    }
++};
++
+ // large Q values, so the online softmax has to rescale the partial results
+ // GGML_OP_FLASH_ATTN_EXT over paged K/V (0119/0122, ggml_flash_attn_ext_set_pages):
+ // a pool laid out like the KV cache (all heads of a token in one row) holds the
+@@ -14682,6 +14903,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+             }
+         }
+     }
++    // 0227: the in-place decode arm's cases (GGML_OPENCL_FA_DEC27=1; without the switch they run on
++    // today's kernels, with the same bound): the dense 27B hybrid's layout, 24 query heads on 4, K
++    // q8_0 / V q4_0, the mask as served. 4 to 8 rows at 1,013 keys (a partial key block) and 4,096;
++    // 4, 6 and 8 rows at 32,768 and at 77,297 keys (the agent's median depth, a partial block); a
++    // hidden stretch at 4,096 and 77,297; 16 query heads on 2 (one mask slot a tile); calls of 6 and
++    // 37 keys (less than a block, less than two); the contiguous layout the gate refuses; and two
++    // calls of more than 8 rows, whose row blocks the arm must not take; then an empty split, a hidden
++    // padded tail, 131,072 keys, and the V-floor case
++    for (int64_t nb : {4, 5, 6, 7, 8}) {
++        for (int64_t kv : {1013, 4096}) {
++            test_cases.emplace_back(new test_flash_attn_dec27(4, 6, kv, nb));
++        }
++    }
++    for (int64_t nb : {4, 6, 8}) {
++        for (int64_t kv : {32768, 77297}) {
++            test_cases.emplace_back(new test_flash_attn_dec27(4, 6, kv, nb));
++        }
++    }
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 4096, 6, 1));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 77297, 6, 1));
++    test_cases.emplace_back(new test_flash_attn_dec27(2, 8, 1013, 6));
++    test_cases.emplace_back(new test_flash_attn_dec27(2, 8, 4096, 8));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 6, 6));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 37, 6));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 1013, 6, 0, 1));
++    // served shapes with a split that sees nothing: 13,056 keys at 6 rows is 25 splits of 17 blocks on 160 compute
++    // units, the 25th past the call's 408 blocks (15 depths from 13,056 to 23,808 have such a split; 71 on 256
++    // units); 8,960 cells holding 8,705 tokens (the cache pads its cells to 256): the last split's 256 keys are
++    // hidden from every row but the last, which sees one
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 13056, 6));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 8960, 6, 0, 0, 255));
++    // 131,072 keys, where the kernel is 55 % of a verify
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 131072, 6));
++    // the V-floor case (see vfloor): the kernel must pass it
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 131072, 6, 0, 0, 0, 1));
++    // the crossover of the dispatch (FA_DEC27_MIN_KV = 8,192 keys): one key below it the call keeps today's kernels
++    // with the switch at 1 ("[FA_DEC27] below the crossover", no launch of the arm), at it the arm takes the call;
++    // with the switch at 2 the arm takes both.
++    // FROM THE THRESHOLD ON, A RUN THAT TESTS THE ARM NEEDS THE SWITCH AT 2: at 1 every case below 8,192 keys runs
++    // today's kernels - the red builds would pass on them without the arm in the run, and the perf case of 4,096
++    // keys would time flash_attn_gqa_dpas
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 8191, 6));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 8192, 6));
++    // 12 and 16 rows: the dispatch cuts them into blocks of 8 (and 4) rows, which have a verify's shape and are NOT
++    // the arm's - with the switch on these two must run on today's kernels ("[FA_DEC27] rows outside the arm")
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 1013, 12));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 4096, 16));
+     // 0119/0122: paged K/V at the agent's geometry (head 256, 4 KV heads x 6,
+ // q8_0 K / q4_0 V), decode and 6-row verify, kv 1k to 262k, pools smaller than
+     // the context with every second page in the ring. The last two arms are all-ring
+@@ -15376,6 +15644,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     std::vector<std::unique_ptr<test_case>> test_cases;
+ 
++    // 0227: the 6-row verify at the agent's depths (4,096, 32,768, the median 77,297, 131,072 keys) and
++    // 4 and 8 rows at the median: GGML_OPENCL_FA_DEC27=1 against today's flash_attn_gqa_dpas
++    for (int64_t kv : {4096, 32768, 77297, 131072}) {
++        test_cases.emplace_back(new test_flash_attn_dec27(4, 6, kv, 6));
++    }
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 77297, 4));
++    test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 77297, 8));
++
+     // 0221: the loop controller, the op (one launch) against the chain it replaces (12 launches)
+     for (int64_t nt : {1024, 1027}) {
+         test_cases.emplace_back(new test_loop_control(nt, 0, 1));
+@@ -16381,6 +16657,228 @@ static const int FA_PORT_EVAL_NEEDLE = 6;
+ 
+ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval();
+ 
++// 0227: GGML_TEST_FA_DEC27_DECISIONS=1 (no device needed): every test_flash_attn_dec27 eval case's op
++// goes through the arm's pure gate (fa_dec27_gate.h), as the launch asks it. A model-layout case the
++// gate refuses, a refused-layout case it accepts, or a stale count fails; each case's split is
++// printed for both cards (B60: 160 compute units, B70: 256) and must keep at least 16 blocks a
++// split and fit one wave. A case of more than 8 rows is refused "rows" as a call and "row-block" as
++// its 8-row block. GGML_TEST_FA_DEC27_DECISIONS=red asks the gate about every case in the contiguous
++// layout instead, and about a row block without the row-block rule: every case must then FAIL.
++#define FA_DEC27_EVAL_CASES   28
++#define FA_DEC27_EVAL_REFUSED 1
++#define FA_DEC27_EVAL_ROWS    2      // more than 8 rows: refused "rows" as a call, "row-block" as its blocks
++static bool test_fa_dec27_decisions() {
++    const char * mode = getenv("GGML_TEST_FA_DEC27_DECISIONS");
++    const bool red = mode != nullptr && strcmp(mode, "red") == 0;
++    auto cases = make_test_cases_eval();
++    int n = 0, n_ref = 0, n_rows = 0, n_fail = 0;
++    for (auto & tc : cases) {
++        auto * fa = dynamic_cast<test_flash_attn_dec27 *>(tc.get());
++        if (fa == nullptr) continue;
++        if (fa->nb > 8) {
++            // the call is refused "rows"; its first 8-row block, as the row-block split builds it, is a verify's
++            // shape and must be refused "row-block" (and would be accepted without that rule: the check can fail)
++            ggml_init_params rp = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++            ggml_context * rc = ggml_init(rp);
++            ggml_tensor * op = fa->build_graph(rc);
++            const char * w1 = "", * w2 = "", * w3 = "";
++            const int a1 = fa_dec27_gate_call(op, 0, 1, 4096, 1, &w1);
++            ggml_tensor qv = *op->src[0], dv = *op, mv = *op->src[3];
++            qv.ne[1] = 8; dv.ne[2] = 8; mv.ne[1] = 8; dv.src[0] = &qv; dv.src[3] = &mv;
++            const int a2 = fa_dec27_gate_call(&dv, red ? 0 : 1, 1, 4096, 1, &w2);
++            const int a3 = fa_dec27_gate_op(&dv, 4096, 1, &w3);
++            const bool ok = a1 == 0 && strcmp(w1, "rows") == 0 && a2 == 0 && strcmp(w2, "row-block") == 0 && a3 != 0;
++            printf("  hkv=%lld G=%lld kv=%lld nb=%lld: the call %s%s | its 8-row block %s%s (the shape alone: %s): %s\n",
++                   (long long) fa->hkv, (long long) fa->G, (long long) fa->kv, (long long) fa->nb, a1 ? "ACCEPT" : "refuse ", a1 ? "" : w1,
++                   a2 ? "ACCEPT" : "refuse ", a2 ? "" : w2, a3 ? "accepted" : w3, ok ? "OK" : "FAIL");
++            n_fail += !ok; n_rows++;
++            ggml_free(rc);
++            continue;
++        }
++        test_flash_attn_dec27 alt(fa->hkv, fa->G, fa->kv, fa->nb, fa->hide, 1, fa->empty, fa->vfloor);
++        test_flash_attn_dec27 * use = red ? &alt : fa;
++        ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++        ggml_context * ctx = ggml_init(params);
++        ggml_tensor * op = use->build_graph(ctx);
++        const char * why = "";
++        const int acc = fa_dec27_gate_op(op, 4096, 1, &why);
++        const bool want = fa->layout == 0;
++        const int tiles = fa_dec27_tiles((int) fa->G, (int) fa->nb), tps = (int) fa->hkv * tiles;
++        const int p60 = fa_dec27_splits(tps, 160, fa->kv, 0, 0), p70 = fa_dec27_splits(tps, 256, fa->kv, 0, 0);
++        const int64_t blocks = (fa->kv + 31) / 32;
++        const bool sok = p60 >= 1 && p70 >= 1 && p60 * tps <= std::max(640, tps) && p70 * tps <= std::max(1024, tps) &&
++                         (p60 == 1 || blocks / p60 >= 16) && (p70 == 1 || blocks / p70 >= 16) &&
++                         (int64_t) fa_dec27_split_blocks(fa->kv, p60) * p60 >= blocks && (int64_t) fa_dec27_split_blocks(fa->kv, p70) * p70 >= blocks;
++        const bool ok = (acc != 0) == want && fa_dec27_in_scope(op) != 0 && sok;
++        // a split past the call's blocks walks nothing (its state weighs 0): named, since a case is there for it
++        const int sb60 = fa_dec27_split_blocks(fa->kv, p60), sb70 = fa_dec27_split_blocks(fa->kv, p70);
++        const int e60 = p60 - (int) ((blocks + sb60 - 1) / sb60), e70 = p70 - (int) ((blocks + sb70 - 1) / sb70);
++        printf("  hkv=%lld G=%lld kv=%lld nb=%lld hide=%d layout=%d%s%s: gate %s%s | tiles %d mt %d | split B60 %d (%d threads, %d empty), B70 %d (%d threads, %d empty): %s\n",
++               (long long) fa->hkv, (long long) fa->G, (long long) fa->kv, (long long) fa->nb, fa->hide, use->layout,
++               fa->empty ? (" empty=" + std::to_string(fa->empty)).c_str() : "", fa->vfloor ? " vfloor" : "",
++               acc ? "ACCEPT" : "refuse ", acc ? "" : why, tiles, fa_dec27_mask_slots((int) fa->G, (int) fa->nb),
++               p60, p60 * tps, e60, p70, p70 * tps, e70, ok ? "OK" : "FAIL");
++        // the empty-split case must have one on the B60's rule (if the rule moves, the case no longer covers it)
++        if (fa->kv == 13056 && fa->nb == 6 && fa->layout == 0 && !red && e60 < 1) { printf("  the empty-split case has no empty split on 160 compute units: FAIL\n"); n_fail++; }
++        n_fail += !ok;
++        if (fa->layout == 0) { n++; } else { n_ref++; }
++        ggml_free(ctx);
++    }
++    // the crossover: one key below the threshold the call is refused "below-crossover" (today's kernels), at the
++    // threshold it is the arm's, and forced (the tests' switch value 2) it is the arm's below it too. A block of the
++    // row-block split stays refused "row-block" whatever the force. GGML_TEST_FA_DEC27_DECISIONS=nomin asks the
++    // check without the rule in mind (it expects the call below the threshold accepted): it must FAIL on this gate.
++    {
++        const bool nomin = mode != nullptr && strcmp(mode, "nomin") == 0;
++        struct { int64_t kv; int force; int want; const char * why; const char * what; } rows[] = {
++            { FA_DEC27_MIN_KV - 1, 0, nomin ? 1 : 0, "below-crossover", "one key below the threshold: today's kernels" },
++            { FA_DEC27_MIN_KV,     0, 1, "", "at the threshold: the arm" },
++            { FA_DEC27_MIN_KV - 1, 1, 1, "", "one key below, forced (the tests): the arm" },
++            { 37,                  1, 1, "", "37 keys, forced: the arm" },
++            { 131072,              0, 1, "", "131,072 keys: the arm" },
++        };
++        for (auto & r : rows) {
++            test_flash_attn_dec27 c(4, 6, r.kv, 6);
++            ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++            ggml_context * ctx = ggml_init(params);
++            ggml_tensor * op = c.build_graph(ctx);
++            const char * why = "";
++            const int acc = fa_dec27_gate_call(op, 0, r.force, 4096, 1, &why);
++            const bool ok = (acc != 0) == (r.want != 0) && (acc != 0 || strcmp(why, r.why) == 0);
++            printf("  crossover (min_kv %d): kv=%lld force=%d: %s%s - %s: %s\n", FA_DEC27_MIN_KV, (long long) r.kv, r.force, acc ? "ACCEPT" : "refuse ", acc ? "" : why, r.what, ok ? "OK" : "FAIL");
++            n_fail += !ok;
++            const char * wb = "";
++            if (fa_dec27_gate_call(op, 1, 1, 4096, 1, &wb) != 0 || strcmp(wb, "row-block") != 0) { printf("  crossover: a row block is not refused row-block under the force: FAIL\n"); n_fail++; }
++            ggml_free(ctx);
++        }
++        if (FA_DEC27_MIN_KV != 8192) { printf("  the threshold is %d, the sweep's measured point is 8192: FAIL\n", FA_DEC27_MIN_KV); n_fail++; }
++    }
++    const bool counts = n == FA_DEC27_EVAL_CASES && n_ref == FA_DEC27_EVAL_REFUSED && n_rows == FA_DEC27_EVAL_ROWS;
++    printf("  eval cases: model layout %d, refused layout %d, more than 8 rows %d: %s\n", n, n_ref, n_rows, counts ? "as the table says" : "FAIL, the table above is stale");
++    printf("  dec27 decisions%s: %s\n", red ? " (every case in the contiguous layout)" : "", n_fail == 0 && counts ? "OK" : "FAIL");
++    return n_fail == 0 && counts;
++}
++
++// 0227: GGML_TEST_FA_DEC27_CPU=1 (the CPU backend, no device): every test_flash_attn_dec27 eval case
++// runs on the CPU backend and is compared with a double-precision attention on ggml's own
++// dequantization of the case's blocks. It shows, on the cases' own data, what the bound rests on:
++// the CPU backend's distance from that reference (it quantizes Q to q8_0) must leave the bound room
++// (at most half of it), and what a kernel that loses keys would do must be far above it - the last
++// key dropped (the arm's RED=2) and the first 32-key block of every split from the second on lost
++// (RED=3, at the B60's split count), each more than 10 times the bound. A case of less than 96
++// keys has no second split and its seam figure is not asked.
++// The fourth figure is a device behaviour, measured on the 24 GB card with the arm's first build: a
++// 16-half block read (intel_sub_group_block_read_us) whose pointer is 2 bytes past a 4-byte boundary
++// gives its odd lanes the cell two before their own (the even lanes their own). The mask is f16
++// [n_kv, rows], so the run of an odd row over an odd key count starts there: in every whole
++// 16-key group the row's odd keys take the mask cell of key - 2 (key 1 the row before's last cell).
++// With that read the double reference stands 4.4e-7 from the card's dumped answers in every row
++// (1,009, 1,013, 1,023 and 2,037 keys at 6 rows; as written 5.4e-4 .. 3.3e-3). The figure here is
++// what the read does to the answer against the CPU's, over the read's own answer squared - the
++// harness's nmse, which divides by the backend's output (at 77,297 keys the two outputs' squares
++// differ by 4 %: 4.13e-2 over the CPU's, 3.97e-2 over the device's, the card's figure). The cases
++// must be able to see it: every case of an odd key count more than 10 times its bound. The kernel reads such a run a key at a
++// time (flash_attn_dec27.cl, mal[]); its red build 7 block-reads it.
++static bool test_fa_dec27_cpu(ggml_backend_t backend) {
++    auto cases = make_test_cases_eval();
++    int n_fail = 0, n_run = 0, n_mrun = 0;
++    for (auto & tc : cases) {
++        auto * fa = dynamic_cast<test_flash_attn_dec27 *>(tc.get());
++        if (fa == nullptr || fa->layout != 0 || fa->nb > 8) continue;
++        ggml_init_params params = { ggml_tensor_overhead()*64 + ggml_graph_overhead(), NULL, true };
++        ggml_context * ctx = ggml_init(params);
++        ggml_tensor * op = fa->build_graph(ctx);
++        ggml_cgraph * gf = ggml_new_graph(ctx);
++        ggml_build_forward_expand(gf, op);
++        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
++        GGML_ASSERT(buf != nullptr);
++        fa->initialize_tensors(ctx);
++        GGML_ASSERT(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
++        const ggml_tensor * q = op->src[0], * k = op->src[1], * v = op->src[2], * mask = op->src[3];
++        const int n_q = (int) q->ne[1], n_kv = (int) k->ne[1], n_head = (int) q->ne[2], hkv = (int) k->ne[2], D = 256, G = n_head / hkv;
++        float scale; memcpy(&scale, op->op_params, sizeof scale);
++        GGML_ASSERT(mask->nb[1] == (size_t) n_kv * sizeof(ggml_fp16_t) && mask->nb[0] == sizeof(ggml_fp16_t));
++        std::vector<float> cpu(ggml_nelements(op));
++        ggml_backend_tensor_get(op, cpu.data(), 0, ggml_nbytes(op));
++        const ggml_to_float_t k_to_float = ggml_get_type_traits(GGML_TYPE_Q8_0)->to_float;
++        const ggml_to_float_t v_to_float = ggml_get_type_traits(GGML_TYPE_Q4_0)->to_float;
++        const int tiles = fa_dec27_tiles(G, n_q), p60 = fa_dec27_splits(hkv * tiles, 160, n_kv, 0, 0), sb = fa_dec27_split_blocks(n_kv, p60);
++        auto hidden = [&](int r, int key, int variant) {
++            size_t cell = (size_t) r * (mask->nb[1] / sizeof(ggml_fp16_t)) + (size_t) key;
++            // the block read of a run that is not on 4 bytes, a whole 16-key group: an odd lane holds the cell two before
++            if (variant == 3 && ((size_t) r * mask->nb[1]) % 4 != 0 && (key / 16) * 16 + 16 <= n_kv && (key & 1) != 0) cell -= 2;
++            const ggml_fp16_t m = ((const ggml_fp16_t *) mask->data)[cell];
++            if ((m & 0x7C00) == 0x7C00 || m == 0xFBFF) return true;
++            if (variant == 1) return key == n_kv - 1 - (int) fa->empty;                // the last used key dropped
++            if (variant == 2) return key >= sb * 32 && (key / 32) % sb == 0;            // a seam block a split lost
++            return false;
++        };
++        double num[4] = { 0, 0, 0, 0 }, den = 0, den_c = 0, den_m = 0;
++        std::vector<float> kdq((size_t) n_kv * D), vdq((size_t) n_kv * D);
++        std::vector<double> sc(n_kv), ex(D);
++        for (int head = 0; head < n_head; ++head) {
++            const int kvh = head / G;
++            if (head % G == 0) {
++                for (int key = 0; key < n_kv; ++key) {
++                    k_to_float((const char *) k->data + (size_t) key * k->nb[1] + (size_t) kvh * k->nb[2], kdq.data() + (size_t) key * D, D);
++                    v_to_float((const char *) v->data + (size_t) key * v->nb[1] + (size_t) kvh * v->nb[2], vdq.data() + (size_t) key * D, D);
++                }
++            }
++            for (int r = 0; r < n_q; ++r) {
++                const float * qr = (const float *) ((const char *) q->data + (size_t) head * q->nb[2] + (size_t) r * q->nb[1]);
++                const float * cr = (const float *) ((const char *) cpu.data() + (size_t) head * op->nb[1] + (size_t) r * op->nb[2]);
++                for (int key = 0; key < n_kv; ++key) {
++                    double a = 0;
++                    const float * kr = kdq.data() + (size_t) key * D;
++                    for (int d = 0; d < D; ++d) a += (double) qr[d] * kr[d];
++                    sc[key] = a * scale;
++                }
++                for (int variant = 0; variant < 4; ++variant) {
++                    double mx = -1e300, l = 0;
++                    for (int key = 0; key < n_kv; ++key) if (!hidden(r, key, variant)) mx = std::max(mx, sc[key]);
++                    std::fill(ex.begin(), ex.end(), 0.0);
++                    for (int key = 0; key < n_kv; ++key) {
++                        if (hidden(r, key, variant)) continue;
++                        const double pw = exp(sc[key] - mx);
++                        l += pw;
++                        const float * vr = vdq.data() + (size_t) key * D;
++                        for (int d = 0; d < D; ++d) ex[d] += pw * vr[d];
++                    }
++                    for (int d = 0; d < D; ++d) {
++                        const double e = l > 0 ? ex[d] / l : 0.0;
++                        if (variant == 0) { num[0] += (cr[d] - e) * (cr[d] - e); den += e * e; den_c += (double) cr[d] * cr[d]; }
++                        else              { num[variant] += (e - cr[d]) * (e - cr[d]); if (variant == 3) den_m += e * e; }
++                    }
++                }
++            }
++        }
++        const double e_cpu = num[0] / den, e_tail = num[1] / den_c, e_seam = num[2] / den_c, e_mrun = num[3] / den_m, bound = fa->arm_bound();
++        // the V-floor case has flat weights by design: a lost key moves it by ~1 / n, and its lost-key figures are not asked
++        const bool seam_asked = p60 > 1 && fa->vfloor == 0, tail_asked = fa->vfloor == 0;
++        // an odd row's mask run over an odd key count is 2 past a 4-byte boundary (the cells are 2 bytes)
++        // The crossover's case of 8,191 keys is in the list for the dispatch (one key below the threshold), not for
++        // this figure: its odd key count shows the read at 7.9 times the bound (7.95e-5; a card would still fail the
++        // case on it), under the 10 asked of the cases that are there to catch it. Named, not asked.
++        const bool mrun_xover = n_kv == FA_DEC27_MIN_KV - 1;
++        const bool mrun_asked = (n_kv & 1) != 0 && n_q > 1 && n_kv >= 16 && fa->vfloor == 0 && !mrun_xover;
++        n_mrun += mrun_asked;
++        const bool ok = e_cpu <= 0.5 * bound && (!tail_asked || e_tail > 10 * bound) && (!seam_asked || e_seam > 10 * bound) && (!mrun_asked || e_mrun > 10 * bound);
++        printf("  %s: cpu/double %.3g | a dropped last key %.3g%s | a lost seam block a split (p %d) %.3g%s (%.0f x the bound) | "
++               "a mask run block-read off 4 bytes %.3g%s: %s\n", fa->vars().c_str(),
++               e_cpu, e_tail, tail_asked ? "" : " (not asked)", p60, e_seam, seam_asked ? "" : " (not asked)", e_seam / bound,
++               e_mrun, mrun_asked ? "" : mrun_xover ? " (not asked: the crossover's case; above the bound, under 10 x)" : " (not asked: no run off 4 bytes)", ok ? "OK" : "FAIL");
++        if (mrun_xover && !(e_mrun > bound)) { printf("  the crossover's case does not show the read above its bound at all: FAIL\n"); n_fail++; }
++        n_fail += !ok;
++        n_run++;
++        ggml_backend_buffer_free(buf);
++        ggml_free(ctx);
++    }
++    // at least the 1,013-key cases at 4 to 8 rows, the 2 x 8 head layout, 37 and 77,297 keys ask the mask-run figure
++    printf("  dec27 cpu (bound 1e-5, 2e-5 from 16,384 keys; the CPU within half of it, each lost-key red above 10 x; a mask run off 4 bytes in %d cases, "
++           "8 at least): %d cases, %s\n", n_mrun, n_run, n_fail == 0 && n_run == FA_DEC27_EVAL_CASES && n_mrun >= 8 ? "OK" : "FAIL");
++    return n_fail == 0 && n_run == FA_DEC27_EVAL_CASES && n_mrun >= 8;
++}
++
+ // 0199: GGML_TEST_FA_PORT_DECISIONS=1 (no device needed): every port=1 eval case's op goes
+ // through the supports_op decision and through the launch-time decision - the same pure
+ // gate (fa_port_gate.h), on the op as the launch is handed it - and any disagreement, or
+@@ -17133,6 +17631,12 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
+     if (getenv("GGML_TEST_FA_PORT_KV8") != nullptr) {
+         return test_fa_port_kv8(backend);
+     }
++    if (getenv("GGML_TEST_FA_DEC27_CPU") != nullptr) {
++        return test_fa_dec27_cpu(backend);
++    }
++    if (getenv("GGML_TEST_FA_DEC27_DECISIONS") != nullptr) {
++        return test_fa_dec27_decisions();
++    }
+     if (getenv("GGML_TEST_FA_PORT_DECISIONS") != nullptr) {
+         return test_fa_port_decisions();
+     }

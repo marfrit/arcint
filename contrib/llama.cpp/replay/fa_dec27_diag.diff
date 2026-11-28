@@ -1,0 +1,72 @@
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index eae05c7..9b11def 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -1603,6 +1603,52 @@ struct test_case {
+             if (ud->tc->err_tag() != nullptr) {
+                 printf("[%s] nmse = %.3g (bound %.3g) ", ud->tc->err_tag(), err, ud->tc->max_err(ud->backend1));
+             }
++            // TEST ONLY, never in the series (contrib/llama.cpp/replay/fa_dec27_diag.diff): GGML_TEST_FA_DEC27_DIAG=<dir>
++            // prints where a dec27 case's answer differs from the CPU's - the error a (token row, query head), a
++            // 32-column chunk, the worst element - and writes both outputs raw (f32, [row][head][column]) to
++            // <dir>/<tag>-<vars>.{dev,cpu}.f32 (tag: GGML_TEST_FA_DEC27_DIAG_TAG)
++            static const char * diag_dir = getenv("GGML_TEST_FA_DEC27_DIAG");
++            if (diag_dir != nullptr && t1->op == GGML_OP_FLASH_ATTN_EXT && ud->tc->err_tag() != nullptr && strcmp(ud->tc->err_tag(), "FA_DEC27") == 0) {
++                const int64_t D = t1->ne[0], NH = t1->ne[1], NR = t1->ne[2];
++                const char * tag = getenv("GGML_TEST_FA_DEC27_DIAG_TAG");
++                std::string vs = ud->tc->vars();
++                for (char & c : vs) { if (c == ',' || c == '=') c = '_'; }
++                printf("\n[FA_DEC27_DIAG] %s %s: out [%lld columns, %lld heads, %lld rows], nmse %.4g\n", tag ? tag : "-", ud->tc->vars().c_str(),
++                       (long long) D, (long long) NH, (long long) NR, err);
++                if ((int64_t) f1.size() == D * NH * NR) {
++                    double tn = 0, td = 0, wd = 0; int64_t wi = 0;
++                    std::vector<double> cn(D / 32, 0.0), cd(D / 32, 0.0);
++                    for (int64_t r = 0; r < NR; ++r) {
++                        printf("[FA_DEC27_DIAG] row %lld, nmse a head:", (long long) r);
++                        for (int64_t h = 0; h < NH; ++h) {
++                            double n = 0, d = 0;
++                            for (int64_t c = 0; c < D; ++c) {
++                                const int64_t i = (r * NH + h) * D + c;
++                                const double e = (double) f1[i] - f2[i];
++                                n += e * e; d += (double) f2[i] * f2[i];
++                                cn[c / 32] += e * e; cd[c / 32] += (double) f2[i] * f2[i];
++                                if (fabs(e) > wd) { wd = fabs(e); wi = i; }
++                            }
++                            tn += n; td += d;
++                            printf(" %.1e", d > 0 ? n / d : n);
++                        }
++                        printf("\n");
++                    }
++                    printf("[FA_DEC27_DIAG] nmse a 32-column chunk:");
++                    for (size_t c = 0; c < cn.size(); ++c) printf(" %.1e", cd[c] > 0 ? cn[c] / cd[c] : cn[c]);
++                    printf("\n[FA_DEC27_DIAG] all: %.4g | the worst element: row %lld head %lld column %lld, device %.6g, CPU %.6g\n", td > 0 ? tn / td : tn,
++                           (long long) (wi / (NH * D)), (long long) ((wi / D) % NH), (long long) (wi % D), (double) f1[wi], (double) f2[wi]);
++                    bool wrote = true;
++                    for (int w = 0; w < 2; ++w) {
++                        const std::string path = std::string(diag_dir) + "/" + (tag ? tag : "x") + "-" + vs + (w == 0 ? ".dev.f32" : ".cpu.f32");
++                        const std::vector<float> & f = w == 0 ? f1 : f2;
++                        FILE * fo = fopen(path.c_str(), "wb");
++                        wrote = fo != nullptr && fwrite(f.data(), sizeof(float), f.size(), fo) == f.size() && wrote;
++                        if (fo != nullptr) wrote = fclose(fo) == 0 && wrote;
++                    }
++                    printf("[FA_DEC27_DIAG] dump %s ", wrote ? "written" : "FAILED");
++                }
++            }
+             if (t1->op == GGML_OP_LOOP_CONTROL) {
+                 // 0221: every loop-control row prints its error, pass or fail (its bound is
+                 // stated before the card run)
+@@ -14948,6 +14994,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
+     test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 8192, 6));
+     // 12 and 16 rows: the dispatch cuts them into blocks of 8 (and 4) rows, which have a verify's shape and are NOT
+     // the arm's - with the switch on these two must run on today's kernels ("[FA_DEC27] rows outside the arm")
++    if (getenv("GGML_TEST_FA_DEC27_DIAG") != nullptr) {
++        // TEST ONLY (replay/fa_dec27_diag.diff): key counts around the failing 1,013 - whole 32-key blocks (992, 1024,
++        // 1056), a whole 16-key group past one (1008, 1040), one key past and one key short of a group (1009, 1023),
++        // the failing count's neighbours (1012, 1014) - and the same tails one split deep (2,037 = 1,013 + 1,024)
++        for (int64_t kv : { 992, 1008, 1009, 1012, 1014, 1023, 1024, 1040, 1056, 2037 }) {
++            test_cases.emplace_back(new test_flash_attn_dec27(4, 6, kv, 6));
++        }
++    }
+     test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 1013, 12));
+     test_cases.emplace_back(new test_flash_attn_dec27(4, 6, 4096, 16));
+     // 0119/0122: paged K/V at the agent's geometry (head 256, 4 KV heads x 6,

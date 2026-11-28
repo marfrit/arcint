@@ -1,0 +1,62 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 1f2c0d2..d32c7a7 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -23,6 +23,8 @@
+ #include <atomic>
+ #include <cassert>
+ #include <cmath>
++#include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <numeric>
+ #include <sstream>
+@@ -3219,6 +3221,48 @@ ggml_tensor * llm_graph_context::build_attn_mha(
+             }
+         }
+ 
++        // TEST ONLY, never in the series (contrib/llama.cpp/replay/fa_noise_control.diff): a noise control for the
++        // attention's result. ARCINT_TEST_FA_NOISE=<amp>:<seed> with amp > 0 moves every element of the op's output
++        // one ulp up or down at random (the size of amp is unused), at every site the in-place decode arm (0227)
++        // would replace: 4 to 8 query rows over a q8_0 K and a q4_0 V at head size 256. With amp = 0 the same op
++        // copies the output unchanged: the identity run. The custom op runs on the CPU, so on a card it puts a CPU
++        // island after every such attention; the identity run prices that island alone.
++        if (const char * e = getenv("ARCINT_TEST_FA_NOISE"); e != nullptr && q->ne[1] >= 4 && q->ne[1] <= 8 && q->ne[0] == 256 &&
++            k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0) {
++            struct fa_noise { float amp; unsigned long long seed; unsigned long long call; };
++            static int call = 0;
++            static bool said = false;
++            fa_noise * ud = new fa_noise;   // leaked: a test run
++            ud->amp = 0.0f; ud->seed = 0;
++            sscanf(e, "%f:%llu", &ud->amp, &ud->seed);
++            ud->call = (unsigned long long) call++;
++            if (!said) {
++                said = true;
++                if (ud->amp > 0.0f) {
++                    LLAMA_LOG_WARN("TEST-ONLY ARCINT_TEST_FA_NOISE: the attention's output moves one ulp at 4 to 8 rows (seed %llu)\n", ud->seed);
++                } else {
++                    LLAMA_LOG_WARN("TEST-ONLY ARCINT_TEST_FA_NOISE: the attention's output is copied unchanged at 4 to 8 rows (the hook's identity run)\n");
++                }
++            }
++            cur = ggml_map_custom1(ctx0, cur, [](ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
++                (void) nth;
++                if (ith != 0) {
++                    return;
++                }
++                const fa_noise * n = (const fa_noise *) userdata;
++                const float * x = (const float *) a->data;
++                float * y = (float *) dst->data;
++                const int64_t cnt = ggml_nelements(a);
++                const unsigned long long h0 = n->seed*0x9E3779B97F4A7C15ull + n->call*0xD1B54A32D192ED03ull;
++                for (int64_t i = 0; i < cnt; ++i) {
++                    unsigned long long z = h0 + (unsigned long long) i*0x9E3779B97F4A7C15ull;
++                    z = (z ^ (z >> 30))*0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27))*0x94D049BB133111EBull; z ^= z >> 31;
++                    // one ulp up or down: the smallest change a float has (relative 6e-8 .. 1.2e-7)
++                    y[i] = n->amp > 0.0f ? nextafterf(x[i], (z & 1) ? INFINITY : -INFINITY) : x[i];
++                }
++            }, 1, ud);
++        }
++
+         if (v_mla) {
+ #if 0
+             // v_mla can be applied as a matrix-vector multiplication with broadcasting across dimension 3 == n_tokens.

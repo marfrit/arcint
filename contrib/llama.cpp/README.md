@@ -12354,3 +12354,344 @@ lines with the split's state, and `TAKEN src=opencl op=FLASH_ATTN port=fa_kern k
 are WARN under `std::call_once`; its split-scratch growth line is WARN once a growth; its trace line is WARN a call,
 behind `GGML_OPENCL_FA_PORT_TRACE=1`. It needs nothing from 0224. `test_taken_lines_183.py` does not hold its split line
 yet, nor 0225's `kv=q8_0:q4_0` line (owed).
+
+## 0227-opencl-flash-attn-dec27.patch / 0227b-flash-attn-dec27-tests.patch
+
+**Status: on the 24 GB card the op cases, the reds, the kernels' own launch times, the served rounds, a greedy
+pair and the crossover sweep ran (on the tree before the key-count threshold), then the 77k on-against-off detector (identity run -0.000000 nats / 100 %, the one-ulp control 0.000137 / 99.751 %, the arm 0.000136 = 0.99 times the control / 99.774 %),
+and on the tree with the threshold its card check (8,191 keys on today's kernels with the ROUTE line, 8,192 on the
+arm, 8,191 forced on the arm; the 22 cases to 13,056 keys 22 of 22 at the switch's three values). The KL gate
+passed at 2k and 32k (the table at the end of this section).** Opt-in,
+`GGML_OPENCL_FA_DEC27=1`; unset, the dispatch is what it was.
+
+**The form (decided 2026-11-27, after the first card part).** `GGML_OPENCL_FA_DEC27=1` selects one kernel: the P V
+phase with the scale normalised a (32-key block, q4_0 block) by a power of two (called NORM or PVNORM below). There
+is no sub-switch. Three forms were built and measured (`measured-here`, the 24 GB card, the FA family's launch time
+a 6-row call, median (minimum) of one run, us; today = `flash_attn_gqa_dpas` + `flash_attn_f32_merge`):
+
+| | 77,297 keys | 131,072 keys | the V-floor case (nmse, bound 2e-5) | the other 28 cases |
+|---|---|---|---|---|
+| today's kernels | 2,811 (2,773) | 4,693 (4,641) | passes at its 5e-4 | 29 / 29, worst 4.8e-6 |
+| **NORM: the kernel** | **1,186 (1,134): -57.8 %** | **2,048 (1,924): -56.4 %** | **3.4e-6: OK** | 28 / 28, worst 3.3e-6 to 13,056 keys, 5.2e-6 from 32,768 |
+| F32 (P V in f32, no DPAS) | 1,793 (1,696): -36.2 % | 3,137 (2,961): -33.2 % | 3.3e-6: OK | 28 / 28, worst 3.3e-6 / 5.1e-6 |
+| f16(p 8 d), the first form | 976 (937) | 1,672 (1,651) | **4.9e-3: FAIL** | 28 / 28 |
+
+The rule set before the run: the default must be right on every input, and the cheaper correct form becomes the only
+one. The first form is wrong on the V-floor case, so it is out whatever its time. NORM and F32 are both right;
+NORM is a third faster in its own launch times at both depths, so F32 leaves the series. The record of the two
+forms that left is the paragraphs below, which describe the build that was measured: the kernel with all three
+forms and their switches `_PVNORM` / `_PV32`. That build is not in the series. The series'
+kernel is that build's NORM text with the other branches removed: offline its ISA is the NORM build's (main kernel
+md5 `a8c59f52da1f`, merge `43e3fb32fd65`, both targets). What NORM costs offline: its main kernel does not fit 256
+registers (3,648 bytes of scratch at 2 mask slots, 3,584 at 1, 4,416 at 8; no IGC recompile) - the launch times
+above are with that. The reds on the card (the NORM and F32 builds): the six fail every case they are run on; the
+red 7 fails the three odd key counts (7.02e-4 .. 3.98e-2) and passes at 4,096 keys.
+
+**The crossover (decided 2026-11-28): the arm from 8,192 keys on.** Fa_dec27 has a fixed cost of ~153 us a call against ~50 us for flash_attn_gqa_dpas, independent of the keys; below 8192 keys the dispatch keeps today's kernel. How it was
+found (`measured-here`, the 24 GB card): the served part passed (3 rotated rounds against the base series, decode
+means: depth 0 -2.4 %, 32k +3.4 %, 77k +29.5 %, 131k +32.4 %, the ranges overlapping under MTP's sampling); a
+greedy pair (temperature 0, MTP 5, 3 tasks x 2 rotated rounds, d = form - base a pair) then proved 77k (25.81 ->
+30.05 t/s, mean_d 4.24, SE_d 1.35) and 131k (15.41 -> 22.94 t/s, mean_d 7.53, SE_d 0.30) and read depth 0 level
+(42.20 -> 42.29 t/s); but the profiled 6-row verify at depth 0 had the FA family at 1.05 ms on today's kernels and
+2.61 ms on the arm (at 32k: 21.1 -> 8.6 ms). The rule set before that run: such a finding is answered by a key-count
+threshold in the dispatch, not by a revert. The sweep (the FA family's launch time a call from a profile a run, 512
+to 32,768 keys x 4 / 6 / 8 rows, today's kernels against the arm): at 4,096 keys the arm loses the 8-row case
+(+4.7 %), at 8,192 it wins every row (-68 / -46 / -44 %) and at every larger size measured. The threshold is the
+smallest measured size from which the arm wins every row - a measured point, not an interpolation:
+`FA_DEC27_MIN_KV` = 8192 in `fa_dec27_gate.h`. A call the shape's gate accepts with fewer keys is refused
+"below-crossover" and keeps today's kernels; that is the designed route, so it prints no DOWNGRADE line but one
+`ROUTE src=opencl op=FLASH_ATTN dec27=below-crossover ..` line a process. `GGML_OPENCL_FA_DEC27=2` takes the arm
+at every key count (the tests: most cases are below the threshold). The TAKEN line carries `min_kv=8192` (0 when
+forced). Device-free, red first, AS WRITTEN: the decisions check is to refuse 8,191 keys, accept 8,192 and accept
+8,191 forced (`GGML_TEST_FA_DEC27_DECISIONS=nomin` expects the call below the threshold accepted and must fail);
+the gate unit test the same, with a build without the rule (`-DFA_DEC27_GATE_RED_NO_MIN_KV`) that must fail. They were written two commits before they were first built (a card window was running and the host was
+to stay quiet); run on the recipe host since, CPU only: the decisions check rc 0 (its five crossover rows OK), its
+`nomin` mode rc 1 and its contiguous-layout mode rc 1, as they must; the gate unit rc 0 and its five red builds rc 1
+each (1, 23, 4, 15 and 1 failures by the test's own summary line: without the crossover, the stride rule, the
+extra sources, the wave bound, the row-block rule); the CPU check rc 0 on 28 cases; the text check PASS; the offline compile PASS on both targets
+with the seven red builds, the main kernel's ISA unchanged by the threshold (md5 `a8c59f52da1f`: the dispatch
+moved, not the kernel). The first run of the CPU check failed, and that is on the record: the crossover's own case
+of 8,191 keys has an odd key count, and the first build's mask read moves it by 7.95e-5, 7.9 times its bound and
+under the 10 the check asks of the cases that are there to catch that read. The case is in the list for the
+dispatch; the check now names it and does not ask the figure of it (a card would still fail the case on that
+read). Two eval cases, 8,191 and 8,192 keys at 6 rows, carry the rule to the card: with the switch at 1 the first
+runs on today's kernels ("[FA_DEC27] below the crossover", no launch of the arm), the second on the arm. **The
+threshold's card check passed (the status above).** **From the threshold on, every run that tests the arm - the op cases,
+the seven red builds, the perf case of 4,096 keys - needs the switch at 2:** at 1 every case below 8,192 keys runs
+today's kernels, so a red build would pass without the arm in the run and the perf case would time
+`flash_attn_gqa_dpas`. In the greedy pair the answers were the same in both rounds within an arm (9 of 9 each) and the same
+between the arms in 8 of 18: the arm is not bit-exact with today's kernels, and draft accept moved with the
+answers (77k: 44.9 -> 39.0 %); the speed gain is measured with that in it.
+
+Also from that run (`measured-here`): the cache question - at 8 rows NORM moves 492 GB/s gross (6 readers x 77,297
+keys x 1,664 B in 1,567 us), above the card's 456 GB/s read rate, so the cache serves the other tiles; the split
+rule's 32 is the fastest at 77,297 keys (8: 15,725, 16: 14,692, 32: 14,277, 64: 14,481 us wall, the first form); at
+4,096 keys 32 splits of 4 blocks ran 4.8 % faster than the rule's 8 (1,092 against 1,147 us wall) - a later item,
+not in this patch.
+
+**What it is for** (`measured-here`, the B60, the dense 27B hybrid as the agent unit serves it: 16 attention layers,
+head size 256, 24 query heads on 4, K q8_0 : V q4_0, MTP 5, so a verify is 6 rows). The agent's turns sit at a median
+depth of ~77k tokens. There `flash_attn_gqa_dpas` and its merge are 40.4 % of a 115-ms 6-row verify graph, and
+55.2 % of 167 ms at 131k; the kernel moves the cache at 30 to 48 GB/s, 6.5 to 10 % of what the card reads. It converts
+K and V to f16 a 32-key tile into local memory, with three barriers a tile; the 42 KB of local memory let one
+work-group run a core, 10 of a core's 32 threads.
+
+**What it adds.** A decode / verify kernel for **4 to 8 query rows over a q8_0 K and a q4_0 V at head size 256,
+both read in place** (`kernels/flash_attn_dec27.cl`), its pure gate and split rule (`fa_dec27_gate.h`), and the launch.
+
+- **The reads are the FA port's** (0199q1's q8_0 K, 0225's q4_0 V, `flash_attn_port.cl`): raw cache bytes by 2D block
+  reads, the key in the lane for K and the byte column in the lane for V; codes and nibbles become f16 by integer
+  operations on whole dwords (`0x6400 | x`), each block's scale multiplies in f32. No local memory, no barrier, no K
+  or V value rounded before its product.
+- **The class is today's**: Q goes through the DPAS as f16, as `flash_attn_gqa_dpas` has it at 4 to 8 rows. K's
+  codes are exact where today's kernel rounds `code x d` to f16. For V, p is rounded to f16 and then `p 8 d` once
+  more, where today's kernel rounds p and `(n - 8) d` each. Nothing is quantized to int8 (the decision of
+  2026-11-26).
+- **The rows.** A query row of a kv head is a (query head, token) pair, in `flash_attn_gqa_dpas`'s order. A
+  sub-group (one thread) owns 8 of them, a tile, and all 256 output columns: at 6 rows 5 tiles a kv head (36 rows),
+  at 4 rows 3, at 8 rows 6.
+- **Q** is re-read a key group from an f16 scratch that a prepass writes once a call (4,096 bytes a tile, already in
+  the lane order K's codes come out in, with the accumulator starts `-1152 sum q`). A tile's output is 128 of the
+  256 registers, so its Q (64 more) does not stay in registers: `flash_attn_dpas2`'s finding at this head size.
+- **The keys are split across threads**, each split with its own online-softmax state, and a merge kernel joins
+  the states (0045's form). The rule fills **one wave**: the most splits whose threads fit the device's (32 a core
+  at 256 GRF), stepped down to a thread count that is a multiple of the core count, and never less than 16 blocks
+  (512 keys) a split. On the B60 at 6 rows: 32 splits, 640 threads, 2,416 keys a split at 77k; 8 splits at 4,096
+  keys. At 4 rows 50 splits (600 threads), at 8 rows 25 (600).
+- **The mask** is read as runs of 16 halves, one run a token a tile holds (2 at 24 heads on 4), not a key at a time.
+- **The dispatch** asks the gate right after the port's check. An accepted call is three launches (the prepass,
+  the split kernel, the merge).
+- **Only the calls the model emits with 4 to 8 rows.** A 9 to 64-row call is cut by the dispatch into blocks of up
+  to 8 rows that re-enter it; such a block has a verify's shape, and the arm does **not** take it
+  (`fa_dec27_gate_call`, reason `row-block`): that would be a second path, with a prompt's shapes, that the cases
+  and the card rows below do not cover. Those calls keep today's kernels until they are covered. A call
+  of the arm's kind that it does not serve prints `DOWNGRADE src=opencl op=FLASH_ATTN dec27=declined reason=..`
+  (or `dec27=not-built ..`) once and keeps today's kernels; a 1-row step, a prompt and any other cache type are not
+  its kind and print nothing.
+- **The TAKEN line**, WARN once a process: `TAKEN src=opencl op=FLASH_ATTN dec27=in-place kv=q8_0:q4_0 head=256
+  grf=256 n_q=.. n_kv=.. kv_heads=.. tiles=.. mt=.. split=.. blocks=.. threads=.. wave=.. minblk=.. force=..
+  pv=f16|norm|f32` (the form of the P V phase; a red build adds ` RED-BUILD-WRONG-ANSWERS`).
+
+**The gate** refuses, each with its reason: another K/V type pair (`kv-type`), another head size (`head`), fewer
+than 4 or more than 8 rows (`rows`), a block of the row-block split (`row-block`), more than one stream, a sink, a page table, a ring, an indexed bias or the
+port's sources (`extra-sources`), ALiBi, a softcap, a mask that is not f16 with one head, and the strides the reads
+cannot take: a K row pitch below 332 bytes or off 16, a V row pitch below 204 or off 16, a head's first byte off
+the 4-byte grid, a backend alignment that is not a multiple of 64. The model's lines pass: q `[256, T, 24]` nb
+`[4, 24576, 1024]`, K `[256, n_kv, 4]` nb `[34, 1088, 272]`, V nb `[18, 576, 144]` (its graph export, a fixture of
+the gate's unit test).
+
+**Switches.** `GGML_OPENCL_FA_DEC27=1` turns the arm on for calls of 8,192 keys or more (`FA_DEC27_MIN_KV`, the
+measured crossover; a shorter call keeps today's kernels); `=2` turns it on at every key count (the tests, the red
+builds, a perf case below the threshold). `_SPLIT=N` sets the split count, `_MINBLK=N` the least
+32-key blocks a split walks (unset 16), `_CU=N` the compute units the wave is computed from, `_TRACE=1` logs a line
+a call. `_RED=1..7` builds a red kernel (the tests only, with the switch at 2): 1 takes V's scale from the next block, 2 drops the call's
+last key, 3 skips the first block of every split from the second on, 4 merges the states without their maxima, 5
+applies K's scale twice, 6 leaves out the `1 / c` that brings O back from a block's scale, 7 block-reads a mask
+run whatever its pointer.
+
+**The record of the three forms** (the measured build with all three; the series has NORM alone, see "The
+form" above). **The P V phase has three forms, and the first is not the one to adopt.** The kernel was written with 0225's scale in
+P, `pe = f16(p d 8)`. That keeps `p d` inside f16 from above, not from below: f16 has 11 bits down to 6.1e-5 and none
+below 6e-8, and the floor is on the product `p 8 d`, not on d alone. A key whose `p 8 d` is small loses bits or
+vanishes while the denominator still counts it. Today's kernel does not have that floor on V (a subnormal scale times
+an integer nibble is exact in f16); it shares only the floor on p (p is an f16 operand there too, gone below 3e-8).
+The default must be right for every input, so the f16 form stays in the patch as the time reference only, and two
+candidates are built beside it; the cheaper correct one becomes 0227's only form after the card window, the other
+is dropped.
+
+- **NORM** (`GGML_OPENCL_FA_DEC27_PVNORM=1`): the scale normalised a (32-key block, q4_0 block) by a power of two.
+  `c = 2^-e`, e the binary exponent of the largest `|d|` among the 32 keys; `pe = f16(p d c)`; O is taken to that
+  scale, through the two DPAS, and back (`1 / c`) in f32. Exact powers of two: only the rounding point moves, to 11
+  bits under the 32 keys' largest scale. p is still an f16 operand, as in today's kernel. A scale that is inf or
+  NaN is not normalised.
+- **F32** (`GGML_OPENCL_FA_DEC27_PV32=1`): V out of the f16 DPAS altogether. For each key, q4_0 block and row the
+  weight `p d` is a float (p in f32 too: this form has no f16 operand in P V); the key's nibbles come out of the same
+  byte read by shifts, become floats, and `O += w (nibble - 8)` is 16 multiply-adds a (key, block). 32 keys x 8
+  blocks x 16 multiply-adds a key block where the DPAS forms have 48 DPAS.
+
+The rounding of the P V phase alone, 131,072 keys (`dec27_kernel_model.py`, NMSE against a double sum,
+`measured-here`, a model):
+
+| the row's weights | V block maximum | f16 `f16(p 8 d)` | NORM | F32 | today's `f16(p) f16(v)` |
+|---|---|---|---|---|---|
+| flat, p in (0.5, 1] | 1 | 8e-8 | 8e-8 | - | 7e-8 |
+| | 1e-4 | 1.1e-7 | 8e-8 | - | 5e-8 |
+| | 1e-5 | 6.8e-6 | 1.1e-7 | - | 4e-8 |
+| | 1e-6 (the V-floor case) | **6.2e-4** | 5e-8 | lane model: 7e-9 | 4e-8 |
+| a dominant key over a tail at p 1e-6 .. 1e-3 (the tail 19 x the key) | 1 | 1.1e-9 | 1.1e-9 | 3e-11 | 1.6e-8 |
+| | 1e-1 | 1.4e-8 | 2.2e-9 | 4e-11 | 5e-8 |
+| | 1e-2 | 4.7e-7 | 9e-10 | 3e-11 | 2e-8 |
+| the same, the tail at p 1e-7 .. 1e-5 (0.28 x the key) | 1e-2 | 2.2e-7 | 4e-10 | 3e-11 | 2e-8 |
+
+So the f16 form falls off where `p 8 d` reaches f16's subnormals: with weights near 1 that is block maxima below
+~1e-5; under a dominant key with a deep tail it is already 20 to 500 times NORM's error at block maxima of 1e-1 and
+1e-2 (still below the op cases' bound there, which is why only the V-floor case shows it red). NORM stays at today's
+class everywhere; F32 is below both.
+
+**Both candidates spill at 256 registers** (ocloc 26.27.1, bmg-g21 and bmg-g31, `tools/ocloc_fa_dec27.sh`): NORM's
+main kernel 3,648 bytes of scratch (4,716 instructions against the f16 form's 3,744, 80 DPAS), F32's 2,560 bytes
+(11,111 instructions, 32 DPAS). Neither is IGC's retry build with rolled loops (no `_1_` dump, the DPAS counts are
+the unrolled ones). The f16 form's ISA is unchanged by the two (md5 b83a228636f4). What was tried for NORM without
+success: the scales loaded once for both the exponent and P (3,904 bytes), a pass of its own for the exponents
+(3,456), a uniform denominator to free 8 registers (3,008); the kernel's output alone is 128 of the 256. So a card
+time of either candidate carries its spill.
+
+**Context, deciding nothing:** the V blocks of this model on the CPU
+(`contrib/refkernels/dec27-fa/v_scale_hist.cpp`, the dense 27B hybrid at Q5_K_M, 1,024 tokens of C++ source, the 16
+attention layers' V projections, 1,572,864 blocks of 32; `measured-here`): block maxima from 0.19 to 124, median
+2.4, the lowest 0.1 % at 0.35; none below 0.1. On such V the f16 form's floor is the floor on p that today's
+kernel has too.
+
+**How it differs from the Inkling port** (0193-0199, 0223, 0225), whose reads it takes:
+
+| | the port | this arm |
+|---|---|---|
+| calls | a prompt, 9 rows and more, an indexed bias, positions, per-query sinks | 4 to 8 rows, an f16 mask, no bias and no sink |
+| head size | 128 | 256 |
+| a tile | 8 rows of one query head | 8 (query head, token) rows of a kv head: 5 threads at 6 rows where a tile a head would be 6 |
+| Q | held in registers, read from the op's f32 Q (no prepass) | re-read a key group from an f16 scratch (a prepass launch): the output takes 128 registers |
+| K, a key group | 5 dword reads (34 dwords) | 9 (68 dwords), three in flight |
+| the visible keys | group classes and positions, blocks skipped | the mask, runs of 16 halves a token; no block is skipped |
+| a work-group | the query heads of a kv head | one sub-group |
+| the split | opt-in; the fewest splits with a wave 95 % full, 128 blocks a split at least, 16 at most; unsplit calls write the output themselves | always a state and a merge; one wave, 16 blocks a split at least |
+
+The split differs from the port's rule because the two calls differ: a prompt has a thousand work-groups before
+any split and the port splits to fill a ragged wave; a 6-row call has 20 threads a split and needs 32 splits to
+occupy the card at all.
+
+**Deviation from the reference mechanism of today's kernel: the K/V read of a kv head is shared through the
+cache, not in registers and not in a staged copy.** The reference is NInfer's small-T form
+(`src/ops/attention/causal_softmax/small_t_bf16.cuh`, `code`), which `flash_attn_gqa_dpas` follows: one work-group
+reads K and V once, into shared memory, for every row of the kv head. Here the 8 rows of a tile share a read in
+registers, and the tiles of a kv head (5 at 6 rows, 3 at 4, 6 at 8) each issue the read themselves. The reason: one
+read in registers for all 36 rows of a 6-row call needs every tile's output in one thread, and 256 registers hold
+one tile's (128 of them); a staged copy is what the arm removes (local memory, the barriers, one work-group a
+core). It follows the other reference instead, the port's, where the query heads of a kv head read the same keys
+side by side. Whether the cache serves the other tiles' reads is a card question, and the card rows answer it two
+ways (row 6): the split kernel's time at 4, 6 and 8 rows over the same keys (3, 5 and 6 readers of each byte), and
+its time a key against the cache's size in bytes. If the cache does not serve it, the choice between this arm and
+a staged read is the operator's, with the measured price of each side on the record.
+
+**Without a device** (`measured-here`, the recipe host):
+
+- **ocloc 26.27.1**, bmg-g21 and bmg-g31 (`tools/ocloc_fa_dec27.sh`): the three kernels at 256 GRF, no scratch, no
+  retry dump, no local-memory send (the f16 form; the two candidates' main kernels spill, above). The main kernel a key block: 80 DPAS (32 for S, 48 for P V with its two bias
+  sums a block) and 46 2D block loads (K 18, Q 16, V 12), 36 other loads. Its two flag registers are spilled to a
+  general register (2 stores, 4 loads; not scratch). The five red builds each change the ISA. One set of Q reads
+  for both key groups of a block (8 instead of 16) spilled 3,264 bytes on both targets and is not in the kernel.
+- **The kernel a lane at a time** (`contrib/refkernels/dec27-fa/dec27_kernel_model.py`, on raw cache bytes from
+  ggml's quantizers, against a double-precision attention on the same blocks): 5e-8 to 8e-8 at 4 to 8 rows, 24
+  heads on 4 and 16 on 2, 1 to 4 splits, a split with nothing visible; every output cell written once. The five
+  reds move the answer by 1e-2 to 2.
+- **The kernel's text against the model** (`contrib/refkernels/dec27-fa/dec27_text_check.py`): the hand-written K
+  table (9 reads, 4 pairs of 17 dwords, each of the head's 68 dwords once) parsed out of the kernel; its lane maps
+  cut out, compiled on the host and compared with the model's; the three parameter lists against the launch's
+  `clSetKernelArg` sequences. PASS; two table entries swapped: rc 1.
+- **The gate unit** (`contrib/refkernels/dec27-fa/dec27_gate_test.cpp`, on the model's two FLASH_ATTN_EXT export
+  lines): green rc 0; the lines as exported (1 and 512 rows) refused `rows`, the decode line at 4 to 8 rows
+  accepted at 4,096, 77,297 and 262,144 keys, 32 bent calls refused with their reasons (the op's last source slot
+  among them), an 8-row block of the row-block split refused, the split table, and the crossover (8,191 keys
+  refused `below-crossover`, 8,192 accepted, 8,191 forced accepted). Red, five builds, rc 1 each, the failures as the test's
+  summary line counts them (failed expectations, the run on the head with the threshold): an f16 cache's
+  head-stride rule (23: the model refused; 19 before the crossover's four accepted calls were in the test), a rule
+  that looks at the page table only (4: a bias, the port's sink and the last slot accepted), the split without the
+  wave bound (15), the gate without the row-block rule (1), the gate without the crossover (1: 8,191 keys accepted). The header's slot numbers are checked against ggml-impl.h by static_asserts in the backend.
+- **test-backend-ops** (0227b): 28 cases in the model's layout (26 until the crossover's two, 8,191 and 8,192 keys), the mask as served, one in a layout the gate
+  refuses, and two of 12 and 16 rows, whose row blocks the arm must not take. Among the 26: 13,056 keys at 6 rows
+  (25 splits on 160 compute units, the 25th past the call's blocks: a split that walks nothing; 15 served depths
+  have one), 8,960 cells holding 8,705 tokens (the cache pads to 256: a last split hidden from every row but one),
+  131,072 keys (where the kernel is 55 % of a verify), and the V-floor case. A case the arm does not serve (the
+  switch unset, the refused layout, more than 8 rows) runs on today's kernels at their bound (5e-4) and fails if
+  the arm launched for it. `GGML_TEST_FA_DEC27_DECISIONS=1` rc 0 (every case through the gate, the split for both
+  cards with its empty splits named, the row blocks refused), `=red` rc 1. `GGML_TEST_FA_DEC27_CPU=1` rc 0, 26
+  cases: the CPU backend, which quantizes Q to q8_0, stands up to 2.9e-6 from the double reference to 13,056 keys
+  and 2.9e-6 to 4.7e-6 from 32,768 to 131,072; a dropped last key moves these cases by 7.3e-4 to 3.4e-2 and a
+  lost seam block a split by 1.35e-3 to 5.8e-2 (131,072 keys: 1.35e-3, 68 times its bound).
+- **The model on the new shapes:** the empty split and the hidden padded tail 8e-8 from the reference, each caught
+  by the lost-seam red (4e-2, 5e-2). The three forms lane by lane at 2,085 keys: on the cases' fill 8e-8 (f16 and
+  NORM) and 7e-9 (F32); on the V-floor fill f16 2.6e-3 (it fails), NORM 6e-8, F32 7e-9. Red 6: NORM without its
+  `1 / c` 2e29 or NaN, F32 without the key's scale 5e2 and 5e14. NORM with its operand kept to 4 bits: 5.8e-4 on
+  the V-floor case (the case can fail).
+- **The bound against the CPU, stated before any card run, for a case on the arm:** 1e-5 below 16,384 keys, 2e-5
+  from there. Two levels because the CPU's own distance from the double reference grows with the depth and the
+  card's kernel adds its rounding; 2e-5 is still a bound there because the lost-key reds sit far above it (1.35e-3
+  at least from 32,768 keys on).
+
+**The first card run and what it found** (`measured-here`, the 24 GB card; the cause from the dumps, off the
+card). The dry run of the first card part stopped at its first case: the first build stood 7.02e-4 from the CPU at
+1,013 keys and 6 rows (bound 1e-5). A diagnosis run (the test-only `contrib/llama.cpp/replay/fa_dec27_diag.diff`:
+the error a (token row, query head), both outputs dumped, a key-count sweep) gave:
+
+| keys (6 rows) | first build, all three forms and split 1 alike | today's kernels |
+|---|---|---|
+| 6, 992, 1,008, 1,012, 1,014, 1,024, 1,040, 1,056, 4,096, 8,960, 13,056, 32,768 | 1.3e-7 .. 3.3e-6: OK | 1.6e-7 .. 2.9e-6 |
+| 37 | 8.81e-3 | 1.4e-6 |
+| 1,009 | 3.32e-3 | 2.8e-6 |
+| 1,013 (4 / 5 / 6 / 7 / 8 rows; 2 x 8 heads) | 7.08e-4 / 5.89e-4 / 7.02e-4 / 5.61e-4 / 1.59e-3; 1.10e-3 | 2.7e-6 .. 2.9e-6 |
+| 1,023 | 7.39e-4 | 2.9e-6 |
+| 2,037 | 5.47e-4 | 3.0e-6 |
+| 77,297 | 3.97e-2 | not run |
+
+Every odd key count fails and every even one passes; the three forms and the split forced to 1 give the same
+figures; in a failing case the odd token rows carry the error in every head and column chunk, the even rows are
+clean (3e-6). The cause is one line: the mask run's 16-half block read (`intel_sub_group_block_read_us`). The
+mask is f16 `[n_kv, rows]`, so an odd row's run over an odd key count starts 2 bytes past a 4-byte boundary, and
+on the card such a read gives its odd lanes the cell two before their own. With exactly that read a
+double-precision reference stands 4.4e-7 from the card's dumped answers in every row (1,009, 1,013, 1,023 and
+2,037 keys; as written 5.4e-4 .. 3.3e-3), and the device-free check's figure for it (`GGML_TEST_FA_DEC27_CPU`,
+"a mask run block-read off 4 bytes") gives the card's numbers: 7.07e-4 / 5.89e-4 / 7.01e-4 / 5.60e-4 / 1.59e-3 at
+1,013 keys, 1.10e-3 on 2 x 8 heads, 8.81e-3 at 37, 3.97e-2 at 77,297 (the card: 7.08e-4 / 5.89e-4 / 7.02e-4 /
+5.61e-4 / 1.59e-3, 1.10e-3, 8.81e-3, 3.97e-2). The figure is divided by the read's own answer squared, as the
+harness divides a card's error by the card's output; over the CPU's output it reads 4.13e-2 at 77,297 keys, a
+4 % difference that is this normalisation and no second effect.
+The even rows also show the arm's own arithmetic on the card: 4.4e-7 from the double reference (the lane model
+said 5e-8 .. 9e-8; the CPU backend stands 2.8e-6 from it).
+
+**The fix:** a run that is not on 4 bytes is read a key at a time (`mal[]`); the block read stays for every other
+run, which is every run of a served call (the cache's key counts are multiples of 256). Offline the fixed main
+kernel compiles at 256 registers without scratch on both targets, and the red build 7
+(`GGML_OPENCL_FA_DEC27_RED=7`: the block read whatever the pointer) has the ISA of the first build's kernel
+(md5 `b83a228636f4`): the red is the kernel that failed. The fixed kernel passed the card rows below.
+
+**Why the lane model did not see it:** it took the mask by index (`mask[row, key]`: what the kernel means), not
+by address, so a read's alignment did not exist in it; the case (1,013 keys) was there, the device's read was
+not. Since then: the model reads the mask run by address with the card's measured behaviour and must fail the
+first build's read at an odd key count (0.4e-3 .. 8e-3 on its own fills) while the kernel's guard passes; the
+text check names every block read and write by pointer in the kernel (three: the mask run's under its guard,
+the split state's on float cells) and fails on a new one until its pointer's alignment is shown; the CPU check
+asks the device figure of every case with an odd key count (11 of the 28; a twelfth, the crossover's 8,191 keys, is named and not asked) to be above 10 times the bound.
+What stays unmodelled: the 2D block loads' own contract (their bases are on 64 bytes by the gate) and the
+DPAS's rounding - the even rows' 4.4e-7 on the card is the evidence for those, not the model.
+
+**The card results** (`measured-here`, the Arc Pro B60 capped at 165 W, the dense 27B hybrid at q8_0 K : q4_0 V,
+MTP 5; each row with its bar and what was run):
+
+| row | bar | result | what was run |
+|---|---|---|---|
+| the op cases and the red builds, the fixed kernel | every case on the arm inside its bound, the V-floor case among them; each red fails | PASS (the f16 form of the P V phase, run as the reference: its V-floor case FAILS at 4.9e-3, as expected) | test-backend-ops, the cases of the model's layout, the switch off and on, and the red builds |
+| the kernels' own launch time, a 6-row call | the arm against today's kernels (`flash_attn_gqa_dpas` + `flash_attn_f32_merge`), +-2 % counts as level | 77k keys 2,811 -> 1,186 us, 131k 4,693 -> 2,048 us | a profiling build, the sum of the family's kernel medians over one run, 77,297 and 131,072 keys, 6 rows |
+| KL, the gate, 2k (6 chunks) | within +0.03 nats and 1 point of the off arm, against the CPU base, `-b 6 -ub 6` | off 0.001817 / 99.039 % -> the arm 0.001803 / 99.055 % (-0.000014 nats, +0.016 point); the base series' build equals the off arm to every digit | perplexity, 6 chunks of 2,048 tokens, `-b 6 -ub 6`, the CPU base on the same chunks |
+| KL, the gate, 32k | the same | off 0.001764 / 99.029 % -> the arm 0.001769 / 99.097 % (+0.000005 nats, +0.068 point) | perplexity, 1 chunk of 32,768 tokens, `-b 6 -ub 6`, the CPU base on the same chunk |
+| served decode, 3 rotated rounds | the 77k row counts | depth 0 -2.4 %, 32k +3.4 %, 77k +29.5 %, 131k +32.4 % (the tree before the threshold: the depth 0 row is why there is one) | the served route, prompts at depth 0 / 32k / 77k / 131k, the base series against the arm |
+| a greedy pair | the same answers within an arm | 77k 25.81 -> 30.05 t/s, 131k 15.41 -> 22.94 t/s, depth 0 level | the served route, greedy, two rounds an arm at depth 0, 77k and 131k |
+| the crossover sweep | the smallest key count from which the arm wins at 4, 6 and 8 rows | 4,096 keys lose at 8 rows (+4.7 %), 8,192 win (-68 / -46 / -44 %): the threshold | the FA family's launch time a call at 4 / 6 / 8 rows over a ladder of key counts, today's kernels against the arm |
+| KL at 77k, the detector for a lost tail (no gate) | the arm's KL against the off arm's own logits at most 2 times a one-ulp control's, top-1 not more than 0.5 point under it | the identity run -0.000000 nats / 100 %, the control 0.000137 / 99.751 %, the arm 0.000136 = 0.99 times the control / 99.774 % | perplexity at 77,824 tokens, `-ub 6`, the off arm's own logits as the reference |
+| the threshold's check | 8,191 keys on today's kernels with the ROUTE line, 8,192 on the arm, 8,191 forced on the arm | PASS; the 22 cases to 13,056 keys 22 of 22 at the switch's three values | test-backend-ops on the tree with the threshold, the switch unset, 1 and 2 |
+
+How the rows were taken:
+
+- **KL, the gate (the operator's bar).** Decode-shaped forwards (`-b 6 -ub 6`: every forward is a 6-row call; a
+  batched arm runs the prompt kernels and is blind to the arm), paired on the same chunks. The reference arm is
+  the tree's own binary with the switch unset; that its off path is the base series' is the third figure of the
+  2k row.
+- **KL at 77k.** There is no CPU base at that depth (~60 GB of RAM and hours). The off arm writes its own logits
+  at 77,824 tokens; the arm is compared with them, and so is a control: the off arm with one ulp of noise in the
+  attention's own output at every 4 to 8-row call (`contrib/llama.cpp/replay/fa_noise_control.diff`, test only,
+  never in the series), the same op, the same chunks. The hook is a custom op on the CPU, so the control's graph
+  has a CPU island after every such attention; an identity run of the same hook (the output copied unchanged)
+  shows what the island alone does and the card's own run-to-run difference: nothing, on this card and run.
+- **The served rows** are the base series against the arm, the TAKEN line in the arm's log and no `dec27=`
+  DOWNGRADE key.
+
+Not measured: micro-batch 1 (a 1-row call is not the arm's: it takes 4 to 8 rows, so that path is today's kernels
+by the gate; the gate unit asserts the exported 1-row decode line refused "rows"), any card but the Arc Pro B60, and any model but the dense 27B hybrid at these cache types.

@@ -18,6 +18,46 @@ plugin patch series, its patch level part of the package version (`+p1` …
 was retired in 0.8.0. Citations "DESIGN §x" in the entries before 0.8.0
 point into `DESIGN.md` at the tag `openvino-history` (`docs/history.md`).
 
+## Unreleased
+
+- **A decode flash-attention kernel that reads a q8_0 K and a q4_0 V in place, for the dense 27B hybrid's verify
+  rows** (patch 0227, opt-in: `GGML_OPENCL_FA_DEC27=1`; unset, nothing changes). The agent's turns sit at a median
+  depth of ~77k tokens, where `flash_attn_gqa_dpas` and its merge are 40.4 % of a 6-row verify graph (55.2 % at
+  131k; the Arc Pro B60 capped at 165 W, `measured-here`): it converts K and V to f16 a tile into local memory and
+  runs one work-group a core.
+  The new kernel takes the FA port's read forms to 4 to 8-row calls at head size 256: raw cache bytes by 2D block
+  reads, integer to f16, the block scale in f32, no local memory and no barrier, Q as f16 through the DPAS as today
+  (the same class; nothing quantized to int8). The keys are split across one wave of the card's threads (32 splits
+  at 6 rows on the B60) and a merge joins the states. It takes the calls the model emits with 4 to 8 rows only, not
+  the 8-row blocks of a longer call. The switch selects one kernel: in its P V phase the scale is normalised a
+  (32-key block, q4_0 block) by a power of two.
+  **On the card** (`measured-here`, the Arc Pro B60 capped at 165 W, the op cases and the kernels' own launch times):
+  the FA family's
+  launch time a 6-row call 1,186 us against today's 2,811 at 77,297 keys (-57.8 %) and 2,048 against 4,693 at 131,072
+  (-56.4 %); 29 of 29 cases within the bound against the CPU (1e-5, 2e-5 from 16,384 keys; worst 5.2e-6), the seven
+  red builds failing. Two other forms of the P V phase were built and measured and left out: `f16(p 8 d)` without the
+  normalisation was the fastest (976 / 1,672 us) and wrong on a V block of very small values (4.9e-3 on the V-floor
+  case), P V in f32 without the DPAS was right and slower (1,793 / 3,137 us). The first build was also wrong at odd
+  key counts (7.0e-4 at 1,013 keys; today's kernels 2.9e-6): its mask block read 2 bytes past a 4-byte boundary gave
+  the odd lanes the wrong cells; such a run is now read a key at a time (the served key counts are multiples of 256
+  and never took that path), and the first build's read is kept as a red build.
+  Served on that card: 3 rotated rounds against the base series gave decode means of -2.4 % at depth 0, +3.4 % at
+  32k, +29.5 % at 77k and +32.4 % at 131k; a greedy pair (temperature 0, 6 pairs a depth) proved 77k (25.81 -> 30.05
+  t/s) and 131k (15.41 -> 22.94 t/s) and read depth 0 level. The arm is taken from 8,192 keys on: fa_dec27 has a fixed
+  cost of ~153 us a call against ~50 us for flash_attn_gqa_dpas, independent of the keys; below 8192 keys the dispatch
+  keeps today's kernel. `GGML_OPENCL_FA_DEC27=2` forces
+  the arm at every key count (the tests, the red builds). The threshold's card check passed (8,191 keys on today's
+  kernels, 8,192
+  on the arm, 8,191 forced on the arm), and so did the 77k on-against-off detector (identity run -0.000000 nats / 100
+  %, the one-ulp control 0.000137 / 99.751 %, the arm 0.000136 = 0.99 times the control / 99.774 %); the device-free
+  checks
+  pass on the recipe host, their reds failing as they must.
+  The KL gate against the CPU base (the bar: +0.03 nats and 1 point against the off arm): at 2k 0.001817 / 99.039 %
+  -> 0.001803 / 99.055 %, at 32k 0.001764 / 99.029 % -> 0.001769 / 99.097 %. Offline (ocloc, bmg-g21 and bmg-g31) the
+  main kernel spills 3,648 bytes of scratch at 256 registers, without a recompile; the launch times above are with
+  that. Not measured: any card but the Arc Pro B60, any model but the dense 27B hybrid at these cache types. The units
+  are unchanged.
+
 ## 1.8.3 — 2026-11-27
 
 Inkling 2 Mini's release on 1.8.2: context checkpoints come back at q8_0 / q4_0 K/V on OpenCL (patch 0209 performs
