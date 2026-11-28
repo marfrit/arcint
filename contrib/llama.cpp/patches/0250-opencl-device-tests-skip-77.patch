@@ -1,0 +1,57 @@
+0250: the OpenCL device tests (test-dspark-shortlist gpu, test-opencl-argmax-sched, test-opencl-kv-view-write) say SKIP and exit 77 when there is no OpenCL device to run on; an explicitly named absent device still fails.
+
+diff --git a/tests/test-dspark-shortlist.cpp b/tests/test-dspark-shortlist.cpp
+index 6f4f2af..7e8c76b 100644
+--- a/tests/test-dspark-shortlist.cpp
++++ b/tests/test-dspark-shortlist.cpp
+@@ -128,7 +128,7 @@ int main(int argc, char ** argv) {
+     ggml_backend_t be = nullptr;
+     if (argc > 1 && std::string(argv[1]) == "gpu") {
+         ggml_backend_dev_t d = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+-        if (!d) { fprintf(stderr, "no GPU device\n"); return 2; }
++        if (!d) { printf("SKIP: no OpenCL device (no GPU device for the gpu mode)\n"); return 77; }
+         be = ggml_backend_dev_init(d, nullptr);
+     } else {
+         be = ggml_backend_cpu_init();
+diff --git a/tests/test-opencl-argmax-sched.cpp b/tests/test-opencl-argmax-sched.cpp
+index 81e81e4..cea1bb8 100644
+--- a/tests/test-opencl-argmax-sched.cpp
++++ b/tests/test-opencl-argmax-sched.cpp
+@@ -47,7 +47,7 @@ int main(int argc, char ** argv) {
+     const int V = 200058, R = 256;
+ 
+     ggml_backend_dev_t gd = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+-    if (!gd) { fprintf(stderr, "no GPU device\n"); return 2; }
++    if (!gd) { printf("SKIP: no OpenCL device (no GPU device)\n"); return 77; }
+     ggml_backend_t gpu = ggml_backend_dev_init(gd, nullptr);
+     ggml_backend_t cpu = ggml_backend_cpu_init();
+     printf("SCHED device: %s (%s), mode %s\n", ggml_backend_dev_name(gd), ggml_backend_dev_description(gd), mode.c_str());
+diff --git a/tests/test-opencl-kv-view-write.cpp b/tests/test-opencl-kv-view-write.cpp
+index 24acbc2..1f01f72 100644
+--- a/tests/test-opencl-kv-view-write.cpp
++++ b/tests/test-opencl-kv-view-write.cpp
+@@ -22,7 +22,8 @@
+ // Needs an OpenCL device; not a ctest case (the recipe host has no card). Run by name:
+ //   test-opencl-kv-view-write [device name, default GPUOpenCL]
+ // One line "test-opencl-kv-view-write: PASS (N cases)" or "... FAIL (k of N cases failed)"; exit 1 on
+-// FAIL, and a run with zero cases or no device is a FAIL.
++// FAIL. A run with zero cases is a FAIL. The default device name (GPUOpenCL) absent is a SKIP
++// (`SKIP: no OpenCL device`, exit 77); an explicitly named device that is absent is a FAIL, exit 1.
+ #include "ggml.h"
+ #include "ggml-alloc.h"
+ #include "ggml-backend.h"
+@@ -217,8 +218,12 @@ int main(int argc, char ** argv) {
+ 
+     ggml_backend_dev_t dev = ggml_backend_dev_by_name(name);
+     if (dev == nullptr) {
+-        std::printf("test-opencl-kv-view-write: FAIL (no device named %s; 0 cases)\n", name);
+-        return 1;
++        if (argc > 1) {
++            std::printf("test-opencl-kv-view-write: FAIL (no device named %s; 0 cases)\n", name);
++            return 1;
++        }
++        std::printf("SKIP: no OpenCL device (no device named GPUOpenCL)\n");
++        return 77;
+     }
+     ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+     if (backend == nullptr) {

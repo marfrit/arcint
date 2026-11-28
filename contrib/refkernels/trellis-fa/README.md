@@ -797,8 +797,8 @@ unset or wide-off build, and the port must not change decode.
 
 3. The cases, on the card, with the port on:
 
-       GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 <build>/bin/test-backend-ops -o FLASH_ATTN_EXT -b OpenCL
-       GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 <build>/bin/test-backend-ops -o FLASH_ATTN_EXT -b OpenCL -p flash_attn  # one case at a time
+       GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 <build>/bin/test-backend-ops -o FLASH_ATTN_EXT -b GPUOpenCL
+       GGML_OPENCL_FA_PORT=1 GGML_OPENCL_BOUNDS=1 <build>/bin/test-backend-ops -o FLASH_ATTN_EXT -b GPUOpenCL -p flash_attn  # one case at a time
 
    Red first, as the tests carry it: `GGML_OPENCL_FA_PORT_RED=2` (the sink term
    dropped) must FAIL on the q512 case, and `GGML_OPENCL_FA_PORT_RED=1` (every

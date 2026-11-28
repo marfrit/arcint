@@ -8637,7 +8637,7 @@ scan must show no `op=MUL_MAT_ID ... kernels-missing` DOWNGRADE. SOFT_MAX over t
 keys is a width below the Intel kernel's required sub-group; three test cases now cover it.
 
 Gate on the card: `test-export-graph-ops` writes the graph's 294 unique op shapes, and
-`test-backend-ops -b OpenCL --test-file` replays them against the CPU reference; the SCALE view,
+`test-backend-ops -b GPUOpenCL --test-file` replays them against the CPU reference; the SCALE view,
 LOG, ARANGE and small SOFT_MAX cases are in the suite directly. No FA kernel is touched.
 
 ## 0146-inkling2-rel-bias-indexed-flash-attention.patch
@@ -10221,8 +10221,8 @@ the weights are re-read once a 512-column band, 2 and 4 times, so about 3.3 / 6.
 
 Card commands, perf mode:
 ```
-GGML_OPENCL_KQ_MM_ID_I8=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
-GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 test-backend-ops perf -b OpenCL -o MUL_MAT_ID -p 'routed=1'
+GGML_OPENCL_KQ_MM_ID_I8=1 test-backend-ops perf -b GPUOpenCL -o MUL_MAT_ID -p 'routed=1'
+GGML_OPENCL_KQ_MM_ID_I8=1 GGML_OPENCL_KQ_MM_ID_I8_WIDE=1 test-backend-ops perf -b GPUOpenCL -o MUL_MAT_ID -p 'routed=1'
 ```
 
 CPU gate: `test-backend-ops -b CPU -o MUL_MAT_ID -p 'routed=1'` gives 2/2 OK (the two new correctness
@@ -13390,3 +13390,58 @@ Tests (`contrib/refkernels/soa-route/soa_route_test.cpp`, CPU): green `SOA ROUTE
 compiler warning; the red build `-DGGML_CL_SOA_ROUTE_RED` (today's routing) `SOA ROUTE: 4 of 8 cases right`, rc 1,
 its four failures cases 4, 5, 6 and 8 (the short write, the offset-to-the-end write, the row range, the q4_0 short
 write), each read as CONVERT where it must be REFUSE_PARTIAL. Not run on a card here.
+
+## 0229-test-backend-ops-fail-on-nothing-run.patch
+
+test-backend-ops ended "OK" with exit 0 when it tested nothing: a `-b` naming no device skipped every device and
+counted each as passed (the OpenCL device is `GPUOpenCL`; three commands in this README said `-b OpenCL` and are
+fixed), and in test mode a backend on which the op / params filter matched no case passed with 0 of 0. Now a `-b`
+that matches no device prints the device names and exits 1, and a backend on which no case ran and none was "not
+supported" fails. A backend that refuses every matching case as not supported still passes (the summary prints the
+not-supported count; a refusal check relies on it). A run with no `-b` on a host where nothing but the CPU
+reference exists tested nothing too: instead of `OK`, it now prints `SKIP: no device to test besides the CPU
+reference` and exits 77 (the skip code this repository's test cells use; a ctest case marks it with SKIP_RETURN_CODE 77) — a check with nothing to run on must not read as passed or as a defect.
+
+The skip is counted apart from the devices tested: the CPU reference (skipped in test mode without `-b`) and a
+`-b` skip do not count, and `ggml_quantize_free()` still runs exactly once on that path — the call after the device
+loop is the single one, the skip block adds none.
+
+Checks (`measured-here`, this host, 2026-11-28: the CPU device is the only one; OpenCL finds no platform, so
+`GPUOpenCL` is not among its devices; `B=build/bin/test-backend-ops` of the build of section 5, one tree, red
+first):
+
+| command | before (0229 red) | after (0229) |
+|---|---|---|
+| `$B -b NOPE -o ADD` | exit 0, `1/1 backends passed`, last line `OK` (every device `Skipping`) | exit 1, `backend filter 'NOPE' matches no device; the devices are: CPU`, last line `FAIL` |
+| `$B -b CPU -o NO_SUCH_OP` | exit 0, `0/0 tests passed`, last line `OK` | exit 1, `0 test cases ran on this backend (the op / params filter matched none): FAIL`, last line `FAIL` |
+| `$B -b CPU -o ADD` | exit 0, last line `OK` | exit 0, last line `OK` (the control) |
+| `$B` (no arguments: test mode) | exit 0, `1/1 backends passed`, last line `OK` (`Skipping CPU backend`) | exit 77, `SKIP: no device to test besides the CPU reference` |
+
+The first two rows above, run again with the skip rule in place, still exit 1.
+
+The refusal stays a pass: `$B -b CPU -o SOFT_MAX_BACK -p 'max_bias=8.000000'` (24 cases the CPU backend refuses,
+0 run) prints `0/0 tests passed` and ends `OK`, exit 0, on the patched build; on the red build the same counters
+path ended `OK` (row 2 above, before). The mutation: with only the `-b` check's `if (!found)` block removed, the first
+row is back to exit 0 and `OK`. The second mutation: with the skip block's `return 77` turned into `return 0`, the
+no-argument run is back to exit 0 (row 4's before column); restored byte-exactly and rebuilt before the commit.
+
+## 0250-opencl-device-tests-skip-77.patch
+
+The three device tests that are built but are not ctest cases — `test-dspark-shortlist gpu`, `test-opencl-argmax-sched`
+and `test-opencl-kv-view-write` (the last one's default device name) — ended 2 / 2 / 1 when the host had no OpenCL
+device: a missing prerequisite read as a defect. They print `SKIP: no OpenCL device (<the reason>)` and exit 77 now,
+as `test-backend-ops` does. The caller-demanded rule stays: `test-opencl-kv-view-write SomeCard` on a host without
+that device still prints its FAIL line and exits 1, because the name was asked for. Numbered 0250: the DSpark series
+holds 0240-0249, and two of the files arrive in 0240 / 0241, after 0229 in the series' byte order.
+
+Checks (`measured-here`, the same host and tree as above, red first):
+
+| command | before (0250 red) | after (0250) |
+|---|---|---|
+| `build/bin/test-dspark-shortlist gpu` | exit 2, `no GPU device` | exit 77, `SKIP: no OpenCL device (no GPU device for the gpu mode)` |
+| `build/bin/test-opencl-argmax-sched` | exit 2, `no GPU device` | exit 77, `SKIP: no OpenCL device (no GPU device)` |
+| `build/bin/test-opencl-kv-view-write` | exit 1, `... FAIL (no device named GPUOpenCL; 0 cases)` | exit 77, `SKIP: no OpenCL device (no device named GPUOpenCL)` |
+| `build/bin/test-opencl-kv-view-write SomeCard` | exit 1, the FAIL line | exit 1, the same FAIL line (explicitly named) |
+
+The CPU modes are untouched: `test-dspark-shortlist` without `gpu` still runs its cases and ends `SHORTLIST PASS`,
+exit 0.

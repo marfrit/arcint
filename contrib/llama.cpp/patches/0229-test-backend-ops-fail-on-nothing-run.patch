@@ -1,0 +1,88 @@
+0229: test-backend-ops fails when -b names no device or no test case ran on a backend in test mode, and says SKIP and exits 77 when there is no device to test besides the CPU reference.
+
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 9ab86f8..4ea512a 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -17851,6 +17851,7 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
+ 
+         std::atomic<size_t> n_ok = 0;
+         std::atomic<size_t> tests_run = 0;
++        std::atomic<size_t> tests_not_supported = 0;
+         std::vector<std::string> failed_tests;
+         std::mutex failed_tests_mutex;
+ 
+@@ -17875,7 +17876,11 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
+                 for (size_t i = my_begin; i < my_end; ++i) {
+                     auto & test = test_cases[i];
+                     test_status_t status = test->eval(b, b_cpu, op_names_filter, output_printer);
+-                    if (status == test_status_t::SKIPPED || status == test_status_t::NOT_SUPPORTED) {
++                    if (status == test_status_t::NOT_SUPPORTED) {
++                        tests_not_supported++;
++                        continue;
++                    }
++                    if (status == test_status_t::SKIPPED) {
+                         continue;
+                     }
+                     tests_run++;
+@@ -17934,6 +17939,12 @@ static bool test_backend(ggml_backend_t backend, ggml_backend_dev_t dev, test_mo
+ 
+         const bool slice_ok = run_fa_vec_slice(backend, backend_cpu.get(), op_names_filter);
+ 
++        // 0229: a backend on which no case ran and none was "not supported" tested nothing (the op or params
++        // filter matched no case): a failure, not a pass. All cases refused as not supported stays a pass.
++        if (tests_run == 0 && tests_not_supported == 0) {
++            printf("  0 test cases ran on this backend (the op / params filter matched none): FAIL\n");
++            return false;
++        }
+         return n_ok == tests_run && slice_ok;
+     }
+ 
+@@ -18196,7 +18207,26 @@ int main(int argc, char ** argv) {
+ 
+     output_printer->print_testing_start(testing_start_info(ggml_backend_dev_count()));
+ 
++    // 0229: a -b that names no device tested nothing; say so and fail instead of "Skipping" every device.
++    if (backend_filter != NULL) {
++        bool found = false;
++        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++            if (strcmp(backend_filter, ggml_backend_dev_name(ggml_backend_dev_get(i))) == 0) {
++                found = true;
++            }
++        }
++        if (!found) {
++            printf("backend filter '%s' matches no device; the devices are:", backend_filter);
++            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
++                printf(" %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
++            }
++            printf("\nFAIL\n");
++            return 1;
++        }
++    }
++
+     size_t n_ok = 0;
++    size_t n_tested = 0;
+ 
+     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+@@ -18231,6 +18261,7 @@ int main(int argc, char ** argv) {
+                                                              total / 1024 / 1024, free / 1024 / 1024, true));
+ 
+         bool ok = test_backend(backend.get(), dev, mode, op_names_filter, params_filter, output_printer.get(), test_file_path, parallel_workers);
++        n_tested++;
+ 
+         if (ok) {
+             n_ok++;
+@@ -18245,6 +18276,12 @@ int main(int argc, char ** argv) {
+         output_printer->print_footer();
+     }
+ 
++    // 0229: no -b and nothing but the CPU reference: nothing was tested; a skip, not a pass (ctest's code 77).
++    if (backend_filter == NULL && n_tested == 0) {
++        printf("SKIP: no device to test besides the CPU reference\n");
++        return 77;
++    }
++
+     output_printer->print_overall_summary(
+         overall_summary_info(n_ok, ggml_backend_dev_count(), n_ok == ggml_backend_dev_count()));
+ 
