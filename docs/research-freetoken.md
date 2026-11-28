@@ -297,7 +297,7 @@ Fifteen FreeToken/q\* references, in file order, with disposition:
     **CONFIRMED**: paper §5.2 first sentence.
 13. Line 1250–1251 (memory citation): "the `reference-freetoken-edge-
     moe` memory note" — meta reference, no verifiable claim.
-14. Line 1273–1276 (honesty constraint): "if FreeToken has no row at
+14. Line 1273–1276 (comparability constraint): "if FreeToken has no row at
     all comparable in card class or model to what arcint actually
     measures, the claim row must say that gap out loud" —
     **CONFIRMED**: paper's own Table 1 has no A770 / Arc-class GPU
@@ -308,7 +308,7 @@ Fifteen FreeToken/q\* references, in file order, with disposition:
     reports on Qwen3.6, DeepSeek-V4-Flash, and GLM-5.2 in its main
     tables; Flash-Next itself is not in the paper's evaluated model
     list. An arcint Flash-Next row against FreeToken is a
-    cross-model comparison, and the design doc's own honesty
+    cross-model comparison, and the design doc's own comparability
     constraint (item 14 above) applies.
 
 **Not previously flagged but should be**:

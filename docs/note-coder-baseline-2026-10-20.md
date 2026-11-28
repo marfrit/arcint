@@ -104,7 +104,7 @@ layers hold no paged KV). Total KV: **2.13 GB**.
 Raising V from q4_0 to q8_0 doubles the V half. On a per-byte basis q8_0
 costs 1.57× what q4_0 costs (34 B vs 18 B per 32-element block), so the
 steady-state increase is on the order of **+0.77 GB** (2.13 GB × 0.5 ×
-0.57/2 ≈ 0.30 GB if K and V are equal halves — the honest statement is that
+0.57/2 ≈ 0.30 GB if K and V are equal halves — the accurate statement is that
 the figure must be read off the KV dump line for the new arm, not derived
 from the old one, because the buffer geometry depends on `n_seq` as well).
 

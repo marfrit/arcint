@@ -3781,7 +3781,7 @@ its falsifiable clause travels to `docs/window-051.md`. What ships:
   reported beside every mean and the bar tagged PROVISIONAL with its
   provenance — red at depth 4 as predicted (11.65 / 11.48 nats);
 - the full-depth artifact built (76.3 GiB, 82 min) and its compile refused by
-  the HOST, measured; the France line at full depth EMPTY by honest refusal;
+  the HOST, measured; the France line at full depth EMPTY by an explicit refusal;
 - the C++ ladder at `--max-skips 0` with the shard, green — the count is
   generated on the tag tree and recorded in the tag-day checklist, never
   typed here.
@@ -5126,7 +5126,7 @@ the package was built from.
   `wanted` = 262,144 evaluates to chunk 32, while the depth auto-fit
   actually adopts (103,040, well short of the train maximum once weights,
   activations and margin are accounted for) only needs chunk 64 -- an
-  explicit request for that SAME 103,040, evaluated honestly at its own
+  explicit request for that SAME 103,040, evaluated in full at its own
   depth, priced chunk 64 and admitted it, while auto-fit -- pricing chunk
   32 the whole time -- served a different, more expensive reservation for
   the identical depth. The corrected design: `fit_context_packed_values_
@@ -5411,7 +5411,7 @@ the package was built from.
   101984 (per token 6.0 KiB + KV 8.8 KiB)"` -- BELOW the same card's own u8
   auto-fit of 133,456 (M8, §7.0.2 table). u8:i4 no longer widens the
   auto-fit context over plain u8 for this shape once the scratch buffer is
-  honestly charged; it still wins on KV bytes/token in isolation, but
+  fully charged; it still wins on KV bytes/token in isolation, but
   auto-fit is what an operator without an explicit --n-ctx actually gets.
   (An earlier estimate in this entry, before the term's chunk-clamp fix
   above landed and before this card run, said 127,680 tokens at chunk 32 --

@@ -48,7 +48,7 @@ VRAM: 15,879 MiB peak against 15,877 for the unit — 2 MiB. Nothing paged, GTT
 
 ## What it costs — this is the part to weigh
 
-Checkpoints exist for production traffic. Counting that traffic honestly means
+Checkpoints exist for production traffic. Counting that traffic correctly means
 excluding my own acceptance batteries, which dominate the journal: of 153
 prefill lines since 2026-10-13, **145 are prompts under 1,000 tokens** (the
 battery's 282-token task, mine). The production traffic is the **8 large
@@ -264,7 +264,7 @@ of the time the zero-rate must be ≤ 0.0039 a run (1 in 254); it is currently
 
 Settling the bar to ±0.03 would take about **1,190 sampled runs** (≈ 40
 batches of 30, ≈ 4.7 h of the unit). Nobody should spend that to argue about
-a tenth of a point; the honest report is the interval above.
+a tenth of a point; the report to give is the interval above.
 
 ### Consequence for the flag under debate
 
@@ -384,7 +384,7 @@ Runs per arm needed for 80 % power at alpha = 0.1, computed from the measured
 variance (`measured-here`, arithmetic). Two SDs are given: the pooled per-run
 SD of the 240-run histogram (**0.976**), and the larger SD implied by the
 between-batch scatter (**1.21**, i.e. treating the batch-to-batch excess as
-real overdispersion). The honest column is the second:
+real overdispersion). The column to use is the second:
 
 | to detect | per arm (pooled SD) | per arm (batch-implied SD) |
 |---|---|---|
@@ -477,7 +477,7 @@ decode speed in one arm. Reopening it means removing that confound first.
    | quant removes the zero mode **entirely** (0.83 % → 0 %) | **~850** |
    | quant cuts it to a third (0.83 % → 0.30 %) | **~2800** |
 
-   The honest number for a realistic gain is therefore **2800 runs per arm**:
+   The required number for a realistic gain is therefore **2800 runs per arm**:
    5600 runs, about **11 hours of serving** at the ~7 s a run costs here, on a
    card that is not the production card. The cheaper variant, 850 per arm
    (~3.3 h total), detects only a quant that makes the defect disappear.
@@ -512,7 +512,7 @@ a live probe returned the instructed token). Driver
 | short | finished runnable Lua, no planning comments, no placeholders, no `pass`/`elif`/`None` | 9.867 | 27 | 0 | 0 | 0 | 1 |
 | strict | answer **only** with a complete Lua program in one code block, no planning text, no comment blocks, no placeholders, no Python syntax, write out every branch | 9.500 | 25 | **1** | **1** | 0 | **0** |
 
-Read it honestly: **nothing here is a lever.** The spread across four arms
+Read plainly: **nothing here is a lever.** The spread across four arms
 (9.500–9.933) is smaller than the spread of repeated batches of one
 configuration (9.233–9.900), the ordering is not monotone in instruction
 strength, and `neutral` — an instruction with no content relevant to the

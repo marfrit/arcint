@@ -11593,7 +11593,7 @@ unit test asserts mode 0 refuses every export line as `off`.
   NMSE int8 2.4-2.7e-5, fp16 1.4-1.5e-5, against the MUL_MAT bound of 5e-4; red 1 0.12-0.13; red 2
   1.5-2.1e-3 (3-4x the bound only: on the uniform fill every row's scales are nearly alike), and 0.977 on
   rows of eight magnitudes; red 3 5.4-6.7e-5 at K 2,304 / 3,072 and 2.95e-4 at K 256: under the bound, so
-  the uniform cases cannot see an activation-scale error (asserted, so the model stays honest). On
+  the uniform cases cannot see an activation-scale error (asserted, so the model cannot drift from it). On
   `test_mul_mat_spread`'s fill at its four shapes (64 rows at most, 32 tokens): int8 2.1-2.6e-5, fp16
   1.3-1.4e-5, red 1 0.12-0.13, red 2 1.11-1.28, red 3 0.98-1.21. So on the card red 2 fails the uniform
   cases by a small margin (a case it passes there is that margin) and red 2 and red 3 fail the spread cases

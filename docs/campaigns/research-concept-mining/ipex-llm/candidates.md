@@ -48,7 +48,7 @@ table.
 - **Cost**: medium — either improve the existing XMX tile's occupancy/tiling, or add a
   "materialize f16 operand + big GEMM" arm. A vendor library cannot be called from OpenCL; the
   alternative is to compare against `clBLAS`-class kernels only if one exists on the host (none is
-  assumed), so the honest port is a tiling experiment on our own kernel.
+  assumed), so the comparable port is a tiling experiment on our own kernel.
 - **Experiment**: on the B60 and A770, IPEX `llama-bench` on Llama 2 Q4_0 with
   `GGML_SYCL_DISABLE_DNN=0` (default) and `=1`; the delta is the vendor-GEMM share. Then arcint's
   own arm: a 512-token prefill profile of the q4_0 GEMM's achieved GFLOPs against the card's XMX
